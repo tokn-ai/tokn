@@ -24,6 +24,23 @@ importers:
         specifier: 7.0.2
         version: 7.0.2
 
+    optionalDependencies:
+      '@tokn/sdk-darwin-arm64':
+        specifier: 0.2.3
+        version: link:platforms/darwin-arm64
+      '@tokn/sdk-linux-x64-gnu':
+        specifier: 0.2.3
+        version: link:platforms/linux-x64-gnu
+      '@tokn/sdk-win32-x64-msvc':
+        specifier: 0.2.3
+        version: link:platforms/win32-x64-msvc
+
+  platforms/darwin-arm64: {}
+
+  platforms/linux-x64-gnu: {}
+
+  platforms/win32-x64-msvc: {}
+
 packages:
 
   '@emnapi/core@1.11.2':

@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-accounts"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4246,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-auth"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4265,7 +4265,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-catalogue"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "directories",
  "reqwest",
@@ -4279,7 +4279,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-core"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4302,7 +4302,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-desktop"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "nix",
@@ -4325,7 +4325,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-headers"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "http",
  "reqwest",
@@ -4337,7 +4337,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-persistence"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4361,14 +4361,14 @@ dependencies = [
 
 [[package]]
 name = "tokn-policy"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "smol_str",
 ]
 
 [[package]]
 name = "tokn-provider-copilot"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4390,7 +4390,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-deepseek"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4407,7 +4407,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-llama-cpp"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -4423,7 +4423,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-openai"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4444,7 +4444,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-opencode"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -4461,7 +4461,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-zai"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -4481,7 +4481,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-router-config"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "reqwest",

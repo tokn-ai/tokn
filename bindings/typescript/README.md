@@ -7,10 +7,20 @@ The package is an ESM package for Node.js 22+ and Bun. Its public API is
 TypeScript, while routing and provider execution run in-process through the
 same Rust engine as `tokn-gateway`.
 
-The repository package is currently a source preview and is deliberately
-marked private. Build it from this checkout and link the directory into an
-application; npm publication stays disabled until the release pipeline builds,
-assembles, and install-tests every declared native package.
+Install it with npm or Bun:
+
+```sh
+npm install @tokn/sdk
+# or
+bun add @tokn/sdk
+```
+
+The package installs a prebuilt native addon through an exact-version optional
+dependency. Supported native platforms are macOS arm64 (addon deployment target
+11.0), Linux x64 with glibc 2.28+, and Windows x64 MSVC. The selected Node.js or
+Bun runtime's own OS requirements also apply. Keep optional dependencies enabled. Other
+architectures and musl-based Linux distributions currently require a source
+build. Consumer installation does not compile Rust or run an install script.
 
 ## Usage
 
@@ -113,7 +123,52 @@ pnpm test
 An application can then depend on this directory with a local `link:` or
 workspace dependency.
 
-The future registry release will use one small root package plus an
-exact-version native package selected for the host platform. Before the
-private guard is removed, that pipeline must also pin and verify the Linux
-glibc floor and install-test assembled tarballs with both Node.js and Bun.
+For a host-only packaging rehearsal, use Node.js 24 for the release scripts:
+
+```sh
+pnpm build
+pnpm release:pack --target darwin-arm64
+pnpm release:test darwin-arm64
+```
+
+Use `linux-x64-gnu` or `win32-x64-msvc` for the other supported hosts. The
+install test serves the packed archives from a temporary local npm registry,
+installs the facade with npm and Bun into fresh directories, and completes a
+native provider request. This verifies dependency selection and loading without
+falling back to a checkout binary.
+
+## Registry releases
+
+Run `.github/workflows/release-npm.yml` manually on the intended source ref,
+with `version` matching `VERSION` and `publish` left false for rehearsal. The
+workflow builds every native target, checks the Linux artifact's glibc symbol
+requirements against the 2.28 floor, packs one facade and three native packages,
+and install-tests the same archives with Node.js 22/24 and Bun 1.3.13. Linux
+uses the locked NAPI cross toolchain's glibc 2.17 sysroot. The resulting support
+floor also accounts for the Node.js runtime.
+
+First publication requires the npm account to own the `@tokn` scope. Publish
+the three native archives before the facade, using the tested `npm-packages`
+workflow artifact and an authenticated npm account. This completes the first
+0.2.3 release. Do not create placeholder versions or run a second publication
+of the same version. See the [SDK release guide](../../docs/sdk-release.md)
+for the publication commands and recovery steps.
+
+npm trusted publishing requires each package to already exist. After the first
+release, register a GitHub trusted publisher for **each** of `@tokn/sdk`,
+`@tokn/sdk-darwin-arm64`, `@tokn/sdk-linux-x64-gnu`, and
+`@tokn/sdk-win32-x64-msvc`, with repository `tokn-ai/tokn`, workflow filename
+`release-npm.yml`, environment `npm`, and direct `npm publish` allowed. Configure
+the `npm` GitHub environment's release protections. Future versions can then
+set `publish` true; publication runs only after every install test passes.
+
+The workflow uses Node.js 24 and checks npm 11.5.1+ for OIDC authentication.
+It publishes the verified archives with provenance and disabled lifecycle
+scripts, uploading native packages first. A partial-publication retry accepts
+an existing version only when the registry archive's integrity matches exactly.
+Different bytes require a new version because npm versions are immutable.
+
+References: [NAPI-RS release model](https://napi.rs/docs/deep-dive/release),
+[cross compilation](https://napi.rs/docs/cross-build),
+[npm trusted publishing](https://docs.npmjs.com/trusted-publishers/), and
+[npm trust prerequisites](https://docs.npmjs.com/cli/v11/commands/npm-trust/).

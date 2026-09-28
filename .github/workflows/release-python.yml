@@ -1,0 +1,268 @@
+name: Python release
+
+on:
+  push:
+    branches:
+      - "v0.2.3-sdk"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified distributions to PyPI
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Check release versions
+        run: node --experimental-strip-types scripts/release/check-version.ts
+
+  wheels:
+    name: Wheel (${{ matrix.platform.label }}, Python ${{ matrix.python }})
+    needs: verify
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        platform:
+          - label: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - label: macos-arm64
+            os: macos-14
+            target: aarch64-apple-darwin
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-release-${{ matrix.platform.label }}-${{ matrix.python }}
+
+      - name: Build release wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          maturin-version: "v1.14.1"
+          command: build
+          target: ${{ matrix.platform.target }}
+          manylinux: "2014"
+          args: >-
+            --release --locked --manifest-path bindings/python/Cargo.toml --out dist
+            --compatibility pypi
+            --interpreter ${{ runner.os == 'Linux' && format('python{0}', matrix.python) || 'python' }}
+
+      - name: Install release wheel
+        shell: bash
+        run: python -m pip install --no-deps dist/*.whl
+
+      - name: Check installed metadata and typing files
+        shell: bash
+        run: |
+          python - <<'PY'
+          from importlib.metadata import distribution
+          from pathlib import Path
+          import tokn
+
+          package = distribution("tokn-sdk")
+          assert package.version == Path("VERSION").read_text().strip().removeprefix("v")
+          package_path = Path(tokn.__file__).parent
+          assert (package_path / "py.typed").is_file()
+          assert (package_path / "_native.pyi").is_file()
+          assert any(str(path).endswith("/licenses/LICENSE") for path in package.files)
+          PY
+
+      - name: Test installed SDK
+        run: python -m unittest discover -s bindings/python/tests
+
+      - name: Upload release wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.platform.label }}-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: python-release-sdist
+
+      - name: Install build tools
+        run: python -m pip install maturin==1.14.1
+
+      - name: Fetch locked packaging dependencies
+        run: cargo fetch --locked --manifest-path bindings/python/Cargo.toml
+
+      - name: Build source distribution
+        run: python bindings/python/scripts/build_sdist.py --out dist
+
+      - name: Check and unpack source distribution
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tarfile
+          import tomllib
+
+          archives = list(Path("dist").glob("*.tar.gz"))
+          assert len(archives) == 1, archives
+          with tarfile.open(archives[0]) as archive:
+            names = archive.getnames()
+            root = names[0].split("/")[0]
+            for path in (
+              "Cargo.lock",
+              "Cargo.toml",
+              "pyproject.toml",
+              "bindings/python/Cargo.toml",
+              "crates/sdk/Cargo.toml",
+              "crates/catalogue/vendor/models.dev.json",
+            ):
+              assert f"{root}/{path}" in names, path
+            project = tomllib.load(archive.extractfile(f"{root}/pyproject.toml"))
+            python_source = project["tool"]["maturin"]["python-source"]
+            for path in ("tokn/py.typed", "tokn/_native.pyi"):
+              assert f"{root}/{python_source}/{path}" in names, path
+            for path in project["project"]["license-files"]:
+              assert f"{root}/{path}" in names, path
+            archive.extractall("tmp/python-sdist", filter="data")
+          source = Path("tmp/python-sdist", root).resolve()
+          with open(os.environ["GITHUB_ENV"], "a") as environment:
+            environment.write(f"SDK_SDIST_SOURCE={source}\n")
+          PY
+
+      - name: Rebuild wheel offline from source distribution
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: python -m pip wheel --no-deps --no-build-isolation dist/*.tar.gz --wheel-dir tmp/python-sdist-wheel
+
+      - name: Install and test rebuilt SDK
+        run: |
+          python -m pip install --no-deps tmp/python-sdist-wheel/*.whl
+          python -m unittest discover -s "$SDK_SDIST_SOURCE/bindings/python/tests"
+
+      - name: Upload source distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  distributions:
+    name: Check all distributions
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check complete distribution set
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          assert len(list(Path("dist").glob("*.whl"))) == 15
+          assert len(list(Path("dist").glob("*.tar.gz"))) == 1
+          PY
+          python -m pip install twine
+          python -m twine check --strict dist/*
+
+  publish:
+    name: Publish to PyPI
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    needs: distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tokn-sdk/
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: python-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish distributions
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

@@ -145,6 +145,16 @@ The `bindings/python` package is a mixed Python/Rust package built with
 Maturin and PyO3. Its native module owns an `Arc<tokn_sdk::Client>`, while the
 public generation models are dependency-free Python dataclasses.
 
+The PyPI distribution is `tokn-sdk`; its import name is `tokn`. Once 0.2.3
+is published, install it with:
+
+```sh
+python -m pip install tokn-sdk==0.2.3
+```
+
+Release preparation and publisher setup are documented in
+[SDK releases](sdk-release.md).
+
 The client-bound builder mirrors the Rust API:
 
 ```python
@@ -330,18 +340,18 @@ pnpm build
 pnpm test
 ```
 
-The generated `_native.cjs` loader is private. The repository package is also
-marked private for now: it can be built and linked from a checkout, but it
-cannot be published accidentally before its platform artifacts are assembled.
-The eventual registry release will keep one public `@tokn/sdk` façade and use
-exact-version optional packages for Linux x64 glibc, macOS arm64, and Windows
-x64 MSVC.
+The generated `_native.cjs` loader is internal. The public `@tokn/sdk` package
+uses exact-version optional native packages for Linux x64 glibc, macOS arm64,
+and Windows x64 MSVC. Once 0.2.3 is published, install it with:
+
+```sh
+npm install @tokn/sdk@0.2.3
+```
 
 CI builds the native binding and runs the façade against it with Node.js 22
-and Bun 1.3.13 on all three platforms, plus Node.js 24 on Linux. The macOS
-artifact is built with an 11.0 deployment target, although the blocking
-runtime job currently runs on macOS 15. Before the private guard is removed,
-Linux release builds must pin and verify a glibc floor instead of treating
-`ubuntu-latest` as a compatibility guarantee, and CI must install-test the
-assembled root and platform tarballs with both runtimes. Publication is
-intentionally separate from the repository's existing CLI release workflow.
+and Bun 1.3.13 on all three platforms, plus Node.js 24 on Linux. The separate
+npm release workflow verifies the Linux glibc floor and tests installed root
+and platform tarballs with both runtimes before publication. The macOS artifact
+uses an 11.0 deployment target; runtime CI runs on a newer macOS version.
+See [SDK releases](sdk-release.md) for platform requirements, build rehearsals,
+and registry publisher setup.

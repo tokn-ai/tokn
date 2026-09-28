@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "tokn"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "tokn-auth",
  "tokn-catalogue",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-access"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-accounts"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2823,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-agent-migration"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "directories",
@@ -2848,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-auth"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-catalogue"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "directories",
  "reqwest",
@@ -2884,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-convert"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-core"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2930,7 +2930,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-endpoint-chat-completions"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2940,7 +2940,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-endpoint-core"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-endpoint-macros"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2958,7 +2958,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-endpoint-messages"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-endpoint-responses"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2978,7 +2978,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-gateway-cli"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3037,7 +3037,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-headers"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "http",
  "reqwest",
@@ -3049,7 +3049,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-mock-server"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "axum",
  "bytes",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-persistence"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "base64",
  "bytes",
@@ -3092,14 +3092,14 @@ dependencies = [
 
 [[package]]
 name = "tokn-policy"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "smol_str",
 ]
 
 [[package]]
 name = "tokn-provider-copilot"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3122,7 +3122,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-deepseek"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3139,7 +3139,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-llama-cpp"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-openai"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -3179,7 +3179,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-opencode"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "reqwest",
@@ -3198,7 +3198,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-provider-zai"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3218,7 +3218,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-python"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "futures-util",
  "pyo3",
@@ -3232,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-requests"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3265,7 +3265,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-router"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-router-config"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -3339,7 +3339,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-router-legacy-config"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "directories",
@@ -3358,7 +3358,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-sdk"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3386,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-service"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "futures-util",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "tokn-typescript"
-version = "0.2.4"
+version = "0.2.3"
 dependencies = [
  "futures-util",
  "napi",

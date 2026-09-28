@@ -2,6 +2,10 @@
 name = "tokn-python"
 version.workspace = true
 edition.workspace = true
+description = "Native Python bindings for the tokn embedded SDK"
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
 publish = false
 
 [lib]
