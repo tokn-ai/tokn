@@ -916,8 +916,8 @@ before trusting a CA fetched over the LAN. The private CA key is never served.
 
 The Python and TypeScript SDKs run the Rust routing engine inside your process
 and use the same configuration and credentials as the gateway. The 0.2.3
-registry release is being prepared as PyPI `tokn-sdk` (import `tokn`) and npm
-`@tokn/sdk`.
+registry release is being prepared as PyPI `tokn-requests` (import `tokn_requests`) and npm
+`@tokn/requests`.
 
 See [SDK usage](docs/sdk.md) and [SDK release preparation](docs/sdk-release.md).
 

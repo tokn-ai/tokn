@@ -3,7 +3,7 @@ requires = ["maturin>=1.14.1,<2"]
 build-backend = "maturin"
 
 [project]
-name = "tokn-sdk"
+name = "tokn-requests"
 version = "0.2.3"
 description = "Embedded Python SDK for routing LLM requests through tokn providers"
 readme = "README.md"
@@ -32,7 +32,7 @@ Repository = "https://github.com/tokn-ai/tokn"
 Issues = "https://github.com/tokn-ai/tokn/issues"
 
 [tool.maturin]
-module-name = "tokn._native"
+module-name = "tokn_requests._native"
 python-source = "python"
 features = ["pyo3/extension-module"]
 locked = true

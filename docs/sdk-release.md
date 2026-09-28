@@ -20,11 +20,11 @@ below.
 
 | Registry | Package | Contents |
 | --- | --- | --- |
-| PyPI | `tokn-sdk` | Python `tokn` module, typed models, native extension, and source distribution |
-| npm | `@tokn/sdk` | ESM façade, declarations, and internal native loader |
-| npm | `@tokn/sdk-linux-x64-gnu` | Linux x64 glibc native binding |
-| npm | `@tokn/sdk-darwin-arm64` | macOS arm64 native binding |
-| npm | `@tokn/sdk-win32-x64-msvc` | Windows x64 MSVC native binding |
+| PyPI | `tokn-requests` | Python `tokn_requests` module, typed models, native extension, and source distribution |
+| npm | `@tokn/requests` | ESM façade, declarations, and internal native loader |
+| npm | `@tokn/requests-linux-x64-gnu` | Linux x64 glibc native binding |
+| npm | `@tokn/requests-darwin-arm64` | macOS arm64 native binding |
+| npm | `@tokn/requests-win32-x64-msvc` | Windows x64 MSVC native binding |
 
 The npm façade declares each native package as an exact-version optional
 dependency. A consumer receives the package for its OS, CPU, and libc. Source
@@ -56,7 +56,7 @@ platform baseline and package assembly commands.
 
 The following commands use a POSIX shell and an authenticated GitHub CLI. List
 the runs, then replace the two run-ID placeholders with the `databaseId` values
-for **Python release** and **Release npm SDK**. Confirm both entries have the
+for **Python release** and **Release @tokn/requests**. Confirm both entries have the
 same `headSha`, `status=completed`, and `conclusion=success`.
 
 ```sh
@@ -65,7 +65,7 @@ gh run list --repo tokn-ai/tokn --branch v0.2.3-sdk --limit 10 \
 
 python_run=REPLACE_WITH_PYTHON_RUN_ID
 npm_run=REPLACE_WITH_NPM_RUN_ID
-release_dir=$(mktemp -d "${TMPDIR:-/tmp}/tokn-sdk-0.2.3.XXXXXX")
+release_dir=$(mktemp -d "${TMPDIR:-/tmp}/tokn-requests-0.2.3.XXXXXX")
 mkdir "$release_dir/python" "$release_dir/npm"
 
 gh run download "$python_run" --repo tokn-ai/tokn \
@@ -85,7 +85,7 @@ prevent mixing previous artifacts.
 
 Sign in to [PyPI](https://pypi.org/), verify your email, and configure two-factor
 authentication. In account settings, create an API token. For the initial
-upload of a new project, use an account-wide token; after `tokn-sdk` exists,
+upload of a new project, use an account-wide token; after `tokn-requests` exists,
 replace it with a project-scoped token. PyPI uses `__token__` as the upload
 username and the complete token, including its `pypi-` prefix, as the password.
 [PyPI token documentation](https://pypi.org/help/#apitoken).
@@ -114,13 +114,13 @@ then publish the three native archives before the façade:
 
 ```sh
 npm login --registry=https://registry.npmjs.org
-npm publish "$release_dir/npm/tokn-sdk-darwin-arm64-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-requests-darwin-arm64-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-sdk-linux-x64-gnu-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-requests-linux-x64-gnu-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-sdk-win32-x64-msvc-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-requests-win32-x64-msvc-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-sdk-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-requests-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
 ```
 
@@ -130,10 +130,14 @@ downloaded tarballs preserves the files tested in CI.
 
 ## Verify and retry
 
-Inspect the run's artifact versions and registry results. Install `tokn-sdk==0.2.3`
-and `@tokn/sdk@0.2.3` in clean consumer environments and check that the expected
-native modules load. Published versions are immutable; correct packaging
+Inspect the run's artifact versions and registry results. Install `tokn-requests==0.2.3`
+and `@tokn/requests@0.2.3` in clean consumer environments and check that the expected
+native modules load. Published files cannot be replaced; correct packaging
 failures through a new version rather than replacing 0.2.3 artifacts.
+
+If a PyPI upload stops partway through, compare the uploaded files' SHA-256
+hashes with the reviewed artifacts, then upload only the missing files. Keep
+the same artifacts for the retry.
 
 If an npm upload stops partway through, retain the same reviewed archives. Check
 an already uploaded package with `npm view PACKAGE@0.2.3 dist.integrity` and
@@ -150,7 +154,7 @@ with owner `tokn-ai`, repository `tokn`, and these workflow/environment pairs:
 
 | Registry | Workflow | GitHub environment |
 | --- | --- | --- |
-| PyPI `tokn-sdk` | `release-python.yml` | `pypi` |
+| PyPI `tokn-requests` | `release-python.yml` | `pypi` |
 | All four npm packages | `release-npm.yml` | `npm` |
 
 Create the matching GitHub environments and enable direct `npm publish` in

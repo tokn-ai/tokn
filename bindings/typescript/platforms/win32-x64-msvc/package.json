@@ -1,7 +1,7 @@
 {
-  "name": "@tokn/sdk-win32-x64-msvc",
+  "name": "@tokn/requests-win32-x64-msvc",
   "version": "0.2.3",
-  "description": "Native Windows x64 MSVC binding for @tokn/sdk",
+  "description": "Native Windows x64 MSVC binding for @tokn/requests",
   "main": "tokn_sdk.win32-x64-msvc.node",
   "files": ["tokn_sdk.win32-x64-msvc.node"],
   "os": ["win32"],

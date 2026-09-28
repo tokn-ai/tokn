@@ -25,13 +25,13 @@ importers:
         version: 7.0.2
 
     optionalDependencies:
-      '@tokn/sdk-darwin-arm64':
+      '@tokn/requests-darwin-arm64':
         specifier: 0.2.3
         version: link:platforms/darwin-arm64
-      '@tokn/sdk-linux-x64-gnu':
+      '@tokn/requests-linux-x64-gnu':
         specifier: 0.2.3
         version: link:platforms/linux-x64-gnu
-      '@tokn/sdk-win32-x64-msvc':
+      '@tokn/requests-win32-x64-msvc':
         specifier: 0.2.3
         version: link:platforms/win32-x64-msvc
 

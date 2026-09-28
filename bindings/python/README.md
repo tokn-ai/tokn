@@ -1,4 +1,4 @@
-# tokn Python SDK
+# tokn-requests Python SDK
 
 The Python package embeds the same Rust routing engine as `tokn-sdk`. It uses
 the existing `config.toml`, `config.d`, `auth.yaml`, and `auth.d` sources and
@@ -6,10 +6,10 @@ does not require a gateway process.
 
 ## Installation
 
-Install the PyPI distribution `tokn-sdk`, then import `tokn`:
+Install the PyPI distribution `tokn-requests`, then import `tokn_requests`:
 
 ```sh
-python -m pip install tokn-sdk==0.2.3
+python -m pip install tokn-requests==0.2.3
 ```
 
 Release wheels support CPython 3.10 through 3.14 on Linux x86-64
@@ -23,7 +23,7 @@ are included in the installed package.
 For a one-off request, start with the client-bound builder:
 
 ```python
-from tokn import Client
+from tokn_requests import Client
 
 client = Client()
 
@@ -45,7 +45,7 @@ Common generation controls are available directly on both the client-bound and
 detached builders:
 
 ```python
-from tokn import (
+from tokn_requests import (
   ReasoningEffort,
   ReasoningMode,
   ReasoningSummary,
@@ -120,7 +120,7 @@ Build an owned request when it needs to be serialized, transformed, queued, or
 reused independently of a client:
 
 ```python
-from tokn import GenerateRequest
+from tokn_requests import GenerateRequest
 
 request = (
   GenerateRequest.builder("smart")
@@ -142,7 +142,7 @@ As an alternative to `client.send(request)`, use
 Semantic streaming returns typed events:
 
 ```python
-from tokn import Completed, TextDelta
+from tokn_requests import Completed, TextDelta
 
 stream = await client.generate("smart").prompt("Write a haiku.").stream()
 async with stream:
@@ -167,7 +167,7 @@ Execution failures derive from `ToknError` (and remain compatible with
 `RuntimeError`). Catch a specific subtype when recovery depends on the cause:
 
 ```python
-from tokn import APIStatusError, ToknError
+from tokn_requests import APIStatusError, ToknError
 
 try:
   response = await client.send(request)
@@ -205,27 +205,28 @@ defaults used by the gateway.
 
 ## Preparing a PyPI release
 
-The `Python release` workflow in `.github/workflows/release-python.yml` is
-manually dispatched against the source ref being released. Its default
-`publish=false` run builds and tests all wheels, rebuilds the source
-distribution with locked Cargo dependencies, and uploads the distributions
-as workflow artifacts. `VERSION`, the Cargo workspace version, and
-`pyproject.toml` must agree.
+Pushing `v0.2.3-sdk` runs the `Python release` workflow in
+`.github/workflows/release-python.yml`. It builds and tests all wheels,
+rebuilds the source distribution with locked Cargo dependencies, and uploads
+the distributions as workflow artifacts. Branch runs build only. Use the
+successful CI artifacts for the manual publication steps in the
+[SDK release guide](../../docs/sdk-release.md). `VERSION`, the Cargo workspace
+version, and `pyproject.toml` must agree.
 
-Before publishing, create the GitHub environment `pypi` and register a PyPI
-trusted publisher for:
+For optional automated publication in future releases, create the GitHub
+environment `pypi` and register a PyPI trusted publisher for:
 
-- Project: `tokn-sdk`
+- Project: `tokn-requests`
 - Owner: `tokn-ai`
 - Repository: `tokn`
 - Workflow: `release-python.yml`
 - Environment: `pypi`
 
-For the first release, use a pending publisher in PyPI's account publishing
-settings. Once the build artifacts have been reviewed, dispatch the workflow
-on the same source ref with `publish=true`. The publishing job uses GitHub
-OIDC; no PyPI API token is required. Configure any desired release approval
-rules on the `pypi` environment before enabling publishing. See the
+Use a pending publisher in PyPI's account publishing settings if the project
+does not exist yet. Once workflow dispatch is available, `publish=false`
+rehearses a release and `publish=true` enables the publishing job. This job
+uses GitHub OIDC. Configure any desired release approval rules on the `pypi`
+environment before enabling publishing. See the
 [PyPI trusted publishing setup](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
 and [publishing documentation](https://docs.pypi.org/trusted-publishers/using-a-publisher/).
 

@@ -107,11 +107,12 @@ jobs:
           python - <<'PY'
           from importlib.metadata import distribution
           from pathlib import Path
-          import tokn
+          import tokn_requests
 
-          package = distribution("tokn-sdk")
+          package = distribution("tokn-requests")
+          assert package.metadata["Name"] == "tokn-requests"
           assert package.version == Path("VERSION").read_text().strip().removeprefix("v")
-          package_path = Path(tokn.__file__).parent
+          package_path = Path(tokn_requests.__file__).parent
           assert (package_path / "py.typed").is_file()
           assert (package_path / "_native.pyi").is_file()
           assert any(str(path).endswith("/licenses/LICENSE") for path in package.files)
@@ -185,7 +186,9 @@ jobs:
               assert f"{root}/{path}" in names, path
             project = tomllib.load(archive.extractfile(f"{root}/pyproject.toml"))
             python_source = project["tool"]["maturin"]["python-source"]
-            for path in ("tokn/py.typed", "tokn/_native.pyi"):
+            assert project["project"]["name"] == "tokn-requests"
+            assert project["tool"]["maturin"]["module-name"] == "tokn_requests._native"
+            for path in ("tokn_requests/py.typed", "tokn_requests/_native.pyi"):
               assert f"{root}/{python_source}/{path}" in names, path
             for path in project["project"]["license-files"]:
               assert f"{root}/{path}" in names, path
@@ -250,7 +253,7 @@ jobs:
     timeout-minutes: 10
     environment:
       name: pypi
-      url: https://pypi.org/project/tokn-sdk/
+      url: https://pypi.org/project/tokn-requests/
     permissions:
       id-token: write
 

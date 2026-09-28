@@ -85,17 +85,17 @@ function isNativeBinding(value: unknown): value is NativeBinding {
 
 function validateNativeBinding(value: unknown): NativeBinding {
   if (!isNativeBinding(value)) {
-    throw new ConfigurationError("the native @tokn/sdk binding does not expose the expected API");
+    throw new ConfigurationError("the native @tokn/requests binding does not expose the expected API");
   }
 
   let abiVersion: number;
   try {
     abiVersion = value.nativeAbiVersion();
   } catch (cause) {
-    throw new ConfigurationError("failed to read the native @tokn/sdk binding ABI version", { cause });
+    throw new ConfigurationError("failed to read the native @tokn/requests binding ABI version", { cause });
   }
   if (abiVersion !== 1) {
-    throw new ConfigurationError("the native @tokn/sdk binding uses an unsupported ABI version");
+    throw new ConfigurationError("the native @tokn/requests binding uses an unsupported ABI version");
   }
   return value;
 }
@@ -113,7 +113,7 @@ export function getNativeBinding(): NativeBinding {
   try {
     candidate = require("../_native.cjs");
   } catch (cause) {
-    throw new ConfigurationError("failed to load the native @tokn/sdk binding", { cause });
+    throw new ConfigurationError("failed to load the native @tokn/requests binding", { cause });
   }
   loadedBinding = validateNativeBinding(candidate);
   return loadedBinding;

@@ -1,4 +1,4 @@
-# @tokn/sdk
+# @tokn/requests
 
 Embedded TypeScript SDK for routing LLM requests through the providers,
 profiles, configuration, and credentials already managed by tokn.
@@ -10,9 +10,9 @@ same Rust engine as `tokn-gateway`.
 Install it with npm or Bun:
 
 ```sh
-npm install @tokn/sdk
+npm install @tokn/requests
 # or
-bun add @tokn/sdk
+bun add @tokn/requests
 ```
 
 The package installs a prebuilt native addon through an exact-version optional
@@ -25,7 +25,7 @@ build. Consumer installation does not compile Rust or run an install script.
 ## Usage
 
 ```ts
-import { Client } from "@tokn/sdk";
+import { Client } from "@tokn/requests";
 
 const client = await Client.create();
 
@@ -139,25 +139,28 @@ falling back to a checkout binary.
 
 ## Registry releases
 
-Run `.github/workflows/release-npm.yml` manually on the intended source ref,
-with `version` matching `VERSION` and `publish` left false for rehearsal. The
-workflow builds every native target, checks the Linux artifact's glibc symbol
+Pushing the `v0.2.3-sdk` branch runs `.github/workflows/release-npm.yml` to build,
+test, and upload release artifacts. Branch pushes do not publish packages. You
+can also run the workflow manually on the intended source ref, with `version`
+matching `VERSION` and `publish` left false for rehearsal. The workflow builds
+every native target, checks the Linux artifact's glibc symbol
 requirements against the 2.28 floor, packs one facade and three native packages,
 and install-tests the same archives with Node.js 22/24 and Bun 1.3.13. Linux
-uses the locked NAPI cross toolchain's glibc 2.17 sysroot. The resulting support
-floor also accounts for the Node.js runtime.
+builds and runs native tests inside a digest-pinned PyPA manylinux_2_28 image
+with glibc 2.28 and GCC 14. A C11 atomics probe checks the compiler before the
+build, and the artifact's glibc symbol gate enforces the published support floor.
 
 First publication requires the npm account to own the `@tokn` scope. Publish
-the three native archives before the facade, using the tested `npm-packages`
-workflow artifact and an authenticated npm account. This completes the first
-0.2.3 release. Do not create placeholder versions or run a second publication
+the three native archives before the facade, using the `npm-packages` artifact
+from a successful workflow run and an authenticated npm account. This completes
+the first 0.2.3 release. Do not create placeholder versions or run a second publication
 of the same version. See the [SDK release guide](../../docs/sdk-release.md)
 for the publication commands and recovery steps.
 
 npm trusted publishing requires each package to already exist. After the first
-release, register a GitHub trusted publisher for **each** of `@tokn/sdk`,
-`@tokn/sdk-darwin-arm64`, `@tokn/sdk-linux-x64-gnu`, and
-`@tokn/sdk-win32-x64-msvc`, with repository `tokn-ai/tokn`, workflow filename
+release, register a GitHub trusted publisher for **each** of `@tokn/requests`,
+`@tokn/requests-darwin-arm64`, `@tokn/requests-linux-x64-gnu`, and
+`@tokn/requests-win32-x64-msvc`, with repository `tokn-ai/tokn`, workflow filename
 `release-npm.yml`, environment `npm`, and direct `npm publish` allowed. Configure
 the `npm` GitHub environment's release protections. Future versions can then
 set `publish` true; publication runs only after every install test passes.
@@ -169,6 +172,6 @@ an existing version only when the registry archive's integrity matches exactly.
 Different bytes require a new version because npm versions are immutable.
 
 References: [NAPI-RS release model](https://napi.rs/docs/deep-dive/release),
-[cross compilation](https://napi.rs/docs/cross-build),
+[PyPA manylinux build image](https://github.com/pypa/manylinux#manylinux_2_28-almalinux-8-based),
 [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/), and
 [npm trust prerequisites](https://docs.npmjs.com/cli/v11/commands/npm-trust/).

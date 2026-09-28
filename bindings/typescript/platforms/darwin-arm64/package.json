@@ -1,7 +1,7 @@
 {
-  "name": "@tokn/sdk-darwin-arm64",
+  "name": "@tokn/requests-darwin-arm64",
   "version": "0.2.3",
-  "description": "Native macOS arm64 binding for @tokn/sdk",
+  "description": "Native macOS arm64 binding for @tokn/requests",
   "main": "tokn_sdk.darwin-arm64.node",
   "files": ["tokn_sdk.darwin-arm64.node"],
   "os": ["darwin"],

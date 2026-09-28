@@ -11,10 +11,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, ClassVar
 
-from tokn import (
+from tokn_requests import (
   APIStatusError,
+  AuthenticationError,
   Client,
   Completed,
+  ConfigurationError,
   GenerateRequest,
   Message,
   ReasoningDelta,
@@ -25,6 +27,7 @@ from tokn import (
   RequestError,
   RequestOptions,
   Role,
+  SerializationError,
   StreamError,
   TextDelta,
   ToknError,
@@ -270,10 +273,21 @@ class ProviderHandler(BaseHTTPRequestHandler):
 class ModelTests(unittest.TestCase):
   def test_sdk_errors_preserve_runtime_error_compatibility(self) -> None:
     self.assertTrue(issubclass(ToknError, RuntimeError))
-    self.assertTrue(issubclass(StreamError, ToknError))
-    restored = pickle.loads(pickle.dumps(ToknError("round trip")))
-    self.assertIsInstance(restored, ToknError)
-    self.assertEqual(str(restored), "round trip")
+    for exception in (
+      ToknError,
+      ConfigurationError,
+      AuthenticationError,
+      RequestError,
+      APIStatusError,
+      StreamError,
+      SerializationError,
+    ):
+      with self.subTest(exception=exception.__name__):
+        self.assertTrue(issubclass(exception, ToknError))
+        self.assertEqual(exception.__module__, "tokn_requests._native")
+        restored = pickle.loads(pickle.dumps(exception("round trip")))
+        self.assertIsInstance(restored, exception)
+        self.assertEqual(str(restored), "round trip")
 
   def test_owned_request_round_trips_and_transforms(self) -> None:
     call = ToolCall(
@@ -988,22 +1002,23 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
       options=RequestOptions(request_id="python-lifecycle"),
     )
 
+    async def wait_for_completion() -> None:
+      async for event in events:
+        if event["request_id"] != "python-lifecycle":
+          continue
+        self.assertIn(event["payload"]["category"], {"stage", "record", "custom"})
+        if event["payload"] == {
+          "category": "stage",
+          "event": {
+            "type": "completed",
+            "data": {"success": True, "attempts": 1},
+          },
+        }:
+          return
+      self.fail("request lifecycle stream closed before completion")
+
     async with events:
-      async with asyncio.timeout(5):
-        async for event in events:
-          if event["request_id"] != "python-lifecycle":
-            continue
-          self.assertIn(event["payload"]["category"], {"stage", "record", "custom"})
-          if event["payload"] == {
-            "category": "stage",
-            "event": {
-              "type": "completed",
-              "data": {"success": True, "attempts": 1},
-            },
-          }:
-            break
-        else:
-          self.fail("request lifecycle stream closed before completion")
+      await asyncio.wait_for(wait_for_completion(), timeout=5)
 
   async def test_request_lifecycle_close_interrupts_pending_read(self) -> None:
     client = self.client()

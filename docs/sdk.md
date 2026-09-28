@@ -145,11 +145,11 @@ The `bindings/python` package is a mixed Python/Rust package built with
 Maturin and PyO3. Its native module owns an `Arc<tokn_sdk::Client>`, while the
 public generation models are dependency-free Python dataclasses.
 
-The PyPI distribution is `tokn-sdk`; its import name is `tokn`. Once 0.2.3
+The PyPI distribution is `tokn-requests`; its import name is `tokn_requests`. Once 0.2.3
 is published, install it with:
 
 ```sh
-python -m pip install tokn-sdk==0.2.3
+python -m pip install tokn-requests==0.2.3
 ```
 
 Release preparation and publisher setup are documented in
@@ -158,7 +158,7 @@ Release preparation and publisher setup are documented in
 The client-bound builder mirrors the Rust API:
 
 ```python
-from tokn import Client
+from tokn_requests import Client
 
 client = Client()
 
@@ -176,7 +176,7 @@ print(response.text)
 Python exposes the same neutral generation controls:
 
 ```python
-from tokn import (
+from tokn_requests import (
   GenerateRequest,
   ReasoningEffort,
   ReasoningMode,
@@ -221,7 +221,7 @@ clients when the application needs to control the exact wire representation.
 serialized, transformed, queued, and later sent or bound:
 
 ```python
-from tokn import Client, GenerateRequest, Message
+from tokn_requests import Client, GenerateRequest, Message
 
 client = Client()
 request = GenerateRequest(
@@ -243,7 +243,7 @@ remain available as raw mapping and byte-stream escape hatches. All calls are
 
 ## Node.js and Bun
 
-`bindings/typescript` is the ESM `@tokn/sdk` package for Node.js 22 and newer
+`bindings/typescript` is the ESM `@tokn/requests` package for Node.js 22 and newer
 and Bun. Its TypeScript façade exposes plain JSON-compatible objects while a
 private N-API binding runs `tokn-sdk` in-process. TypeScript does not load
 configuration or credentials itself.
@@ -251,7 +251,7 @@ configuration or credentials itself.
 Create and close the client asynchronously:
 
 ```ts
-import { Client } from "@tokn/sdk";
+import { Client } from "@tokn/requests";
 
 const client = await Client.create();
 
@@ -274,7 +274,7 @@ controls as Rust and Python. Builder methods use normal TypeScript casing;
 every serializable field stays `snake_case`:
 
 ```ts
-import { request } from "@tokn/sdk";
+import { request } from "@tokn/requests";
 
 const value = request("smart")
   .prompt("Plan this migration.")
@@ -340,12 +340,12 @@ pnpm build
 pnpm test
 ```
 
-The generated `_native.cjs` loader is internal. The public `@tokn/sdk` package
+The generated `_native.cjs` loader is internal. The public `@tokn/requests` package
 uses exact-version optional native packages for Linux x64 glibc, macOS arm64,
 and Windows x64 MSVC. Once 0.2.3 is published, install it with:
 
 ```sh
-npm install @tokn/sdk@0.2.3
+npm install @tokn/requests@0.2.3
 ```
 
 CI builds the native binding and runs the façade against it with Node.js 22
