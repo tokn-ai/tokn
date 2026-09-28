@@ -155,6 +155,10 @@ python -m pip install tokn-requests==0.2.3
 Release preparation and publisher setup are documented in
 [SDK releases](sdk-release.md).
 
+The native extension uses CPython's Python 3.10 stable ABI (`abi3-py310`). Each
+platform wheel supports regular CPython 3.10 and newer; CI tests the same wheel
+on CPython 3.10–3.14. Free-threaded Python requires a different ABI.
+
 The client-bound builder mirrors the Rust API:
 
 ```python

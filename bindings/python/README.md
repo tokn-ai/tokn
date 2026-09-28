@@ -12,8 +12,12 @@ Install the PyPI distribution `tokn-requests`, then import `tokn_requests`:
 python -m pip install tokn-requests==0.2.3
 ```
 
-Release wheels support CPython 3.10 through 3.14 on Linux x86-64
+Release wheels use CPython's Python 3.10 stable ABI (`abi3-py310`): one
+`cp310-abi3` wheel per platform supports regular CPython 3.10 and newer.
+CI tests the same wheels on CPython 3.10 through 3.14 on Linux x86-64
 (glibc 2.17 or newer), macOS 11 or newer on Apple Silicon, and Windows x86-64.
+Free-threaded CPython builds require a different ABI and are not covered by
+these wheels.
 Other platforms can build the source distribution with a current stable Rust
 toolchain and a C/C++ compiler. Type annotations and native extension stubs
 are included in the installed package.
@@ -206,7 +210,8 @@ defaults used by the gateway.
 ## Preparing a PyPI release
 
 Pushing `v0.2.3-sdk` runs the `Python release` workflow in
-`.github/workflows/release-python.yml`. It builds and tests all wheels,
+`.github/workflows/release-python.yml`. It builds three stable-ABI wheels,
+audits their Python symbols, installs the same artifacts on CPython 3.10–3.14,
 rebuilds the source distribution with locked Cargo dependencies, and uploads
 the distributions as workflow artifacts. Branch runs build only. Use the
 successful CI artifacts for the manual publication steps in the
@@ -246,9 +251,17 @@ tmp/release-python/venv/bin/python -m pip install tmp/release-python/dist/*.whl
 tmp/release-python/venv/bin/python -m unittest discover -s bindings/python/tests
 ```
 
-The local wheel targets the current interpreter and operating system. The
-release workflow builds the portable Linux wheels inside a manylinux2014
-container.
+The local wheel targets the current operating system and CPython's Python 3.10
+stable ABI. The release workflow builds the portable Linux wheel inside a
+manylinux2014 container. Check a wheel's package metadata and stable ABI with:
+
+```sh
+tmp/release-python/venv/bin/python bindings/python/scripts/check_wheel.py \
+  tmp/release-python/dist/*.whl
+tmp/release-python/venv/bin/python -m pip install abi3audit==0.0.26
+tmp/release-python/venv/bin/python -m abi3audit --strict --summary \
+  tmp/release-python/dist/*.whl
+```
 
 Use the source-distribution helper above when preparing releases. Maturin
 removes unrelated Cargo workspace members from an sdist but currently leaves

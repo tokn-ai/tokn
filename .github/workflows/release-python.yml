@@ -43,7 +43,7 @@ jobs:
         run: node --experimental-strip-types scripts/release/check-version.ts
 
   wheels:
-    name: Wheel (${{ matrix.platform.label }}, Python ${{ matrix.python }})
+    name: Stable ABI wheel (${{ matrix.platform.label }})
     needs: verify
     runs-on: ${{ matrix.platform.os }}
     timeout-minutes: 60
@@ -52,7 +52,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         platform:
           - label: linux-x64
             os: ubuntu-latest
@@ -78,12 +77,12 @@ jobs:
       - name: Install Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python }}
+          python-version: "3.10"
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: python-release-${{ matrix.platform.label }}-${{ matrix.python }}
+          shared-key: python-release-abi3-${{ matrix.platform.label }}
 
       - name: Build release wheel
         uses: PyO3/maturin-action@v1
@@ -95,7 +94,59 @@ jobs:
           args: >-
             --release --locked --manifest-path bindings/python/Cargo.toml --out dist
             --compatibility pypi
-            --interpreter ${{ runner.os == 'Linux' && format('python{0}', matrix.python) || 'python' }}
+            --interpreter ${{ runner.os == 'Linux' && 'python3.10' || 'python' }}
+
+      - name: Check stable ABI wheel metadata and symbols
+        shell: bash
+        run: |
+          python bindings/python/scripts/check_wheel.py dist/*.whl
+          python -m pip install abi3audit==0.0.26
+          python -m abi3audit --strict --summary dist/*.whl
+
+      - name: Upload stable ABI wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.platform.label }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  install-test:
+    name: Install stable ABI wheel (${{ matrix.platform.label }}, Python ${{ matrix.python }})
+    needs: wheels
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        platform:
+          - label: linux-x64
+            os: ubuntu-latest
+          - label: macos-arm64
+            os: macos-14
+          - label: windows-x64
+            os: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Download the platform's stable ABI wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.platform.label }}
+          path: dist
+
+      - name: Check stable ABI wheel metadata
+        shell: bash
+        run: python bindings/python/scripts/check_wheel.py dist/*.whl
 
       - name: Install release wheel
         shell: bash
@@ -120,13 +171,6 @@ jobs:
 
       - name: Test installed SDK
         run: python -m unittest discover -s bindings/python/tests
-
-      - name: Upload release wheel
-        uses: actions/upload-artifact@v4
-        with:
-          name: python-wheel-${{ matrix.platform.label }}-${{ matrix.python }}
-          path: dist/*.whl
-          if-no-files-found: error
 
   sdist:
     name: Source distribution
@@ -205,6 +249,9 @@ jobs:
 
       - name: Install and test rebuilt SDK
         run: |
+          python bindings/python/scripts/check_wheel.py tmp/python-sdist-wheel/*.whl
+          python -m pip install abi3audit==0.0.26
+          python -m abi3audit --strict --summary tmp/python-sdist-wheel/*.whl
           python -m pip install --no-deps tmp/python-sdist-wheel/*.whl
           python -m unittest discover -s "$SDK_SDIST_SOURCE/bindings/python/tests"
 
@@ -217,11 +264,16 @@ jobs:
 
   distributions:
     name: Check all distributions
-    needs: [wheels, sdist]
+    needs: [wheels, install-test, sdist]
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download distributions
         uses: actions/download-artifact@v4
         with:
@@ -239,9 +291,10 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          assert len(list(Path("dist").glob("*.whl"))) == 15
+          assert len(list(Path("dist").glob("*.whl"))) == 3
           assert len(list(Path("dist").glob("*.tar.gz"))) == 1
           PY
+          python bindings/python/scripts/check_wheel.py dist/*.whl
           python -m pip install twine
           python -m twine check --strict dist/*
 

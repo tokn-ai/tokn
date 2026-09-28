@@ -44,10 +44,12 @@ are absent from the default branch. GitHub's **Run workflow** button requires
 the workflow file on the default branch.
 [GitHub workflow dispatch documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch).
 
-Python preparation builds 15 wheels for CPython 3.10–3.14 on Linux x64,
-macOS arm64, and Windows x64, plus one source distribution. The source
-distribution includes the Rust path dependencies and is rebuilt offline with
-locked dependencies. See [Python packaging](../bindings/python/README.md).
+Python preparation builds three `cp310-abi3` wheels, one for each of Linux x64,
+macOS arm64, and Windows x64, plus one source distribution. Each wheel uses
+CPython's Python 3.10 stable ABI, and CI installs and tests the same wheel on
+regular CPython 3.10–3.14. Free-threaded Python builds use a different ABI.
+The source distribution includes the Rust path dependencies and is rebuilt
+offline with locked dependencies. See [Python packaging](../bindings/python/README.md).
 
 npm preparation builds the three native packages, assembles the façade, checks
 Linux glibc compatibility, and tests installation of the packed artifacts with
@@ -75,7 +77,7 @@ gh run download "$npm_run" --repo tokn-ai/tokn \
 ```
 
 Keep `release_dir` available in the same shell for the commands below. The
-Python download contains artifact-named subdirectories with 15 `.whl` files
+Python download contains artifact-named subdirectories with three `.whl` files
 and one `.tar.gz` file. The npm directory contains four `.tgz` archives and
 `manifest.json`. Run IDs select the exact builds; separate fresh directories
 prevent mixing previous artifacts.
@@ -90,7 +92,7 @@ replace it with a project-scoped token. PyPI uses `__token__` as the upload
 username and the complete token, including its `pypi-` prefix, as the password.
 [PyPI token documentation](https://pypi.org/help/#apitoken).
 
-Install Twine in an isolated environment, check all 16 downloaded distributions,
+Install Twine in an isolated environment, check all four downloaded distributions,
 then upload them:
 
 ```sh
