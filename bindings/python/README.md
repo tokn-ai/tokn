@@ -1,15 +1,33 @@
-# tokn Python SDK
+# tokn-requests Python SDK
 
 The Python package embeds the same Rust routing engine as `tokn-sdk`. It uses
 the existing `config.toml`, `config.d`, `auth.yaml`, and `auth.d` sources and
 does not require a gateway process.
+
+## Installation
+
+Install the PyPI distribution `tokn-requests`, then import `tokn_requests`:
+
+```sh
+python -m pip install tokn-requests
+```
+
+Release wheels use CPython's Python 3.10 stable ABI (`abi3-py310`): one
+`cp310-abi3` wheel per platform supports regular CPython 3.10 and newer.
+CI tests the same wheels on CPython 3.10 through 3.14 on Linux x86-64
+(glibc 2.17 or newer), macOS 11 or newer on Apple Silicon, and Windows x86-64.
+Free-threaded CPython builds require a different ABI and are not covered by
+these wheels.
+Other platforms can build the source distribution with a current stable Rust
+toolchain and a C/C++ compiler. Type annotations and native extension stubs
+are included in the installed package.
 
 ## Friendly generation API
 
 For a one-off request, start with the client-bound builder:
 
 ```python
-from tokn import Client
+from tokn_requests import Client
 
 client = Client()
 
@@ -31,7 +49,7 @@ Common generation controls are available directly on both the client-bound and
 detached builders:
 
 ```python
-from tokn import (
+from tokn_requests import (
   ReasoningEffort,
   ReasoningMode,
   ReasoningSummary,
@@ -106,7 +124,7 @@ Build an owned request when it needs to be serialized, transformed, queued, or
 reused independently of a client:
 
 ```python
-from tokn import GenerateRequest
+from tokn_requests import GenerateRequest
 
 request = (
   GenerateRequest.builder("smart")
@@ -128,7 +146,7 @@ As an alternative to `client.send(request)`, use
 Semantic streaming returns typed events:
 
 ```python
-from tokn import Completed, TextDelta
+from tokn_requests import Completed, TextDelta
 
 stream = await client.generate("smart").prompt("Write a haiku.").stream()
 async with stream:
@@ -153,7 +171,7 @@ Execution failures derive from `ToknError` (and remain compatible with
 `RuntimeError`). Catch a specific subtype when recovery depends on the cause:
 
 ```python
-from tokn import APIStatusError, ToknError
+from tokn_requests import APIStatusError, ToknError
 
 try:
   response = await client.send(request)
@@ -188,3 +206,64 @@ event or UTF-8 boundaries.
 
 Pass `config_path`, `auth_path`, or `profile` to `Client` to override the same
 defaults used by the gateway.
+
+## Preparing a PyPI release
+
+Run `.github/workflows/release-python.yml` manually on the intended source ref
+to build three stable-ABI wheels, audit their Python symbols, test the same
+artifacts on CPython 3.10–3.14, rebuild the source distribution with locked
+Cargo dependencies, and upload the distributions as workflow artifacts. Leave
+`publish` false for a build rehearsal. The
+[SDK release guide](../../docs/sdk-release.md) covers artifact review and
+publication. `VERSION`, the Cargo workspace version, and `pyproject.toml` must
+agree. A publishing run also requires release notes for that version.
+
+For optional automated publication in future releases, create the GitHub
+environment `pypi` and register a PyPI trusted publisher for:
+
+- Project: `tokn-requests`
+- Owner: `tokn-ai`
+- Repository: `tokn`
+- Workflow: `release-python.yml`
+- Environment: `pypi`
+
+Set `publish=true` with an explicit version matching `VERSION` to enable the
+publishing job. This job uses GitHub OIDC. Configure any desired release
+approval rules on the `pypi` environment before enabling publishing. See the
+[PyPI trusted publishing setup](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
+and [publishing documentation](https://docs.pypi.org/trusted-publishers/using-a-publisher/).
+
+Use Python 3.12 or newer to run the release packaging helper. To build and
+test a local wheel from the repository root:
+
+```sh
+python -m venv tmp/release-python/venv
+tmp/release-python/venv/bin/python -m pip install 'maturin==1.14.1' twine
+tmp/release-python/venv/bin/maturin build --release --locked \
+  --manifest-path bindings/python/Cargo.toml --out tmp/release-python/dist
+cargo fetch --locked --manifest-path bindings/python/Cargo.toml
+tmp/release-python/venv/bin/python bindings/python/scripts/build_sdist.py \
+  --out tmp/release-python/dist
+tmp/release-python/venv/bin/python -m twine check --strict tmp/release-python/dist/*
+tmp/release-python/venv/bin/python -m pip install tmp/release-python/dist/*.whl
+tmp/release-python/venv/bin/python -m unittest discover -s bindings/python/tests
+```
+
+The local wheel targets the current operating system and CPython's Python 3.10
+stable ABI. The release workflow builds the portable Linux wheel inside a
+manylinux2014 container. Check a wheel's package metadata and stable ABI with:
+
+```sh
+tmp/release-python/venv/bin/python bindings/python/scripts/check_wheel.py \
+  tmp/release-python/dist/*.whl
+tmp/release-python/venv/bin/python -m pip install abi3audit==0.0.26
+tmp/release-python/venv/bin/python -m abi3audit --strict --summary \
+  tmp/release-python/dist/*.whl
+```
+
+Use the source-distribution helper above when preparing releases. Maturin
+removes unrelated Cargo workspace members from an sdist but currently leaves
+their lockfile entries behind ([upstream issue](https://github.com/PyO3/maturin/issues/2609)).
+The helper reconciles the archive's lockfile offline, verifies that every
+remaining dependency retains its original version and checksum, and checks
+that Cargo accepts it with `--locked`. The repository's lockfile is preserved.

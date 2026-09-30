@@ -1,4 +1,5 @@
 /target
+/.pnpm-store/
 /vendor/
 __pycache__/
 *.py[cod]
@@ -10,4 +11,5 @@ __pycache__/
 /bindings/typescript/tokn_sdk.*.node
 /tmp/docker-trials/
 /tmp/docker-agent-tests/
+/tmp/release-python/
 /scripts/node_modules/

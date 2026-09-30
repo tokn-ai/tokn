@@ -1,0 +1,17 @@
+{
+  "name": "@tokn-ai/requests-win32-x64-msvc",
+  "version": "0.2.4",
+  "description": "Native Windows x64 MSVC binding for @tokn-ai/requests",
+  "main": "tokn_sdk.win32-x64-msvc.node",
+  "files": ["tokn_sdk.win32-x64-msvc.node"],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "engines": { "node": ">=22.0.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokn-ai/tokn.git",
+    "directory": "bindings/typescript"
+  },
+  "license": "MIT"
+}

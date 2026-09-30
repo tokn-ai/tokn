@@ -11,38 +11,43 @@ use tokn_sdk::{
 };
 
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
   ToknError,
   PyRuntimeError,
   "Base exception for errors reported by the tokn SDK."
 );
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
   ConfigurationError,
   ToknError,
   "Configuration or profile loading failed."
 );
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
   AuthenticationError,
   ToknError,
   "Credential loading or authentication setup failed."
 );
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
   RequestError,
   ToknError,
   "The generation request could not be executed."
 );
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
   APIStatusError,
   ToknError,
   "The provider returned an unsuccessful HTTP status."
 );
-pyo3::create_exception!(tokn._native, StreamError, ToknError, "A generation stream failed.");
 pyo3::create_exception!(
-  tokn._native,
+  tokn_requests._native,
+  StreamError,
+  ToknError,
+  "A generation stream failed."
+);
+pyo3::create_exception!(
+  tokn_requests._native,
   SerializationError,
   ToknError,
   "The SDK could not serialize or deserialize provider data."
