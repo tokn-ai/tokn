@@ -912,6 +912,15 @@ using that listener from another machine.
 The proxy prints the CA SHA-256 fingerprint at startup. Verify that fingerprint
 before trusting a CA fetched over the LAN. The private CA key is never served.
 
+## Embedded SDKs
+
+The Python and TypeScript SDKs run the Rust routing engine inside your process
+and use the same configuration and credentials as the gateway. Install the
+Python SDK with `python -m pip install tokn-requests` (import `tokn_requests`)
+or the TypeScript SDK with `npm install @tokn-ai/requests`.
+
+See [SDK usage](docs/sdk.md) and [SDK releases](docs/sdk-release.md).
+
 ## Desktop app
 
 A macOS-first desktop app is available in [apps/desktop](apps/desktop/README.md).

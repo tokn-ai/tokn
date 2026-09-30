@@ -42,16 +42,20 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Verify release tag and notes
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Verify release metadata
+        run: node --experimental-strip-types scripts/release/check-version.ts --require-release-notes
+
+      - name: Verify release tag
         shell: bash
         run: |
           expected_tag="$(tr -d '\r\n' < VERSION)"
           if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
             echo "Release tag $GITHUB_REF_NAME does not match VERSION ($expected_tag)" >&2
-            exit 1
-          fi
-          if [ ! -s "docs/releases/$expected_tag.md" ]; then
-            echo "Missing release notes for $expected_tag" >&2
             exit 1
           fi
 

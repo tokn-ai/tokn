@@ -1,7 +1,6 @@
 {
-  "name": "@tokn/sdk",
+  "name": "@tokn-ai/requests",
   "version": "0.2.4",
-  "private": true,
   "description": "In-process TypeScript SDK for tokn routing and provider integrations",
   "type": "module",
   "main": "./dist/index.js",
@@ -20,6 +19,10 @@
     "_native.cjs"
   ],
   "sideEffects": false,
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
   "engines": {
     "node": ">=22.0.0"
   },
@@ -31,8 +34,8 @@
   },
   "scripts": {
     "build": "pnpm build:native && pnpm build:ts",
-    "build:native": "cross-env MACOSX_DEPLOYMENT_TARGET=11.0 napi build --platform --output-dir . --js _native.cjs --dts _native.d.ts",
-    "build:native:release": "cross-env MACOSX_DEPLOYMENT_TARGET=11.0 napi build --platform --release --output-dir . --js _native.cjs --dts _native.d.ts",
+    "build:native": "cross-env MACOSX_DEPLOYMENT_TARGET=11.0 napi build --platform --output-dir . --js _native.cjs --dts _native.d.ts -- --locked",
+    "build:native:release": "cross-env MACOSX_DEPLOYMENT_TARGET=11.0 napi build --platform --release --output-dir . --js _native.cjs --dts _native.d.ts -- --locked",
     "build:ts": "tsc -p tsconfig.build.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "pnpm test:node && pnpm test:bun",
@@ -42,11 +45,14 @@
     "test:unit:bun": "bun test tests/client.test.ts tests/request.test.ts",
     "test:native": "pnpm test:native:node && pnpm test:native:bun",
     "test:native:node": "cross-env TOKN_NATIVE_SMOKE=1 node --import tsx --test tests/native.test.ts tests/dist.test.mjs",
-    "test:native:bun": "cross-env TOKN_NATIVE_SMOKE=1 bun test tests/native.test.ts tests/dist.test.mjs"
+    "test:native:bun": "cross-env TOKN_NATIVE_SMOKE=1 bun test tests/native.test.ts tests/dist.test.mjs",
+    "release:pack": "node --experimental-strip-types scripts/release.ts pack",
+    "release:test": "node --experimental-strip-types scripts/release.ts test",
+    "release:check-glibc": "node --experimental-strip-types scripts/release.ts check-glibc"
   },
   "napi": {
     "binaryName": "tokn_sdk",
-    "packageName": "@tokn/sdk",
+    "packageName": "@tokn-ai/requests",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-pc-windows-msvc",
@@ -59,6 +65,11 @@
     "directory": "bindings/typescript"
   },
   "license": "MIT",
+  "optionalDependencies": {
+    "@tokn-ai/requests-darwin-arm64": "0.2.4",
+    "@tokn-ai/requests-linux-x64-gnu": "0.2.4",
+    "@tokn-ai/requests-win32-x64-msvc": "0.2.4"
+  },
   "devDependencies": {
     "@napi-rs/cli": "3.7.1",
     "@types/node": "22.20.1",

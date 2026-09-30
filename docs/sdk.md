@@ -145,10 +145,24 @@ The `bindings/python` package is a mixed Python/Rust package built with
 Maturin and PyO3. Its native module owns an `Arc<tokn_sdk::Client>`, while the
 public generation models are dependency-free Python dataclasses.
 
+The PyPI distribution is `tokn-requests`; its import name is `tokn_requests`.
+Install it with:
+
+```sh
+python -m pip install tokn-requests
+```
+
+Release preparation and publisher setup are documented in
+[SDK releases](sdk-release.md).
+
+The native extension uses CPython's Python 3.10 stable ABI (`abi3-py310`). Each
+platform wheel supports regular CPython 3.10 and newer; CI tests the same wheel
+on CPython 3.10–3.14. Free-threaded Python requires a different ABI.
+
 The client-bound builder mirrors the Rust API:
 
 ```python
-from tokn import Client
+from tokn_requests import Client
 
 client = Client()
 
@@ -166,7 +180,7 @@ print(response.text)
 Python exposes the same neutral generation controls:
 
 ```python
-from tokn import (
+from tokn_requests import (
   GenerateRequest,
   ReasoningEffort,
   ReasoningMode,
@@ -211,7 +225,7 @@ clients when the application needs to control the exact wire representation.
 serialized, transformed, queued, and later sent or bound:
 
 ```python
-from tokn import Client, GenerateRequest, Message
+from tokn_requests import Client, GenerateRequest, Message
 
 client = Client()
 request = GenerateRequest(
@@ -233,7 +247,7 @@ remain available as raw mapping and byte-stream escape hatches. All calls are
 
 ## Node.js and Bun
 
-`bindings/typescript` is the ESM `@tokn/sdk` package for Node.js 22 and newer
+`bindings/typescript` is the ESM `@tokn-ai/requests` package for Node.js 22 and newer
 and Bun. Its TypeScript façade exposes plain JSON-compatible objects while a
 private N-API binding runs `tokn-sdk` in-process. TypeScript does not load
 configuration or credentials itself.
@@ -241,7 +255,7 @@ configuration or credentials itself.
 Create and close the client asynchronously:
 
 ```ts
-import { Client } from "@tokn/sdk";
+import { Client } from "@tokn-ai/requests";
 
 const client = await Client.create();
 
@@ -264,7 +278,7 @@ controls as Rust and Python. Builder methods use normal TypeScript casing;
 every serializable field stays `snake_case`:
 
 ```ts
-import { request } from "@tokn/sdk";
+import { request } from "@tokn-ai/requests";
 
 const value = request("smart")
   .prompt("Plan this migration.")
@@ -330,18 +344,18 @@ pnpm build
 pnpm test
 ```
 
-The generated `_native.cjs` loader is private. The repository package is also
-marked private for now: it can be built and linked from a checkout, but it
-cannot be published accidentally before its platform artifacts are assembled.
-The eventual registry release will keep one public `@tokn/sdk` façade and use
-exact-version optional packages for Linux x64 glibc, macOS arm64, and Windows
-x64 MSVC.
+The generated `_native.cjs` loader is internal. The public `@tokn-ai/requests`
+package uses exact-version optional native packages for Linux x64 glibc, macOS
+arm64, and Windows x64 MSVC. Install it with:
+
+```sh
+npm install @tokn-ai/requests
+```
 
 CI builds the native binding and runs the façade against it with Node.js 22
-and Bun 1.3.13 on all three platforms, plus Node.js 24 on Linux. The macOS
-artifact is built with an 11.0 deployment target, although the blocking
-runtime job currently runs on macOS 15. Before the private guard is removed,
-Linux release builds must pin and verify a glibc floor instead of treating
-`ubuntu-latest` as a compatibility guarantee, and CI must install-test the
-assembled root and platform tarballs with both runtimes. Publication is
-intentionally separate from the repository's existing CLI release workflow.
+and Bun 1.3.13 on all three platforms, plus Node.js 24 on Linux. The separate
+npm release workflow verifies the Linux glibc floor and tests installed root
+and platform tarballs with both runtimes before publication. The macOS artifact
+uses an 11.0 deployment target; runtime CI runs on a newer macOS version.
+See [SDK releases](sdk-release.md) for platform requirements, build rehearsals,
+and registry publisher setup.

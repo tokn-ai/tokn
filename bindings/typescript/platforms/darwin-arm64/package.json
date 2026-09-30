@@ -1,0 +1,17 @@
+{
+  "name": "@tokn-ai/requests-darwin-arm64",
+  "version": "0.2.4",
+  "description": "Native macOS arm64 binding for @tokn-ai/requests",
+  "main": "tokn_sdk.darwin-arm64.node",
+  "files": ["tokn_sdk.darwin-arm64.node"],
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "engines": { "node": ">=22.0.0" },
+  "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tokn-ai/tokn.git",
+    "directory": "bindings/typescript"
+  },
+  "license": "MIT"
+}

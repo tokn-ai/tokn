@@ -278,7 +278,7 @@ test("native binding validation uses the public configuration error type", async
     Client.create(),
     (error: unknown) =>
       error instanceof ConfigurationError &&
-      error.message === "the native @tokn/sdk binding does not expose the expected API",
+      error.message === "the native @tokn-ai/requests binding does not expose the expected API",
   );
 
   setNativeBindingForTests({
@@ -289,7 +289,7 @@ test("native binding validation uses the public configuration error type", async
     Client.create(),
     (error: unknown) =>
       error instanceof ConfigurationError &&
-      error.message === "the native @tokn/sdk binding uses an unsupported ABI version",
+      error.message === "the native @tokn-ai/requests binding uses an unsupported ABI version",
   );
 });
 
