@@ -1,4 +1,4 @@
-name: Release @tokn/requests
+name: Release @tokn-ai/requests
 
 on:
   push:

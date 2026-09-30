@@ -1,4 +1,4 @@
-# @tokn/requests
+# @tokn-ai/requests
 
 Embedded TypeScript SDK for routing LLM requests through the providers,
 profiles, configuration, and credentials already managed by tokn.
@@ -10,9 +10,9 @@ same Rust engine as `tokn-gateway`.
 Install it with npm or Bun:
 
 ```sh
-npm install @tokn/requests
+npm install @tokn-ai/requests
 # or
-bun add @tokn/requests
+bun add @tokn-ai/requests
 ```
 
 The package installs a prebuilt native addon through an exact-version optional
@@ -25,7 +25,7 @@ build. Consumer installation does not compile Rust or run an install script.
 ## Usage
 
 ```ts
-import { Client } from "@tokn/requests";
+import { Client } from "@tokn-ai/requests";
 
 const client = await Client.create();
 
@@ -150,7 +150,7 @@ builds and runs native tests inside a digest-pinned PyPA manylinux_2_28 image
 with glibc 2.28 and GCC 14. A C11 atomics probe checks the compiler before the
 build, and the artifact's glibc symbol gate enforces the published support floor.
 
-First publication requires the npm account to own the `@tokn` scope. Publish
+First publication requires npm write access to the `@tokn-ai` organization. Publish
 the three native archives before the facade, using the `npm-packages` artifact
 from a successful workflow run and an authenticated npm account. This completes
 the first 0.2.3 release. Do not create placeholder versions or run a second publication
@@ -158,9 +158,9 @@ of the same version. See the [SDK release guide](../../docs/sdk-release.md)
 for the publication commands and recovery steps.
 
 npm trusted publishing requires each package to already exist. After the first
-release, register a GitHub trusted publisher for **each** of `@tokn/requests`,
-`@tokn/requests-darwin-arm64`, `@tokn/requests-linux-x64-gnu`, and
-`@tokn/requests-win32-x64-msvc`, with repository `tokn-ai/tokn`, workflow filename
+release, register a GitHub trusted publisher for **each** of `@tokn-ai/requests`,
+`@tokn-ai/requests-darwin-arm64`, `@tokn-ai/requests-linux-x64-gnu`, and
+`@tokn-ai/requests-win32-x64-msvc`, with repository `tokn-ai/tokn`, workflow filename
 `release-npm.yml`, environment `npm`, and direct `npm publish` allowed. Configure
 the `npm` GitHub environment's release protections. Future versions can then
 set `publish` true; publication runs only after every install test passes.

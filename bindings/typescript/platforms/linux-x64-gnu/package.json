@@ -1,7 +1,7 @@
 {
-  "name": "@tokn/requests-linux-x64-gnu",
+  "name": "@tokn-ai/requests-linux-x64-gnu",
   "version": "0.2.3",
-  "description": "Native Linux x64 glibc binding for @tokn/requests",
+  "description": "Native Linux x64 glibc binding for @tokn-ai/requests",
   "main": "tokn_sdk.linux-x64-gnu.node",
   "files": ["tokn_sdk.linux-x64-gnu.node"],
   "os": ["linux"],

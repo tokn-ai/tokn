@@ -13,31 +13,35 @@ cargo test --locked --workspace --all-features
 
 The version check also runs in CI and the CLI release workflow. The SDK release
 source is the `v0.2.3-sdk` branch; the existing `v0.2.3` CLI tag identifies an
-earlier commit. Publish the verified branch artifacts manually using the steps
-below.
+earlier commit. [PyPI `tokn-requests` 0.2.3](https://pypi.org/project/tokn-requests/0.2.3/)
+has already been published from audited commit `8528671`. Its three `cp310-abi3`
+wheels and source distribution match the verified CI artifacts. Do not upload
+those files again. The remaining manual publication is npm `@tokn-ai/requests`
+and its three native packages.
 
 ## Packages
 
 | Registry | Package | Contents |
 | --- | --- | --- |
 | PyPI | `tokn-requests` | Python `tokn_requests` module, typed models, native extension, and source distribution |
-| npm | `@tokn/requests` | ESM façade, declarations, and internal native loader |
-| npm | `@tokn/requests-linux-x64-gnu` | Linux x64 glibc native binding |
-| npm | `@tokn/requests-darwin-arm64` | macOS arm64 native binding |
-| npm | `@tokn/requests-win32-x64-msvc` | Windows x64 MSVC native binding |
+| npm | `@tokn-ai/requests` | ESM façade, declarations, and internal native loader |
+| npm | `@tokn-ai/requests-linux-x64-gnu` | Linux x64 glibc native binding |
+| npm | `@tokn-ai/requests-darwin-arm64` | macOS arm64 native binding |
+| npm | `@tokn-ai/requests-win32-x64-msvc` | Windows x64 MSVC native binding |
 
 The npm façade declares each native package as an exact-version optional
 dependency. A consumer receives the package for its OS, CPU, and libc. Source
 checkouts use local pnpm workspace links so development does not depend on a
 previous registry publication.
 
-## Build and download release artifacts
+## Build and download npm release artifacts
 
 Pushing `v0.2.3-sdk` runs `release-python.yml` and `release-npm.yml` to build,
-test, and upload packages. These branch runs do not publish. Wait for both
-workflows to finish successfully on the same reviewed commit. Local debug
-artifacts under `tmp/` exercise packaging and APIs; use the green branch CI
-artifacts for publication.
+test, and upload packages. These branch runs do not publish. For npm, wait for
+the `Release @tokn-ai/requests` workflow to finish successfully on the reviewed
+commit that contains the `@tokn-ai` scope change. Local debug artifacts under
+`tmp/` exercise packaging and APIs; use that green branch CI artifact for npm
+publication. The earlier PyPI publication remains tied to commit `8528671`.
 
 The initial branch push also makes builds available while the new workflows
 are absent from the default branch. GitHub's **Run workflow** button requires
@@ -57,72 +61,43 @@ Node.js and Bun. See [npm packaging](../bindings/typescript/README.md) for the
 platform baseline and package assembly commands.
 
 The following commands use a POSIX shell and an authenticated GitHub CLI. List
-the runs, then replace the two run-ID placeholders with the `databaseId` values
-for **Python release** and **Release @tokn/requests**. Confirm both entries have the
-same `headSha`, `status=completed`, and `conclusion=success`.
+the runs, then replace the run-ID placeholder with the `databaseId` for
+**Release @tokn-ai/requests**. Confirm its `headSha` is the reviewed scope-change
+commit, with `status=completed` and `conclusion=success`.
 
 ```sh
 gh run list --repo tokn-ai/tokn --branch v0.2.3-sdk --limit 10 \
   --json databaseId,workflowName,headSha,status,conclusion
 
-python_run=REPLACE_WITH_PYTHON_RUN_ID
 npm_run=REPLACE_WITH_NPM_RUN_ID
-release_dir=$(mktemp -d "${TMPDIR:-/tmp}/tokn-requests-0.2.3.XXXXXX")
-mkdir "$release_dir/python" "$release_dir/npm"
+release_dir=$(mktemp -d "${TMPDIR:-/tmp}/tokn-ai-requests-0.2.3.XXXXXX")
+mkdir "$release_dir/npm"
 
-gh run download "$python_run" --repo tokn-ai/tokn \
-  --pattern 'python-*' --dir "$release_dir/python"
 gh run download "$npm_run" --repo tokn-ai/tokn \
   --name npm-packages --dir "$release_dir/npm"
 ```
 
-Keep `release_dir` available in the same shell for the commands below. The
-Python download contains artifact-named subdirectories with three `.whl` files
-and one `.tar.gz` file. The npm directory contains four `.tgz` archives and
-`manifest.json`. Run IDs select the exact builds; separate fresh directories
-prevent mixing previous artifacts.
+Keep `release_dir` available in the same shell for the commands below. The npm
+directory contains four `.tgz` archives and `manifest.json`. Use a fresh
+directory so earlier `@tokn/requests` archives cannot be mixed into this
+release. Check the manifest names and filenames before publishing.
 [GitHub artifact download documentation](https://cli.github.com/manual/gh_run_download).
-
-## Publish to PyPI manually
-
-Sign in to [PyPI](https://pypi.org/), verify your email, and configure two-factor
-authentication. In account settings, create an API token. For the initial
-upload of a new project, use an account-wide token; after `tokn-requests` exists,
-replace it with a project-scoped token. PyPI uses `__token__` as the upload
-username and the complete token, including its `pypi-` prefix, as the password.
-[PyPI token documentation](https://pypi.org/help/#apitoken).
-
-Install Twine in an isolated environment, check all four downloaded distributions,
-then upload them:
-
-```sh
-python3 -m venv "$release_dir/tools"
-"$release_dir/tools/bin/python" -m pip install --upgrade twine
-"$release_dir/tools/bin/python" -m twine check --strict \
-  "$release_dir"/python/*/*.whl "$release_dir"/python/*/*.tar.gz
-"$release_dir/tools/bin/python" -m twine upload --repository pypi --username __token__ \
-  "$release_dir"/python/*/*.whl "$release_dir"/python/*/*.tar.gz
-```
-
-Paste the API token into Twine's hidden password/token prompt. Keep the token
-out of command arguments, shell history, and repository files. Twine uploads
-these existing files without rebuilding them.
-[Twine upload and validation documentation](https://twine.readthedocs.io/en/stable/).
 
 ## Publish to npm manually
 
-Use an npm account authorized to publish in the `@tokn` scope. Authenticate,
+Use an npm account authorized to publish in the `@tokn-ai` scope. Authenticate,
 then publish the three native archives before the façade:
 
 ```sh
 npm login --registry=https://registry.npmjs.org
-npm publish "$release_dir/npm/tokn-requests-darwin-arm64-0.2.3.tgz" \
+npm whoami --registry=https://registry.npmjs.org
+npm publish "$release_dir/npm/tokn-ai-requests-darwin-arm64-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-requests-linux-x64-gnu-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-ai-requests-linux-x64-gnu-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-requests-win32-x64-msvc-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-ai-requests-win32-x64-msvc-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
-npm publish "$release_dir/npm/tokn-requests-0.2.3.tgz" \
+npm publish "$release_dir/npm/tokn-ai-requests-0.2.3.tgz" \
   --registry=https://registry.npmjs.org --access public --ignore-scripts
 ```
 
@@ -132,14 +107,10 @@ downloaded tarballs preserves the files tested in CI.
 
 ## Verify and retry
 
-Inspect the run's artifact versions and registry results. Install `tokn-requests==0.2.3`
-and `@tokn/requests@0.2.3` in clean consumer environments and check that the expected
-native modules load. Published files cannot be replaced; correct packaging
+Inspect the run's artifact versions and registry results. Install
+`@tokn-ai/requests@0.2.3` in a clean consumer environment and check that its
+native module loads. Published files cannot be replaced; correct packaging
 failures through a new version rather than replacing 0.2.3 artifacts.
-
-If a PyPI upload stops partway through, compare the uploaded files' SHA-256
-hashes with the reviewed artifacts, then upload only the missing files. Keep
-the same artifacts for the retry.
 
 If an npm upload stops partway through, retain the same reviewed archives. Check
 an already uploaded package with `npm view PACKAGE@0.2.3 dist.integrity` and

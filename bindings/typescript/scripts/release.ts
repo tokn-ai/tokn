@@ -86,7 +86,7 @@ async function pack(artifactDirectory?: string, selectedPlatform?: string): Prom
   assert.equal(manifest["version"], version);
   assert.equal(manifest["private"], undefined);
   assert.deepEqual([...(manifest["napi"] as Manifest)["targets"] as string[]].sort(), platforms.map((platform) => platform.target).sort());
-  assert.deepEqual(manifest["optionalDependencies"], Object.fromEntries(platforms.map((platform) => [`@tokn/requests-${platform.suffix}`, version])));
+  assert.deepEqual(manifest["optionalDependencies"], Object.fromEntries(platforms.map((platform) => [`@tokn-ai/requests-${platform.suffix}`, version])));
   const selected = selectedPlatform === undefined ? platforms : platforms.filter((platform) => platform.suffix === selectedPlatform);
   assert(selected.length > 0, `Unsupported platform: ${selectedPlatform}`);
   await rm(releaseRoot, { recursive: true, force: true });
@@ -114,7 +114,7 @@ async function pack(artifactDirectory?: string, selectedPlatform?: string): Prom
       assert(binary.length > 64 && binary.subarray(0, expectedMagic.length / 2).toString("hex") === expectedMagic,
         `Invalid ${platform.suffix} native binary`);
       const platformManifest = await readManifest(join(packageRoot, "platforms", platform.suffix, "package.json"));
-      assert.equal(platformManifest["name"], `@tokn/requests-${platform.suffix}`);
+      assert.equal(platformManifest["name"], `@tokn-ai/requests-${platform.suffix}`);
       assert.equal(platformManifest["version"], version);
       assert.equal(platformManifest["main"], nativeName);
       assert.deepEqual(platformManifest["os"], [platform.os]);
@@ -127,7 +127,7 @@ async function pack(artifactDirectory?: string, selectedPlatform?: string): Prom
       await writeFile(join(directory, "package.json"), `${JSON.stringify(platformManifest, null, 2)}\n`);
       await cp(nativePath, join(directory, nativeName));
       await cp(join(repositoryRoot, "LICENSE"), join(directory, "LICENSE"));
-      await writeFile(join(directory, "README.md"), `# ${platformManifest["name"]}\n\nNative binding for [@tokn/requests](https://www.npmjs.com/package/@tokn/requests). Install the facade package instead.\n`);
+      await writeFile(join(directory, "README.md"), `# ${platformManifest["name"]}\n\nNative binding for [@tokn-ai/requests](https://www.npmjs.com/package/@tokn-ai/requests). Install the facade package instead.\n`);
       archives.push(await packDirectory(directory, nativeName));
     }
     archives.push(await packDirectory(facade));
@@ -144,9 +144,9 @@ async function testInstalled(selectedPlatform: string): Promise<void> {
   assert.equal(platform.os, process.platform);
   assert.equal(platform.cpu, process.arch);
   const archives = JSON.parse(await readFile(join(releaseRoot, "manifest.json"), "utf8")) as PackedPackage[];
-  const facade = archives.find((archive) => archive.package_name === "@tokn/requests");
+  const facade = archives.find((archive) => archive.package_name === "@tokn-ai/requests");
   assert(facade !== undefined);
-  assert(archives.some((archive) => archive.package_name === `@tokn/requests-${selectedPlatform}`));
+  assert(archives.some((archive) => archive.package_name === `@tokn-ai/requests-${selectedPlatform}`));
   const tarballs = new Map<string, Buffer>();
   for (const archive of archives) {
     const bytes = await readFile(join(releaseRoot, archive.filename));
@@ -193,14 +193,14 @@ async function testInstalled(selectedPlatform: string): Promise<void> {
       await writeFile(join(directory, "package.json"), JSON.stringify({
         private: true,
         type: "module",
-        dependencies: { "@tokn/requests": facade.manifest["version"] },
+        dependencies: { "@tokn-ai/requests": facade.manifest["version"] },
       }));
-      await writeFile(join(directory, ".npmrc"), `@tokn:registry=${registry}\n`);
+      await writeFile(join(directory, ".npmrc"), `@tokn-ai:registry=${registry}\n`);
       await cp(join(packageRoot, "scripts/installed-smoke.ts"), join(directory, "installed-smoke.ts"));
       const env = {
         ...process.env,
         TOKN_PACKAGE_VERSION: String(facade.manifest["version"]),
-        TOKN_NATIVE_PACKAGE: `@tokn/requests-${selectedPlatform}`,
+        TOKN_NATIVE_PACKAGE: `@tokn-ai/requests-${selectedPlatform}`,
         npm_config_userconfig: join(directory, ".npmrc"),
       };
       if (runtime === "node") {
@@ -232,7 +232,7 @@ async function publish(): Promise<void> {
   assert.equal(process.env["TOKN_NPM_PUBLISH"], "1", "Publication requires an explicit TOKN_NPM_PUBLISH=1 opt-in");
   const archives = JSON.parse(await readFile(join(releaseRoot, "manifest.json"), "utf8")) as PackedPackage[];
   assert.deepEqual(archives.map((archive) => archive.package_name), [
-    ...platforms.map((platform) => `@tokn/requests-${platform.suffix}`), "@tokn/requests",
+    ...platforms.map((platform) => `@tokn-ai/requests-${platform.suffix}`), "@tokn-ai/requests",
   ]);
   const facade = await readManifest(join(packageRoot, "package.json"));
   const pending: PackedPackage[] = [];

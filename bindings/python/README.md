@@ -213,10 +213,12 @@ Pushing `v0.2.3-sdk` runs the `Python release` workflow in
 `.github/workflows/release-python.yml`. It builds three stable-ABI wheels,
 audits their Python symbols, installs the same artifacts on CPython 3.10–3.14,
 rebuilds the source distribution with locked Cargo dependencies, and uploads
-the distributions as workflow artifacts. Branch runs build only. Use the
-successful CI artifacts for the manual publication steps in the
-[SDK release guide](../../docs/sdk-release.md). `VERSION`, the Cargo workspace
-version, and `pyproject.toml` must agree.
+the distributions as workflow artifacts. Branch runs build only. Version 0.2.3
+is already [published on PyPI](https://pypi.org/project/tokn-requests/0.2.3/)
+from the audited `8528671` artifacts; do not upload it again. The
+[SDK release guide](../../docs/sdk-release.md) covers the remaining npm
+publication. `VERSION`, the Cargo workspace version, and `pyproject.toml` must
+agree.
 
 For optional automated publication in future releases, create the GitHub
 environment `pypi` and register a PyPI trusted publisher for:

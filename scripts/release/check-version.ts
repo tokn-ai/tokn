@@ -130,6 +130,16 @@ function checkLock(path: string, expected: string, required_names: Set<string>):
 function checkNpm(expected: string): number {
   const path = "bindings/typescript/package.json";
   const facade = readJson(path);
+  const package_name = "@tokn-ai/requests";
+  const facade_name = string(facade["name"], `${path} name`);
+  if (facade_name !== package_name) {
+    failures.push(`${path} name: expected ${package_name}, got ${facade_name}`);
+  }
+  const napi = object(facade["napi"], `${path} napi`);
+  const napi_package_name = string(napi["packageName"], `${path} napi.packageName`);
+  if (napi_package_name !== package_name) {
+    failures.push(`${path} napi.packageName: expected ${package_name}, got ${napi_package_name}`);
+  }
   expectVersion(`${path} version`, facade["version"], expected);
   const optional = object(facade["optionalDependencies"] ?? {}, `${path} optionalDependencies`);
   for (const [name, version] of Object.entries(optional)) {
@@ -146,6 +156,10 @@ function checkNpm(expected: string): number {
       const manifest_path = join(platforms_path, entry.name, "package.json");
       const manifest = readJson(manifest_path);
       const name = string(manifest["name"], `${manifest_path} name`);
+      const expected_name = `${package_name}-${entry.name}`;
+      if (name !== expected_name) {
+        failures.push(`${manifest_path} name: expected ${expected_name}, got ${name}`);
+      }
       if (platform_names.has(name)) {
         failures.push(`${manifest_path}: duplicate platform package ${name}`);
       }

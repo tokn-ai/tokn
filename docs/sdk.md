@@ -145,8 +145,8 @@ The `bindings/python` package is a mixed Python/Rust package built with
 Maturin and PyO3. Its native module owns an `Arc<tokn_sdk::Client>`, while the
 public generation models are dependency-free Python dataclasses.
 
-The PyPI distribution is `tokn-requests`; its import name is `tokn_requests`. Once 0.2.3
-is published, install it with:
+The PyPI distribution is `tokn-requests`; its import name is `tokn_requests`.
+Install version 0.2.3 with:
 
 ```sh
 python -m pip install tokn-requests==0.2.3
@@ -247,7 +247,7 @@ remain available as raw mapping and byte-stream escape hatches. All calls are
 
 ## Node.js and Bun
 
-`bindings/typescript` is the ESM `@tokn/requests` package for Node.js 22 and newer
+`bindings/typescript` is the ESM `@tokn-ai/requests` package for Node.js 22 and newer
 and Bun. Its TypeScript façade exposes plain JSON-compatible objects while a
 private N-API binding runs `tokn-sdk` in-process. TypeScript does not load
 configuration or credentials itself.
@@ -255,7 +255,7 @@ configuration or credentials itself.
 Create and close the client asynchronously:
 
 ```ts
-import { Client } from "@tokn/requests";
+import { Client } from "@tokn-ai/requests";
 
 const client = await Client.create();
 
@@ -278,7 +278,7 @@ controls as Rust and Python. Builder methods use normal TypeScript casing;
 every serializable field stays `snake_case`:
 
 ```ts
-import { request } from "@tokn/requests";
+import { request } from "@tokn-ai/requests";
 
 const value = request("smart")
   .prompt("Plan this migration.")
@@ -344,12 +344,12 @@ pnpm build
 pnpm test
 ```
 
-The generated `_native.cjs` loader is internal. The public `@tokn/requests` package
+The generated `_native.cjs` loader is internal. The public `@tokn-ai/requests` package
 uses exact-version optional native packages for Linux x64 glibc, macOS arm64,
 and Windows x64 MSVC. Once 0.2.3 is published, install it with:
 
 ```sh
-npm install @tokn/requests@0.2.3
+npm install @tokn-ai/requests@0.2.3
 ```
 
 CI builds the native binding and runs the façade against it with Node.js 22

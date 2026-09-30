@@ -7,10 +7,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 // Resolve from this installed fixture, never from the source checkout.
-const packageName: string = "@tokn/requests";
+const packageName: string = "@tokn-ai/requests";
 const { Client, request }: typeof import("../src/index.js") = await import(packageName);
 const require = createRequire(import.meta.url);
-const manifestPath = require.resolve("@tokn/requests/package.json");
+const manifestPath = require.resolve("@tokn-ai/requests/package.json");
 const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
 assert.equal(manifest["version"], process.env["TOKN_PACKAGE_VERSION"]);
 assert(!(await readdir(dirname(manifestPath))).some((path) => path.endsWith(".node")));
@@ -66,7 +66,7 @@ try {
   assert.equal(response.text, "installed native answer");
   assert.equal(response.usage?.total_tokens, 3);
   assert.equal(requestCount, 1);
-  console.log(`Installed @tokn/requests ${manifest["version"]}: native ABI and provider request passed`);
+  console.log(`Installed @tokn-ai/requests ${manifest["version"]}: native ABI and provider request passed`);
 } finally {
   await client?.close();
   server.closeAllConnections();

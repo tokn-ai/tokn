@@ -1,5 +1,5 @@
 {
-  "name": "@tokn/requests",
+  "name": "@tokn-ai/requests",
   "version": "0.2.3",
   "description": "In-process TypeScript SDK for tokn routing and provider integrations",
   "type": "module",
@@ -52,7 +52,7 @@
   },
   "napi": {
     "binaryName": "tokn_sdk",
-    "packageName": "@tokn/requests",
+    "packageName": "@tokn-ai/requests",
     "targets": [
       "aarch64-apple-darwin",
       "x86_64-pc-windows-msvc",
@@ -66,9 +66,9 @@
   },
   "license": "MIT",
   "optionalDependencies": {
-    "@tokn/requests-darwin-arm64": "0.2.3",
-    "@tokn/requests-linux-x64-gnu": "0.2.3",
-    "@tokn/requests-win32-x64-msvc": "0.2.3"
+    "@tokn-ai/requests-darwin-arm64": "0.2.3",
+    "@tokn-ai/requests-linux-x64-gnu": "0.2.3",
+    "@tokn-ai/requests-win32-x64-msvc": "0.2.3"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.1",
