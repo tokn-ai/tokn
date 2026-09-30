@@ -38,8 +38,8 @@ previous registry publication.
 
 Pushing `v0.2.3-sdk` runs `release-python.yml` and `release-npm.yml` to build,
 test, and upload packages. These branch runs do not publish. For npm, wait for
-the `Release @tokn-ai/requests` workflow to finish successfully on the reviewed
-commit that contains the `@tokn-ai` scope change. Local debug artifacts under
+`release-npm.yml` to finish successfully on the reviewed commit that contains
+the `@tokn-ai` scope change. Local debug artifacts under
 `tmp/` exercise packaging and APIs; use that green branch CI artifact for npm
 publication. The earlier PyPI publication remains tied to commit `8528671`.
 
@@ -61,13 +61,14 @@ Node.js and Bun. See [npm packaging](../bindings/typescript/README.md) for the
 platform baseline and package assembly commands.
 
 The following commands use a POSIX shell and an authenticated GitHub CLI. List
-the runs, then replace the run-ID placeholder with the `databaseId` for
-**Release @tokn-ai/requests**. Confirm its `headSha` is the reviewed scope-change
-commit, with `status=completed` and `conclusion=success`.
+the npm workflow runs, then replace the run-ID placeholder with the `databaseId`
+for the reviewed scope-change commit. Confirm its `headSha`,
+`status=completed`, and `conclusion=success`.
 
 ```sh
-gh run list --repo tokn-ai/tokn --branch v0.2.3-sdk --limit 10 \
-  --json databaseId,workflowName,headSha,status,conclusion
+gh run list --repo tokn-ai/tokn --workflow release-npm.yml \
+  --branch v0.2.3-sdk --limit 10 \
+  --json databaseId,headSha,status,conclusion
 
 npm_run=REPLACE_WITH_NPM_RUN_ID
 release_dir=$(mktemp -d "${TMPDIR:-/tmp}/tokn-ai-requests-0.2.3.XXXXXX")
