@@ -17,6 +17,7 @@ use rusqlite::params;
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use tokn_core::event::{Event, EventHandler};
+use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEventPayload, Stage, StageEvent};
 
 /// `EventHandler` that persists requests stage events into the requests DB.
@@ -89,6 +90,7 @@ impl EventHandler for RequestEventHandler {
           s.stream,
           s.session_id.as_deref(),
           s.initiator.as_deref(),
+          s.request_classification,
           &s.headers,
           &s.raw_body,
         ),
@@ -260,6 +262,7 @@ impl RequestEventHandler {
     stream: bool,
     session_id: Option<&str>,
     initiator: Option<&str>,
+    request_classification: Option<RequestClassification>,
     inbound_req_headers: &tokn_headers::HeaderMap,
     inbound_req_body: &bytes::Bytes,
   ) -> Result<()> {
@@ -279,7 +282,7 @@ impl RequestEventHandler {
          session_id = COALESCE(excluded.session_id, request_metadata.session_id)",
       params![id, model, session_id],
     )?;
-    patch_params_json(conn, &id, params_patch(initiator, stream))?;
+    patch_params_json(conn, &id, params_patch(initiator, stream, request_classification))?;
     conn.execute(
       "INSERT INTO request_downstream (request_id, inbound_req_headers, inbound_req_body)
        VALUES (?1, ?2, ?3)
@@ -590,12 +593,19 @@ fn persisted_body(options: RequestPersistenceOptions, body: &bytes::Bytes) -> Op
     .then(|| &body[..body.len().min(options.body_max_bytes)])
 }
 
-fn params_patch(initiator: Option<&str>, stream: bool) -> Map<String, Value> {
+fn params_patch(
+  initiator: Option<&str>,
+  stream: bool,
+  request_classification: Option<RequestClassification>,
+) -> Map<String, Value> {
   let mut out = Map::new();
   if let Some(initiator) = initiator {
     out.insert("initiator".to_string(), Value::String(initiator.to_string()));
   }
   out.insert("stream".to_string(), Value::Bool(stream));
+  if let Some(classification) = request_classification {
+    out.insert("request_classification".to_string(), serde_json::json!(classification));
+  }
   out
 }
 

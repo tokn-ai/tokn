@@ -3,6 +3,10 @@ import {
   cacheReadPercent,
   isLlmRequest,
 } from "./llm-request.js";
+import {
+  classificationSourceLabel,
+  readRequestClassification,
+} from "./request-classification.js";
 
 function assertEqual(actual: unknown, expected: unknown, message: string) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
@@ -72,6 +76,71 @@ assertEqual(
   false,
   "ordinary HTTP traffic keeps the generic overview",
 );
+assertEqual(
+  isLlmRequest({
+    endpoint: "/backend-api/codex/responses/compact",
+    inbound_req_url:
+      "https://example.test/backend-api/codex/responses/compact?source=test",
+    model: "gpt-test",
+  }),
+  true,
+  "a routed compaction endpoint uses the LLM overview",
+);
+assertEqual(
+  isLlmRequest({ inbound_req_url: "/v1/responses/compact" }),
+  false,
+  "a compaction path alone does not classify arbitrary HTTP traffic",
+);
+
+for (const source of [
+  "endpoint",
+  "request_field",
+  "codex_prompt",
+  "claude_code_prompt",
+  "opencode_prompt",
+] as const) {
+  const classification = { purpose: "compaction", source };
+  assertEqual(
+    readRequestClassification({
+      params_json: { request_classification: classification },
+    }),
+    classification,
+    `${source} classification is read from decoded metadata`,
+  );
+  assertEqual(
+    readRequestClassification({
+      params_json: JSON.stringify({ request_classification: classification }),
+    }),
+    classification,
+    `${source} classification is read from serialized metadata`,
+  );
+  assertEqual(
+    readRequestClassification({ request_classification: classification }),
+    classification,
+    `${source} classification is read from a summary`,
+  );
+}
+for (const params_json of [
+  undefined,
+  null,
+  "invalid json",
+  { stream: false },
+  { request_classification: null },
+  { request_classification: { purpose: "unknown", source: "endpoint" } },
+  { request_classification: { purpose: "compaction", source: "unknown" } },
+  { request_classification: { purpose: "compaction", source: "toString" } },
+]) {
+  assertEqual(
+    readRequestClassification({ params_json }),
+    undefined,
+    "absent, malformed, or future classification remains unclassified",
+  );
+}
+assertEqual(
+  classificationSourceLabel("claude_code_prompt"),
+  "Claude Code prompt",
+  "the detection source label identifies the client",
+);
 
 const overview = buildLlmRequestOverview(request);
 assertDefined(overview, "LLM overview is built");
@@ -112,6 +181,19 @@ const stringOverview = buildLlmRequestOverview({
 });
 assertDefined(stringOverview, "serialized JSON columns are accepted");
 assertEqual(stringOverview.stream, false, "serialized stream mode is parsed");
+const compactionOverview = buildLlmRequestOverview({
+  endpoint: "responses",
+  params_json: {
+    stream: false,
+    request_classification: { purpose: "compaction", source: "endpoint" },
+  },
+});
+assertDefined(compactionOverview, "compaction overview is built");
+assertEqual(
+  compactionOverview.request_classification,
+  { purpose: "compaction", source: "endpoint" },
+  "the overview preserves purpose and detection source",
+);
 assertEqual(
   stringOverview.usage.cache_write_tokens,
   4,

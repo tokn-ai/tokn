@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
+use tokn_core::request_classification::classify_request;
 use tokn_core::util::initiator::{classify_initiator as classify_chat_initiator, classify_initiator_responses};
 use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS};
 use tokn_headers::HeaderMap;
@@ -56,6 +57,7 @@ impl ExtractStage for DefaultExtract {
     let initiator = header_initiator
       .clone()
       .or_else(|| classify_initiator(&body_json).map(SmolStr::new));
+    let request_classification = classify_request(&ctx.request_endpoint, &body_json);
 
     let session_id = inbound_correlation(&headers).session_id;
     let project_id = first_present_smol(&headers, PROJECT_ID_HEADERS);
@@ -82,6 +84,7 @@ impl ExtractStage for DefaultExtract {
       project_id,
       initiator,
       header_initiator,
+      request_classification,
       route_mode_hint,
       headers,
       raw_body,
@@ -130,6 +133,8 @@ mod tests {
   use bytes::Bytes;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
+  use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
+  use tokn_core::request_event::ExtractedSummary;
   use tokn_core::AgentId;
   use tokn_headers::inbound::{first_present, SESSION_ID_HEADERS};
 
@@ -175,6 +180,35 @@ mod tests {
     assert_eq!(ex.initiator, None);
     assert!(!ex.stream);
     assert!(ex.agent_id.is_none());
+  }
+
+  #[tokio::test]
+  async fn codex_compaction_classification_reaches_extract_event_summary() {
+    let body = serde_json::json!({
+      "model": "gpt-test",
+      "input": [{
+        "role": "user",
+        "content": "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task."
+      }]
+    });
+    let ctx = PipelineCtx::new("req-compact", Endpoint::Responses.into(), Arc::new(EventBus::new(64)));
+    let ex = DefaultExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: Endpoint::Responses.into(),
+          ..raw(HeaderMap::new(), body)
+        },
+      )
+      .await
+      .unwrap();
+    let expected = Some(RequestClassification {
+      purpose: RequestPurpose::Compaction,
+      source: RequestClassificationSource::CodexPrompt,
+    });
+    assert_eq!(ex.request_classification, expected);
+    let summary = ExtractedSummary::from(&ex);
+    assert_eq!(summary.request_classification, expected);
   }
 
   #[tokio::test]

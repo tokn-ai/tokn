@@ -1,4 +1,4 @@
-import { LitElement, html } from "lit";
+import { LitElement, html, nothing } from "lit";
 import {
   formatTimestamp,
   requestKey,
@@ -7,6 +7,7 @@ import {
   shortId,
 } from "./format";
 import type { RequestSummary, TimezoneMode } from "./types";
+import { classificationSourceLabel } from "./request-classification";
 
 export class RequestList extends LitElement {
   static properties = {
@@ -67,6 +68,15 @@ export class RequestList extends LitElement {
                     ><strong>${method}</strong><span>${path}</span></span
                   >
                   <span class="request-context">
+                    ${
+                      request.request_classification?.purpose === "compaction"
+                        ? html`<span
+                            class="request-classification-badge"
+                            title=${classificationSourceLabel(request.request_classification.source)}
+                            >Compaction</span
+                          >`
+                        : nothing
+                    }
                     <span>${request.model ?? "unknown model"}</span>
                     <span aria-hidden="true">·</span>
                     <span>${request.provider_id ?? "unknown provider"}</span>

@@ -1,5 +1,6 @@
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tokn_core::request_classification::RequestClassification;
 
 use super::RequestCursor;
 use crate::viewer::{effective_limit, value::serialize_i64_as_string};
@@ -40,6 +41,7 @@ pub struct RequestSummary {
   pub request_id: String,
   pub ts: i64,
   pub endpoint: Option<String>,
+  pub request_classification: Option<RequestClassification>,
   pub status: Option<u16>,
   pub request_error: Option<String>,
   pub session_id: Option<String>,

@@ -603,6 +603,17 @@ h3 {
   font-size: 0.72rem;
 }
 
+.request-classification-badge {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.3rem;
+  color: var(--accent);
+  background: var(--accent-surface);
+  font-size: 0.64rem;
+  font-weight: 650;
+}
+
 .request-identifiers {
   gap: 0.7rem;
   color: var(--ui-muted);

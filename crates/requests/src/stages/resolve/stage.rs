@@ -150,6 +150,7 @@ mod tests {
       project_id: None,
       initiator: None,
       header_initiator: None,
+      request_classification: None,
       route_mode_hint: None,
       headers: HeaderMap::new(),
       raw_body: Bytes::new(),

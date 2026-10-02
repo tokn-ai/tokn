@@ -145,15 +145,20 @@ fn list_split_day_requests(
   limit: Option<usize>,
   schema: RequestSchema,
 ) -> Result<Vec<RequestSummary>> {
-  let mut sql = String::from(
+  let params_json = if schema.has_params_json() {
+    "m.params_json"
+  } else {
+    "NULL"
+  };
+  let mut sql = format!(
     "SELECT c.request_id, c.ts, c.endpoint, c.status, c.request_error, m.session_id, m.account_id,
             m.provider_id, m.model, d.inbound_req_method, d.inbound_req_url, u.outbound_resp_status,
-            d.inbound_resp_status, c.rowid
+            d.inbound_resp_status, c.rowid, {params_json}
      FROM request_connection c
      LEFT JOIN request_metadata m ON m.request_id = c.request_id
      LEFT JOIN request_downstream d ON d.request_id = c.request_id
      LEFT JOIN request_upstream u ON u.request_id = c.request_id
-     WHERE 1 = 1",
+     WHERE 1 = 1"
   );
   let mut values = Vec::new();
 
@@ -224,7 +229,7 @@ fn list_legacy_day_requests(
   };
   let mut sql = format!(
     "SELECT {request_id}, ts, endpoint, status, {request_error}, session_id, account_id, provider_id,
-            model, inbound_req_method, inbound_req_url, outbound_resp_status, inbound_resp_status, id
+            model, inbound_req_method, inbound_req_url, outbound_resp_status, inbound_resp_status, id, NULL
      FROM requests
      WHERE 1 = 1"
   );
@@ -351,12 +356,19 @@ fn request_summary_from_row(
   day: &str,
   schema: RequestSchema,
 ) -> rusqlite::Result<RequestSummary> {
+  let params_json: Option<String> = row.get(14)?;
+  let request_classification = params_json
+    .as_deref()
+    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+    .and_then(|params| params.get("request_classification").cloned())
+    .and_then(|classification| serde_json::from_value(classification).ok());
   Ok(RequestSummary {
     row_id: row.get(13)?,
     day: day.to_string(),
     request_id: row.get(0)?,
     ts: schema.normalized_timestamp(row.get(1)?),
     endpoint: row.get(2)?,
+    request_classification,
     status: sqlite_status(row.get(3)?),
     request_error: row.get(4)?,
     session_id: row.get(5)?,

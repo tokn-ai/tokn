@@ -333,6 +333,11 @@ impl UsageEventHandler {
     pending
       .params_json
       .insert("stream".to_string(), Value::Bool(summary.stream));
+    if let Some(classification) = summary.request_classification {
+      pending
+        .params_json
+        .insert("request_classification".to_string(), serde_json::json!(classification));
+    }
   }
 
   fn on_resolve(&mut self, request_id: &str, attempt: u32, summary: &ResolvedSummary) {
@@ -1021,6 +1026,72 @@ mod tests {
     extract_summary_with_initiator(Some("user"))
   }
 
+  #[test]
+  fn usage_preserves_request_classification_for_each_attempt() {
+    use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
+
+    let dir = std::env::temp_dir().join(format!("tokn-router-usage-classification-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("usage.db");
+    let mut handler = UsageEventHandler::new(path.clone()).unwrap();
+    for (attempt, source) in [
+      (0, RequestClassificationSource::CodexPrompt),
+      (1, RequestClassificationSource::Endpoint),
+    ] {
+      handler.handle(&request_stage(
+        "compaction-request",
+        attempt,
+        1_000,
+        StageEvent::Started {
+          request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
+        },
+      ));
+      let StageEvent::Extract(mut summary) = extract_summary() else {
+        panic!("expected extract summary");
+      };
+      summary.request_classification = Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source,
+      });
+      handler.handle(&request_stage(
+        "compaction-request",
+        attempt,
+        1_002,
+        StageEvent::Extract(summary),
+      ));
+      handler.handle(&request_stage(
+        "compaction-request",
+        attempt,
+        1_010,
+        StageEvent::Completed {
+          success: true,
+          attempts: attempt + 1,
+        },
+      ));
+    }
+    let conn = Connection::open(path).unwrap();
+    for (request_id, source) in [
+      ("compaction-request", "codex_prompt"),
+      ("compaction-request:1", "endpoint"),
+    ] {
+      let params_json: Option<String> = conn
+        .query_row(
+          "SELECT params_json FROM requests WHERE request_id = ?1",
+          [request_id],
+          |row| row.get(0),
+        )
+        .unwrap();
+      assert_eq!(
+        parse_json(params_json.as_deref()),
+        Some(json!({
+          "initiator": "user",
+          "stream": true,
+          "request_classification": {"purpose": "compaction", "source": source}
+        }))
+      );
+    }
+  }
+
   fn extract_summary_with_initiator(initiator: Option<&str>) -> StageEvent {
     let mut headers = HeaderMap::new();
     headers.insert("x-test", "1");
@@ -1033,6 +1104,7 @@ mod tests {
       initiator: initiator.map(SmolStr::new),
       header_initiator: None,
       route_mode_hint: None,
+      request_classification: None,
       headers,
       raw_body: Bytes::new(),
       decoded_body: Bytes::new(),

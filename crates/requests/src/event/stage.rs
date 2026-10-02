@@ -21,6 +21,7 @@ impl From<&Extracted> for ExtractedSummary {
       project_id: e.project_id.clone(),
       initiator: e.initiator.clone(),
       header_initiator: e.header_initiator.clone(),
+      request_classification: e.request_classification,
       route_mode_hint: e.route_mode_hint.clone(),
       headers: e.headers.clone(),
       raw_body: e.raw_body.clone(),

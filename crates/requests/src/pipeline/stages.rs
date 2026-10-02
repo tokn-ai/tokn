@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
+use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{RequestEndpoint, Stage, StageEvent};
 use tokn_core::AgentId;
 use tokn_headers::{HeaderMap, TemplateVars};
@@ -312,6 +313,7 @@ pub struct Extracted {
   pub project_id: Option<SmolStr>,
   pub initiator: Option<SmolStr>,
   pub header_initiator: Option<SmolStr>,
+  pub request_classification: Option<RequestClassification>,
   pub route_mode_hint: Option<SmolStr>,
   pub headers: HeaderMap,
   pub raw_body: Bytes,

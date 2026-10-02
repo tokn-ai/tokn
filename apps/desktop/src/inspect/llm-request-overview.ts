@@ -3,6 +3,7 @@ import type { PropertyValues } from "lit";
 import { readInspector, isAbortError } from "./api";
 import { displayPath, formatTimestamp, numberField } from "./format";
 import { buildLlmRequestOverview, cacheReadPercent } from "./llm-request";
+import { classificationSourceLabel } from "./request-classification";
 import "./llm-expandable-item";
 import type {
   LlmMessageSummary,
@@ -455,6 +456,22 @@ export class LlmRequestOverview extends LitElement {
         ${this.renderContentSummary()}
 
         <dl class="metadata-grid llm-metadata-grid">
+          ${
+            overview.request_classification
+              ? html`
+                  <div>
+                    <dt>Purpose</dt>
+                    <dd>Compaction</dd>
+                  </div>
+                  <div>
+                    <dt>Detection source</dt>
+                    <dd>
+                      ${classificationSourceLabel(overview.request_classification.source)}
+                    </dd>
+                  </div>
+                `
+              : nothing
+          }
           <div>
             <dt>Timestamp</dt>
             <dd>
