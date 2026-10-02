@@ -12,6 +12,14 @@ pub enum RequestPurpose {
   Compaction,
 }
 
+impl RequestPurpose {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Compaction => "compaction",
+    }
+  }
+}
+
 /// The concrete signal that identified a request's purpose. Prompt sources
 /// name a recognized template, independently of the configured wire identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
