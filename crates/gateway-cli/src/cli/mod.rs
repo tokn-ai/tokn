@@ -14,6 +14,8 @@ mod headers;
 mod history;
 mod import;
 mod lan_bootstrap;
+#[cfg(unix)]
+mod lifecycle;
 mod login;
 mod migration;
 mod onboarding;
@@ -52,8 +54,15 @@ pub enum Cmd {
   ApiKey(api_key::ApiKeyCmd),
   /// Show the Copilot identity headers that will be sent upstream
   Headers(headers::HeadersArgs),
-  /// Run the local OpenAI-compatible server
+  /// Start or reuse the frontend and run a replacement worker
   Serve(serve::ServeArgs),
+  /// Run fixed public listeners and accept workers from any gateway version.
+  #[cfg(unix)]
+  Frontend(serve::ServeArgs),
+  /// Manage request execution workers.
+  #[cfg(unix)]
+  #[command(subcommand)]
+  Worker(lifecycle::WorkerCmd),
   /// Run the local MITM forward proxy or print proxy env exports
   Proxy(proxy::ProxyArgs),
   /// Query usage statistics from the local SQLite log
@@ -114,6 +123,10 @@ impl Cli {
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
       Cmd::Serve(a) => serve::run(cfg_path, a).await,
+      #[cfg(unix)]
+      Cmd::Frontend(a) => lifecycle::frontend(cfg_path, a).await,
+      #[cfg(unix)]
+      Cmd::Worker(c) => lifecycle::worker(cfg_path, c).await,
       Cmd::Proxy(a) => proxy::run(cfg_path, a).await,
       Cmd::Usage(a) => usage::run(cfg_path, a).await,
       Cmd::Requests(c) => requests::run(cfg_path, c).await,
@@ -150,6 +163,8 @@ fn run_mode_for(cmd: &Cmd) -> RunMode {
   use config_cmd::ConfigCmd::*;
   match cmd {
     Cmd::Serve(_) | Cmd::Proxy(_) => RunMode::Server,
+    #[cfg(unix)]
+    Cmd::Frontend(_) | Cmd::Worker(_) => RunMode::Server,
     Cmd::Requests(requests::RequestsCmd::Prune(requests::PruneArgs { commit: false })) => RunMode::ReadOnlyCli,
     Cmd::Requests(requests::RequestsCmd::Prune(requests::PruneArgs { commit: true })) => RunMode::MutatingCli,
     Cmd::Update(_) | Cmd::Migration(_) => RunMode::MutatingCli,

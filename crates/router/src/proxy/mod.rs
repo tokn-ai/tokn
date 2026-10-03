@@ -1,5 +1,6 @@
 mod ca;
 mod connect_proxy;
+pub(crate) mod ingress;
 pub mod passthrough_pipeline;
 mod transport;
 
@@ -172,13 +173,26 @@ where
 pub(crate) async fn serve_v2_policy<F>(
   addr: SocketAddr,
   outbound_proxy: HttpClientOptions,
-  state: crate::v2::LiveForwardProxyState,
+  state: ingress::IngressSource,
   shutdown: F,
 ) -> Result<()>
 where
   F: Future<Output = ()> + Send,
 {
   let listener = TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
+  serve_bound_v2_policy(listener, outbound_proxy, state, shutdown).await
+}
+
+pub(crate) async fn serve_bound_v2_policy<F>(
+  listener: TcpListener,
+  outbound_proxy: HttpClientOptions,
+  state: ingress::IngressSource,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let addr = listener.local_addr()?;
   let outbound_proxy = Arc::new(connect_proxy::ConnectProxy::from_options(&outbound_proxy));
   tracing::info!(%addr, "tokn-router v2 proxy listening");
   let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(false);

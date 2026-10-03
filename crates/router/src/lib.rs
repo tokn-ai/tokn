@@ -2,9 +2,14 @@ use anyhow::{anyhow, Result};
 
 pub mod api;
 mod cors;
+pub mod dispatch;
+pub mod frontend;
+#[cfg(unix)]
+pub mod ipc;
 pub mod pipeline;
 pub mod proxy;
 mod request_id;
+pub mod routing;
 pub mod server;
 pub mod v2;
 

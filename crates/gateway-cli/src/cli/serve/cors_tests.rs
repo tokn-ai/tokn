@@ -84,6 +84,7 @@ async fn cors_reload_reads_both_schemas_and_preserves_permissions_after_invalid_
     };
     write_config(&config_path, legacy, &cors);
     let args = ServeArgs {
+      worker_socket: None,
       host: None,
       port: None,
       with_proxy: false,

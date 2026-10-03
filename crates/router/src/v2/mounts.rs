@@ -8,26 +8,26 @@ use std::borrow::Cow;
 mod tests;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ApiOperation {
+pub(crate) enum ApiOperation {
   Generate(Endpoint),
   Models,
   Providers,
 }
 
 #[derive(Debug)]
-pub(super) struct MountedEndpoint {
-  pub(super) profile: ProfileId,
-  pub(super) operation: ApiOperation,
-  pub(super) enabled: bool,
+pub(crate) struct MountedEndpoint {
+  pub(crate) profile: ProfileId,
+  pub(crate) operation: ApiOperation,
+  pub(crate) enabled: bool,
 }
 
 #[derive(Default)]
-pub(super) struct ApiMounts {
+pub(crate) struct ApiMounts {
   paths: BTreeMap<String, MountedEndpoint>,
 }
 
 impl ApiMounts {
-  pub(super) fn new(plan: &GatewayPlan) -> anyhow::Result<Self> {
+  pub(crate) fn new(plan: &GatewayPlan) -> anyhow::Result<Self> {
     let mut mounts = Self::default();
     for (id, profile) in plan.profiles() {
       let Some(binding) = profile.api_binding() else {
@@ -61,7 +61,11 @@ impl ApiMounts {
     Ok(mounts)
   }
 
-  pub(super) fn get(&self, path: &str) -> Option<&MountedEndpoint> {
+  pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &MountedEndpoint)> {
+    self.paths.iter().map(|(path, entry)| (path.as_str(), entry))
+  }
+
+  pub(crate) fn get(&self, path: &str) -> Option<&MountedEndpoint> {
     self.paths.get(canonical_path(path).as_ref())
   }
 }
@@ -86,7 +90,7 @@ fn canonical_path(path: &str) -> Cow<'_, str> {
   Cow::Owned(String::from_utf8(bytes).expect("ASCII substitutions preserve UTF-8"))
 }
 
-pub(super) async fn dispatch(
+pub(crate) async fn dispatch(
   Extension(state): Extension<Arc<AppState>>,
   Extension(access): Extension<AccessContext>,
   connection: InboundConnectionInfo,

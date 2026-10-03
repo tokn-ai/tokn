@@ -33,8 +33,9 @@ bytes = { workspace = true }
 flate2 = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 http-body-util = { workspace = true }
-hyper = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
 hyper-util = { workspace = true, features = ["service"] }
 ipnet = { workspace = true }
 parking_lot = { workspace = true }

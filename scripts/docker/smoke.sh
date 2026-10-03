@@ -39,7 +39,11 @@ for attempt in {1..30}; do
   sleep 1
 done
 test "$status" = 401
+# Authentication is frontend-owned, so a 401 does not mean its worker has
+# registered yet. Retry transient startup failures until execution is ready;
+# curl still fails immediately on authentication errors such as 401 or 403.
 curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+  --retry 30 --retry-delay 1 --retry-max-time 30 \
   -H "Authorization: Bearer $token" "http://$address/v1/models" >/dev/null
 docker stop --time 40 "$smoke_container"
 test "$(docker inspect --format '{{.State.ExitCode}}' "$smoke_container")" = 0
