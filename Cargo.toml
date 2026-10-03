@@ -101,7 +101,7 @@ libc = "0.2"
 notify = "8"
 parking_lot = "0.12"
 rcgen = { version = "0.14", features = ["crypto", "pem"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "socks", "gzip", "brotli", "deflate", "zstd", "form"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2", "socks", "gzip", "brotli", "deflate", "zstd", "form"] }
 rustls-native-certs = "0.8"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"

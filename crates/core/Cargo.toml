@@ -26,3 +26,6 @@ time = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+h2 = "0.4"
