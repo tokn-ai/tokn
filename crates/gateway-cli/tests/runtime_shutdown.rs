@@ -487,6 +487,103 @@ base_url = "http://{old_address}/v1"
   new_task.await.unwrap();
 }
 
+#[tokio::test]
+async fn ab_test_flags_keep_idle_baseline_available_and_interrupt_cancels_the_ramp() {
+  for custom_policy in [false, true] {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let policy_path = home.path().join("rollout.toml");
+    let policy_source =
+      "initial_percent = 10\ncompletion_percent = 100\n[[stages]]\nduration_seconds = 259200\ntraffic_percent = 90\n";
+    fs::write(&policy_path, policy_source).unwrap();
+    let command = if custom_policy {
+      vec![
+        "worker",
+        "start",
+        "--ab-test",
+        "--ab-test-policy",
+        policy_path.to_str().unwrap(),
+      ]
+    } else {
+      vec!["serve", "--ab-test", "--ab-test-duration", "72h"]
+    };
+    let address = free_address();
+    fs::write(
+      &path,
+      format!(
+        r#"
+schema_version = 2
+[service.logging]
+target = "stderr"
+[service.persistence]
+enabled = false
+[listeners.api]
+kind = "llm_api"
+bind = "{address}"
+client_auth = "none"
+"#
+      ),
+    )
+    .unwrap();
+    let mut frontend = frontend(home.path(), &path);
+    ready_frontend(&mut frontend, address, home.path()).await;
+    let mut baseline = start(home.path(), &path);
+    ready(&mut baseline, address, home.path()).await;
+    let baseline_id = workers(address).await["main_worker_id"].clone();
+    let mut candidate = start_command(home.path(), &path, &command, "ab-stderr.log");
+    tokio::time::timeout(WAIT, async {
+      while !workers(address).await["ab_test"].is_object() {
+        assert!(
+          candidate.try_wait().unwrap().is_none(),
+          "{}",
+          fs::read_to_string(home.path().join("ab-stderr.log")).unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .unwrap();
+    let report = workers(address).await;
+    assert_eq!(report["ab_test"]["baseline_worker_id"], baseline_id);
+    assert_eq!(report["ab_test"]["traffic_percent"], 10);
+    assert_eq!(report["ab_test"]["duration_seconds"], 72 * 3600);
+    assert_eq!(
+      report["ab_test"]["rollout_policy"]["stages"][0]["duration_seconds"],
+      72 * 3600
+    );
+    assert_eq!(report["workers"][0]["weight"], 90);
+    assert_eq!(report["workers"][1]["weight"], 10);
+    if custom_policy {
+      fs::write(&policy_path, policy_source.replace("259200", "129600")).unwrap();
+      assert_eq!(
+        workers(address).await["ab_test"]["rollout_policy"],
+        report["ab_test"]["rollout_policy"]
+      );
+    }
+    assert!(
+      baseline.try_wait().unwrap().is_none(),
+      "idle baseline must survive the experiment"
+    );
+    signal(&candidate, "-INT");
+    assert!(tokio::time::timeout(WAIT, candidate.wait())
+      .await
+      .unwrap()
+      .unwrap()
+      .success());
+    let report = workers(address).await;
+    assert!(report["ab_test"].is_null());
+    assert_eq!(report["main_worker_id"], baseline_id);
+    signal(&baseline, "-INT");
+    assert_clean_exit(&mut baseline, home.path()).await;
+    signal(&frontend, "-TERM");
+    assert!(tokio::time::timeout(WAIT, frontend.wait())
+      .await
+      .unwrap()
+      .unwrap()
+      .success());
+  }
+}
+
 async fn read_request(stream: &mut TcpStream) {
   let mut header = Vec::new();
   while !header.ends_with(b"\r\n\r\n") {

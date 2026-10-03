@@ -116,6 +116,97 @@ For temporary experiments, persistence may instead be disabled explicitly.
 
 ## A/B experiments
 
+### Automatic rollout policies
+
+With a frontend and one baseline worker already running, start the new version:
+
+```sh
+/path/to/new/tokn-gateway worker start --ab-test
+# Or reuse the existing frontend through serve:
+/path/to/new/tokn-gateway serve --with-proxy --ab-test
+```
+
+By default, the frontend sends the new worker 10% of new requests initially and increases
+its share linearly toward 90% over 24 hours. Weights advance in one percentage
+point increments every 18 minutes: 30% at six hours, 50% at twelve hours, and
+70% at eighteen hours. At 24 hours, the new worker takes 100% and the baseline
+exits automatically after its existing requests and streams finish. Idle client
+connections do not delay retirement. The new worker is `current` during the
+experiment; the baseline is `stale` and continues receiving its share.
+
+The frontend owns the monotonic clock and updates weights independently of
+request arrivals. This rollout is driven by elapsed time, without an error-rate
+or latency threshold. The `ab_test` object in `/admin/workers` shows the worker
+IDs, elapsed and total seconds, the initialized `rollout_policy`, and the new
+worker's traffic percentage; it is
+removed after completion or cancellation. The worker's terminal footer also shows
+`ab=10%/90% elapsed=00:01/24:00`: the split is new/baseline and times are hours
+and minutes. It refreshes every five seconds even without requests, and clears
+when the experiment ends. The frontend must support banner status queries;
+restart it with this version to enable them.
+
+A manual weight update cancels the automatic ramp. Starting an ordinary worker
+also cancels it and replaces both versions. Stopping either participating worker
+cancels the ramp and leaves the surviving worker handling traffic. Existing
+requests retain their original worker throughout all changes. Only one automatic
+experiment may run at a time, and starting it requires exactly one worker with a
+positive weight. `--ab-test` conflicts with `--candidate`.
+
+The frontend must advertise `rollout_policy_v1` for custom policies. Upgrade an
+older frontend once, then attach the baseline and new worker. Future changes to
+initial policies do not require restarting that frontend. The default 24-hour
+policy also works with a frontend that advertises the earlier automatic A/B
+capability; custom policies fail clearly on that version. Control protocol v2 and request IPC v1 are unchanged, so earlier v2
+worker binaries can still act as the baseline. An experiment is not persisted
+across frontend shutdown; attached workers stop when the frontend stops.
+
+Set the duration when starting the worker:
+
+```sh
+tokn-gateway worker start --ab-test --ab-test-duration 72h
+tokn-gateway serve --with-proxy --ab-test --ab-test-duration 36h
+```
+
+For custom percentages and stages, initialize from a TOML file:
+
+```sh
+tokn-gateway worker start --ab-test --ab-test-policy rollout.toml
+```
+
+```toml
+initial_percent = 5
+completion_percent = 100
+
+# Hold at 5% for six hours.
+[[stages]]
+duration_seconds = 21600
+traffic_percent = 5
+
+# Ramp from 5% to 90% over the next 66 hours.
+[[stages]]
+duration_seconds = 237600
+traffic_percent = 90
+```
+
+Each stage interpolates linearly from the previous percentage to its target.
+Durations must be positive whole seconds. Initial and stage percentages must be
+between 1 and 99 so both workers remain available throughout the experiment.
+At completion, `completion_percent` applies immediately: 100 drains the baseline,
+0 returns traffic to the baseline and drains the new worker, and an intermediate
+percentage retains that split.
+
+The CLI reads the policy once and sends it to the frontend during registration.
+An active policy cannot be edited; changing its file does not change the running
+experiment. `--ab-test-duration` and `--ab-test-policy` require `--ab-test` and
+cannot be combined. The frontend executes the supplied stages and owns their
+clock; duration and traffic defaults belong to the CLI.
+
+For a separate new-version config, use `worker start --ab-test` with the global
+`--config candidate.toml` and `--frontend-config frontend.toml` options. The
+separate persistence paths described above still apply.
+
+### Manual traffic weights
+
 Register a candidate without replacing or retiring the current worker:
 
 ```sh

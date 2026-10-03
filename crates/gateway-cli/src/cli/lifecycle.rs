@@ -1,4 +1,5 @@
 //! Stable listener discovery, worker promotion, and process ownership.
+use super::rollout::{default_duration, default_policy, RolloutArgs};
 use super::serve::{self, ServeArgs};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -16,16 +17,16 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokn_core::util::shutdown::ShutdownSignal;
 use tokn_router::ipc::{WorkerEndpoint, WorkerPool};
-use tokn_router::routing::RoutingControl;
+use tokn_router::routing::{AbTestStatus, RolloutPolicy, RoutingControl};
 
-// Retirement changes the control protocol; request IPC remains independently versioned.
+// Optional capabilities extend control v2 without excluding older worker binaries.
 const CONTROL_PROTOCOL_VERSION: u32 = 2;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const MESSAGE_LIMIT: u64 = 64 * 1024;
 
 #[derive(Subcommand, Debug)]
 pub enum WorkerCmd {
-  /// Start a worker, take all new requests, and drain the previous worker.
+  /// Start a worker, replacing the current worker or joining an A/B experiment.
   Start(WorkerArgs),
 }
 
@@ -35,8 +36,10 @@ pub struct WorkerArgs {
   #[arg(long)]
   frontend_config: Option<PathBuf>,
   /// Register without promoting, for an A/B experiment using /admin/workers.
-  #[arg(long)]
+  #[arg(long, conflicts_with = "ab_test")]
   candidate: bool,
+  #[command(flatten)]
+  rollout: RolloutArgs,
   /// Skip outbound proxy for this worker.
   #[arg(long)]
   no_proxy: bool,
@@ -45,6 +48,12 @@ pub struct WorkerArgs {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FrontendInfo {
   protocol_version: u32,
+  #[serde(default)]
+  supports_ab_test: bool,
+  #[serde(default)]
+  supports_ab_test_status: bool,
+  #[serde(default)]
+  capabilities: Vec<String>,
   frontend_pid: u32,
   args: ServeArgs,
 }
@@ -53,18 +62,28 @@ struct FrontendInfo {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum ControlRequest {
   Inspect,
+  AbTestStatus,
   Retire,
   Register {
     worker_id: String,
     socket_path: PathBuf,
     candidate: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    ab_test: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout_policy: Option<RolloutPolicy>,
   },
+}
+
+fn is_false(value: &bool) -> bool {
+  !*value
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum ControlReply {
   Info { info: FrontendInfo },
+  AbTest { ab_test: Option<AbTestStatus> },
   Registered,
   Retired,
   Stopping,
@@ -125,6 +144,19 @@ async fn read_buffered_message<T: DeserializeOwned>(
   Ok(message)
 }
 
+async fn read_ab_test_status(path: &Path) -> Result<Option<AbTestStatus>> {
+  tokio::time::timeout(Duration::from_secs(1), async {
+    let mut stream = UnixStream::connect(path).await?;
+    write_message(&mut stream, &ControlRequest::AbTestStatus).await?;
+    match read_message(&mut BufReader::new(stream)).await? {
+      ControlReply::AbTest { ab_test } => Ok(ab_test),
+      _ => anyhow::bail!("invalid frontend A/B status response"),
+    }
+  })
+  .await
+  .context("frontend A/B status timed out")?
+}
+
 async fn inspect(path: &Path) -> Result<FrontendInfo> {
   tokio::time::timeout(Duration::from_secs(2), async {
     let mut stream = UnixStream::connect(path).await?;
@@ -179,18 +211,35 @@ async fn connection(
   let request = tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream)).await??;
   match request {
     ControlRequest::Retire => anyhow::bail!("register before retiring a worker"),
+    ControlRequest::AbTestStatus => {
+      let ab_test = pool.status().ab_test;
+      write_message(stream.get_mut(), &ControlReply::AbTest { ab_test }).await
+    }
     ControlRequest::Inspect => write_message(stream.get_mut(), &ControlReply::Info { info: (*info).clone() }).await,
     ControlRequest::Register {
       worker_id,
       socket_path,
       candidate,
+      ab_test,
+      rollout_policy,
     } => {
       let endpoint = WorkerEndpoint {
         worker_id: worker_id.clone(),
         socket_path,
         weight: 1,
       };
-      let result = if candidate {
+      anyhow::ensure!(
+        !(candidate && (ab_test || rollout_policy.is_some())),
+        "--candidate and --ab-test are mutually exclusive"
+      );
+      let result = if ab_test || rollout_policy.is_some() {
+        pool
+          .register_rollout(
+            endpoint,
+            rollout_policy.unwrap_or_else(|| default_policy(default_duration())),
+          )
+          .await
+      } else if candidate {
         pool.register_candidate(endpoint).await
       } else {
         pool.register(endpoint).await
@@ -240,10 +289,13 @@ async fn serve_control(
 ) -> Result<()> {
   let info = Arc::new(info);
   let mut tasks = JoinSet::new();
+  let mut ramp_tick = tokio::time::interval(Duration::from_secs(1));
+  ramp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   loop {
     tokio::select! {
       biased;
       _ = stop.changed() => break,
+      _ = ramp_tick.tick() => pool.advance_ab_test(),
       result = tasks.join_next(), if !tasks.is_empty() => {
         if let Some(Err(error)) = result { tracing::warn!(%error, "frontend control task failed"); }
       }
@@ -268,6 +320,10 @@ async fn serve_control(
 pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let shutdown = ShutdownSignal::new()?;
   anyhow::ensure!(args.worker_socket.is_none(), "frontend does not accept --worker-socket");
+  anyhow::ensure!(
+    !args.rollout.ab_test,
+    "--ab-test belongs to serve or worker start, not frontend"
+  );
   let dir = runtime_dir(config.as_deref())?;
   let path = dir.join("frontend.sock");
   let (_, loaded) = serve::load_runtime(config, args.clone())?;
@@ -316,6 +372,9 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     listener,
     FrontendInfo {
       protocol_version: CONTROL_PROTOCOL_VERSION,
+      supports_ab_test: true,
+      supports_ab_test_status: true,
+      capabilities: vec!["rollout_policy_v1".into()],
       frontend_pid: std::process::id(),
       args,
     },
@@ -348,19 +407,55 @@ pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
       "no compatible frontend; run `tokn-gateway frontend --with-proxy` or `tokn-gateway serve --with-proxy` first",
     )?,
   };
-  start_worker(config, dir, info, args.candidate, args.no_proxy, shutdown).await
+  let registration = WorkerRegistration {
+    candidate: args.candidate,
+    rollout_policy: args.rollout.policy()?,
+    no_proxy: args.no_proxy,
+  };
+  start_worker(config, dir, info, registration, shutdown).await
+}
+
+struct WorkerRegistration {
+  candidate: bool,
+  rollout_policy: Option<RolloutPolicy>,
+  no_proxy: bool,
 }
 
 async fn start_worker(
   config: Option<PathBuf>,
   dir: PathBuf,
   info: FrontendInfo,
-  candidate: bool,
-  no_proxy: bool,
+  registration: WorkerRegistration,
   mut shutdown: ShutdownSignal,
 ) -> Result<()> {
+  let WorkerRegistration {
+    candidate,
+    rollout_policy,
+    no_proxy,
+  } = registration;
+  let ab_test = rollout_policy.is_some();
+  let rollout_policy = if info
+    .capabilities
+    .iter()
+    .any(|capability| capability == "rollout_policy_v1")
+  {
+    rollout_policy
+  } else {
+    anyhow::ensure!(
+      rollout_policy
+        .as_ref()
+        .is_none_or(|policy| *policy == default_policy(default_duration())),
+      "this frontend cannot execute custom rollout policies; restart it with a version supporting rollout_policy_v1"
+    );
+    None
+  };
+  anyhow::ensure!(
+    !ab_test || info.supports_ab_test,
+    "this frontend does not support --ab-test; restart it with a gateway version supporting automatic A/B ramps"
+  );
   let worker_id = uuid::Uuid::new_v4().simple().to_string();
   let socket_path = dir.join(format!("w-{worker_id}.sock"));
+  let supports_ab_test_status = info.supports_ab_test_status;
   let mut args = info.args;
   args.worker_socket = Some(socket_path.clone());
   args.no_proxy |= no_proxy;
@@ -408,6 +503,8 @@ async fn start_worker(
         worker_id: worker_id.clone(),
         socket_path,
         candidate,
+        ab_test,
+        rollout_policy,
       },
     )
     .await?;
@@ -420,12 +517,29 @@ async fn start_worker(
     tracing::info!(%worker_id, "worker started; frontend owns traffic assignment");
     let mut retirement_sent = false;
     let mut reply_buffer = Vec::new();
+    let mut status_tick = tokio::time::interval(Duration::from_secs(5));
+    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let control_path = dir.join("frontend.sock");
     loop {
       if !retirement_sent && *retire_rx.borrow() {
         write_message(stream.get_mut(), &ControlRequest::Retire).await?;
         retirement_sent = true;
       }
+      let status_update = async {
+        status_tick.tick().await;
+        read_ab_test_status(&control_path).await
+      };
       let reply = tokio::select! {
+        status = status_update, if supports_ab_test_status => {
+          match status {
+            Ok(status) => crate::progress::set_ab_test_status(status),
+            Err(error) => {
+              crate::progress::set_ab_test_status(None);
+              tracing::debug!(%error, "frontend A/B banner status unavailable");
+            }
+          }
+          continue;
+        }
         reply = read_buffered_message(&mut stream, &mut reply_buffer) => reply,
         result = retire_rx.changed(), if !retirement_sent => { result?; continue; }
       };
@@ -460,10 +574,14 @@ async fn start_worker(
         tracing::info!(%worker_id, "retiring worker; waiting for existing requests (Ctrl+C again forces exit)");
         let _ = retire_tx.send(true);
       }
-      result = &mut server => return attachment_result.and(result),
+      result = &mut server => {
+        crate::progress::set_ab_test_status(None);
+        return attachment_result.and(result);
+      }
       result = &mut attach, if !attachment_done => {
         attachment_result = result;
         attachment_done = true;
+        crate::progress::set_ab_test_status(None);
         let _ = stop_tx.send(true);
       }
     }
@@ -483,6 +601,10 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       )?,
     }
   } else {
+    anyhow::ensure!(
+      !args.rollout.ab_test,
+      "--ab-test requires an existing frontend with one active baseline worker"
+    );
     // Validate all configuration before spawning an independently owned process.
     let _ = serve::load_runtime(config.clone(), args.clone())?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -562,5 +684,140 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     "the existing frontend was started without --with-proxy; restart the frontend to enable its legacy proxy listener"
   );
   tracing::info!(frontend_pid = info.frontend_pid, "using frontend");
-  start_worker(config, dir, info, false, args.no_proxy, shutdown).await
+  let registration = WorkerRegistration {
+    candidate: false,
+    rollout_policy: args.rollout.policy()?,
+    no_proxy: args.no_proxy,
+  };
+  start_worker(config, dir, info, registration, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::cli::{Cli, Cmd};
+  use clap::Parser;
+
+  #[tokio::test]
+  async fn banner_status_reads_active_and_cancelled_experiments_over_control_socket() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("frontend.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+      for ab_test in [
+        Some(AbTestStatus {
+          baseline_worker_id: "old".into(),
+          worker_id: "new".into(),
+          elapsed_seconds: 12 * 3600,
+          duration_seconds: 24 * 3600,
+          traffic_percent: 50,
+          rollout_policy: None,
+        }),
+        None,
+      ] {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = BufReader::new(stream);
+        assert!(matches!(
+          read_message::<ControlRequest>(&mut stream).await.unwrap(),
+          ControlRequest::AbTestStatus
+        ));
+        write_message(stream.get_mut(), &ControlReply::AbTest { ab_test })
+          .await
+          .unwrap();
+      }
+    });
+    let status = read_ab_test_status(&path).await.unwrap().unwrap();
+    assert_eq!(status.traffic_percent, 50);
+    assert_eq!(status.elapsed_seconds, 12 * 3600);
+    assert!(read_ab_test_status(&path).await.unwrap().is_none());
+    server.await.unwrap();
+  }
+
+  #[test]
+  fn optional_ab_capability_preserves_control_v2_compatibility() {
+    let info = FrontendInfo {
+      protocol_version: CONTROL_PROTOCOL_VERSION,
+      supports_ab_test: true,
+      supports_ab_test_status: true,
+      capabilities: vec!["rollout_policy_v1".into()],
+      frontend_pid: 123,
+      args: ServeArgs::default(),
+    };
+    let mut legacy_info = serde_json::to_value(info).unwrap();
+    legacy_info.as_object_mut().unwrap().remove("supports_ab_test");
+    legacy_info.as_object_mut().unwrap().remove("supports_ab_test_status");
+    legacy_info.as_object_mut().unwrap().remove("capabilities");
+    legacy_info["args"].as_object_mut().unwrap().remove("ab_test");
+    let decoded: FrontendInfo = serde_json::from_value(legacy_info).unwrap();
+    assert!(!decoded.supports_ab_test);
+    assert!(!decoded.supports_ab_test_status);
+    assert!(!decoded.args.rollout.ab_test);
+    assert!(decoded.capabilities.is_empty());
+    let register = ControlRequest::Register {
+      worker_id: "fixture".into(),
+      socket_path: "/tmp/fixture.sock".into(),
+      candidate: false,
+      ab_test: false,
+      rollout_policy: None,
+    };
+    let legacy_message = serde_json::to_value(register).unwrap();
+    assert!(
+      legacy_message.get("ab_test").is_none(),
+      "normal registration must stay readable by v2 frontends"
+    );
+    let ControlRequest::Register { ab_test, .. } = serde_json::from_value(legacy_message).unwrap() else {
+      panic!("registration");
+    };
+    assert!(!ab_test, "new frontends must accept older worker registration messages");
+  }
+
+  #[test]
+  fn rollout_duration_flags_are_shared_and_require_an_experiment() {
+    for argv in [
+      vec!["tokn-gateway", "serve", "--ab-test", "--ab-test-duration", "72h"],
+      vec![
+        "tokn-gateway",
+        "worker",
+        "start",
+        "--ab-test",
+        "--ab-test-duration",
+        "72h",
+      ],
+    ] {
+      let cli = Cli::try_parse_from(argv).unwrap();
+      let args = match cli.cmd {
+        Cmd::Serve(args) => args.rollout,
+        Cmd::Worker(WorkerCmd::Start(args)) => args.rollout,
+        _ => panic!("worker startup command"),
+      };
+      assert_eq!(args.policy().unwrap().unwrap().validate().unwrap(), 72 * 3600);
+    }
+    assert!(Cli::try_parse_from(["tokn-gateway", "serve", "--ab-test-duration", "72h"]).is_err());
+    assert!(Cli::try_parse_from(["tokn-gateway", "serve", "--ab-test", "--ab-test-duration", "0s"]).is_err());
+    assert!(Cli::try_parse_from([
+      "tokn-gateway",
+      "serve",
+      "--ab-test",
+      "--ab-test-duration",
+      "72h",
+      "--ab-test-policy",
+      "policy.toml"
+    ])
+    .is_err());
+  }
+
+  #[test]
+  fn ab_test_flags_select_automatic_registration() {
+    let cli = Cli::try_parse_from(["tokn-gateway", "serve", "--with-proxy", "--ab-test"]).unwrap();
+    let Cmd::Serve(args) = cli.cmd else {
+      panic!("serve command");
+    };
+    assert!(args.rollout.ab_test && args.with_proxy);
+    let cli = Cli::try_parse_from(["tokn-gateway", "worker", "start", "--ab-test"]).unwrap();
+    let Cmd::Worker(WorkerCmd::Start(args)) = cli.cmd else {
+      panic!("worker command");
+    };
+    assert!(args.rollout.ab_test && !args.candidate);
+    assert!(Cli::try_parse_from(["tokn-gateway", "worker", "start", "--ab-test", "--candidate"]).is_err());
+  }
 }
