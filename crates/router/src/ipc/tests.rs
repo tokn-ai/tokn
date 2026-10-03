@@ -2,7 +2,7 @@ use super::protocol::CONTEXT_HEADER;
 use super::*;
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
 use crate::frontend::Frontend;
-use crate::routing::RoutingControl;
+use crate::routing::{RoutingControl, WorkerState};
 use crate::v2::{build_worker_runtime_states, LiveRuntime};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -633,10 +633,95 @@ async fn dynamic_registration_promotes_atomically_and_waits_for_stream_drain() {
     .await
     .unwrap()
     .unwrap();
+  assert_eq!(pool.status().workers[0].state, WorkerState::Exiting);
+  pool.retire("new").unwrap();
+  assert!(
+    pool.status().main_worker_id.is_none(),
+    "automatic exit must not be reversed"
+  );
   pool.disconnect("old");
   assert_eq!(pool.status().workers.len(), 1);
   pool.disconnect("new");
   assert!(pool.dispatch(context(), request()).await.is_err());
+  old.stop().await;
+  new.stop().await;
+}
+
+#[tokio::test]
+async fn retiring_current_promotes_busy_stale_without_interrupting_either_stream() {
+  let ca = tempfile::tempdir().unwrap();
+  let compiled = config(address(), address(), ca.path(), "127.0.0.1:1".parse().unwrap());
+  let (old_tx, old_rx) = tokio::sync::mpsc::channel(1);
+  let (new_tx, new_rx) = tokio::sync::mpsc::channel(1);
+  let old = Worker::start(
+    compiled.gateway().clone(),
+    Arc::new(FixtureDispatcher {
+      stream: parking_lot::Mutex::new(Some(old_rx)),
+      contexts: parking_lot::Mutex::new(Vec::new()),
+    }),
+  )
+  .await;
+  let new = Worker::start(
+    compiled.gateway().clone(),
+    Arc::new(FixtureDispatcher {
+      stream: parking_lot::Mutex::new(Some(new_rx)),
+      contexts: parking_lot::Mutex::new(Vec::new()),
+    }),
+  )
+  .await;
+  let pool = WorkerPool::empty(compiled.gateway()).unwrap();
+  pool.register(old.endpoint("old", 1)).await.unwrap();
+  let mut old_body = pool
+    .dispatch(context(), request())
+    .await
+    .unwrap()
+    .into_body()
+    .into_data_stream();
+  old_tx.send(Ok(bytes::Bytes::from_static(b"old"))).await.unwrap();
+  assert!(old_body.next().await.unwrap().is_ok());
+  pool.register(new.endpoint("new", 1)).await.unwrap();
+  let mut new_body = pool
+    .dispatch(context(), request())
+    .await
+    .unwrap()
+    .into_body()
+    .into_data_stream();
+  new_tx.send(Ok(bytes::Bytes::from_static(b"new"))).await.unwrap();
+  assert!(new_body.next().await.unwrap().is_ok());
+  pool.retire("new").unwrap();
+  let report = pool.status();
+  assert_eq!(report.main_worker_id.as_deref(), Some("old"));
+  assert_eq!(report.workers[0].state, WorkerState::Current);
+  assert_eq!(report.workers[0].weight, 1);
+  assert_eq!(report.workers[1].state, WorkerState::Exiting);
+  assert_eq!(report.workers[1].weight, 0);
+  assert!(report.workers.iter().all(|worker| worker.in_flight == 1));
+  assert!(pool
+    .update_weights(BTreeMap::from([("old".into(), 0), ("new".into(), 1)]))
+    .await
+    .is_err());
+  assert!(
+    tokio::time::timeout(Duration::from_millis(20), pool.wait_retired("new"))
+      .await
+      .is_err()
+  );
+  drop(new_tx);
+  assert!(new_body.next().await.is_none());
+  pool.wait_retired("new").await.unwrap();
+  pool.disconnect("new");
+  let response = pool.dispatch(context(), request()).await.unwrap();
+  assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "fixture");
+  drop(old_tx);
+  assert!(old_body.next().await.is_none());
+  assert!(
+    tokio::time::timeout(Duration::from_millis(20), pool.wait_retired("old"))
+      .await
+      .is_err()
+  );
+  pool.retire("old").unwrap();
+  assert!(pool.status().main_worker_id.is_none());
+  pool.wait_retired("old").await.unwrap();
+  pool.disconnect("old");
   old.stop().await;
   new.stop().await;
 }

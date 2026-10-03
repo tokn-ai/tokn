@@ -7,7 +7,17 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Serialize)]
 pub struct RoutingReport {
   pub generation: u64,
+  pub main_worker_id: Option<String>,
   pub workers: Vec<WorkerStatus>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+  Current,
+  #[default]
+  Stale,
+  Exiting,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -15,6 +25,7 @@ pub struct WorkerStatus {
   pub worker_id: String,
   pub version: Option<String>,
   pub weight: u32,
+  pub state: WorkerState,
   pub in_flight: u64,
   pub requests: u64,
   pub completed: u64,

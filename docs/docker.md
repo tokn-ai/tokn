@@ -35,19 +35,24 @@ state directory.
 
 ## Shutdown
 
-`serve` handles SIGINT and SIGTERM (Ctrl-C and Ctrl-Break on Windows). It stops
-accepting connections, allows active API and decoded proxy HTTP requests up to
-30 seconds to finish, then cancels and joins remaining connection tasks. Idle
-HTTP keep-alive connections close immediately. Opaque CONNECT tunnels close
-immediately because they have no HTTP request boundary to drain. The standalone
-legacy `proxy start` also handles termination signals and bounds connection
-draining to 30 seconds, but cannot distinguish idle from active legacy tunnels.
+On macOS and Linux, `serve` runs a worker attached to an independent frontend.
+The first SIGINT or SIGTERM marks the worker exiting and transfers new requests
+to another eligible worker, when available. Existing worker requests drain
+without a deadline. A second signal forces immediate exit with status 130.
+The frontend remains running; see [worker lifecycle](version-dispatch.md#worker-states-and-ctrl-c).
+
+Signalling the frontend stops its public listeners and allows active API and
+decoded proxy requests up to 30 seconds to finish. Idle keep-alive connections
+and opaque CONNECT tunnels close immediately. The standalone legacy `proxy start`
+also bounds draining to 30 seconds. On Windows, `serve` uses the standalone runtime
+and its bounded shutdown path.
 
 Request, usage, session, and archival handlers then get up to five seconds for
 cleanup. A drain or cleanup timeout is logged and returns a nonzero exit status;
 timed-out cleanup cannot guarantee that every queued record was written. The
 async runtime gets a final one-second bounded wait for blocking background
-tasks. Allow at least 40 seconds before a supervisor force-kills the process:
+tasks. Allow at least 40 seconds for bounded frontend shutdown. Worker shutdown can
+take longer if an upstream stream remains active:
 
 ```sh
 docker stop --time 40 tokn-gateway
