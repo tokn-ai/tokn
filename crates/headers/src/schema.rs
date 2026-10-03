@@ -48,6 +48,17 @@ pub fn optional(map: &HeaderMap, name: &HeaderName) -> Option<SmolStr> {
   map.get(name).map(|v| SmolStr::new(v.as_str()))
 }
 
+/// Combine every value of an optional header using its protocol's delimiter.
+pub fn optional_joined(map: &HeaderMap, name: &HeaderName, separator: &str) -> Option<SmolStr> {
+  let mut values = map.get_all(name);
+  let mut joined = values.next()?.as_str().to_string();
+  for value in values {
+    joined.push_str(separator);
+    joined.push_str(value.as_str());
+  }
+  Some(joined.into())
+}
+
 /// Insert a `SmolStr` value into the map under `name`.
 pub fn put(map: &mut HeaderMap, name: &HeaderName, value: &SmolStr) {
   map.insert(name.clone(), HeaderValue::from_string(value.to_string()));

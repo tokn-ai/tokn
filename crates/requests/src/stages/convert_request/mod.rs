@@ -21,7 +21,8 @@ mod generation;
 mod noop;
 mod passthrough;
 
-pub use compaction::apply_compaction_priority;
+pub(crate) use compaction::compaction_provider_id;
+pub use compaction::{apply_compaction_priority, apply_compaction_priority_routing_hint};
 pub use default::DefaultConvertRequest;
 pub use noop::NoopConvertRequest;
 pub use passthrough::PassthroughConvertRequest;

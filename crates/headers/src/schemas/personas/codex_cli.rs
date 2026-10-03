@@ -16,7 +16,9 @@ use crate::error::Error;
 use crate::keys;
 use crate::map::HeaderMap;
 use crate::name::HeaderName;
-use crate::schema::{from_inbound_or, opt_from_inbound, optional, put, put_opt, required, HeaderSchema};
+use crate::schema::{
+  from_inbound_or, opt_from_inbound, optional, optional_joined, put, put_opt, required, HeaderSchema,
+};
 use crate::vars::TemplateVars;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -68,6 +70,8 @@ pub struct CodexCliHeaders {
   pub codex_beta_features: Option<SmolStr>,
   #[serde(rename = "x-codex-turn-metadata", skip_serializing_if = "Option::is_none")]
   pub codex_turn_metadata: Option<SmolStr>,
+  #[serde(rename = "x-codex-routing-hint", skip_serializing_if = "Option::is_none")]
+  pub codex_routing_hint: Option<SmolStr>,
   /// Selects the wire format that carries tools in `additional_tools` input items.
   #[serde(
     rename = "x-openai-internal-codex-responses-lite",
@@ -110,6 +114,7 @@ impl HeaderSchema for CodexCliHeaders {
       codex_window_id: optional(map, &keys::X_CODEX_WINDOW_ID),
       codex_beta_features: optional(map, &keys::X_CODEX_BETA_FEATURES),
       codex_turn_metadata: optional(map, &keys::X_CODEX_TURN_METADATA),
+      codex_routing_hint: optional_joined(map, &keys::X_CODEX_ROUTING_HINT, ";"),
       codex_responses_lite: optional(map, &keys::X_CODEX_RESPONSES_LITE),
       openai_beta: optional(map, &keys::OPENAI_BETA),
       request_id: optional(map, &keys::X_REQUEST_ID),
@@ -138,6 +143,7 @@ impl HeaderSchema for CodexCliHeaders {
     put_opt(&mut m, &keys::X_CODEX_WINDOW_ID, &self.codex_window_id);
     put_opt(&mut m, &keys::X_CODEX_BETA_FEATURES, &self.codex_beta_features);
     put_opt(&mut m, &keys::X_CODEX_TURN_METADATA, &self.codex_turn_metadata);
+    put_opt(&mut m, &keys::X_CODEX_ROUTING_HINT, &self.codex_routing_hint);
     put_opt(&mut m, &keys::X_CODEX_RESPONSES_LITE, &self.codex_responses_lite);
     put_opt(&mut m, &keys::OPENAI_BETA, &self.openai_beta);
     put_opt(&mut m, &keys::X_REQUEST_ID, &self.request_id);
@@ -148,7 +154,7 @@ impl HeaderSchema for CodexCliHeaders {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 24] = [
+    static NAMES: [&HeaderName; 25] = [
       &keys::USER_AGENT,
       &keys::AUTHORIZATION,
       &keys::HOST,
@@ -166,6 +172,7 @@ impl HeaderSchema for CodexCliHeaders {
       &keys::X_CODEX_WINDOW_ID,
       &keys::X_CODEX_BETA_FEATURES,
       &keys::X_CODEX_TURN_METADATA,
+      &keys::X_CODEX_ROUTING_HINT,
       &keys::X_CODEX_RESPONSES_LITE,
       &keys::OPENAI_BETA,
       &keys::X_REQUEST_ID,
@@ -210,6 +217,7 @@ impl CodexCliHeaders {
       codex_window_id: opt_from_inbound(inbound, &keys::X_CODEX_WINDOW_ID),
       codex_beta_features: opt_from_inbound(inbound, &keys::X_CODEX_BETA_FEATURES),
       codex_turn_metadata: opt_from_inbound(inbound, &keys::X_CODEX_TURN_METADATA),
+      codex_routing_hint: optional_joined(inbound, &keys::X_CODEX_ROUTING_HINT, ";"),
       codex_responses_lite: opt_from_inbound(inbound, &keys::X_CODEX_RESPONSES_LITE),
       openai_beta: opt_from_inbound(inbound, &keys::OPENAI_BETA),
       request_id: vars
@@ -247,6 +255,7 @@ mod tests {
       codex_window_id: Some("019e271b-4023-7081-be3e-7a69d97138a2:0".into()),
       codex_beta_features: Some("terminal_resize_reflow".into()),
       codex_turn_metadata: Some("{\"session_id\":\"019e271b\"}".into()),
+      codex_routing_hint: Some("model=gpt-6.1-sol;tier=priority;shard=example".into()),
       codex_responses_lite: Some("true".into()),
       openai_beta: None,
       request_id: None,
@@ -288,6 +297,7 @@ mod tests {
     assert!(h.content_type.is_none());
     assert!(h.session_id.is_none());
     assert!(h.thread_id.is_none());
+    assert!(h.codex_routing_hint.is_none());
   }
 
   #[test]
@@ -298,12 +308,22 @@ mod tests {
     inbound.insert(&keys::OPENAI_BETA, "responses=v1");
     inbound.insert(&keys::HOST, "chatgpt.com");
     inbound.insert(&keys::X_CLIENT_REQUEST_ID, "codex-req");
+    inbound.insert(&keys::X_CODEX_ROUTING_HINT, "model=gpt-6.1-sol;shard=example");
+    inbound.append(&keys::X_CODEX_ROUTING_HINT, "sticky=on");
     let h = CodexCliHeaders::build(&TemplateVars::default(), &inbound);
     assert_eq!(h.user_agent.as_str(), "codex_exec/9.9.9");
     assert_eq!(h.authorization.as_str(), "Bearer abc");
     assert_eq!(h.openai_beta.as_deref(), Some("responses=v1"));
     assert_eq!(h.host.as_deref(), None);
     assert_eq!(h.client_request_id.as_deref(), Some("codex-req"));
+    assert_eq!(
+      h.codex_routing_hint.as_deref(),
+      Some("model=gpt-6.1-sol;shard=example;sticky=on")
+    );
+    assert_eq!(
+      CodexCliHeaders::parse(&inbound).unwrap().codex_routing_hint,
+      h.codex_routing_hint
+    );
   }
 
   #[test]

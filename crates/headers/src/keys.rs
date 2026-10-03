@@ -65,6 +65,7 @@ key!(THREAD_ID, "thread_id", "thread_id");
 key!(X_CLIENT_REQUEST_ID, "x-client-request-id", "x-client-request-id");
 key!(X_CODEX_BETA_FEATURES, "x-codex-beta-features", "x-codex-beta-features");
 key!(X_CODEX_TURN_METADATA, "x-codex-turn-metadata", "x-codex-turn-metadata");
+key!(X_CODEX_ROUTING_HINT, "x-codex-routing-hint", "x-codex-routing-hint");
 key!(X_CODEX_WINDOW_ID, "x-codex-window-id", "x-codex-window-id");
 key!(
   X_CODEX_RESPONSES_LITE,
@@ -177,6 +178,7 @@ mod tests {
       X_CLIENT_REQUEST_ID,
       X_CODEX_BETA_FEATURES,
       X_CODEX_TURN_METADATA,
+      X_CODEX_ROUTING_HINT,
       X_CODEX_WINDOW_ID,
       X_GITHUB_API_VERSION,
       X_INTERACTION_TYPE,

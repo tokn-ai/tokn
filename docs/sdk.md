@@ -111,7 +111,9 @@ hatch for an exact provider wire shape.
 
 `passthrough` and `switch` profiles preserve the generated Responses payload,
 except detected compaction requests sent to Codex always use
-`service_tier: "priority"`, overriding any incoming tier. These profiles
+`service_tier: "priority"`, overriding any incoming tier. Their outgoing
+`x-codex-routing-hint` also uses the outgoing model and `tier=priority`,
+preserving unrelated routing directives. These profiles
 reject typed `top_k` and reasoning controls that would
 require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
 the provider-neutral control API.

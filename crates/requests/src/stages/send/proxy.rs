@@ -169,6 +169,7 @@ impl SendStage for ProxySend {
     // HTTP/1.1 and strict upstream CDNs may close the connection without
     // returning a response.
     outbound_headers.remove(&tokn_headers::keys::HOST);
+    super::patch_compaction_routing_hint(ctx, extracted, resolved, body, &mut outbound_headers);
     if body.upstream_wire_body != extracted.raw_body {
       // A request policy may rewrite and re-encode an otherwise opaque
       // proxy body. Its inherited length must match the encoded bytes
@@ -593,10 +594,13 @@ mod tests {
       let mut events = ctx.events.subscribe();
       let resolved = fake_resolved(&ctx).await;
       let mut extracted = fake_extracted();
+      extracted.request_classification =
+        tokn_core::request_classification::classify_request(&Endpoint::Responses.into(), &upstream_body);
       extracted.raw_body = inbound_wire.clone();
       extracted.decoded_body = inbound_decoded;
       extracted.content_encoding = Some(encoding);
       let mut headers = fake_headers();
+      headers.headers.insert("x-codex-routing-hint", "model=gpt-6.1-sol");
       headers
         .headers
         .insert(&tokn_headers::keys::CONTENT_LENGTH, inbound_wire.len().to_string());
@@ -629,6 +633,7 @@ mod tests {
       assert_eq!(wire_headers.matches("\r\ncontent-length:").count(), 1);
       assert!(wire_headers.contains(&format!("\r\ncontent-length: {}", upstream_wire.len())));
       assert!(wire_headers.contains(&format!("\r\ncontent-encoding: {}", encoding.as_str())));
+      assert!(wire_headers.contains("\r\nx-codex-routing-hint: model=gpt-6.1-sol;tier=priority"));
       for name in BODY_DIGEST_HEADERS {
         assert!(!wire_headers.contains(&format!("\r\n{name}:")));
       }
@@ -648,6 +653,10 @@ mod tests {
         upstream_wire.len().to_string()
       );
       assert_eq!(*body, upstream_wire);
+      assert_eq!(
+        headers.get("x-codex-routing-hint").unwrap().as_str(),
+        "model=gpt-6.1-sol;tier=priority"
+      );
       for name in BODY_DIGEST_HEADERS {
         assert!(!headers.contains_key(*name));
       }

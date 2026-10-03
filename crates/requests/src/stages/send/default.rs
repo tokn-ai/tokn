@@ -73,6 +73,7 @@ impl SendStage for DefaultSend {
     if body.upstream_wire_body != extracted.raw_body {
       super::remove_body_digests(&mut client_headers);
     }
+    super::patch_compaction_routing_hint(ctx, extracted, resolved, body, &mut client_headers);
     let req_ctx = RequestCtx {
       endpoint: upstream_endpoint,
       http: &self.http,

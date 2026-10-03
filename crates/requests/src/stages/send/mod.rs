@@ -25,6 +25,21 @@ fn remove_body_digests(headers: &mut tokn_headers::HeaderMap) {
   }
 }
 
+fn patch_compaction_routing_hint(
+  ctx: &PipelineCtx,
+  extracted: &Extracted,
+  resolved: &Resolved,
+  body: &ConvertedRequest,
+  headers: &mut tokn_headers::HeaderMap,
+) {
+  super::convert_request::apply_compaction_priority_routing_hint(
+    super::convert_request::compaction_provider_id(ctx, resolved),
+    extracted.request_classification,
+    &body.debug_outbound_body,
+    headers,
+  );
+}
+
 pub struct NoopSend;
 
 #[async_trait]

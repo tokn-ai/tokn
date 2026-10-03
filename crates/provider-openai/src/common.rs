@@ -2,8 +2,9 @@ use crate::util::secret::Secret;
 use crate::HeaderPatchCtx;
 use tokn_headers::keys::{
   ACCEPT, AUTHORIZATION, CHATGPT_ACCOUNT_ID, CONTENT_ENCODING, CONTENT_TYPE, OPENAI_BETA, ORIGINATOR, SESSION_ID_LOWER,
-  USER_AGENT, VERSION, X_CODEX_RESPONSES_LITE, X_CODEX_TURN_METADATA, X_SESSION_AFFINITY,
+  USER_AGENT, VERSION, X_CODEX_RESPONSES_LITE, X_CODEX_ROUTING_HINT, X_CODEX_TURN_METADATA, X_SESSION_AFFINITY,
 };
+use tokn_headers::schema::optional_joined;
 use tokn_headers::{AgentId, HeaderMap, HeaderName, HeaderNormalizeCtx, HeaderNormalizer, HeaderValue};
 
 pub const CODEX_CLI_VERSION: &str = "0.155.1";
@@ -91,8 +92,9 @@ impl HeaderNormalizer for CodexCliNormalizer {
     out.insert(&ORIGINATOR, HeaderValue::from_string(originator));
     out.insert(&VERSION, HeaderValue::from_static(CODEX_CLI_VERSION));
     out.insert(&USER_AGENT, HeaderValue::from_string(user_agent));
-    // Keep the protocol selector paired with the unmodified lite request body.
+    // Keep request protocol and routing controls after rebuilding the persona.
     preserve_allowed(headers, &mut out, &[&X_CODEX_RESPONSES_LITE]);
+    preserve_routing_hint(headers, &mut out);
     if let Some(chatgpt_account_id) = chatgpt_account_id {
       out.insert(&CHATGPT_ACCOUNT_ID, HeaderValue::from_string(chatgpt_account_id));
     }
@@ -125,6 +127,7 @@ impl HeaderNormalizer for CodexOpencodeNormalizer {
     out.insert(&OPENAI_BETA, HeaderValue::from_static(CODEX_RESPONSES_BETA));
     out.insert(&ORIGINATOR, HeaderValue::from_static("opencode"));
     out.insert(&USER_AGENT, HeaderValue::from_static(OPENCODE_USER_AGENT));
+    preserve_routing_hint(headers, &mut out);
     if let Some(chatgpt_account_id) = chatgpt_account_id {
       out.insert(&CHATGPT_ACCOUNT_ID, HeaderValue::from_string(chatgpt_account_id));
     }
@@ -170,6 +173,12 @@ fn preserve_allowed(src: &HeaderMap, dst: &mut HeaderMap, allowed: &[&HeaderName
     if let Some(value) = src.get(*key) {
       dst.insert(*key, HeaderValue::from_string(value.as_str().to_string()));
     }
+  }
+}
+
+fn preserve_routing_hint(src: &HeaderMap, dst: &mut HeaderMap) {
+  if let Some(value) = optional_joined(src, &X_CODEX_ROUTING_HINT, ";") {
+    dst.insert(&X_CODEX_ROUTING_HINT, value.to_string());
   }
 }
 
@@ -250,6 +259,47 @@ mod tests {
     assert_eq!(out.get(&USER_AGENT).unwrap().as_str(), "codex_exec/0.130.0");
     assert_eq!(out.get(&SESSION_ID_LOWER).unwrap().as_str(), "sess-inbound");
     assert_eq!(out.get(&X_CODEX_TURN_METADATA).unwrap().as_str(), r#"{"cwd":"/work"}"#);
+  }
+
+  #[test]
+  fn codex_normalizers_preserve_routing_hint() {
+    for agent_id in [AgentId::CodexCli, AgentId::Opencode] {
+      let ctx = HeaderPatchCtx {
+        request_kind: ProviderRequestKind::Operation(crate::Endpoint::Responses),
+        body: &serde_json::Value::Null,
+        bearer_token: None,
+        content_encoding: None,
+        stream: true,
+        initiator: "user",
+        inbound_headers: &HeaderMap::new(),
+        vars: &TemplateVars::default(),
+        agent_id: &agent_id,
+      };
+      for hint in [
+        None,
+        Some("model=gpt-6.1-sol"),
+        Some("model=gpt-6.1-sol;tier=priority;shard=example"),
+        Some("opaque-routing-directive"),
+      ] {
+        let mut headers = HeaderMap::new();
+        if let Some(hint) = hint {
+          headers.insert(&X_CODEX_ROUTING_HINT, hint);
+        }
+        let out = normalize_codex_headers(&headers, &ctx);
+
+        assert_eq!(out.get(&X_CODEX_ROUTING_HINT).map(HeaderValue::as_str), hint);
+      }
+
+      let mut headers = HeaderMap::new();
+      headers.append(&X_CODEX_ROUTING_HINT, "model=gpt-6.1-sol;tier=priority;region=west");
+      headers.append(&X_CODEX_ROUTING_HINT, "tier=default;sticky=on");
+      let out = normalize_codex_headers(&headers, &ctx);
+      assert_eq!(out.get_all(&X_CODEX_ROUTING_HINT).count(), 1);
+      assert_eq!(
+        out.get(&X_CODEX_ROUTING_HINT).unwrap().as_str(),
+        "model=gpt-6.1-sol;tier=priority;region=west;tier=default;sticky=on"
+      );
+    }
   }
 
   #[test]

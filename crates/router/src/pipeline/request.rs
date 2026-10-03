@@ -45,6 +45,7 @@ impl From<DryRunEndpoint> for Endpoint {
 
 struct PreparedDryRun {
   meta: RequestMeta,
+  request_classification: Option<tokn_core::request_classification::RequestClassification>,
   upstream_body: Value,
   debug_outbound_body: Bytes,
   content_encoding: Option<crate::api::codec::ContentEncodingKind>,
@@ -144,6 +145,7 @@ fn prepare_dry_run(
   let client_headers = build_client_headers(&account, &inbound_compat, &vars);
   Ok(PreparedDryRun {
     meta,
+    request_classification: classification,
     upstream_body,
     debug_outbound_body,
     content_encoding,
@@ -236,6 +238,12 @@ pub fn dry_run_request(
       },
     )
     .ok();
+  tokn_requests::stages::convert_request::apply_compaction_priority_routing_hint(
+    prepared.account.provider.info().id.as_str(),
+    prepared.request_classification,
+    &prepared.debug_outbound_body,
+    &mut headers,
+  );
   let headers: reqwest::header::HeaderMap = headers.into();
   Ok(DryRunOutput {
     account_id: prepared.account.id(),
@@ -351,19 +359,33 @@ mod tests {
       "input": [{"type": "compaction_trigger"}],
       "service_tier": "auto"
     });
-    let out = dry_run_request(
-      &state,
-      DryRunEndpoint::Responses,
-      reqwest::header::HeaderMap::new(),
-      body.clone(),
-      Bytes::from(serde_json::to_vec(&body).unwrap()),
-      None,
-    )
-    .unwrap();
+    for hint in [None, Some("model=old;tier=default;region=test")] {
+      let mut headers = reqwest::header::HeaderMap::new();
+      if let Some(hint) = hint {
+        headers.insert("x-codex-routing-hint", hint.parse().unwrap());
+      }
+      let out = dry_run_request(
+        &state,
+        DryRunEndpoint::Responses,
+        headers,
+        body.clone(),
+        Bytes::from(serde_json::to_vec(&body).unwrap()),
+        None,
+      )
+      .unwrap();
 
-    assert_eq!(out.provider_id, crate::provider::ID_CODEX);
-    let body: Value = serde_json::from_slice(&out.body).unwrap();
-    assert_eq!(body["service_tier"], "priority");
+      assert_eq!(out.provider_id, crate::provider::ID_CODEX);
+      let body: Value = serde_json::from_slice(&out.body).unwrap();
+      assert_eq!(body["service_tier"], "priority");
+      assert_eq!(
+        out.headers.get("x-codex-routing-hint").unwrap(),
+        if hint.is_some() {
+          "model=gpt-6.1-sol;tier=priority;region=test"
+        } else {
+          "model=gpt-6.1-sol;tier=priority"
+        }
+      );
+    }
   }
 
   #[test]

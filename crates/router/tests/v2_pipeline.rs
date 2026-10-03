@@ -98,10 +98,15 @@ base_url = "http://{upstream_addr}/backend-api/codex"
 
   let body = br#"{"model":"gpt-test","input":[{"type":"compaction_trigger"}],"service_tier":"auto"}"#;
   let response = app
+    .clone()
     .oneshot(
       Request::post("/relay/v1/responses")
         .header("content-type", "application/json")
         .header("authorization", "Bearer client-key")
+        .header(
+          "x-codex-routing-hint",
+          "model=stale-model;tier=default;region=test;tier=flex",
+        )
         .body(Body::from(body.as_slice()))
         .unwrap(),
     )
@@ -113,6 +118,25 @@ base_url = "http://{upstream_addr}/backend-api/codex"
   assert_eq!(api_request.headers["authorization"], "Bearer client-key");
   let api_body: serde_json::Value = serde_json::from_slice(&api_request.body).unwrap();
   assert_eq!(api_body["service_tier"], "priority");
+  assert_priority_routing_hint(&api_request.headers, "gpt-test", &["region=test"]);
+
+  let ordinary_body = br#"{ "model": "gpt-test", "input": [], "service_tier": "priority" }"#;
+  let ordinary_hint = "model=stale-model;tier=default;region=test";
+  let response = app
+    .oneshot(
+      Request::post("/relay/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer client-key")
+        .header("x-codex-routing-hint", ordinary_hint)
+        .body(Body::from(ordinary_body.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  let ordinary_request = capture_rx.recv().await.unwrap();
+  assert_eq!(ordinary_request.headers["x-codex-routing-hint"], ordinary_hint);
+  assert_eq!(ordinary_request.body.as_ref(), ordinary_body);
 
   let client = reqwest::Client::builder()
     .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
@@ -137,11 +161,46 @@ base_url = "http://{upstream_addr}/backend-api/codex"
   );
   let proxy_body: serde_json::Value = serde_json::from_slice(&proxy_request.body).unwrap();
   assert_eq!(proxy_body["service_tier"], "priority");
+  assert_priority_routing_hint(&proxy_request.headers, "gpt-test", &[]);
 
   drop(client);
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();
   upstream_task.abort();
+}
+
+fn assert_priority_routing_hint(headers: &HeaderMap, model: &str, unrelated: &[&str]) {
+  let directives: Vec<_> = headers["x-codex-routing-hint"]
+    .to_str()
+    .unwrap()
+    .split(';')
+    .map(str::trim)
+    .collect();
+  let expected_model = format!("model={model}");
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| directive.starts_with("model="))
+      .collect::<Vec<_>>(),
+    [expected_model.as_str()]
+  );
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| directive.starts_with("tier="))
+      .collect::<Vec<_>>(),
+    ["tier=priority"]
+  );
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| !directive.starts_with("model=") && !directive.starts_with("tier="))
+      .collect::<Vec<_>>(),
+    unrelated
+  );
 }
 
 #[tokio::test]
