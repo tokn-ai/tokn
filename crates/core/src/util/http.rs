@@ -10,6 +10,8 @@ use tokn_headers::HeaderMap;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const HTTP2_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ClientKind {
@@ -71,7 +73,13 @@ pub fn build_opaque_client(options: &HttpClientOptions) -> Result<reqwest::Clien
 fn transport_client_builder(kind: ClientKind) -> reqwest::ClientBuilder {
   let builder = reqwest::Client::builder()
     .connect_timeout(CONNECT_TIMEOUT)
-    .pool_idle_timeout(Some(POOL_IDLE_TIMEOUT));
+    .pool_idle_timeout(Some(POOL_IDLE_TIMEOUT))
+    .http2_keep_alive_interval(HTTP2_KEEP_ALIVE_INTERVAL)
+    .http2_keep_alive_timeout(HTTP2_KEEP_ALIVE_TIMEOUT)
+    // Hyper can classify a connection as idle after its pooled sender expires
+    // while a response body is still open. Keep pinging that connection so
+    // an outbound proxy does not truncate a quiet response.
+    .http2_keep_alive_while_idle(true);
   match kind.total_timeout() {
     Some(timeout) => builder.timeout(timeout),
     None => builder,
@@ -252,6 +260,10 @@ where
 fn scheme_of(url: &str) -> &str {
   url.split("://").next().unwrap_or("?")
 }
+
+#[cfg(test)]
+#[path = "http2_tests.rs"]
+mod http2_tests;
 
 #[cfg(test)]
 mod tests {
