@@ -54,6 +54,30 @@ Frontend policy changes require restarting the frontend. An existing frontend
 started without the legacy proxy cannot gain it through a later
 `serve --with-proxy` invocation.
 
+## Worker states and Ctrl-C
+
+The frontend tracks `current`, `stale`, and `exiting` workers. Starting a normal
+worker makes it current and makes earlier workers stale. Stale workers exit
+automatically once their requests finish; until then, they can take over again.
+Zero-weight A/B candidates stay available until replaced or explicitly stopped.
+
+The first Ctrl-C (or SIGTERM) on `serve` or `worker start` marks that worker
+exiting and stops assigning it requests. The newest eligible stale worker becomes
+current, preferring one already receiving traffic. Existing requests on both
+workers continue uninterrupted. The exiting worker waits for all its requests
+and streams to finish, with no drain deadline, then flushes persistence and exits.
+Exiting workers cannot be promoted or given a positive traffic weight.
+A second shutdown signal exits immediately with status 130, cancelling remaining
+work. The frontend and its client connections remain running.
+
+`GET /admin/workers` includes `main_worker_id` and each worker's `state`; exiting
+workers remain listed while draining. If no eligible worker remains, new requests
+fail until another worker registers.
+
+This lifecycle uses frontend control protocol version 2. Restart a frontend
+running control version 1 before attaching these workers. Request IPC remains
+version 1.
+
 ## Configuration and discovery
 
 All commands use the usual global `--config` option. Discovery is scoped to the

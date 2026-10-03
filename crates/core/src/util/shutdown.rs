@@ -36,6 +36,11 @@ impl ShutdownSignal {
   }
 
   pub async fn wait(mut self) -> io::Result<()> {
+    self.recv().await
+  }
+
+  /// Receive another signal without replacing the registered handlers.
+  pub async fn recv(&mut self) -> io::Result<()> {
     #[cfg(any(unix, windows))]
     {
       let received = tokio::select! {

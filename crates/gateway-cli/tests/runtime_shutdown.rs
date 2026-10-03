@@ -78,9 +78,9 @@ async fn workers(address: SocketAddr) -> serde_json::Value {
     .unwrap()
 }
 
-async fn wait_for_no_workers(address: SocketAddr) {
+async fn wait_for_exiting_worker(address: SocketAddr) {
   tokio::time::timeout(WAIT, async {
-    while !workers(address).await["workers"].as_array().unwrap().is_empty() {
+    while workers(address).await["workers"][0]["state"] != "exiting" {
       tokio::time::sleep(Duration::from_millis(10)).await;
     }
   })
@@ -142,7 +142,7 @@ async fn assert_clean_exit(child: &mut Child, home: &Path) {
 
 #[tokio::test]
 async fn sigint_and_sigterm_drain_streams_and_flush_request_records() {
-  for signal_name in ["-INT", "-TERM"] {
+  for (signal_name, force) in [("-INT", false), ("-TERM", false), ("-INT", true)] {
     let home = tempfile::tempdir().unwrap();
     let config_path = home.path().join("config.toml");
     let requests_dir = home.path().join("requests");
@@ -229,12 +229,30 @@ base_url = "http://{upstream_address}/v1"
       .unwrap()
       .is_some());
     signal(&child, signal_name);
-    wait_for_no_workers(address).await;
+    wait_for_exiting_worker(address).await;
     assert!(
       TcpStream::connect(address).await.is_ok(),
       "worker signals must preserve the frontend listener"
     );
     assert!(child.try_wait().unwrap().is_none(), "must wait for the admitted stream");
+    if force {
+      signal(&child, "-INT");
+      let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+      assert_eq!(status.code(), Some(130));
+      drop(response);
+      upstream_task.abort();
+      let _ = upstream_task.await;
+      signal(&frontend, "-TERM");
+      assert!(tokio::time::timeout(WAIT, frontend.wait())
+        .await
+        .unwrap()
+        .unwrap()
+        .success());
+      continue;
+    }
     release.send(()).unwrap();
     let remaining = tokio::time::timeout(WAIT, response.bytes()).await.unwrap().unwrap();
     assert!(remaining.ends_with(b"data: [DONE]\n\n"));
@@ -323,7 +341,7 @@ client_auth = "none"
 }
 
 #[tokio::test]
-async fn serve_reuses_frontend_and_replacement_worker_exits_after_stream_drain() {
+async fn serve_interrupt_promotes_busy_stale_worker_and_preserves_its_stream() {
   let home = tempfile::tempdir().unwrap();
   let path = home.path().join("config.toml");
   let address = free_address();
@@ -338,8 +356,15 @@ async fn serve_reuses_frontend_and_replacement_worker_exits_after_stream_drain()
     let first = "data: {\"id\":\"old\",\"choices\":[{\"delta\":{\"content\":\"old\"}}]}\n\n";
     let last = "data: [DONE]\n\n";
     stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len() + last.len()).as_bytes()).await.unwrap();
+    let recovery = tokio::spawn(async move {
+      let (mut stream, _) = old_upstream.accept().await.unwrap();
+      read_request(&mut stream).await;
+      let body = r#"{"id":"old-takeover","choices":[]}"#;
+      stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+    });
     released.await.unwrap();
     stream.write_all(last.as_bytes()).await.unwrap();
+    recovery.await.unwrap();
   });
   let new_task = tokio::spawn(async move {
     let (mut stream, _) = new_upstream.accept().await.unwrap();
@@ -428,18 +453,30 @@ base_url = "http://{old_address}/v1"
     .unwrap();
   assert_eq!(next.status(), 200);
   assert_eq!(next.json::<serde_json::Value>().await.unwrap()["id"], "new");
+  assert_eq!(report["workers"][0]["state"], "stale");
+  assert_eq!(report["workers"][1]["state"], "current");
+  signal(&new, "-INT");
+  assert!(tokio::time::timeout(WAIT, new.wait()).await.unwrap().unwrap().success());
+  let promoted = workers(address).await;
+  assert_eq!(promoted["main_worker_id"], report["workers"][0]["worker_id"]);
+  assert_eq!(promoted["workers"][0]["state"], "current");
+  assert_eq!(promoted["workers"][0]["weight"], 1);
+  let next = client
+    .post(format!("http://{address}/v1/chat/completions"))
+    .json(&serde_json::json!({"model":"fixture", "messages":[]}))
+    .send()
+    .await
+    .unwrap();
+  assert_eq!(next.json::<serde_json::Value>().await.unwrap()["id"], "old-takeover");
   release.send(()).unwrap();
   assert!(response.bytes().await.unwrap().ends_with(b"data: [DONE]\n\n"));
-  assert_clean_exit(&mut old, home.path()).await;
-  assert!(fs::read_to_string(home.path().join("stderr.log"))
-    .unwrap()
-    .contains("worker drained; exiting"));
   assert!(
-    frontend.try_wait().unwrap().is_none(),
-    "old worker exit must not stop frontend"
+    old.try_wait().unwrap().is_none(),
+    "promoted worker must remain available after draining"
   );
-  signal(&new, "-TERM");
-  assert!(tokio::time::timeout(WAIT, new.wait()).await.unwrap().unwrap().success());
+  signal(&old, "-INT");
+  assert_clean_exit(&mut old, home.path()).await;
+  assert!(frontend.try_wait().unwrap().is_none());
   signal(&frontend, "-TERM");
   assert!(tokio::time::timeout(WAIT, frontend.wait())
     .await

@@ -896,6 +896,8 @@ and serve them together with API listeners without compatibility flags.
 previous workers exit after their pending requests and streams drain.
 `tokn-gateway serve --with-proxy` starts both parts, reusing an existing frontend.
 Persistent intercepted CONNECT connections stay open across switches.
+Ctrl-C marks the attached worker exiting and promotes an available stale worker;
+existing requests finish before exit. Press Ctrl-C again to exit immediately.
 
 Use `worker start --candidate` for A/B experiments with live traffic weights.
 See [request-level version dispatch](docs/version-dispatch.md) for commands,

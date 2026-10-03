@@ -15,8 +15,11 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokn_core::util::shutdown::ShutdownSignal;
-use tokn_router::ipc::{WorkerEndpoint, WorkerPool, PROTOCOL_VERSION};
+use tokn_router::ipc::{WorkerEndpoint, WorkerPool};
+use tokn_router::routing::RoutingControl;
 
+// Retirement changes the control protocol; request IPC remains independently versioned.
+const CONTROL_PROTOCOL_VERSION: u32 = 2;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const MESSAGE_LIMIT: u64 = 64 * 1024;
 
@@ -50,6 +53,7 @@ struct FrontendInfo {
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum ControlRequest {
   Inspect,
+  Retire,
   Register {
     worker_id: String,
     socket_path: PathBuf,
@@ -102,14 +106,23 @@ async fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Re
 }
 
 async fn read_message<T: DeserializeOwned>(stream: &mut BufReader<UnixStream>) -> Result<T> {
-  let mut bytes = Vec::new();
-  let read = stream.take(MESSAGE_LIMIT + 1).read_until(b'\n', &mut bytes).await?;
+  read_buffered_message(stream, &mut Vec::new()).await
+}
+
+async fn read_buffered_message<T: DeserializeOwned>(
+  stream: &mut BufReader<UnixStream>,
+  bytes: &mut Vec<u8>,
+) -> Result<T> {
+  let remaining = MESSAGE_LIMIT.saturating_sub(bytes.len() as u64);
+  let read = stream.take(remaining + 1).read_until(b'\n', bytes).await?;
   anyhow::ensure!(read > 0, "frontend control connection closed");
   anyhow::ensure!(
-    read as u64 <= MESSAGE_LIMIT && bytes.last() == Some(&b'\n'),
+    bytes.len() as u64 <= MESSAGE_LIMIT && bytes.last() == Some(&b'\n'),
     "invalid control message length"
   );
-  Ok(serde_json::from_slice(&bytes)?)
+  let message = serde_json::from_slice(bytes)?;
+  bytes.clear();
+  Ok(message)
 }
 
 async fn inspect(path: &Path) -> Result<FrontendInfo> {
@@ -119,8 +132,8 @@ async fn inspect(path: &Path) -> Result<FrontendInfo> {
     match read_message(&mut BufReader::new(stream)).await? {
       ControlReply::Info { info } => {
         anyhow::ensure!(
-          info.protocol_version == PROTOCOL_VERSION,
-          "incompatible frontend control protocol"
+          info.protocol_version == CONTROL_PROTOCOL_VERSION,
+          "incompatible frontend control protocol; restart the frontend with this gateway version"
         );
         Ok(info)
       }
@@ -165,6 +178,7 @@ async fn connection(
   let mut stream = BufReader::new(stream);
   let request = tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream)).await??;
   match request {
+    ControlRequest::Retire => anyhow::bail!("register before retiring a worker"),
     ControlRequest::Inspect => write_message(stream.get_mut(), &ControlReply::Info { info: (*info).clone() }).await,
     ControlRequest::Register {
       worker_id,
@@ -196,12 +210,24 @@ async fn connection(
       };
       write_message(stream.get_mut(), &ControlReply::Registered).await?;
       tracing::info!(%worker_id, candidate, "worker registered with frontend");
-      let reply = tokio::select! {
-        result = pool.wait_retired(&worker_id) => { result?; ControlReply::Retired }
-        _ = stop.changed() => ControlReply::Stopping,
-        _ = read_message::<ControlRequest>(&mut stream) => return Ok(()),
-      };
-      write_message(stream.get_mut(), &reply).await
+      loop {
+        let reply = tokio::select! {
+          result = pool.wait_retired(&worker_id) => { result?; ControlReply::Retired }
+          _ = stop.changed() => ControlReply::Stopping,
+          request = read_message::<ControlRequest>(&mut stream) => {
+            match request {
+              Ok(ControlRequest::Retire) => {
+                pool.retire(&worker_id)?;
+                tracing::info!(%worker_id, main_worker_id = ?pool.status().main_worker_id, "worker exiting; main worker reassigned");
+                continue;
+              }
+              Err(_) => return Ok(()),
+              _ => anyhow::bail!("unexpected registered-worker command"),
+            }
+          }
+        };
+        return write_message(stream.get_mut(), &reply).await;
+      }
     }
   }
 }
@@ -240,6 +266,7 @@ async fn serve_control(
 }
 
 pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
+  let shutdown = ShutdownSignal::new()?;
   anyhow::ensure!(args.worker_socket.is_none(), "frontend does not accept --worker-socket");
   let dir = runtime_dir(config.as_deref())?;
   let path = dir.join("frontend.sock");
@@ -284,12 +311,11 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     inode: metadata.ino(),
   };
   std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-  let shutdown = ShutdownSignal::new()?;
   let (stop_tx, mut stop_rx) = watch::channel(false);
   let control = serve_control(
     listener,
     FrontendInfo {
-      protocol_version: PROTOCOL_VERSION,
+      protocol_version: CONTROL_PROTOCOL_VERSION,
       frontend_pid: std::process::id(),
       args,
     },
@@ -310,13 +336,19 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
 }
 
 pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
+  let mut shutdown = ShutdownSignal::new()?;
   let WorkerCmd::Start(args) = command;
   let discovery = args.frontend_config.as_deref().or(config.as_deref());
   let dir = runtime_dir(discovery)?;
-  let info = inspect(&dir.join("frontend.sock")).await.context(
-    "no compatible frontend; run `tokn-gateway frontend --with-proxy` or `tokn-gateway serve --with-proxy` first",
-  )?;
-  start_worker(config, dir, info, args.candidate, args.no_proxy).await
+  let control_path = dir.join("frontend.sock");
+  let info = tokio::select! {
+    biased;
+    result = shutdown.recv() => return result.map_err(Into::into),
+    result = inspect(&control_path) => result.context(
+      "no compatible frontend; run `tokn-gateway frontend --with-proxy` or `tokn-gateway serve --with-proxy` first",
+    )?,
+  };
+  start_worker(config, dir, info, args.candidate, args.no_proxy, shutdown).await
 }
 
 async fn start_worker(
@@ -325,6 +357,7 @@ async fn start_worker(
   info: FrontendInfo,
   candidate: bool,
   no_proxy: bool,
+  mut shutdown: ShutdownSignal,
 ) -> Result<()> {
   let worker_id = uuid::Uuid::new_v4().simple().to_string();
   let socket_path = dir.join(format!("w-{worker_id}.sock"));
@@ -336,7 +369,6 @@ async fn start_worker(
   loaded.args.insecure_allow_remote = false;
   loaded.args.host = None;
   loaded.args.port = None;
-  let shutdown = ShutdownSignal::new()?;
   let (stop_tx, mut stop_rx) = watch::channel(false);
   let server = serve::run_loaded(source, loaded, async move {
     let _ = stop_rx.changed().await;
@@ -345,72 +377,111 @@ async fn start_worker(
   tokio::pin!(server);
   // Poll only during startup. A long-lived control connection owns registration
   // and delivers retirement without polling or observing idle CONNECT tunnels.
-  let result = {
-    let attach = async {
-      tokio::time::timeout(START_TIMEOUT, async {
-        loop {
-          match UnixStream::connect(&socket_path).await {
-            Ok(stream) => {
-              drop(stream);
-              return Ok::<(), anyhow::Error>(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-              tokio::time::sleep(Duration::from_millis(10)).await
-            }
-            Err(error) => return Err(error.into()),
-          }
+  let (retire_tx, mut retire_rx) = watch::channel(false);
+  let attach = async {
+    tokio::time::timeout(START_TIMEOUT, async {
+      loop {
+        if *retire_rx.borrow() {
+          return Ok::<(), anyhow::Error>(());
         }
-      })
-      .await
-      .context("worker socket startup timed out")??;
-      let mut stream = UnixStream::connect(dir.join("frontend.sock")).await?;
-      write_message(
-        &mut stream,
-        &ControlRequest::Register {
-          worker_id: worker_id.clone(),
-          socket_path,
-          candidate,
-        },
-      )
-      .await?;
-      let mut stream = BufReader::new(stream);
-      match tokio::time::timeout(START_TIMEOUT, read_message(&mut stream)).await?? {
-        ControlReply::Registered => {}
-        ControlReply::Error { message } => anyhow::bail!(message),
-        _ => anyhow::bail!("invalid frontend registration response"),
+        match UnixStream::connect(&socket_path).await {
+          Ok(stream) => {
+            drop(stream);
+            return Ok::<(), anyhow::Error>(());
+          }
+          Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::time::sleep(Duration::from_millis(10)).await
+          }
+          Err(error) => return Err(error.into()),
+        }
       }
-      tracing::info!(%worker_id, "worker started; frontend owns traffic assignment");
-      match read_message(&mut stream).await {
+    })
+    .await
+    .context("worker socket startup timed out")??;
+    if *retire_rx.borrow() {
+      return Ok(());
+    }
+    let mut stream = UnixStream::connect(dir.join("frontend.sock")).await?;
+    write_message(
+      &mut stream,
+      &ControlRequest::Register {
+        worker_id: worker_id.clone(),
+        socket_path,
+        candidate,
+      },
+    )
+    .await?;
+    let mut stream = BufReader::new(stream);
+    match tokio::time::timeout(START_TIMEOUT, read_message(&mut stream)).await?? {
+      ControlReply::Registered => {}
+      ControlReply::Error { message } => anyhow::bail!(message),
+      _ => anyhow::bail!("invalid frontend registration response"),
+    }
+    tracing::info!(%worker_id, "worker started; frontend owns traffic assignment");
+    let mut retirement_sent = false;
+    let mut reply_buffer = Vec::new();
+    loop {
+      if !retirement_sent && *retire_rx.borrow() {
+        write_message(stream.get_mut(), &ControlRequest::Retire).await?;
+        retirement_sent = true;
+      }
+      let reply = tokio::select! {
+        reply = read_buffered_message(&mut stream, &mut reply_buffer) => reply,
+        result = retire_rx.changed(), if !retirement_sent => { result?; continue; }
+      };
+      match reply {
         Ok(ControlReply::Retired) => {
           tracing::info!(%worker_id, "worker drained; exiting");
-          Ok(())
+          return Ok(());
         }
-        Ok(ControlReply::Stopping) => Ok(()),
+        Ok(ControlReply::Stopping) => return Ok(()),
         Ok(_) => anyhow::bail!("unexpected frontend lifecycle message"),
         Err(error) => {
           tracing::warn!(%error, "frontend disconnected; stopping worker");
-          Ok(())
+          return Ok(());
         }
       }
-    };
-    tokio::pin!(attach);
-    tokio::select! {
-      result = &mut server => return result,
-      result = &mut attach => result,
-      result = shutdown.wait() => result.map_err(Into::into),
     }
   };
-  let _ = stop_tx.send(true);
-  result.and(server.await)
+  tokio::pin!(attach);
+  let mut attachment_done = false;
+  let mut attachment_result = Ok(());
+  let mut interrupted = false;
+  loop {
+    tokio::select! {
+      biased;
+      result = shutdown.recv() => {
+        result?;
+        if interrupted {
+          eprintln!("Second shutdown signal received; exiting immediately.");
+          std::process::exit(130);
+        }
+        interrupted = true;
+        tracing::info!(%worker_id, "retiring worker; waiting for existing requests (Ctrl+C again forces exit)");
+        let _ = retire_tx.send(true);
+      }
+      result = &mut server => return attachment_result.and(result),
+      result = &mut attach, if !attachment_done => {
+        attachment_result = result;
+        attachment_done = true;
+        let _ = stop_tx.send(true);
+      }
+    }
+  }
 }
 
 pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
+  let mut shutdown = ShutdownSignal::new()?;
   let dir = runtime_dir(config.as_deref())?;
   let control_path = dir.join("frontend.sock");
   let info = if control_path.exists() {
-    inspect(&control_path).await.context(
-      "frontend socket exists but is unavailable; stop its owner or remove the stale socket before restarting",
-    )?
+    tokio::select! {
+      biased;
+      result = shutdown.recv() => return result.map_err(Into::into),
+      result = inspect(&control_path) => result.context(
+        "frontend socket exists but is unavailable; stop its owner or remove the stale socket before restarting",
+      )?,
+    }
   } else {
     // Validate all configuration before spawning an independently owned process.
     let _ = serve::load_runtime(config.clone(), args.clone())?;
@@ -451,20 +522,29 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       .stderr(log)
       .process_group(0);
     let mut child = command.spawn().context("start frontend process")?;
-    let ready = tokio::time::timeout(START_TIMEOUT, async {
-      loop {
-        if let Ok(info) = inspect(&control_path).await {
-          return Ok(info);
-        }
-        if let Some(status) = child.try_wait()? {
-          anyhow::bail!("frontend exited ({status}); see {}", dir.join("frontend.log").display());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    let ready = {
+      let startup = async {
+        tokio::time::timeout(START_TIMEOUT, async {
+          loop {
+            if let Ok(info) = inspect(&control_path).await {
+              return Ok(info);
+            }
+            if let Some(status) = child.try_wait()? {
+              anyhow::bail!("frontend exited ({status}); see {}", dir.join("frontend.log").display());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+          }
+        })
+        .await
+        .context("frontend startup timed out")
+        .and_then(|result| result)
+      };
+      tokio::select! {
+        biased;
+        result = shutdown.recv() => return result.map_err(Into::into),
+        result = startup => result,
       }
-    })
-    .await
-    .context("frontend startup timed out")
-    .and_then(|result| result);
+    };
     match ready {
       Ok(info) => {
         tracing::info!(frontend_pid = info.frontend_pid, log = %dir.join("frontend.log").display(), "started independent frontend");
@@ -482,5 +562,5 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     "the existing frontend was started without --with-proxy; restart the frontend to enable its legacy proxy listener"
   );
   tracing::info!(frontend_pid = info.frontend_pid, "using frontend");
-  start_worker(config, dir, info, false, args.no_proxy).await
+  start_worker(config, dir, info, false, args.no_proxy, shutdown).await
 }

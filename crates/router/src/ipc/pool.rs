@@ -4,7 +4,7 @@ use super::protocol::{WireContext, CONNECT_TIMEOUT, CONTEXT_HEADER, MAX_CONTEXT_
 use super::transport::{exchange, strip_connection_headers, strip_internal_headers};
 use super::WorkerInfo;
 use crate::dispatch::{DispatchContext, RequestDispatcher};
-use crate::routing::{RoutingControl, RoutingReport, WorkerStatus};
+use crate::routing::{RoutingControl, RoutingReport, WorkerState, WorkerStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -40,6 +40,7 @@ pub struct WorkerPool {
 }
 
 struct RoutingTable {
+  main_worker_id: Option<String>,
   workers: Vec<WorkerEndpoint>,
   stats: Vec<Arc<WorkerStats>>,
   weights: Vec<u32>,
@@ -47,9 +48,40 @@ struct RoutingTable {
   generation: u64,
 }
 
+impl RoutingTable {
+  fn advance_main(&mut self) {
+    let eligible = |index: usize| *self.stats[index].state.read() != WorkerState::Exiting;
+    if self.workers.iter().enumerate().any(|(index, worker)| {
+      self.main_worker_id.as_ref() == Some(&worker.worker_id) && eligible(index) && self.weights[index] > 0
+    }) {
+      return;
+    }
+    let replacement = (0..self.workers.len())
+      .rev()
+      .find(|&index| eligible(index) && self.weights[index] > 0)
+      .or_else(|| (0..self.workers.len()).rev().find(|&index| eligible(index)));
+    for stats in &self.stats {
+      if *stats.state.read() == WorkerState::Current {
+        *stats.state.write() = WorkerState::Stale;
+        stats.changed.notify_waiters();
+      }
+    }
+    self.main_worker_id = replacement.map(|index| {
+      *self.stats[index].state.write() = WorkerState::Current;
+      self.stats[index].changed.notify_waiters();
+      if self.weights[index] == 0 {
+        self.weights[index] = 1;
+        self.total_weight += 1;
+      }
+      self.workers[index].worker_id.clone()
+    });
+  }
+}
+
 #[derive(Default)]
 struct WorkerStats {
-  retired: std::sync::atomic::AtomicBool,
+  state: parking_lot::RwLock<WorkerState>,
+  keep_alive: std::sync::atomic::AtomicBool,
   changed: tokio::sync::Notify,
   version: parking_lot::RwLock<Option<String>>,
   in_flight: AtomicU64,
@@ -73,10 +105,26 @@ impl WorkerPool {
     }
     let total_weight = workers.iter().map(|worker| u64::from(worker.weight)).sum();
     anyhow::ensure!(total_weight > 0, "at least one worker must have a positive weight");
+    let main_worker_id = workers
+      .iter()
+      .rev()
+      .find(|worker| worker.weight > 0)
+      .map(|worker| worker.worker_id.clone());
     let weights = workers.iter().map(|worker| worker.weight).collect();
-    let stats = workers.iter().map(|_| Arc::new(WorkerStats::default())).collect();
+    let stats = workers
+      .iter()
+      .map(|worker| {
+        let stats = Arc::new(WorkerStats::default());
+        stats.keep_alive.store(true, Ordering::Relaxed);
+        if main_worker_id.as_ref() == Some(&worker.worker_id) {
+          *stats.state.write() = WorkerState::Current;
+        }
+        stats
+      })
+      .collect();
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        main_worker_id,
         workers,
         stats,
         weights,
@@ -108,6 +156,7 @@ impl WorkerPool {
   pub fn empty(plan: &GatewayPlan) -> Result<Self> {
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        main_worker_id: None,
         workers: Vec::new(),
         stats: Vec::new(),
         weights: Vec::new(),
@@ -120,8 +169,8 @@ impl WorkerPool {
     })
   }
 
-  /// Validate before atomically promoting the newcomer. No request can be
-  /// admitted to an old worker after its retirement is published.
+  /// Validate before atomically promoting the newcomer. Previous workers become stale and
+  /// may take over again until they claim automatic exit after draining.
   pub async fn register(&self, worker: WorkerEndpoint) -> Result<()> {
     self.register_inner(worker, false).await
   }
@@ -149,13 +198,25 @@ impl WorkerPool {
     );
     if !candidate {
       for stats in &routing.stats {
-        stats.retired.store(true, Ordering::Release);
+        if *stats.state.read() != WorkerState::Exiting {
+          *stats.state.write() = WorkerState::Stale;
+        }
+        stats.keep_alive.store(false, Ordering::Release);
         stats.changed.notify_waiters();
       }
       routing.weights.fill(0);
     }
     let stats = Arc::new(WorkerStats::default());
     *stats.version.write() = Some(info.version);
+    *stats.state.write() = if candidate {
+      WorkerState::Stale
+    } else {
+      WorkerState::Current
+    };
+    stats.keep_alive.store(candidate, Ordering::Release);
+    if !candidate {
+      routing.main_worker_id = Some(worker.worker_id.clone());
+    }
     routing.workers.push(worker);
     routing.stats.push(stats);
     routing.weights.push(if candidate { 0 } else { 1 });
@@ -166,16 +227,36 @@ impl WorkerPool {
     Ok(())
   }
 
+  /// Stop new admissions while retaining response leases and the worker record.
+  pub fn retire(&self, worker_id: &str) -> Result<()> {
+    let mut routing = self.routing.write();
+    let index = routing
+      .workers
+      .iter()
+      .position(|worker| worker.worker_id == worker_id)
+      .context("unknown worker")?;
+    if *routing.stats[index].state.read() != WorkerState::Exiting {
+      *routing.stats[index].state.write() = WorkerState::Exiting;
+      routing.total_weight -= u64::from(routing.weights[index]);
+      routing.weights[index] = 0;
+      routing.advance_main();
+      routing.generation += 1;
+      routing.stats[index].changed.notify_waiters();
+    }
+    Ok(())
+  }
+
   pub fn disconnect(&self, worker_id: &str) {
     let mut routing = self.routing.write();
     if let Some(index) = routing.workers.iter().position(|worker| worker.worker_id == worker_id) {
       routing.total_weight -= u64::from(routing.weights[index]);
       routing.weights[index] = 0;
-      routing.stats[index].retired.store(true, Ordering::Release);
+      *routing.stats[index].state.write() = WorkerState::Exiting;
       routing.stats[index].changed.notify_waiters();
       routing.workers.remove(index);
       routing.stats.remove(index);
       routing.weights.remove(index);
+      routing.advance_main();
       routing.generation += 1;
     }
   }
@@ -194,8 +275,25 @@ impl WorkerPool {
       let changed = stats.changed.notified();
       tokio::pin!(changed);
       changed.as_mut().enable();
-      if stats.retired.load(Ordering::Acquire) && stats.in_flight.load(Ordering::Acquire) == 0 {
-        return Ok(());
+      {
+        // Claim automatic exit under the admission lock. A stale worker may be
+        // promoted again until this transition, but never after exit is sent.
+        let mut routing = self.routing.write();
+        let index = routing
+          .workers
+          .iter()
+          .position(|worker| worker.worker_id == worker_id)
+          .context("worker disconnected")?;
+        let state = *stats.state.read();
+        let idle_stale =
+          state == WorkerState::Stale && routing.weights[index] == 0 && !stats.keep_alive.load(Ordering::Acquire);
+        if (state == WorkerState::Exiting || idle_stale) && stats.in_flight.load(Ordering::Acquire) == 0 {
+          if idle_stale {
+            *stats.state.write() = WorkerState::Exiting;
+            routing.generation += 1;
+          }
+          return Ok(());
+        }
       }
       changed.await;
     }
@@ -270,6 +368,7 @@ impl RoutingControl for WorkerPool {
     let routing = self.routing.read();
     RoutingReport {
       generation: routing.generation,
+      main_worker_id: routing.main_worker_id.clone(),
       workers: routing
         .workers
         .iter()
@@ -280,6 +379,7 @@ impl RoutingControl for WorkerPool {
             worker_id: worker.worker_id.clone(),
             version: stats.version.read().clone(),
             weight: routing.weights[index],
+            state: *stats.state.read(),
             in_flight: stats.in_flight.load(Ordering::Relaxed),
             requests: stats.requests.load(Ordering::Relaxed),
             completed: stats.completed.load(Ordering::Relaxed),
@@ -322,7 +422,7 @@ impl RoutingControl for WorkerPool {
       .context("initial worker readiness has not been checked")?;
     for (index, (worker, weight)) in workers.iter().zip(&values).enumerate() {
       if *weight > 0 {
-        anyhow::ensure!(!stats[index].retired.load(Ordering::Acquire), "worker is retired");
+        anyhow::ensure!(*stats[index].state.read() != WorkerState::Exiting, "worker is exiting");
         let info = verify_worker(worker, &expected).await?;
         *stats[index].version.write() = Some(info.version);
       }
@@ -335,7 +435,11 @@ impl RoutingControl for WorkerPool {
       );
       routing.weights = values;
       routing.total_weight = total_weight;
+      routing.advance_main();
       routing.generation += 1;
+      for stats in &routing.stats {
+        stats.changed.notify_waiters();
+      }
     }
     let report = self.status();
     tracing::info!(
