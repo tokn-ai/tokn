@@ -116,6 +116,49 @@ For temporary experiments, persistence may instead be disabled explicitly.
 
 ## A/B experiments
 
+### Automatic 24-hour rollout
+
+With a frontend and one baseline worker already running, start the new version:
+
+```sh
+/path/to/new/tokn-gateway worker start --ab-test
+# Or reuse the existing frontend through serve:
+/path/to/new/tokn-gateway serve --with-proxy --ab-test
+```
+
+The frontend sends the new worker 10% of new requests initially and increases
+its share linearly toward 90% over 24 hours. Weights advance in one percentage
+point increments every 18 minutes: 30% at six hours, 50% at twelve hours, and
+70% at eighteen hours. At 24 hours, the new worker takes 100% and the baseline
+exits automatically after its existing requests and streams finish. Idle client
+connections do not delay retirement. The new worker is `current` during the
+experiment; the baseline is `stale` and continues receiving its share.
+
+The frontend owns the monotonic clock and updates weights independently of
+request arrivals. This rollout is driven by elapsed time, without an error-rate
+or latency threshold. The `ab_test` object in `/admin/workers` shows the worker
+IDs, elapsed and total seconds, and the new worker's traffic percentage; it is
+removed after completion or cancellation.
+
+A manual weight update cancels the automatic ramp. Starting an ordinary worker
+also cancels it and replaces both versions. Stopping either participating worker
+cancels the ramp and leaves the surviving worker handling traffic. Existing
+requests retain their original worker throughout all changes. Only one automatic
+experiment may run at a time, and starting it requires exactly one worker with a
+positive weight. `--ab-test` conflicts with `--candidate`.
+
+The frontend must advertise automatic A/B support. Restart an older frontend
+with this version before starting the experiment, then attach the baseline and
+new worker. Control protocol v2 and request IPC v1 are unchanged, so earlier v2
+worker binaries can still act as the baseline. An experiment is not persisted
+across frontend shutdown; attached workers stop when the frontend stops.
+
+For a separate new-version config, use `worker start --ab-test` with the global
+`--config candidate.toml` and `--frontend-config frontend.toml` options. The
+separate persistence paths described above still apply.
+
+### Manual traffic weights
+
 Register a candidate without replacing or retiring the current worker:
 
 ```sh

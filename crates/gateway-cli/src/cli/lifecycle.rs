@@ -18,14 +18,14 @@ use tokn_core::util::shutdown::ShutdownSignal;
 use tokn_router::ipc::{WorkerEndpoint, WorkerPool};
 use tokn_router::routing::RoutingControl;
 
-// Retirement changes the control protocol; request IPC remains independently versioned.
+// Optional capabilities extend control v2 without excluding older worker binaries.
 const CONTROL_PROTOCOL_VERSION: u32 = 2;
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 const MESSAGE_LIMIT: u64 = 64 * 1024;
 
 #[derive(Subcommand, Debug)]
 pub enum WorkerCmd {
-  /// Start a worker, take all new requests, and drain the previous worker.
+  /// Start a worker, replacing the current worker or joining an A/B experiment.
   Start(WorkerArgs),
 }
 
@@ -37,6 +37,9 @@ pub struct WorkerArgs {
   /// Register without promoting, for an A/B experiment using /admin/workers.
   #[arg(long)]
   candidate: bool,
+  /// Ramp this worker from 10% to 90% of requests over 24 hours.
+  #[arg(long, conflicts_with = "candidate")]
+  ab_test: bool,
   /// Skip outbound proxy for this worker.
   #[arg(long)]
   no_proxy: bool,
@@ -45,6 +48,8 @@ pub struct WorkerArgs {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct FrontendInfo {
   protocol_version: u32,
+  #[serde(default)]
+  supports_ab_test: bool,
   frontend_pid: u32,
   args: ServeArgs,
 }
@@ -58,7 +63,13 @@ enum ControlRequest {
     worker_id: String,
     socket_path: PathBuf,
     candidate: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    ab_test: bool,
   },
+}
+
+fn is_false(value: &bool) -> bool {
+  !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -184,13 +195,20 @@ async fn connection(
       worker_id,
       socket_path,
       candidate,
+      ab_test,
     } => {
       let endpoint = WorkerEndpoint {
         worker_id: worker_id.clone(),
         socket_path,
         weight: 1,
       };
-      let result = if candidate {
+      anyhow::ensure!(
+        !(candidate && ab_test),
+        "--candidate and --ab-test are mutually exclusive"
+      );
+      let result = if ab_test {
+        pool.register_ab_test(endpoint).await
+      } else if candidate {
         pool.register_candidate(endpoint).await
       } else {
         pool.register(endpoint).await
@@ -240,10 +258,13 @@ async fn serve_control(
 ) -> Result<()> {
   let info = Arc::new(info);
   let mut tasks = JoinSet::new();
+  let mut ramp_tick = tokio::time::interval(Duration::from_secs(1));
+  ramp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
   loop {
     tokio::select! {
       biased;
       _ = stop.changed() => break,
+      _ = ramp_tick.tick() => pool.advance_ab_test(),
       result = tasks.join_next(), if !tasks.is_empty() => {
         if let Some(Err(error)) = result { tracing::warn!(%error, "frontend control task failed"); }
       }
@@ -268,6 +289,10 @@ async fn serve_control(
 pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let shutdown = ShutdownSignal::new()?;
   anyhow::ensure!(args.worker_socket.is_none(), "frontend does not accept --worker-socket");
+  anyhow::ensure!(
+    !args.ab_test,
+    "--ab-test belongs to serve or worker start, not frontend"
+  );
   let dir = runtime_dir(config.as_deref())?;
   let path = dir.join("frontend.sock");
   let (_, loaded) = serve::load_runtime(config, args.clone())?;
@@ -316,6 +341,7 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     listener,
     FrontendInfo {
       protocol_version: CONTROL_PROTOCOL_VERSION,
+      supports_ab_test: true,
       frontend_pid: std::process::id(),
       args,
     },
@@ -348,7 +374,7 @@ pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
       "no compatible frontend; run `tokn-gateway frontend --with-proxy` or `tokn-gateway serve --with-proxy` first",
     )?,
   };
-  start_worker(config, dir, info, args.candidate, args.no_proxy, shutdown).await
+  start_worker(config, dir, info, args.candidate, args.ab_test, args.no_proxy, shutdown).await
 }
 
 async fn start_worker(
@@ -356,9 +382,14 @@ async fn start_worker(
   dir: PathBuf,
   info: FrontendInfo,
   candidate: bool,
+  ab_test: bool,
   no_proxy: bool,
   mut shutdown: ShutdownSignal,
 ) -> Result<()> {
+  anyhow::ensure!(
+    !ab_test || info.supports_ab_test,
+    "this frontend does not support --ab-test; restart it with a gateway version supporting automatic A/B ramps"
+  );
   let worker_id = uuid::Uuid::new_v4().simple().to_string();
   let socket_path = dir.join(format!("w-{worker_id}.sock"));
   let mut args = info.args;
@@ -408,6 +439,7 @@ async fn start_worker(
         worker_id: worker_id.clone(),
         socket_path,
         candidate,
+        ab_test,
       },
     )
     .await?;
@@ -483,6 +515,10 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       )?,
     }
   } else {
+    anyhow::ensure!(
+      !args.ab_test,
+      "--ab-test requires an existing frontend with one active baseline worker"
+    );
     // Validate all configuration before spawning an independently owned process.
     let _ = serve::load_runtime(config.clone(), args.clone())?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -562,5 +598,58 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     "the existing frontend was started without --with-proxy; restart the frontend to enable its legacy proxy listener"
   );
   tracing::info!(frontend_pid = info.frontend_pid, "using frontend");
-  start_worker(config, dir, info, false, args.no_proxy, shutdown).await
+  start_worker(config, dir, info, false, args.ab_test, args.no_proxy, shutdown).await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::cli::{Cli, Cmd};
+  use clap::Parser;
+
+  #[test]
+  fn optional_ab_capability_preserves_control_v2_compatibility() {
+    let info = FrontendInfo {
+      protocol_version: CONTROL_PROTOCOL_VERSION,
+      supports_ab_test: true,
+      frontend_pid: 123,
+      args: ServeArgs::default(),
+    };
+    let mut legacy_info = serde_json::to_value(info).unwrap();
+    legacy_info.as_object_mut().unwrap().remove("supports_ab_test");
+    legacy_info["args"].as_object_mut().unwrap().remove("ab_test");
+    let decoded: FrontendInfo = serde_json::from_value(legacy_info).unwrap();
+    assert!(!decoded.supports_ab_test);
+    assert!(!decoded.args.ab_test);
+    let register = ControlRequest::Register {
+      worker_id: "fixture".into(),
+      socket_path: "/tmp/fixture.sock".into(),
+      candidate: false,
+      ab_test: false,
+    };
+    let legacy_message = serde_json::to_value(register).unwrap();
+    assert!(
+      legacy_message.get("ab_test").is_none(),
+      "normal registration must stay readable by v2 frontends"
+    );
+    let ControlRequest::Register { ab_test, .. } = serde_json::from_value(legacy_message).unwrap() else {
+      panic!("registration");
+    };
+    assert!(!ab_test, "new frontends must accept older worker registration messages");
+  }
+
+  #[test]
+  fn ab_test_flags_select_automatic_registration() {
+    let cli = Cli::try_parse_from(["tokn-gateway", "serve", "--with-proxy", "--ab-test"]).unwrap();
+    let Cmd::Serve(args) = cli.cmd else {
+      panic!("serve command");
+    };
+    assert!(args.ab_test && args.with_proxy);
+    let cli = Cli::try_parse_from(["tokn-gateway", "worker", "start", "--ab-test"]).unwrap();
+    let Cmd::Worker(WorkerCmd::Start(args)) = cli.cmd else {
+      panic!("worker command");
+    };
+    assert!(args.ab_test && !args.candidate);
+    assert!(Cli::try_parse_from(["tokn-gateway", "worker", "start", "--ab-test", "--candidate"]).is_err());
+  }
 }

@@ -8,7 +8,18 @@ use std::collections::BTreeMap;
 pub struct RoutingReport {
   pub generation: u64,
   pub main_worker_id: Option<String>,
+  pub ab_test: Option<AbTestStatus>,
   pub workers: Vec<WorkerStatus>,
+}
+
+/// Frontend-owned linear traffic ramp, present until completion or cancellation.
+#[derive(Clone, Debug, Serialize)]
+pub struct AbTestStatus {
+  pub baseline_worker_id: String,
+  pub worker_id: String,
+  pub elapsed_seconds: u64,
+  pub duration_seconds: u64,
+  pub traffic_percent: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]

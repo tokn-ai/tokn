@@ -899,7 +899,9 @@ Persistent intercepted CONNECT connections stay open across switches.
 Ctrl-C marks the attached worker exiting and promotes an available stale worker;
 existing requests finish before exit. Press Ctrl-C again to exit immediately.
 
-Use `worker start --candidate` for A/B experiments with live traffic weights.
+Use `worker start --ab-test` or `serve --ab-test` to ramp a new worker from
+10% toward 90% over 24 hours, then switch to 100% and drain the baseline.
+Use `worker start --candidate` for A/B experiments with manual traffic weights.
 See [request-level version dispatch](docs/version-dispatch.md) for commands,
 configuration, compatibility, and process lifecycle.
 

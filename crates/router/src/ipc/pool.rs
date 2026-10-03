@@ -4,7 +4,7 @@ use super::protocol::{WireContext, CONNECT_TIMEOUT, CONTEXT_HEADER, MAX_CONTEXT_
 use super::transport::{exchange, strip_connection_headers, strip_internal_headers};
 use super::WorkerInfo;
 use crate::dispatch::{DispatchContext, RequestDispatcher};
-use crate::routing::{RoutingControl, RoutingReport, WorkerState, WorkerStatus};
+use crate::routing::{AbTestStatus, RoutingControl, RoutingReport, WorkerState, WorkerStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokn_policy::GatewayPlan;
 
 #[derive(Clone, Debug)]
@@ -40,6 +40,7 @@ pub struct WorkerPool {
 }
 
 struct RoutingTable {
+  ab_test: Option<AbTest>,
   main_worker_id: Option<String>,
   workers: Vec<WorkerEndpoint>,
   stats: Vec<Arc<WorkerStats>>,
@@ -48,7 +49,82 @@ struct RoutingTable {
   generation: u64,
 }
 
+const AB_TEST_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistrationMode {
+  Current,
+  Candidate,
+  AbTest,
+}
+
+struct AbTest {
+  baseline_worker_id: String,
+  worker_id: String,
+  started: Instant,
+}
+
+impl AbTest {
+  fn status(&self, now: Instant) -> AbTestStatus {
+    let elapsed = now.saturating_duration_since(self.started).min(AB_TEST_DURATION);
+    AbTestStatus {
+      baseline_worker_id: self.baseline_worker_id.clone(),
+      worker_id: self.worker_id.clone(),
+      elapsed_seconds: elapsed.as_secs(),
+      duration_seconds: AB_TEST_DURATION.as_secs(),
+      traffic_percent: 10 + (elapsed.as_secs() * 80 / AB_TEST_DURATION.as_secs()) as u32,
+    }
+  }
+}
+
 impl RoutingTable {
+  fn advance_ab_test(&mut self, now: Instant) {
+    let Some(experiment) = &self.ab_test else {
+      return;
+    };
+    let baseline = self
+      .workers
+      .iter()
+      .position(|worker| worker.worker_id == experiment.baseline_worker_id);
+    let candidate = self
+      .workers
+      .iter()
+      .position(|worker| worker.worker_id == experiment.worker_id);
+    let (Some(baseline), Some(candidate)) = (baseline, candidate) else {
+      self.ab_test = None;
+      return;
+    };
+    let status = experiment.status(now);
+    if status.elapsed_seconds == status.duration_seconds {
+      self.weights[baseline] = 0;
+      self.weights[candidate] = 1;
+      self.total_weight = 1;
+      self.stats[baseline].keep_alive.store(false, Ordering::Release);
+      self.stats[candidate].keep_alive.store(false, Ordering::Release);
+      self.stats[baseline].changed.notify_waiters();
+      self.ab_test = None;
+      self.generation += 1;
+      tracing::info!("A/B ramp complete; new worker receives all traffic and baseline drains");
+      return;
+    }
+    let percent = status.traffic_percent;
+    if self.weights[candidate] != percent {
+      self.weights[candidate] = percent;
+      self.weights[baseline] = 100 - percent;
+      self.generation += 1;
+    }
+  }
+
+  fn cancel_ab_test_for(&mut self, worker_id: &str) {
+    if self
+      .ab_test
+      .as_ref()
+      .is_some_and(|experiment| experiment.worker_id == worker_id || experiment.baseline_worker_id == worker_id)
+    {
+      self.ab_test = None;
+    }
+  }
+
   fn advance_main(&mut self) {
     let eligible = |index: usize| *self.stats[index].state.read() != WorkerState::Exiting;
     if self.workers.iter().enumerate().any(|(index, worker)| {
@@ -124,6 +200,7 @@ impl WorkerPool {
       .collect();
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        ab_test: None,
         main_worker_id,
         workers,
         stats,
@@ -156,6 +233,7 @@ impl WorkerPool {
   pub fn empty(plan: &GatewayPlan) -> Result<Self> {
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        ab_test: None,
         main_worker_id: None,
         workers: Vec::new(),
         stats: Vec::new(),
@@ -172,14 +250,25 @@ impl WorkerPool {
   /// Validate before atomically promoting the newcomer. Previous workers become stale and
   /// may take over again until they claim automatic exit after draining.
   pub async fn register(&self, worker: WorkerEndpoint) -> Result<()> {
-    self.register_inner(worker, false).await
+    self.register_inner(worker, RegistrationMode::Current).await
   }
 
   pub async fn register_candidate(&self, worker: WorkerEndpoint) -> Result<()> {
-    self.register_inner(worker, true).await
+    self.register_inner(worker, RegistrationMode::Candidate).await
   }
 
-  async fn register_inner(&self, worker: WorkerEndpoint, candidate: bool) -> Result<()> {
+  /// Start a frontend-owned linear ramp against the sole active baseline worker.
+  pub async fn register_ab_test(&self, worker: WorkerEndpoint) -> Result<()> {
+    self.register_inner(worker, RegistrationMode::AbTest).await
+  }
+
+  /// Called by the frontend clock independently of request arrivals.
+  pub fn advance_ab_test(&self) {
+    self.routing.write().advance_ab_test(Instant::now());
+  }
+
+  async fn register_inner(&self, worker: WorkerEndpoint, mode: RegistrationMode) -> Result<()> {
+    let candidate = mode == RegistrationMode::Candidate;
     let _update = self.update_lock.lock().await;
     anyhow::ensure!(!worker.worker_id.trim().is_empty(), "worker id must not be empty");
     let expected = self.expected.read().clone().context("missing frontend manifest")?;
@@ -196,7 +285,28 @@ impl WorkerPool {
       !candidate || routing.total_weight > 0,
       "start a primary worker before registering a candidate"
     );
-    if !candidate {
+    let baseline = if mode == RegistrationMode::AbTest {
+      anyhow::ensure!(
+        routing.ab_test.is_none(),
+        "an A/B test is already active; cancel it with a manual weight update first"
+      );
+      let active = routing
+        .weights
+        .iter()
+        .enumerate()
+        .filter(|(_, weight)| **weight > 0)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+      anyhow::ensure!(
+        active.len() == 1,
+        "--ab-test requires exactly one active baseline worker"
+      );
+      Some(active[0])
+    } else {
+      None
+    };
+    if mode == RegistrationMode::Current {
+      routing.ab_test = None;
       for stats in &routing.stats {
         if *stats.state.read() != WorkerState::Exiting {
           *stats.state.write() = WorkerState::Stale;
@@ -205,6 +315,17 @@ impl WorkerPool {
         stats.changed.notify_waiters();
       }
       routing.weights.fill(0);
+    }
+    if let Some(baseline) = baseline {
+      *routing.stats[baseline].state.write() = WorkerState::Stale;
+      routing.stats[baseline].keep_alive.store(false, Ordering::Release);
+      routing.weights[baseline] = 90;
+      routing.ab_test = Some(AbTest {
+        baseline_worker_id: routing.workers[baseline].worker_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        started: Instant::now(),
+      });
+      routing.stats[baseline].changed.notify_waiters();
     }
     let stats = Arc::new(WorkerStats::default());
     *stats.version.write() = Some(info.version);
@@ -219,9 +340,13 @@ impl WorkerPool {
     }
     routing.workers.push(worker);
     routing.stats.push(stats);
-    routing.weights.push(if candidate { 0 } else { 1 });
+    routing.weights.push(match mode {
+      RegistrationMode::Current => 1,
+      RegistrationMode::Candidate => 0,
+      RegistrationMode::AbTest => 10,
+    });
     if !candidate {
-      routing.total_weight = 1;
+      routing.total_weight = if baseline.is_some() { 100 } else { 1 };
     }
     routing.generation += 1;
     Ok(())
@@ -236,6 +361,7 @@ impl WorkerPool {
       .position(|worker| worker.worker_id == worker_id)
       .context("unknown worker")?;
     if *routing.stats[index].state.read() != WorkerState::Exiting {
+      routing.cancel_ab_test_for(worker_id);
       *routing.stats[index].state.write() = WorkerState::Exiting;
       routing.total_weight -= u64::from(routing.weights[index]);
       routing.weights[index] = 0;
@@ -249,6 +375,7 @@ impl WorkerPool {
   pub fn disconnect(&self, worker_id: &str) {
     let mut routing = self.routing.write();
     if let Some(index) = routing.workers.iter().position(|worker| worker.worker_id == worker_id) {
+      routing.cancel_ab_test_for(worker_id);
       routing.total_weight -= u64::from(routing.weights[index]);
       routing.weights[index] = 0;
       *routing.stats[index].state.write() = WorkerState::Exiting;
@@ -365,10 +492,13 @@ async fn verify_worker(worker: &WorkerEndpoint, expected: &WorkerInfo) -> Result
 #[async_trait]
 impl RoutingControl for WorkerPool {
   fn status(&self) -> RoutingReport {
-    let routing = self.routing.read();
+    let mut routing = self.routing.write();
+    let now = Instant::now();
+    routing.advance_ab_test(now);
     RoutingReport {
       generation: routing.generation,
       main_worker_id: routing.main_worker_id.clone(),
+      ab_test: routing.ab_test.as_ref().map(|experiment| experiment.status(now)),
       workers: routing
         .workers
         .iter()
@@ -433,6 +563,7 @@ impl RoutingControl for WorkerPool {
         routing.generation == generation,
         "workers changed during readiness checks; retry the weight update"
       );
+      routing.ab_test = None;
       routing.weights = values;
       routing.total_weight = total_weight;
       routing.advance_main();
@@ -564,5 +695,82 @@ impl RequestDispatcher for WorkerPool {
       lease.finish();
     }
     Ok(Response::from_parts(parts, Body::new(TrackedBody { body, lease })))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn experiment(started: Instant) -> AbTest {
+    AbTest {
+      baseline_worker_id: "old".into(),
+      worker_id: "new".into(),
+      started,
+    }
+  }
+
+  #[test]
+  fn ramp_is_linear_and_caps_at_twenty_four_hours() {
+    let start = Instant::now();
+    let ramp = experiment(start);
+    for (seconds, percent, complete) in [
+      (0, 10, false),
+      (6 * 3600, 30, false),
+      (12 * 3600, 50, false),
+      (24 * 3600 - 1, 89, false),
+      (24 * 3600, 90, true),
+      (48 * 3600, 90, true),
+    ] {
+      let status = ramp.status(start + Duration::from_secs(seconds));
+      assert_eq!(status.traffic_percent, percent);
+      assert_eq!(status.elapsed_seconds == status.duration_seconds, complete);
+      assert!(status.elapsed_seconds <= status.duration_seconds);
+    }
+  }
+
+  #[test]
+  fn completion_routes_every_request_to_new_worker_and_preserves_old_lease() {
+    let start = Instant::now();
+    let pool = WorkerPool::new(vec![
+      WorkerEndpoint {
+        worker_id: "old".into(),
+        socket_path: "/tmp/old.sock".into(),
+        weight: 90,
+      },
+      WorkerEndpoint {
+        worker_id: "new".into(),
+        socket_path: "/tmp/new.sock".into(),
+        weight: 10,
+      },
+    ])
+    .unwrap();
+    pool.routing.write().ab_test = Some(experiment(start));
+    let (_, mut pending) = pool.select().unwrap();
+    for (elapsed, expected) in [(Duration::ZERO, [90, 10]), (AB_TEST_DURATION / 2, [50, 50])] {
+      pool.routing.write().advance_ab_test(start + elapsed);
+      let mut counts = [0, 0];
+      for _ in 0..100 {
+        let (worker, mut lease) = pool.select().unwrap();
+        counts[usize::from(worker.worker_id == "new")] += 1;
+        lease.finish();
+      }
+      assert_eq!(counts, expected);
+    }
+    let generation = pool.routing.read().generation;
+    pool.routing.write().advance_ab_test(start + AB_TEST_DURATION);
+    assert!(pool.status().ab_test.is_none());
+    assert_eq!(pool.status().workers[0].in_flight, 1);
+    assert_eq!(pool.status().workers[0].weight, 0);
+    assert!(!pool.routing.read().stats[0].keep_alive.load(Ordering::Acquire));
+    for _ in 0..100 {
+      let (worker, mut lease) = pool.select().unwrap();
+      assert_eq!(worker.worker_id, "new");
+      lease.finish();
+    }
+    pending.finish();
+    assert_eq!(pool.status().workers[0].in_flight, 0);
+    pool.routing.write().advance_ab_test(start + AB_TEST_DURATION * 2);
+    assert_eq!(pool.status().generation, generation + 1);
   }
 }
