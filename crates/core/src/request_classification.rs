@@ -44,7 +44,7 @@ const OPENCODE_LEGACY_SYSTEM: &str = "You are a helpful AI assistant tasked with
 const OPENCODE_LEGACY_PROMPT: &str = "Provide a detailed prompt for continuing our conversation above.";
 
 /// Detect explicit compaction endpoints and recognized agent prompt templates.
-/// Only the final user item/block is inspected: historical prompts, tool
+/// Only the final input item or user block is inspected: historical prompts, tool
 /// results, `context_management`, and replayed compaction items are not signals
 /// that this request performs compaction.
 pub fn classify_request(endpoint: &RequestEndpoint, body: &Value) -> Option<RequestClassification> {
@@ -53,15 +53,30 @@ pub fn classify_request(endpoint: &RequestEndpoint, body: &Value) -> Option<Requ
     RequestClassificationSource::Endpoint
   } else {
     let operation = endpoint.resolved().or_else(|| Endpoint::infer_from(path))?;
-    // https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand
-    // The beta header also accompanies normal requests carrying an old summary.
-    if operation == Endpoint::Messages
-      && body
-        .get("compaction")
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        == Some("summarize")
-    {
+    let explicit_field = match operation {
+      // Codex remote compaction appends this request control after the history.
+      // https://github.com/openai/codex/blob/main/codex-rs/core/src/compact_remote_v2_attempt.rs
+      Endpoint::Responses => {
+        body
+          .get("input")
+          .and_then(Value::as_array)
+          .and_then(|items| items.last())
+          .and_then(|item| item.get("type"))
+          .and_then(Value::as_str)
+          == Some("compaction_trigger")
+      }
+      // https://platform.claude.com/docs/en/build-with-claude/compaction-on-demand
+      // The beta header also accompanies normal requests carrying an old summary.
+      Endpoint::Messages => {
+        body
+          .get("compaction")
+          .and_then(|value| value.get("type"))
+          .and_then(Value::as_str)
+          == Some("summarize")
+      }
+      Endpoint::ChatCompletions => false,
+    };
+    if explicit_field {
       RequestClassificationSource::RequestField
     } else {
       let text = active_user_text(body)?.trim();
@@ -270,6 +285,47 @@ mod tests {
         classify_request(&endpoint, &body),
         compaction(RequestClassificationSource::CodexPrompt)
       );
+    }
+  }
+
+  #[test]
+  fn responses_compaction_trigger_is_an_explicit_request_field() {
+    let body = json!({"input": [
+      {"role": "user", "content": "work on the task"},
+      {"type": "compaction", "encrypted_content": "previous summary"},
+      {"type": "compaction_trigger"}
+    ]});
+    for endpoint in [
+      Endpoint::Responses.into(),
+      RequestEndpoint::custom("/backend-api/codex/responses"),
+      RequestEndpoint::custom("/v1/responses?client_version=test"),
+    ] {
+      assert_eq!(
+        classify_request(&endpoint, &body),
+        compaction(RequestClassificationSource::RequestField)
+      );
+    }
+    for endpoint in [
+      Endpoint::Messages.into(),
+      Endpoint::ChatCompletions.into(),
+      RequestEndpoint::custom("/search"),
+    ] {
+      assert_eq!(classify_request(&endpoint, &body), None);
+    }
+  }
+
+  #[test]
+  fn historical_or_nested_triggers_are_not_active_compaction() {
+    for body in [
+      json!({"input": [{"type": "compaction_trigger"}, {"role": "user", "content": "continue"}]}),
+      json!({"input": [{"type": "compaction_trigger"}, {"type": "function_call_output", "output": "done"}]}),
+      json!({"input": [{"type": "compaction", "encrypted_content": "previous summary"}]}),
+      json!({"input": [{"role": "user", "content": [{"type": "compaction_trigger"}]}]}),
+      json!({"input": [{"type": "compaction_trigger_extra"}]}),
+      json!({"input": "Explain compaction_trigger"}),
+      json!({"input": []}),
+    ] {
+      assert_eq!(classify_request(&Endpoint::Responses.into(), &body), None, "{body}");
     }
   }
 

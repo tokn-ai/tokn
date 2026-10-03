@@ -926,6 +926,9 @@ mod tests {
   use tokn_core::db::UsageDetails;
   use tokn_core::request_classification::{RequestClassificationSource, RequestPurpose};
   use tokn_core::request_event::{ExtractedSummary, RequestEndpoint, RequestEventPayload, StageEvent};
+  use tokn_requests::pipeline::stages::ExtractStage;
+  use tokn_requests::stages::PassthroughExtract;
+  use tokn_requests::{EventBus, PipelineCtx, RawInbound, RunConfig};
 
   fn req(payload: RequestEventPayload) -> RequestEvent {
     req_with_id("req-1", payload)
@@ -1041,6 +1044,83 @@ mod tests {
     assert!(!lines[2].contains("[compaction]"));
 
     drop(handler);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[tokio::test]
+  async fn passthrough_compaction_trigger_reaches_progress_handlers_on_retry_attempt() {
+    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
+    let mut tty = ProgressEventHandler::new();
+    let mut log = ProgressLogEventHandler::new(&dir).unwrap();
+    let bus = Arc::new(EventBus::new(8));
+    let mut events = bus.subscribe();
+    let endpoint = RequestEndpoint::custom("/backend-api/codex/responses");
+    let ctx = PipelineCtx::new_with_attempt_and_config(
+      "req-compaction-trigger",
+      1,
+      endpoint.clone(),
+      bus,
+      Arc::new(RunConfig::default()),
+    );
+    let body = Bytes::from_static(
+      br#"{"model":"gpt-test","stream":true,"input":[{"role":"user","content":"Continue the task."},{"type":"compaction_trigger"}]}"#,
+    );
+    ctx.emit_stage(StageEvent::Started {
+      request_endpoint: endpoint.clone(),
+    });
+    let extracted = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: tokn_headers::HeaderMap::new(),
+          raw_body: body.clone(),
+          decoded_body: body.clone(),
+          body_json: serde_json::Value::Null,
+          request_id: Some(ctx.request_id.clone()),
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(extracted.raw_body, body);
+    assert_eq!(*extracted.body_json, serde_json::Value::Null);
+    ctx.emit_stage(StageEvent::Extract(ExtractedSummary::from(&extracted)));
+
+    for _ in 0..2 {
+      let event = events.try_recv().unwrap();
+      tty.handle(event.as_ref());
+      log.handle(event.as_ref());
+    }
+    let attempt_id = "req-compaction-trigger:1";
+    let state = &tty.bars.get(attempt_id).unwrap().request;
+    assert_eq!(
+      state.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::RequestField,
+      })
+    );
+    assert!(state
+      .render_in_flight(attempt_id)
+      .contains("/backend-api/codex/responses [compaction] sent="));
+    assert!(tty.bars.get(attempt_id).unwrap().bar.message().contains("[compaction]"));
+    assert_eq!(
+      log.requests.get(attempt_id).unwrap().request_classification,
+      state.request_classification
+    );
+
+    ctx.emit_stage(StageEvent::Completed {
+      success: false,
+      attempts: 2,
+    });
+    let event = events.try_recv().unwrap();
+    tty.handle(event.as_ref());
+    log.handle(event.as_ref());
+    let content = std::fs::read_to_string(progress_log_path(&dir)).unwrap();
+    assert!(content.contains("/backend-api/codex/responses [compaction] sent="));
+    assert!(content.contains("error=failed"));
+
+    drop(log);
     std::fs::remove_dir_all(&dir).unwrap();
   }
 

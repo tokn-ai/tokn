@@ -225,6 +225,40 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn responses_compaction_trigger_is_classified_without_changing_proxy_bytes() {
+    let endpoint = RequestEndpoint::custom("/backend-api/codex/responses");
+    let ctx = PipelineCtx::new("req-passthrough-trigger", endpoint.clone(), Arc::new(EventBus::new(64)));
+    let body =
+      Bytes::from_static(br#"{ "model": "gpt-test", "stream": true, "input": [{"type":"compaction_trigger"}] }"#);
+    let ex = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: HeaderMap::new(),
+          raw_body: body.clone(),
+          decoded_body: body.clone(),
+          body_json: Value::Null,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(ex.model, "gpt-test");
+    assert!(ex.stream);
+    assert_eq!(
+      ex.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::RequestField,
+      })
+    );
+    assert_eq!(ex.raw_body, body);
+    assert_eq!(ex.decoded_body, body);
+    assert_eq!(*ex.body_json, Value::Null);
+  }
+
+  #[tokio::test]
   async fn compact_endpoint_is_classified_without_changing_forwarded_bytes() {
     let endpoint = RequestEndpoint::custom("/v1/responses/compact");
     let ctx = PipelineCtx::new("req-passthrough-compact", endpoint.clone(), Arc::new(EventBus::new(64)));
