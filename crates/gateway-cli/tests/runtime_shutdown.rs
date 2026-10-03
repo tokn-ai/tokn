@@ -21,12 +21,12 @@ fn free_address() -> SocketAddr {
     .unwrap()
 }
 
-fn start(home: &Path, config: &Path) -> Child {
-  let stderr = fs::File::create(home.join("stderr.log")).unwrap();
+fn start_command(home: &Path, config: &Path, command: &[&str], log: &str) -> Child {
+  let stderr = fs::File::create(home.join(log)).unwrap();
   Command::new(env!("CARGO_BIN_EXE_tokn-gateway"))
     .arg("--config")
     .arg(config)
-    .arg("serve")
+    .args(command)
     // Only the child gets an isolated home; never read or mutate user auth.
     .env("HOME", home)
     .env_remove("RUST_LOG")
@@ -40,6 +40,54 @@ fn start(home: &Path, config: &Path) -> Child {
     .unwrap()
 }
 
+fn start(home: &Path, config: &Path) -> Child {
+  start_command(home, config, &["worker", "start"], "stderr.log")
+}
+
+fn frontend(home: &Path, config: &Path) -> Child {
+  start_command(home, config, &["frontend"], "frontend-stderr.log")
+}
+
+async fn ready_frontend(child: &mut Child, address: SocketAddr, home: &Path) {
+  tokio::time::timeout(WAIT, async {
+    while TcpStream::connect(address).await.is_err() {
+      assert!(
+        child.try_wait().unwrap().is_none(),
+        "{}",
+        fs::read_to_string(home.join("frontend-stderr.log")).unwrap()
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+}
+
+async fn workers(address: SocketAddr) -> serde_json::Value {
+  reqwest::Client::builder()
+    .no_proxy()
+    .build()
+    .unwrap()
+    .get(format!("http://{address}/admin/workers"))
+    .header("x-tokn-admin", "workers")
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap()
+}
+
+async fn wait_for_no_workers(address: SocketAddr) {
+  tokio::time::timeout(WAIT, async {
+    while !workers(address).await["workers"].as_array().unwrap().is_empty() {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+}
+
 async fn ready(child: &mut Child, address: SocketAddr, home: &Path) {
   let client = reqwest::Client::builder().no_proxy().build().unwrap();
   tokio::time::timeout(WAIT, async {
@@ -49,7 +97,11 @@ async fn ready(child: &mut Child, address: SocketAddr, home: &Path) {
         "gateway exited: {}",
         fs::read_to_string(home.join("stderr.log")).unwrap()
       );
-      if client.get(format!("http://{address}/health")).send().await.is_ok() {
+      if client.get(format!("http://{address}/health")).send().await.is_ok()
+        && workers(address).await["workers"]
+          .as_array()
+          .is_some_and(|values| values.iter().any(|value| value["weight"].as_u64().unwrap() > 0))
+      {
         return;
       }
       tokio::time::sleep(Duration::from_millis(20)).await;
@@ -154,6 +206,8 @@ base_url = "http://{upstream_address}/v1"
     raw.service.persistence.usage_db_path = Some(home.path().join("usage.db"));
     raw.service.persistence.sessions_db_path = Some(home.path().join("sessions.db"));
     fs::write(&config_path, toml::to_string(&raw).unwrap()).unwrap();
+    let mut frontend = frontend(home.path(), &config_path);
+    ready_frontend(&mut frontend, address, home.path()).await;
     let mut child = start(home.path(), &config_path);
     ready(&mut child, address, home.path()).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -175,13 +229,24 @@ base_url = "http://{upstream_address}/v1"
       .unwrap()
       .is_some());
     signal(&child, signal_name);
-    wait_for_closed_listener(address).await;
+    wait_for_no_workers(address).await;
+    assert!(
+      TcpStream::connect(address).await.is_ok(),
+      "worker signals must preserve the frontend listener"
+    );
     assert!(child.try_wait().unwrap().is_none(), "must wait for the admitted stream");
     release.send(()).unwrap();
     let remaining = tokio::time::timeout(WAIT, response.bytes()).await.unwrap().unwrap();
     assert!(remaining.ends_with(b"data: [DONE]\n\n"));
     upstream_task.await.unwrap();
     assert_clean_exit(&mut child, home.path()).await;
+    signal(&frontend, "-TERM");
+    assert!(tokio::time::timeout(WAIT, frontend.wait())
+      .await
+      .unwrap()
+      .unwrap()
+      .success());
+    wait_for_closed_listener(address).await;
     let row = tokn_persistence::read_request_row(&requests_dir, "shutdown-fixture")
       .unwrap()
       .expect("flushed request row");
@@ -212,14 +277,22 @@ enabled = false
   let mut auth = tokn_auth::AuthStore::load(Some(&auth_path), None).unwrap();
   auth.upsert(toml::from_str("id = 'fixture'\nprovider = 'openai'\napi_key = 'not-a-real-key'").unwrap());
   auth.save().unwrap();
+  let mut frontend = frontend(home.path(), &path);
+  ready_frontend(&mut frontend, address, home.path()).await;
   let mut child = start(home.path(), &path);
   ready(&mut child, address, home.path()).await;
   signal(&child, "-TERM");
   assert_clean_exit(&mut child, home.path()).await;
+  signal(&frontend, "-TERM");
+  assert!(tokio::time::timeout(WAIT, frontend.wait())
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
 }
 
 #[tokio::test]
-async fn bind_failure_closes_sibling_listener_and_flushes_before_exiting() {
+async fn frontend_bind_failure_closes_sibling_listener_before_exiting() {
   let home = tempfile::tempdir().unwrap();
   let path = home.path().join("config.toml");
   let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -243,10 +316,239 @@ client_auth = "none"
 "#
   );
   fs::write(&path, source).unwrap();
-  let mut child = start(home.path(), &path);
+  let mut child = frontend(home.path(), &path);
   let status = tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap();
   assert!(!status.success());
-  let log = fs::read_to_string(home.path().join("stderr.log")).unwrap();
-  assert!(log.contains("shutdown persistence cleanup complete"), "{log}");
   assert!(TcpStream::connect(sibling).await.is_err());
+}
+
+#[tokio::test]
+async fn serve_reuses_frontend_and_replacement_worker_exits_after_stream_drain() {
+  let home = tempfile::tempdir().unwrap();
+  let path = home.path().join("config.toml");
+  let address = free_address();
+  let old_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let old_address = old_upstream.local_addr().unwrap();
+  let new_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let new_address = new_upstream.local_addr().unwrap();
+  let (release, released) = oneshot::channel();
+  let old_task = tokio::spawn(async move {
+    let (mut stream, _) = old_upstream.accept().await.unwrap();
+    read_request(&mut stream).await;
+    let first = "data: {\"id\":\"old\",\"choices\":[{\"delta\":{\"content\":\"old\"}}]}\n\n";
+    let last = "data: [DONE]\n\n";
+    stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{first}", first.len() + last.len()).as_bytes()).await.unwrap();
+    released.await.unwrap();
+    stream.write_all(last.as_bytes()).await.unwrap();
+  });
+  let new_task = tokio::spawn(async move {
+    let (mut stream, _) = new_upstream.accept().await.unwrap();
+    read_request(&mut stream).await;
+    let body = r#"{"id":"new","choices":[]}"#;
+    stream
+      .write_all(
+        format!(
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )
+        .as_bytes(),
+      )
+      .await
+      .unwrap();
+  });
+  let source = format!(
+    r#"
+schema_version = 2
+[service.logging]
+target = "stderr"
+[service.persistence]
+enabled = false
+[listeners.api]
+kind = "llm_api"
+bind = "{address}"
+client_auth = "none"
+[profiles.default]
+route = "relay"
+[routes.relay]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "client" }}
+[providers.local]
+driver = "openai"
+base_url = "http://{old_address}/v1"
+"#
+  );
+  fs::write(&path, &source).unwrap();
+  let mut frontend = frontend(home.path(), &path);
+  ready_frontend(&mut frontend, address, home.path()).await;
+  let mut old = start(home.path(), &path);
+  ready(&mut old, address, home.path()).await;
+  let client = reqwest::Client::builder().no_proxy().build().unwrap();
+  let mut response = client
+    .post(format!("http://{address}/v1/chat/completions"))
+    .json(&serde_json::json!({"model":"fixture", "messages":[], "stream":true}))
+    .send()
+    .await
+    .unwrap();
+  assert_eq!(response.status(), 200);
+  let first = response.chunk().await.unwrap().unwrap();
+  assert!(std::str::from_utf8(&first).unwrap().contains("old"));
+  fs::write(
+    &path,
+    source.replace(&old_address.to_string(), &new_address.to_string()),
+  )
+  .unwrap();
+  let mut new = start_command(home.path(), &path, &["serve"], "new-stderr.log");
+  tokio::time::timeout(WAIT, async {
+    while workers(address).await["workers"].as_array().unwrap().len() != 2 {
+      assert!(
+        new.try_wait().unwrap().is_none(),
+        "{}",
+        fs::read_to_string(home.path().join("new-stderr.log")).unwrap()
+      );
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+  assert!(frontend.try_wait().unwrap().is_none());
+  assert!(
+    old.try_wait().unwrap().is_none(),
+    "retired worker must retain its stream"
+  );
+  let report = workers(address).await;
+  assert_eq!(report["workers"][0]["weight"], 0);
+  assert_eq!(report["workers"][0]["in_flight"], 1);
+  assert_eq!(report["workers"][1]["weight"], 1);
+  let next = client
+    .post(format!("http://{address}/v1/chat/completions"))
+    .json(&serde_json::json!({"model":"fixture", "messages":[]}))
+    .send()
+    .await
+    .unwrap();
+  assert_eq!(next.status(), 200);
+  assert_eq!(next.json::<serde_json::Value>().await.unwrap()["id"], "new");
+  release.send(()).unwrap();
+  assert!(response.bytes().await.unwrap().ends_with(b"data: [DONE]\n\n"));
+  assert_clean_exit(&mut old, home.path()).await;
+  assert!(fs::read_to_string(home.path().join("stderr.log"))
+    .unwrap()
+    .contains("worker drained; exiting"));
+  assert!(
+    frontend.try_wait().unwrap().is_none(),
+    "old worker exit must not stop frontend"
+  );
+  signal(&new, "-TERM");
+  assert!(tokio::time::timeout(WAIT, new.wait()).await.unwrap().unwrap().success());
+  signal(&frontend, "-TERM");
+  assert!(tokio::time::timeout(WAIT, frontend.wait())
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
+  old_task.await.unwrap();
+  new_task.await.unwrap();
+}
+
+async fn read_request(stream: &mut TcpStream) {
+  let mut header = Vec::new();
+  while !header.ends_with(b"\r\n\r\n") {
+    header.push(stream.read_u8().await.unwrap());
+  }
+  let header = String::from_utf8(header).unwrap();
+  let length = header
+    .lines()
+    .find_map(|line| {
+      let (name, value) = line.split_once(':')?;
+      name
+        .eq_ignore_ascii_case("content-length")
+        .then(|| value.trim().parse::<usize>().unwrap())
+    })
+    .unwrap_or(0);
+  stream.read_exact(&mut vec![0; length]).await.unwrap();
+}
+
+struct IndependentFrontend(u32);
+impl Drop for IndependentFrontend {
+  fn drop(&mut self) {
+    let _ = std::process::Command::new("kill")
+      .arg("-TERM")
+      .arg(self.0.to_string())
+      .stdout(Stdio::null())
+      .stderr(Stdio::null())
+      .status();
+  }
+}
+
+#[tokio::test]
+async fn serve_bootstraps_proxy_frontend_and_worker_start_inherits_proxy_settings() {
+  let home = tempfile::tempdir().unwrap();
+  let path = home.path().join("config.toml");
+  let address = free_address();
+  let proxy = free_address();
+  fs::write(
+    &path,
+    format!(
+      r#"
+[server]
+host = "127.0.0.1"
+port = {}
+[proxy_mode]
+host = "127.0.0.1"
+port = {}
+[logging]
+target = "stderr"
+ansi = false
+[db]
+enabled = false
+"#,
+      address.port(),
+      proxy.port()
+    ),
+  )
+  .unwrap();
+  let auth_path = home.path().join(".tokn/router/auth.yaml");
+  let mut auth = tokn_auth::AuthStore::load(Some(&auth_path), None).unwrap();
+  auth.upsert(toml::from_str("id = 'fixture'\nprovider = 'openai'\napi_key = 'not-a-real-key'").unwrap());
+  auth.save().unwrap();
+  let mut old = start_command(home.path(), &path, &["serve", "--with-proxy"], "stderr.log");
+  let frontend_pid = tokio::time::timeout(WAIT, async {
+    loop {
+      let log = fs::read_to_string(home.path().join("stderr.log")).unwrap();
+      if let Some(pid) = log
+        .lines()
+        .find(|line| line.contains("started independent frontend"))
+        .and_then(|line| line.split("frontend_pid=").nth(1))
+        .and_then(|field| field.split_whitespace().next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+      {
+        break pid;
+      }
+      assert!(old.try_wait().unwrap().is_none(), "{log}");
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap();
+  let frontend = IndependentFrontend(frontend_pid);
+  ready(&mut old, address, home.path()).await;
+  assert!(TcpStream::connect(proxy).await.is_ok());
+  let old_id = workers(address).await["workers"][0]["worker_id"]
+    .as_str()
+    .unwrap()
+    .to_string();
+  let mut new = start_command(home.path(), &path, &["worker", "start"], "new-stderr.log");
+  assert_clean_exit(&mut old, home.path()).await;
+  let report = workers(address).await;
+  assert_eq!(report["workers"].as_array().unwrap().len(), 1);
+  assert_ne!(report["workers"][0]["worker_id"], old_id);
+  assert!(new.try_wait().unwrap().is_none());
+  assert!(
+    TcpStream::connect(proxy).await.is_ok(),
+    "worker replacement must preserve proxy listener"
+  );
+  drop(frontend);
+  assert!(tokio::time::timeout(WAIT, new.wait()).await.unwrap().unwrap().success());
+  wait_for_closed_listener(address).await;
+  wait_for_closed_listener(proxy).await;
 }

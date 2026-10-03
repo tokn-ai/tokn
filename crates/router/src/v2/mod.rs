@@ -2,8 +2,9 @@
 mod cors_tests;
 mod discovery;
 mod model_refresh;
-mod mounts;
+pub(crate) mod mounts;
 mod selector;
+mod worker;
 
 pub use model_refresh::ModelRefreshGuard;
 
@@ -45,10 +46,9 @@ use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
-  CanonicalHost, ClientAuthPlan, ConnectAction, CredentialPolicy, DriverId, ForwardProxyListenerPlan, GatewayPlan,
-  HttpAction, HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector,
-  ProfileId, ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan,
-  WireIdentity,
+  ClientAuthPlan, ConnectAction, CredentialPolicy, DriverId, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
+  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector, ProfileId,
+  ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -208,20 +208,6 @@ impl ForwardProxyState {
     self.listener.bind()
   }
 
-  fn connect_action(&self, host: &CanonicalHost, port: u16) -> ConnectAction {
-    self
-      .listener
-      .connect_rules()
-      .iter()
-      .find(|rule| {
-        let matcher = rule.matcher();
-        (matcher.hosts().is_empty() || matcher.hosts().iter().any(|pattern| pattern.matches(host)))
-          && (matcher.ports().is_empty() || matcher.ports().contains(&port))
-      })
-      .map(|rule| rule.action())
-      .unwrap_or_else(|| self.listener.default_connect_action())
-  }
-
   fn select_profile(
     &self,
     ingress: &IngressAuthority,
@@ -246,7 +232,7 @@ impl ForwardProxyState {
   }
 
   pub(crate) fn connect_action_for(&self, ingress: &IngressAuthority) -> ConnectAction {
-    self.connect_action(ingress.host(), ingress.port())
+    crate::proxy::ingress::connect_action_for(&self.listener, ingress)
   }
 
   pub(crate) fn pinned_tls_config(&self, ingress: &IngressAuthority) -> anyhow::Result<Arc<rustls::ServerConfig>> {
@@ -261,34 +247,7 @@ impl ForwardProxyState {
     &self,
     headers: &mut HeaderMap,
   ) -> Result<AccessContext, ProxyAuthenticationError> {
-    let authorization = headers
-      .get_all(axum::http::header::PROXY_AUTHORIZATION)
-      .iter()
-      .map(|value| value.to_str().ok())
-      .collect::<Option<Vec<_>>>();
-    let token = match (self.listener.client_auth(), authorization.as_deref()) {
-      (ClientAuthPlan::None, _) => None,
-      (ClientAuthPlan::LocalKeys, Some([value])) => {
-        let mut parts = value.split_ascii_whitespace();
-        match (parts.next(), parts.next(), parts.next()) {
-          (Some(scheme), Some(token), None) if scheme.eq_ignore_ascii_case("bearer") => Some(token.to_string()),
-          _ => return Err(ProxyAuthenticationError::Rejected),
-        }
-      }
-      (ClientAuthPlan::LocalKeys, _) => return Err(ProxyAuthenticationError::Rejected),
-    };
-    headers.remove(axum::http::header::PROXY_AUTHORIZATION);
-    let Some(token) = token else {
-      return Ok(AccessContext::unrestricted());
-    };
-    let access = self.access.clone();
-    tokio::task::spawn_blocking(move || access.authenticate(Some(&token)))
-      .await
-      .map_err(|error| {
-        tracing::error!(%error, "v2 proxy authentication task failed");
-        ProxyAuthenticationError::Unavailable
-      })?
-      .map_err(|_| ProxyAuthenticationError::Rejected)
+    crate::proxy::ingress::authenticate_proxy(self.listener.client_auth(), self.access.clone(), headers).await
   }
 
   pub(crate) async fn dispatch_http(
@@ -297,7 +256,7 @@ impl ForwardProxyState {
     scheme: &'static str,
     access: AccessContext,
     connection: InboundConnectionInfo,
-    request: Request<hyper::body::Incoming>,
+    request: Request,
   ) -> Response {
     match self
       .dispatch_http_inner(ingress, scheme, access, connection, request)
@@ -314,7 +273,7 @@ impl ForwardProxyState {
     scheme: &'static str,
     access: AccessContext,
     connection: InboundConnectionInfo,
-    request: Request<hyper::body::Incoming>,
+    request: Request,
   ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
     let runtime = self.select_profile(ingress, &parts.method, &parts.uri)?;
@@ -454,8 +413,8 @@ impl ForwardProxyState {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InboundConnectionInfo {
-  local_addr: Option<SocketAddr>,
-  peer_addr: Option<SocketAddr>,
+  pub(crate) local_addr: Option<SocketAddr>,
+  pub(crate) peer_addr: Option<SocketAddr>,
 }
 
 struct ApiRequestContext {
@@ -512,7 +471,7 @@ where
     .into_iter()
     .next()
     .expect("a runtime created with one forward proxy exposes it");
-  crate::proxy::serve_v2_policy(bind, outbound, state, shutdown).await
+  crate::proxy::serve_v2_policy(bind, outbound, state.into(), shutdown).await
 }
 
 pub async fn serve_live_forward_proxy<F>(
@@ -524,7 +483,7 @@ where
   F: Future<Output = ()> + Send,
 {
   let outbound = state.outbound();
-  crate::proxy::serve_v2_policy(bind, outbound, state, shutdown).await
+  crate::proxy::serve_v2_policy(bind, outbound, state.into(), shutdown).await
 }
 
 pub struct RuntimeStates {
@@ -844,6 +803,28 @@ pub fn build_runtime_states_with_service(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<RuntimeStates> {
+  build_runtime_states_inner(plan, service, accounts, access, events, true)
+}
+
+/// Build execution-only workers without reading or generating interception CA keys.
+pub fn build_worker_runtime_states(
+  plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+) -> anyhow::Result<RuntimeStates> {
+  build_runtime_states_inner(plan, service, accounts, access, events, false)
+}
+
+fn build_runtime_states_inner(
+  plan: GatewayPlan,
+  service: tokn_config::v2::ServicePlan,
+  accounts: &[AccountConfig],
+  access: Arc<tokn_access::AccessStore>,
+  events: Arc<EventBus>,
+  load_tls: bool,
+) -> anyhow::Result<RuntimeStates> {
   let plan = Arc::new(plan);
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
@@ -870,6 +851,7 @@ pub fn build_runtime_states_with_service(
       ListenerPlan::ForwardProxy(listener) => {
         let ca = listener
           .tls()
+          .filter(|_| load_tls)
           .map(|tls| crate::proxy::load_or_generate_ca(tls.ca_dir(), false).map(Arc::new))
           .transpose()
           .map_err(|error| anyhow::anyhow!("load v2 proxy CA for listener '{listener_id}': {error}"))?;
@@ -1516,27 +1498,9 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
     }
   }
 
-  let context = match state.listener.client_auth() {
-    ClientAuthPlan::None => Ok(AccessContext::unrestricted()),
-    ClientAuthPlan::LocalKeys => {
-      let token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once(char::is_whitespace))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, token)| token.trim())
-        .filter(|token| !token.is_empty())
-        .or_else(|| request.headers().get("x-api-key").and_then(|value| value.to_str().ok()));
-      state.access.authenticate(token)
-    }
-  };
+  let context = crate::dispatch::authenticate_api(state.listener.client_auth(), &state.access, request.headers_mut());
   match context {
     Ok(context) => {
-      if state.listener.client_auth() == ClientAuthPlan::LocalKeys {
-        request.headers_mut().remove(axum::http::header::AUTHORIZATION);
-        request.headers_mut().remove("x-api-key");
-      }
       request.extensions_mut().insert(context);
       next.run(request).await
     }

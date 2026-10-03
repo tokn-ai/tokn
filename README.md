@@ -889,6 +889,18 @@ Per-request `x-route-mode` and Basic proxy-auth username mode overrides are not
 projected. Native v2 configs can declare one or more `forward_proxy` listeners
 and serve them together with API listeners without compatibility flags.
 
+## Version switching and A/B tests
+
+`tokn-gateway frontend --with-proxy` owns the fixed public listeners.
+`tokn-gateway worker start` registers a worker and takes all new requests;
+previous workers exit after their pending requests and streams drain.
+`tokn-gateway serve --with-proxy` starts both parts, reusing an existing frontend.
+Persistent intercepted CONNECT connections stay open across switches.
+
+Use `worker start --candidate` for A/B experiments with live traffic weights.
+See [request-level version dispatch](docs/version-dispatch.md) for commands,
+configuration, compatibility, and process lifecycle.
+
 ## LAN Bootstrap
 
 By default, listeners must bind to loopback. To expose a trusted LAN gateway,

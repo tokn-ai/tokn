@@ -72,7 +72,8 @@ pub struct MigrateV2Args {
   pub allow_insecure_http: bool,
 }
 
-#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+#[derive(Copy, Clone, Debug, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RouteModeArg {
   Passthrough,
   Switch,
