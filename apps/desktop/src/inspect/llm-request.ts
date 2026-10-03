@@ -1,4 +1,6 @@
 import { numberField, stringField } from "./format.js";
+import { readRequestClassification } from "./request-classification.js";
+import type { RequestClassification } from "./types.js";
 
 const LLM_ENDPOINTS = new Set([
   "chat",
@@ -6,7 +8,12 @@ const LLM_ENDPOINTS = new Set([
   "messages",
   "responses",
 ]);
-const LLM_PATH_SUFFIXES = ["/chat/completions", "/messages", "/responses"];
+const LLM_PATH_SUFFIXES = [
+  "/chat/completions",
+  "/messages",
+  "/responses",
+  "/responses/compact",
+];
 
 export interface LlmUsage {
   kind: string | undefined;
@@ -29,6 +36,7 @@ export interface LlmRequestOverviewModel {
   account_id: string | undefined;
   pipeline: string | undefined;
   mode: string | undefined;
+  request_classification: RequestClassification | undefined;
   stream: boolean | undefined;
   client_status: number | undefined;
   provider_status: number | undefined;
@@ -134,6 +142,7 @@ export function buildLlmRequestOverview(
     account_id: stringField(request, "account_id"),
     pipeline: stringField(context ?? {}, "pipeline_id"),
     mode: stringField(context ?? {}, "mode"),
+    request_classification: readRequestClassification(request),
     stream:
       typeof parameters?.stream === "boolean" ? parameters.stream : undefined,
     client_status:

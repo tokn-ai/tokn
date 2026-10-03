@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokn_core::db::{Usage, UsageDetails, UsageType};
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::provider::Endpoint;
+use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
 use tokn_core::request_event::stage::{
   BuiltHeadersSummary, ConvertedRequestSummary, ConvertedResponseSummary, ExtractedSummary, ResolvedSummary,
   SentSummary, Stage, StageEvent,
@@ -64,6 +65,7 @@ fn extracted_with_initiator(
     initiator: initiator.map(SmolStr::new),
     header_initiator: None,
     route_mode_hint: None,
+    request_classification: None,
     headers,
     raw_body: Bytes::copy_from_slice(body),
     decoded_body: Bytes::copy_from_slice(body),
@@ -81,6 +83,17 @@ fn resolved(account: &str, provider: &str) -> StageEvent {
     account_id: SmolStr::new(account),
     provider_id: SmolStr::new(provider),
   })
+}
+
+fn classified(mut event: StageEvent, source: RequestClassificationSource) -> StageEvent {
+  let StageEvent::Extract(summary) = &mut event else {
+    panic!("expected an extract event");
+  };
+  summary.request_classification = Some(RequestClassification {
+    purpose: RequestPurpose::Compaction,
+    source,
+  });
+  event
 }
 
 fn built_headers() -> StageEvent {
@@ -284,7 +297,14 @@ fn body_recording_can_be_disabled() {
       request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
     },
   ));
-  h.handle(&r2(req, 0, extracted("model", false, None, b"inbound")));
+  h.handle(&r2(
+    req,
+    0,
+    classified(
+      extracted("model", false, None, b"inbound"),
+      RequestClassificationSource::Endpoint,
+    ),
+  ));
   h.handle(&r2(req, 0, converted_request(b"outbound")));
   h.handle(&r2(
     req,
@@ -296,6 +316,14 @@ fn body_recording_can_be_disabled() {
   assert!(is_null(&row["inbound_req_body"]));
   assert!(is_null(&row["outbound_req_body"]));
   assert!(is_null(&row["inbound_resp_body"]));
+  assert_eq!(
+    as_json(&row["params_json"]),
+    Some(serde_json::json!({
+      "initiator": "user",
+      "stream": false,
+      "request_classification": {"purpose": "compaction", "source": "endpoint"}
+    }))
+  );
 }
 
 #[test]
@@ -394,7 +422,14 @@ fn extract_merges_params_json_with_existing_keys() {
     .unwrap();
   drop(conn);
 
-  h.handle(&r2(req, 0, extracted("client-model-2", false, None, b"{\"in\":2}")));
+  h.handle(&r2(
+    req,
+    0,
+    classified(
+      extracted("client-model-2", false, None, b"{\"in\":2}"),
+      RequestClassificationSource::CodexPrompt,
+    ),
+  ));
 
   let row = fetch_row(&dir, req);
   assert_eq!(as_text(&row["model"]).as_deref(), Some("client-model-2"));
@@ -403,6 +438,7 @@ fn extract_merges_params_json_with_existing_keys() {
     Some(serde_json::json!({
       "initiator": "user",
       "stream": false,
+      "request_classification": {"purpose": "compaction", "source": "codex_prompt"},
       "temperature": 0.7
     }))
   );
@@ -530,7 +566,14 @@ fn retry_produces_two_independent_rows() {
       request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
     },
   ));
-  h.handle(&r2(req, 0, extracted("m", false, None, b"a")));
+  h.handle(&r2(
+    req,
+    0,
+    classified(
+      extracted("m", false, None, b"a"),
+      RequestClassificationSource::CodexPrompt,
+    ),
+  ));
   h.handle(&r2(req, 0, resolved("acct", "prov")));
   h.handle(&r2(req, 0, built_headers()));
   h.handle(&r2(req, 0, converted_request(b"o0")));
@@ -544,7 +587,11 @@ fn retry_produces_two_independent_rows() {
       request_endpoint: RequestEndpoint::Known(Endpoint::Responses),
     },
   ));
-  h.handle(&r2(req, 1, extracted("m", false, None, b"a")));
+  h.handle(&r2(
+    req,
+    1,
+    classified(extracted("m", false, None, b"a"), RequestClassificationSource::Endpoint),
+  ));
   h.handle(&r2(req, 1, resolved("acct", "prov")));
   h.handle(&r2(req, 1, built_headers()));
   h.handle(&r2(req, 1, converted_request(b"o1")));
@@ -559,6 +606,14 @@ fn retry_produces_two_independent_rows() {
   assert_eq!(as_text(&row0["request_error"]).as_deref(), Some("send: 500"));
   assert_eq!(as_int(&row1["status"]), Some(200));
   assert!(is_null(&row1["request_error"]));
+  assert_eq!(
+    as_json(&row0["params_json"]).unwrap()["request_classification"]["source"],
+    "codex_prompt"
+  );
+  assert_eq!(
+    as_json(&row1["params_json"]).unwrap()["request_classification"]["source"],
+    "endpoint"
+  );
 }
 
 #[test]

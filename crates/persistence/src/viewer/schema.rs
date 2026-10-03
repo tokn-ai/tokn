@@ -4,6 +4,7 @@ use crate::{migrate, Result};
 
 const CURRENT_TS_MILLIS_SCHEMA_VERSION: u32 = 8;
 const SPLIT_REQUESTS_SCHEMA_VERSION: u32 = 7;
+const REQUEST_PARAMS_JSON_SCHEMA_VERSION: u32 = 8;
 const REQUEST_ID_SCHEMA_VERSION: u32 = 2;
 pub(super) const SESSION_TREE_SCHEMA_VERSION: u32 = 2;
 pub(super) const SESSION_MESSAGE_TREE_SCHEMA_VERSION: u32 = 5;
@@ -26,6 +27,10 @@ impl RequestSchema {
 
   pub(super) fn has_request_id(self) -> bool {
     self.version >= REQUEST_ID_SCHEMA_VERSION
+  }
+
+  pub(super) fn has_params_json(self) -> bool {
+    self.version >= REQUEST_PARAMS_JSON_SCHEMA_VERSION
   }
 
   pub(super) fn row_id_column(self) -> &'static str {

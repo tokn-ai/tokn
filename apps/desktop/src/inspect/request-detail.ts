@@ -18,6 +18,10 @@ import type {
 } from "./types";
 import { isCodexWebSearchEndpoint } from "./web-search";
 import { isLlmRequest } from "./llm-request";
+import {
+  classificationSourceLabel,
+  readRequestClassification,
+} from "./request-classification";
 
 const DETAIL_TABS: { id: DetailTab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -180,6 +184,7 @@ export class RequestDetailView extends LitElement {
     const ts = numberField(request, "ts");
     const latency = nestedValue(request, "ctx_json", "latency_ms");
     const stream = nestedValue(request, "params_json", "stream");
+    const classification = readRequestClassification(request);
     const metadata = [
       [
         "Timestamp",
@@ -193,6 +198,12 @@ export class RequestDetailView extends LitElement {
       ["Latency", typeof latency === "number" ? `${latency} ms` : latency],
       ["Streaming", stream],
     ];
+    if (classification) {
+      metadata.push(
+        ["Purpose", "Compaction"],
+        ["Detection source", classificationSourceLabel(classification.source)],
+      );
+    }
     const inbound_status = numberField(request, "inbound_resp_status");
     const outbound_status = numberField(request, "outbound_resp_status");
     const final_status = numberField(request, "status");

@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 use tokn_core::db::Usage;
 use tokn_core::event::{Event, EventHandler};
+use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
 
 /// Process-wide [`MultiProgress`] shared between [`ProgressEventHandler`]
@@ -40,6 +41,7 @@ struct RequestState {
   model: String,
   account: String,
   endpoint: String,
+  request_classification: Option<RequestClassification>,
   attempt: u32,
   sent_bytes: u64,
   recv_bytes: u64,
@@ -56,6 +58,7 @@ impl RequestState {
       model: String::new(),
       account: String::new(),
       endpoint,
+      request_classification: None,
       attempt: 0,
       sent_bytes: 0,
       recv_bytes: 0,
@@ -67,6 +70,14 @@ impl RequestState {
 
   fn id_short(request_id: &str) -> String {
     request_id.chars().take(8).collect()
+  }
+
+  fn render_endpoint(&self) -> String {
+    let classification = self
+      .request_classification
+      .map(|classification| format!(" {}", style(format!("[{}]", classification.purpose.as_str())).yellow()))
+      .unwrap_or_default();
+    format!("{}{}", style(&self.endpoint).dim(), classification)
   }
 
   fn render_in_flight(&self, request_id: &str) -> String {
@@ -88,7 +99,7 @@ impl RequestState {
       style(truncate(&self.model, 28)).cyan(),
       style(truncate(&self.account, 16)).magenta(),
       attempt_part,
-      style(&self.endpoint).dim(),
+      self.render_endpoint(),
       (self.sent_bytes as f64) / 1024.0,
       (self.recv_bytes as f64) / 1024.0,
       speed_kbs,
@@ -145,7 +156,7 @@ impl RequestState {
         style(&self.provider).blue(),
         style(truncate(&self.model, 28)).cyan(),
         style(truncate(&self.account, 16)).magenta(),
-        style(&self.endpoint).dim(),
+        self.render_endpoint(),
         (self.sent_bytes as f64) / 1024.0,
         (self.recv_bytes as f64) / 1024.0,
         format_usage(&self.usage),
@@ -166,7 +177,7 @@ impl RequestState {
         style(&self.provider).blue(),
         style(truncate(&self.model, 28)).cyan(),
         style(truncate(&self.account, 16)).magenta(),
-        style(&self.endpoint).dim(),
+        self.render_endpoint(),
         (self.sent_bytes as f64) / 1024.0,
         (self.recv_bytes as f64) / 1024.0,
         latency_s,
@@ -190,11 +201,12 @@ impl RequestState {
       format!(" {}", style(truncate(&self.account, 16)).magenta())
     };
     format!(
-      "[{}] {}{}{} sent={:.1}kB recv={:.1}kB elapsed={:.1}s",
+      "[{}] {}{}{} {} sent={:.1}kB recv={:.1}kB elapsed={:.1}s",
       style(&id_short).dim(),
       style("⚠ interrupted").yellow().bold(),
       model_part,
       account_part,
+      self.render_endpoint(),
       (self.sent_bytes as f64) / 1024.0,
       (self.recv_bytes as f64) / 1024.0,
       elapsed,
@@ -445,6 +457,7 @@ impl ProgressEventHandler {
       RequestEventPayload::Stage(StageEvent::Extract(s)) => {
         if let Some(state) = self.bars.get_mut(&composite_id) {
           state.request.model = s.model.to_string();
+          state.request.request_classification = s.request_classification;
         }
         self.refresh(&composite_id);
       }
@@ -816,6 +829,7 @@ impl ProgressLogEventHandler {
       RequestEventPayload::Stage(StageEvent::Extract(s)) => {
         if let Some(state) = self.requests.get_mut(&composite_id) {
           state.model = s.model.to_string();
+          state.request_classification = s.request_classification;
         }
       }
       RequestEventPayload::Stage(StageEvent::Resolve(s)) => {
@@ -910,15 +924,204 @@ mod tests {
   use super::*;
   use bytes::Bytes;
   use tokn_core::db::UsageDetails;
-  use tokn_core::request_event::{RequestEventPayload, StageEvent};
+  use tokn_core::request_classification::{RequestClassificationSource, RequestPurpose};
+  use tokn_core::request_event::{ExtractedSummary, RequestEndpoint, RequestEventPayload, StageEvent};
+  use tokn_requests::pipeline::stages::ExtractStage;
+  use tokn_requests::stages::PassthroughExtract;
+  use tokn_requests::{EventBus, PipelineCtx, RawInbound, RunConfig};
 
   fn req(payload: RequestEventPayload) -> RequestEvent {
+    req_with_id("req-1", payload)
+  }
+
+  fn req_with_id(request_id: &str, payload: RequestEventPayload) -> RequestEvent {
     RequestEvent {
-      request_id: "req-1".into(),
+      request_id: request_id.into(),
       attempt: 0,
       ts: 0,
       payload,
     }
+  }
+
+  fn extract_event(classification: Option<RequestClassification>) -> RequestEventPayload {
+    RequestEventPayload::Stage(StageEvent::Extract(ExtractedSummary {
+      agent_id: None,
+      request_classification: classification,
+      model: "gpt-test".into(),
+      stream: false,
+      session_id: None,
+      project_id: None,
+      initiator: None,
+      header_initiator: None,
+      route_mode_hint: None,
+      headers: tokn_headers::HeaderMap::new(),
+      raw_body: Bytes::new(),
+      decoded_body: Bytes::new(),
+      body_json: Arc::new(serde_json::Value::Null),
+    }))
+  }
+
+  fn compaction() -> RequestClassification {
+    RequestClassification {
+      purpose: RequestPurpose::Compaction,
+      source: RequestClassificationSource::CodexPrompt,
+    }
+  }
+
+  #[test]
+  fn tty_extract_event_labels_all_request_states() {
+    let mut handler = ProgressEventHandler::new();
+    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
+      request_endpoint: RequestEndpoint::custom("responses"),
+    })));
+    handler.handle_request(&req(extract_event(Some(compaction()))));
+
+    let state = &handler.bars.get("req-1").unwrap().request;
+    assert_eq!(state.request_classification, Some(compaction()));
+    assert!(state.render_in_flight("req-1").contains("responses [compaction] sent="));
+    assert!(state
+      .render_completed("req-1", true, 1, Some(200), 0, None)
+      .contains("responses [compaction] sent="));
+    assert!(state
+      .render_completed("req-1", false, 1, Some(500), 0, Some("failed"))
+      .contains("responses [compaction] sent="));
+    assert!(state
+      .render_interrupted("req-1")
+      .contains("responses [compaction] sent="));
+
+    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Completed {
+      success: true,
+      attempts: 1,
+    })));
+    let pending = handler.pending.get("req-1").unwrap().lock().unwrap();
+    assert!(pending
+      .request
+      .render_waiting_for_usage("req-1")
+      .contains("responses [compaction] sent="));
+    drop(pending);
+    handler.handle_request(&req(RequestEventPayload::Record(RecordEvent::Usage(Usage::default()))));
+
+    handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
+      request_endpoint: RequestEndpoint::custom("responses"),
+    })));
+    handler.handle_request(&req(extract_event(None)));
+    assert!(!handler
+      .bars
+      .get("req-1")
+      .unwrap()
+      .request
+      .render_in_flight("req-1")
+      .contains("[compaction]"));
+  }
+
+  #[test]
+  fn progress_log_extract_event_labels_completed_and_failed_rows_only_when_known() {
+    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
+    let mut handler = ProgressLogEventHandler::new(&dir).unwrap();
+    for (id, classification, success) in [
+      ("req-success", Some(compaction()), true),
+      ("req-failure", Some(compaction()), false),
+      ("req-ordinary", None, true),
+    ] {
+      handler.handle_request(&req_with_id(
+        id,
+        RequestEventPayload::Stage(StageEvent::Started {
+          request_endpoint: RequestEndpoint::custom("responses"),
+        }),
+      ));
+      handler.handle_request(&req_with_id(id, extract_event(classification)));
+      handler.handle_request(&req_with_id(
+        id,
+        RequestEventPayload::Stage(StageEvent::Completed { success, attempts: 1 }),
+      ));
+    }
+    let content = std::fs::read_to_string(progress_log_path(&dir)).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(lines[0].contains("responses [compaction] sent="));
+    assert!(lines[1].contains("responses [compaction] sent="));
+    assert!(lines[1].contains("error=failed"));
+    assert!(lines[2].contains("responses sent="));
+    assert!(!lines[2].contains("[compaction]"));
+
+    drop(handler);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[tokio::test]
+  async fn passthrough_compaction_trigger_reaches_progress_handlers_on_retry_attempt() {
+    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
+    let mut tty = ProgressEventHandler::new();
+    let mut log = ProgressLogEventHandler::new(&dir).unwrap();
+    let bus = Arc::new(EventBus::new(8));
+    let mut events = bus.subscribe();
+    let endpoint = RequestEndpoint::custom("/backend-api/codex/responses");
+    let ctx = PipelineCtx::new_with_attempt_and_config(
+      "req-compaction-trigger",
+      1,
+      endpoint.clone(),
+      bus,
+      Arc::new(RunConfig::default()),
+    );
+    let body = Bytes::from_static(
+      br#"{"model":"gpt-test","stream":true,"input":[{"role":"user","content":"Continue the task."},{"type":"compaction_trigger"}]}"#,
+    );
+    ctx.emit_stage(StageEvent::Started {
+      request_endpoint: endpoint.clone(),
+    });
+    let extracted = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: tokn_headers::HeaderMap::new(),
+          raw_body: body.clone(),
+          decoded_body: body.clone(),
+          body_json: serde_json::Value::Null,
+          request_id: Some(ctx.request_id.clone()),
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(extracted.raw_body, body);
+    assert_eq!(*extracted.body_json, serde_json::Value::Null);
+    ctx.emit_stage(StageEvent::Extract(ExtractedSummary::from(&extracted)));
+
+    for _ in 0..2 {
+      let event = events.try_recv().unwrap();
+      tty.handle(event.as_ref());
+      log.handle(event.as_ref());
+    }
+    let attempt_id = "req-compaction-trigger:1";
+    let state = &tty.bars.get(attempt_id).unwrap().request;
+    assert_eq!(
+      state.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::RequestField,
+      })
+    );
+    assert!(state
+      .render_in_flight(attempt_id)
+      .contains("/backend-api/codex/responses [compaction] sent="));
+    assert!(tty.bars.get(attempt_id).unwrap().bar.message().contains("[compaction]"));
+    assert_eq!(
+      log.requests.get(attempt_id).unwrap().request_classification,
+      state.request_classification
+    );
+
+    ctx.emit_stage(StageEvent::Completed {
+      success: false,
+      attempts: 2,
+    });
+    let event = events.try_recv().unwrap();
+    tty.handle(event.as_ref());
+    log.handle(event.as_ref());
+    let content = std::fs::read_to_string(progress_log_path(&dir)).unwrap();
+    assert!(content.contains("/backend-api/codex/responses [compaction] sent="));
+    assert!(content.contains("error=failed"));
+
+    drop(log);
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 
   #[test]

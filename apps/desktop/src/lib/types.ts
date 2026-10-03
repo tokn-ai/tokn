@@ -36,12 +36,23 @@ export interface UsageSummary {
   output_tokens: number;
   cached_tokens: number;
 }
+export interface RequestClassification {
+  purpose: "compaction";
+  source:
+    | "endpoint"
+    | "request_field"
+    | "codex_prompt"
+    | "claude_code_prompt"
+    | "opencode_prompt";
+}
+
 export interface RequestSummary {
   row_id: string;
   day: string;
   request_id: string;
   ts: number;
   endpoint: string | null;
+  request_classification: RequestClassification | null;
   status: number | null;
   request_error: string | null;
   session_id: string | null;

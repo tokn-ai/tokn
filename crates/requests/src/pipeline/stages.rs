@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
+use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{RequestEndpoint, Stage, StageEvent};
 use tokn_core::AgentId;
 use tokn_headers::{HeaderMap, TemplateVars};
@@ -312,6 +313,7 @@ pub struct Extracted {
   pub project_id: Option<SmolStr>,
   pub initiator: Option<SmolStr>,
   pub header_initiator: Option<SmolStr>,
+  pub request_classification: Option<RequestClassification>,
   pub route_mode_hint: Option<SmolStr>,
   pub headers: HeaderMap,
   pub raw_body: Bytes,
@@ -635,16 +637,28 @@ impl std::fmt::Debug for ConvertedResponse {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ExtractStage: Send + Sync {
   async fn extract(&self, ctx: &PipelineCtx, raw: RawInbound) -> Result<Extracted, PipelineError>;
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ResolveStage: Send + Sync {
   async fn resolve(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<Resolved, PipelineError>;
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait BuildHeadersStage: Send + Sync {
   async fn build_headers(
     &self,
@@ -655,6 +669,10 @@ pub trait BuildHeadersStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ConvertRequestStage: Send + Sync {
   async fn convert_request(
     &self,
@@ -665,6 +683,10 @@ pub trait ConvertRequestStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait SendStage: Send + Sync {
   async fn send(
     &self,
@@ -677,6 +699,10 @@ pub trait SendStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ConvertResponseStage: Send + Sync {
   async fn convert_buffered(
     &self,

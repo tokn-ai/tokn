@@ -588,6 +588,7 @@ mod tests {
       initiator: None,
       header_initiator: None,
       route_mode_hint: None,
+      request_classification: None,
       headers,
       raw_body: body_bytes.clone(),
       decoded_body: body_bytes,

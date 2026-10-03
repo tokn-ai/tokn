@@ -56,6 +56,10 @@ pub trait RequestSender: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait OutputTransformer: Send + Sync {
   type State;
   type Upstream;

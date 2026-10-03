@@ -7,6 +7,57 @@ use super::super::{
 use super::support::{request_ids, tempdir, write_request};
 
 #[test]
+fn request_summaries_read_classification_without_requiring_body_payloads() {
+  let dir = tempdir();
+  let day = "2026-07-14";
+  for request_id in ["compaction", "normal", "unknown-classification", "invalid-params"] {
+    write_request(&dir, day, request_id, 1_784_444_800_000, None, Some("openai"));
+  }
+  let conn = open_day_db(&dir.join(format!("{day}.db"))).unwrap();
+  for (request_id, params_json) in [
+    (
+      "compaction",
+      r#"{"stream":false,"request_classification":{"purpose":"compaction","source":"codex_prompt"}}"#,
+    ),
+    (
+      "unknown-classification",
+      r#"{"request_classification":{"purpose":"compaction","source":"future_source"}}"#,
+    ),
+    ("invalid-params", "invalid json"),
+  ] {
+    conn
+      .execute(
+        "UPDATE request_metadata SET params_json = ?2 WHERE request_id = ?1",
+        [request_id, params_json],
+      )
+      .unwrap();
+  }
+  conn
+    .execute("UPDATE request_downstream SET inbound_req_body = NULL", [])
+    .unwrap();
+
+  let page = list_requests(
+    &dir,
+    &RequestListOptions {
+      day: Some(day.to_string()),
+      ..RequestListOptions::default()
+    },
+  )
+  .unwrap();
+  assert_eq!(page.requests.len(), 4);
+  for request in page.requests {
+    if request.request_id == "compaction" {
+      assert_eq!(
+        serde_json::to_value(request.request_classification).unwrap(),
+        serde_json::json!({"purpose": "compaction", "source": "codex_prompt"})
+      );
+    } else {
+      assert!(request.request_classification.is_none());
+    }
+  }
+}
+
+#[test]
 fn paginates_a_request_day_without_duplicates_at_equal_timestamps() {
   let dir = tempdir();
   for request_id in ["request-a", "request-b", "request-c", "request-d", "request-e"] {

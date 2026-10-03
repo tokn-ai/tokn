@@ -17,6 +17,7 @@
 //! `SentResponse`, `ConvertedResponse`); requests provides `From` impls.
 
 use crate::provider::Endpoint;
+use crate::request_classification::RequestClassification;
 use crate::AgentId;
 use bytes::Bytes;
 use serde::Serialize;
@@ -121,6 +122,7 @@ impl std::fmt::Display for Stage {
 #[derive(Debug, Clone, Serialize)]
 pub struct ExtractedSummary {
   pub agent_id: Option<AgentId>,
+  pub request_classification: Option<RequestClassification>,
   pub model: SmolStr,
   pub stream: bool,
   pub session_id: Option<SmolStr>,

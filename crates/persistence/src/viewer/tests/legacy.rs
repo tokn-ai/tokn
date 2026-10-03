@@ -18,6 +18,51 @@ const PAYLOAD_FIELDS: &[&str] = &[
 ];
 
 #[test]
+fn split_v7_requests_have_no_classification_and_remain_unmigrated() {
+  let dir = tempdir();
+  let day = "2026-07-14";
+  let path = dir.join(format!("{day}.db"));
+  let conn = Connection::open(&path).unwrap();
+  for sql in [
+    include_str!("../../../schemas/snapshot/requests/v0.0.0.sql"),
+    include_str!("../../../schemas/migrations/requests/0002_add_correlation_and_error.sql"),
+    include_str!("../../../schemas/migrations/requests/0003_add_usage_breakdown.sql"),
+    include_str!("../../../schemas/migrations/requests/0004_add_response_header_latency.sql"),
+    include_str!("../../../schemas/migrations/requests/0005_add_source_and_method.sql"),
+    include_str!("../../../schemas/migrations/requests/0006_add_context_and_metrics.sql"),
+    include_str!("../../../schemas/migrations/requests/0007_split_requests.sql"),
+  ] {
+    conn.execute_batch(sql).unwrap();
+  }
+  conn
+    .execute_batch(
+      "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_ts INTEGER NOT NULL);
+       INSERT INTO schema_migrations VALUES (7, 'split_requests', 0);
+       INSERT INTO request_connection (request_id, ts, endpoint) VALUES ('split-request', 1784444800, 'responses');
+       INSERT INTO request_metadata (request_id, model) VALUES ('split-request', 'gpt-test');",
+    )
+    .unwrap();
+  drop(conn);
+
+  let page = list_requests(
+    &dir,
+    &RequestListOptions {
+      day: Some(day.to_string()),
+      ..RequestListOptions::default()
+    },
+  )
+  .unwrap();
+  assert_eq!(page.requests.len(), 1);
+  assert!(page.requests[0].request_classification.is_none());
+  assert_eq!(page.requests[0].ts, 1_784_444_800_000);
+  let conn = Connection::open(path).unwrap();
+  let version: u32 = conn
+    .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get(0))
+    .unwrap();
+  assert_eq!(version, 7);
+}
+
+#[test]
 fn legacy_pagination_uses_numeric_row_id_with_duplicate_and_null_request_ids() {
   let dir = tempdir();
   let path = dir.join("2026-07-14.db");
@@ -197,6 +242,7 @@ fn reads_legacy_request_days_without_migrating_them() {
   };
   let page = list_requests(&dir, &options).unwrap();
   assert_eq!(request_ids(&page.requests), ["legacy:2"]);
+  assert!(page.requests[0].request_classification.is_none());
   assert_eq!(page.requests[0].ts, 1_784_444_800_000);
   options.cursor = Some(RequestCursor::decode(page.next_cursor.as_deref().unwrap()).unwrap());
   let next_page = list_requests(&dir, &options).unwrap();

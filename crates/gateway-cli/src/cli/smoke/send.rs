@@ -12,8 +12,10 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokn_core::event::Event as CoreEvent;
 use tokn_core::provider::Endpoint;
+use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{
-  BuiltHeadersSummary, ConvertedRequestSummary, RequestEvent, RequestEventPayload, ResolvedSummary, StageEvent,
+  BuiltHeadersSummary, ConvertedRequestSummary, ExtractedSummary, RequestEvent, RequestEventPayload, ResolvedSummary,
+  StageEvent,
 };
 use tokn_policy::ClientAuthPlan;
 use tower::ServiceExt;
@@ -287,23 +289,9 @@ fn print_buffered_response(
   format: OutputFormat,
   redact: bool,
 ) -> Result<()> {
-  let body_json = serde_json::from_slice::<Value>(body).ok();
   match format {
     OutputFormat::Json => {
-      let report = serde_json::json!({
-        "listener": listener,
-        "request_id": snapshot.request_id,
-        "account": snapshot.resolved.as_ref().map(|resolved| resolved.account_id.as_str()),
-        "provider": snapshot.configured_provider,
-        "driver": snapshot.resolved.as_ref().map(|resolved| resolved.provider_id.as_str()),
-        "model": snapshot.resolved.as_ref().map(|resolved| resolved.model.as_str()),
-        "upstream_model": snapshot.resolved.as_ref().map(|resolved| resolved.upstream_model.as_str()),
-        "upstream_endpoint": snapshot.resolved.as_ref().and_then(|resolved| resolved.upstream_endpoint).map(|endpoint| endpoint.as_str()),
-        "attempts": snapshot.attempts,
-        "status": status.as_u16(),
-        "headers": headers_json_value(headers, redact),
-        "body": body_json.unwrap_or_else(|| Value::String(String::from_utf8_lossy(body).into_owned())),
-      });
+      let report = buffered_result(listener, status, headers, body, snapshot, redact);
       println!("{}", serde_json::to_string_pretty(&report)?);
     }
     OutputFormat::Text => {
@@ -323,13 +311,38 @@ fn print_buffered_response(
       println!("status:   {status}");
       print_headers_text(headers, redact);
       println!("body:");
-      match body_json {
+      match serde_json::from_slice::<Value>(body).ok() {
         Some(body) => println!("{}", serde_json::to_string_pretty(&body)?),
         None => println!("{}", String::from_utf8_lossy(body)),
       }
     }
   }
   Ok(())
+}
+
+fn buffered_result(
+  listener: &str,
+  status: http::StatusCode,
+  headers: &http::HeaderMap,
+  body: &Bytes,
+  snapshot: &CapturedSnapshot,
+  redact: bool,
+) -> Value {
+  serde_json::json!({
+    "listener": listener,
+    "request_id": snapshot.request_id,
+    "request_classification": snapshot.request_classification,
+    "account": snapshot.resolved.as_ref().map(|resolved| resolved.account_id.as_str()),
+    "provider": snapshot.configured_provider,
+    "driver": snapshot.resolved.as_ref().map(|resolved| resolved.provider_id.as_str()),
+    "model": snapshot.resolved.as_ref().map(|resolved| resolved.model.as_str()),
+    "upstream_model": snapshot.resolved.as_ref().map(|resolved| resolved.upstream_model.as_str()),
+    "upstream_endpoint": snapshot.resolved.as_ref().and_then(|resolved| resolved.upstream_endpoint).map(Endpoint::as_str),
+    "attempts": snapshot.attempts,
+    "status": status.as_u16(),
+    "headers": headers_json_value(headers, redact),
+    "body": serde_json::from_slice::<Value>(body).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body).into_owned())),
+  })
 }
 
 fn print_dry_run_response(
@@ -343,21 +356,7 @@ fn print_dry_run_response(
   let converted = snapshot.converted_request.as_ref();
   match format {
     OutputFormat::Json => {
-      let report = serde_json::json!({
-        "dry_run": true,
-        "listener": listener,
-        "request_id": snapshot.request_id,
-        "account": resolved.map(|resolved| resolved.account_id.as_str()),
-        "provider": snapshot.configured_provider,
-        "driver": resolved.map(|resolved| resolved.provider_id.as_str()),
-        "model": resolved.map(|resolved| resolved.model.as_str()),
-        "upstream_model": resolved.map(|resolved| resolved.upstream_model.as_str()),
-        "upstream_endpoint": resolved.and_then(|resolved| resolved.upstream_endpoint).map(Endpoint::as_str),
-        "attempts": snapshot.attempts,
-        "headers": headers.map(|headers| pipeline_headers_json(&headers.headers, redact)).unwrap_or(Value::Null),
-        "body": converted.map(|converted| (*converted.upstream_body).clone()).unwrap_or(Value::Null),
-        "content_encoding": converted.and_then(|converted| converted.content_encoding.as_deref()),
-      });
+      let report = dry_run_result(listener, snapshot, redact);
       println!("{}", serde_json::to_string_pretty(&report)?);
     }
     OutputFormat::Text => {
@@ -396,6 +395,28 @@ fn print_dry_run_response(
   Ok(())
 }
 
+fn dry_run_result(listener: &str, snapshot: &CapturedSnapshot, redact: bool) -> Value {
+  let resolved = snapshot.resolved.as_ref();
+  let headers = snapshot.built_headers.as_ref();
+  let converted = snapshot.converted_request.as_ref();
+  serde_json::json!({
+    "dry_run": true,
+    "listener": listener,
+    "request_id": snapshot.request_id,
+    "request_classification": snapshot.request_classification,
+    "account": resolved.map(|resolved| resolved.account_id.as_str()),
+    "provider": snapshot.configured_provider,
+    "driver": resolved.map(|resolved| resolved.provider_id.as_str()),
+    "model": resolved.map(|resolved| resolved.model.as_str()),
+    "upstream_model": resolved.map(|resolved| resolved.upstream_model.as_str()),
+    "upstream_endpoint": resolved.and_then(|resolved| resolved.upstream_endpoint).map(Endpoint::as_str),
+    "attempts": snapshot.attempts,
+    "headers": headers.map(|headers| pipeline_headers_json(&headers.headers, redact)).unwrap_or(Value::Null),
+    "body": converted.map(|converted| (*converted.upstream_body).clone()).unwrap_or(Value::Null),
+    "content_encoding": converted.and_then(|converted| converted.content_encoding.as_deref()),
+  })
+}
+
 #[derive(Default)]
 struct Captured {
   inner: Mutex<CapturedSnapshot>,
@@ -405,6 +426,7 @@ struct Captured {
 #[derive(Clone, Default)]
 struct CapturedSnapshot {
   request_id: Option<String>,
+  request_classification: Option<RequestClassification>,
   configured_provider: Option<String>,
   resolved: Option<ResolvedSummary>,
   built_headers: Option<BuiltHeadersSummary>,
@@ -429,6 +451,9 @@ impl Captured {
             let mut snapshot = sink.inner.lock().unwrap();
             snapshot.request_id.get_or_insert_with(|| event.request_id.to_string());
             match &event.payload {
+              RequestEventPayload::Stage(StageEvent::Extract(extracted)) => {
+                snapshot.request_classification = extracted.request_classification;
+              }
               RequestEventPayload::Stage(StageEvent::Resolve(resolved)) => snapshot.resolved = Some(resolved.clone()),
               RequestEventPayload::Stage(StageEvent::BuildHeaders(headers)) => {
                 snapshot.built_headers = Some(headers.clone())
@@ -493,10 +518,7 @@ fn print_event(event: &RequestEvent) {
   };
   match stage {
     StageEvent::Started { request_endpoint } => println!("[started]          endpoint={request_endpoint}"),
-    StageEvent::Extract(extracted) => println!(
-      "[extract]          model={} stream={}",
-      extracted.model, extracted.stream
-    ),
+    StageEvent::Extract(extracted) => println!("{}", extract_event_text(extracted)),
     StageEvent::Resolve(resolved) => println!(
       "[resolve]          model={} -> {} account={} driver={} upstream_endpoint={}",
       resolved.model,
@@ -519,6 +541,17 @@ fn print_event(event: &RequestEvent) {
       println!("[completed]        success={success} attempts={attempts}")
     }
   }
+}
+
+fn extract_event_text(extracted: &ExtractedSummary) -> String {
+  let label = extracted
+    .request_classification
+    .map(|classification| format!(" [{}]", classification.purpose.as_str()))
+    .unwrap_or_default();
+  format!(
+    "[extract]          model={} stream={}{}",
+    extracted.model, extracted.stream, label
+  )
 }
 
 fn parse_header_kv(raw: &str) -> std::result::Result<(String, String), String> {
@@ -659,6 +692,86 @@ fn redact_header(name: &str, value: &str, redact: bool) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tokn_core::request_classification::{RequestClassificationSource, RequestPurpose};
+
+  fn extract_summary(request_classification: Option<RequestClassification>) -> ExtractedSummary {
+    ExtractedSummary {
+      agent_id: None,
+      request_classification,
+      model: "gpt-test".into(),
+      stream: false,
+      session_id: None,
+      project_id: None,
+      initiator: None,
+      header_initiator: None,
+      route_mode_hint: None,
+      headers: tokn_headers::HeaderMap::new(),
+      raw_body: Bytes::new(),
+      decoded_body: Bytes::new(),
+      body_json: Arc::new(Value::Null),
+    }
+  }
+
+  #[tokio::test]
+  async fn smoke_reports_preserve_extract_classification_or_unknown() {
+    for request_classification in [
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::CodexPrompt,
+      }),
+      None,
+    ] {
+      let events = tokn_core::event::EventBus::new(16);
+      let captured = Captured::install(&events);
+      for stage in [
+        StageEvent::Extract(extract_summary(request_classification)),
+        StageEvent::Completed {
+          success: true,
+          attempts: 1,
+        },
+      ] {
+        events.emit(CoreEvent::Requests(RequestEvent {
+          request_id: "req-smoke-classification".into(),
+          attempt: 0,
+          ts: 1,
+          payload: RequestEventPayload::Stage(stage),
+        }));
+      }
+      let snapshot = captured.snapshot_after_completion().await;
+      assert!(snapshot.completed);
+      assert_eq!(snapshot.request_classification, request_classification);
+
+      let expected = serde_json::to_value(request_classification).unwrap();
+      let response_headers = http::HeaderMap::new();
+      let body = Bytes::from_static(br#"{"result":"ok"}"#);
+      for report in [
+        buffered_result("api", http::StatusCode::OK, &response_headers, &body, &snapshot, true),
+        dry_run_result("api", &snapshot, true),
+      ] {
+        let serialized = serde_json::to_string(&report).unwrap();
+        let report: Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(report["request_classification"], expected);
+        assert_eq!(report["request_id"], "req-smoke-classification");
+        assert_eq!(report["attempts"], 1);
+      }
+    }
+  }
+
+  #[test]
+  fn extract_text_only_labels_classified_requests() {
+    let classified = extract_summary(Some(RequestClassification {
+      purpose: RequestPurpose::Compaction,
+      source: RequestClassificationSource::RequestField,
+    }));
+    assert_eq!(
+      extract_event_text(&classified),
+      "[extract]          model=gpt-test stream=false [compaction]"
+    );
+    assert_eq!(
+      extract_event_text(&extract_summary(None)),
+      "[extract]          model=gpt-test stream=false"
+    );
+  }
 
   #[test]
   fn smoke_uses_only_profile_mounts_and_rejects_missing_or_proxy_only_profiles() {

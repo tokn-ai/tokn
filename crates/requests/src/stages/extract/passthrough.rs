@@ -1,15 +1,15 @@
-//! Zero-parse Extract stage for the passthrough pipeline.
+//! Best-effort inspection for the passthrough pipeline.
 //!
 //! The contract differs from [`DefaultExtract`](super::DefaultExtract) on
 //! one axis: we must **not** treat the inbound JSON body as authoritative
 //! and we must **not** keep it around as `Arc<Value>` for downstream
 //! stages to re-serialize. The body bytes are forwarded verbatim by
-//! [`PassthroughConvertRequest`](crate::stages::PassthroughConvertRequest)
-//! and the only thing Resolve needs is the *model name*.
+//! [`PassthroughConvertRequest`](crate::stages::PassthroughConvertRequest).
 //!
-//! Strategy: do a single cheap `serde_json::from_slice::<ModelPeek>(...)`
-//! to pull `model` (and `stream`) out of the body, then discard the parsed
-//! value. The full body bytes remain in `raw_body` / `decoded_body` and
+//! Strategy: retain the typed metadata peek for model and stream, then parse
+//! the decoded bytes separately for observational classification. Both values
+//! are discarded; neither parse affects forwarding. The full body bytes remain
+//! in `raw_body` / `decoded_body` and
 //! `body_json` is set to `Value::Null` to signal "do not consult".
 //!
 //! Header extraction (session, project, route mode, initiator, etc.)
@@ -25,12 +25,12 @@ use serde::Deserialize;
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
+use tokn_core::request_classification::classify_request;
 use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS};
 use tokn_headers::HeaderMap;
 
-/// Minimal field set peeled off the inbound JSON body. Everything else
-/// is intentionally ignored — the body bytes are forwarded verbatim
-/// without re-serialization.
+/// Preserve the original all-or-nothing metadata peek: an invalid type in
+/// either field makes both peeked fields unavailable.
 #[derive(Debug, Default, Deserialize)]
 struct ModelPeek {
   #[serde(default)]
@@ -53,10 +53,11 @@ impl ExtractStage for PassthroughExtract {
       request_id: _,
     } = raw;
 
-    // Cheap peek for routing-relevant fields. We deliberately ignore
-    // parse errors — passthrough must remain best-effort for routing
-    // while still forwarding the original bytes verbatim.
-    let peek: ModelPeek = serde_json::from_slice(&decoded_body).unwrap_or_default();
+    // Preserve typed-peek behavior, including rejection of duplicate keys
+    // and invalid field types. Classification parses independently so it
+    // cannot change routing metadata or the original forwarded bytes.
+    let peek = serde_json::from_slice::<ModelPeek>(&decoded_body).unwrap_or_default();
+    let inspected_body = serde_json::from_slice::<Value>(&decoded_body).unwrap_or(Value::Null);
 
     let model = peek
       .model
@@ -64,6 +65,7 @@ impl ExtractStage for PassthroughExtract {
       .unwrap_or_else(|| SmolStr::new("unknown"));
 
     let stream = peek.stream.unwrap_or_else(|| accept_is_sse(&headers));
+    let request_classification = classify_request(&ctx.request_endpoint, &inspected_body);
 
     let header_initiator = header_str(&headers, "x-initiator")
       .map(|s| s.trim().to_ascii_lowercase())
@@ -94,6 +96,7 @@ impl ExtractStage for PassthroughExtract {
       project_id,
       initiator,
       header_initiator,
+      request_classification,
       route_mode_hint,
       headers,
       raw_body,
@@ -125,6 +128,8 @@ mod tests {
   use bytes::Bytes;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
+  use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
+  use tokn_core::request_event::RequestEndpoint;
 
   fn ctx() -> PipelineCtx {
     PipelineCtx::new(
@@ -181,6 +186,135 @@ mod tests {
     assert_eq!(ex.model, "unknown");
     assert!(!ex.stream);
     assert_eq!(ex.raw_body, body);
+  }
+
+  #[tokio::test]
+  async fn invalid_stream_type_invalidates_the_entire_metadata_peek() {
+    let body = Bytes::from_static(br#"{"model":"gpt-test","stream":"true"}"#);
+    let headers = header_map(&[("accept", "text/event-stream")]);
+    let ex = PassthroughExtract
+      .extract(&ctx(), raw_with_body(body.clone(), headers))
+      .await
+      .unwrap();
+    assert_eq!(ex.model, "unknown");
+    assert!(ex.stream, "invalid stream falls back to Accept");
+    assert_eq!(ex.raw_body, body);
+    assert_eq!(*ex.body_json, Value::Null);
+  }
+
+  #[tokio::test]
+  async fn duplicate_model_key_invalidates_peek_but_not_classification() {
+    let body = Bytes::from_static(
+      br#"{"model":"first","model":"second","stream":false,"messages":[{"role":"user","content":"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task."}]}"#,
+    );
+    let headers = header_map(&[("accept", "text/event-stream")]);
+    let ex = PassthroughExtract
+      .extract(&ctx(), raw_with_body(body.clone(), headers))
+      .await
+      .unwrap();
+    assert_eq!(ex.model, "unknown");
+    assert!(ex.stream, "duplicate model invalidates stream peek too");
+    assert_eq!(ex.raw_body, body);
+    assert_eq!(
+      ex.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::CodexPrompt,
+      })
+    );
+  }
+
+  #[tokio::test]
+  async fn responses_compaction_trigger_is_classified_without_changing_proxy_bytes() {
+    let endpoint = RequestEndpoint::custom("/backend-api/codex/responses");
+    let ctx = PipelineCtx::new("req-passthrough-trigger", endpoint.clone(), Arc::new(EventBus::new(64)));
+    let body =
+      Bytes::from_static(br#"{ "model": "gpt-test", "stream": true, "input": [{"type":"compaction_trigger"}] }"#);
+    let ex = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: HeaderMap::new(),
+          raw_body: body.clone(),
+          decoded_body: body.clone(),
+          body_json: Value::Null,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(ex.model, "gpt-test");
+    assert!(ex.stream);
+    assert_eq!(
+      ex.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::RequestField,
+      })
+    );
+    assert_eq!(ex.raw_body, body);
+    assert_eq!(ex.decoded_body, body);
+    assert_eq!(*ex.body_json, Value::Null);
+  }
+
+  #[tokio::test]
+  async fn compact_endpoint_is_classified_without_changing_forwarded_bytes() {
+    let endpoint = RequestEndpoint::custom("/v1/responses/compact");
+    let ctx = PipelineCtx::new("req-passthrough-compact", endpoint.clone(), Arc::new(EventBus::new(64)));
+    let raw_body = Bytes::from_static(b"wire bytes stay untouched");
+    let decoded_body = Bytes::from_static(br#"{"model":"gpt-test","stream":true}"#);
+    let inbound = RawInbound {
+      request_endpoint: endpoint,
+      headers: HeaderMap::new(),
+      raw_body: raw_body.clone(),
+      decoded_body: decoded_body.clone(),
+      body_json: serde_json::json!({"model": "do-not-use"}),
+      request_id: None,
+    };
+    let ex = PassthroughExtract.extract(&ctx, inbound).await.unwrap();
+    assert_eq!(ex.model, "gpt-test");
+    assert!(ex.stream);
+    assert_eq!(
+      ex.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::Endpoint,
+      })
+    );
+    assert_eq!(ex.raw_body, raw_body);
+    assert_eq!(ex.decoded_body, decoded_body);
+    assert_eq!(*ex.body_json, Value::Null);
+  }
+
+  #[tokio::test]
+  async fn compact_endpoint_is_classified_even_when_body_is_malformed() {
+    let endpoint = RequestEndpoint::custom("/v1/responses/compact");
+    let ctx = PipelineCtx::new("req-passthrough-compact", endpoint.clone(), Arc::new(EventBus::new(64)));
+    let malformed = Bytes::from_static(b"{not json");
+    let ex = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: HeaderMap::new(),
+          raw_body: malformed.clone(),
+          decoded_body: malformed.clone(),
+          body_json: Value::Null,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    assert_eq!(ex.model, "unknown");
+    assert_eq!(ex.raw_body, malformed);
+    assert_eq!(
+      ex.request_classification,
+      Some(RequestClassification {
+        purpose: RequestPurpose::Compaction,
+        source: RequestClassificationSource::Endpoint,
+      })
+    );
   }
 
   #[tokio::test]
