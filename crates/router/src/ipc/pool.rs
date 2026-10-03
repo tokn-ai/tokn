@@ -4,7 +4,7 @@ use super::protocol::{WireContext, CONNECT_TIMEOUT, CONTEXT_HEADER, MAX_CONTEXT_
 use super::transport::{exchange, strip_connection_headers, strip_internal_headers};
 use super::WorkerInfo;
 use crate::dispatch::{DispatchContext, RequestDispatcher};
-use crate::routing::{AbTestStatus, RoutingControl, RoutingReport, WorkerState, WorkerStatus};
+use crate::routing::{AbTestStatus, RolloutPolicy, RoutingControl, RoutingReport, WorkerState, WorkerStatus};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokn_policy::GatewayPlan;
 
 #[derive(Clone, Debug)]
@@ -49,8 +49,6 @@ struct RoutingTable {
   generation: u64,
 }
 
-const AB_TEST_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegistrationMode {
   Current,
@@ -62,17 +60,42 @@ struct AbTest {
   baseline_worker_id: String,
   worker_id: String,
   started: Instant,
+  policy: RolloutPolicy,
+  duration_seconds: u64,
 }
 
 impl AbTest {
+  fn progress(&self, now: Instant) -> (u64, u32) {
+    let elapsed = now
+      .saturating_duration_since(self.started)
+      .as_secs()
+      .min(self.duration_seconds);
+    if elapsed == self.duration_seconds {
+      return (elapsed, self.policy.completion_percent);
+    }
+    let mut remaining = elapsed;
+    let mut previous = self.policy.initial_percent;
+    for stage in &self.policy.stages {
+      if remaining < stage.duration_seconds {
+        let delta = i128::from(stage.traffic_percent) - i128::from(previous);
+        let percent = i128::from(previous) + delta * i128::from(remaining) / i128::from(stage.duration_seconds);
+        return (elapsed, percent as u32);
+      }
+      remaining -= stage.duration_seconds;
+      previous = stage.traffic_percent;
+    }
+    unreachable!("validated stages cover the policy duration")
+  }
+
   fn status(&self, now: Instant) -> AbTestStatus {
-    let elapsed = now.saturating_duration_since(self.started).min(AB_TEST_DURATION);
+    let (elapsed_seconds, traffic_percent) = self.progress(now);
     AbTestStatus {
       baseline_worker_id: self.baseline_worker_id.clone(),
       worker_id: self.worker_id.clone(),
-      elapsed_seconds: elapsed.as_secs(),
-      duration_seconds: AB_TEST_DURATION.as_secs(),
-      traffic_percent: 10 + (elapsed.as_secs() * 80 / AB_TEST_DURATION.as_secs()) as u32,
+      elapsed_seconds,
+      duration_seconds: self.duration_seconds,
+      traffic_percent,
+      rollout_policy: Some(self.policy.clone()),
     }
   }
 }
@@ -94,20 +117,24 @@ impl RoutingTable {
       self.ab_test = None;
       return;
     };
-    let status = experiment.status(now);
-    if status.elapsed_seconds == status.duration_seconds {
-      self.weights[baseline] = 0;
-      self.weights[candidate] = 1;
-      self.total_weight = 1;
+    let (elapsed_seconds, percent) = experiment.progress(now);
+    if elapsed_seconds == experiment.duration_seconds {
+      self.weights[baseline] = 100 - percent;
+      self.weights[candidate] = percent;
+      self.total_weight = 100;
       self.stats[baseline].keep_alive.store(false, Ordering::Release);
       self.stats[candidate].keep_alive.store(false, Ordering::Release);
       self.stats[baseline].changed.notify_waiters();
+      self.stats[candidate].changed.notify_waiters();
       self.ab_test = None;
+      self.advance_main();
       self.generation += 1;
-      tracing::info!("A/B ramp complete; new worker receives all traffic and baseline drains");
+      tracing::info!(
+        traffic_percent = percent,
+        "rollout policy complete; zero-weight workers drain"
+      );
       return;
     }
-    let percent = status.traffic_percent;
     if self.weights[candidate] != percent {
       self.weights[candidate] = percent;
       self.weights[baseline] = 100 - percent;
@@ -250,16 +277,19 @@ impl WorkerPool {
   /// Validate before atomically promoting the newcomer. Previous workers become stale and
   /// may take over again until they claim automatic exit after draining.
   pub async fn register(&self, worker: WorkerEndpoint) -> Result<()> {
-    self.register_inner(worker, RegistrationMode::Current).await
+    self.register_inner(worker, RegistrationMode::Current, None).await
   }
 
   pub async fn register_candidate(&self, worker: WorkerEndpoint) -> Result<()> {
-    self.register_inner(worker, RegistrationMode::Candidate).await
+    self.register_inner(worker, RegistrationMode::Candidate, None).await
   }
 
-  /// Start a frontend-owned linear ramp against the sole active baseline worker.
-  pub async fn register_ab_test(&self, worker: WorkerEndpoint) -> Result<()> {
-    self.register_inner(worker, RegistrationMode::AbTest).await
+  /// Initialize an immutable policy against the sole active baseline worker.
+  pub async fn register_rollout(&self, worker: WorkerEndpoint, policy: RolloutPolicy) -> Result<()> {
+    policy.validate()?;
+    self
+      .register_inner(worker, RegistrationMode::AbTest, Some(policy))
+      .await
   }
 
   /// Called by the frontend clock independently of request arrivals.
@@ -267,7 +297,12 @@ impl WorkerPool {
     self.routing.write().advance_ab_test(Instant::now());
   }
 
-  async fn register_inner(&self, worker: WorkerEndpoint, mode: RegistrationMode) -> Result<()> {
+  async fn register_inner(
+    &self,
+    worker: WorkerEndpoint,
+    mode: RegistrationMode,
+    policy: Option<RolloutPolicy>,
+  ) -> Result<()> {
     let candidate = mode == RegistrationMode::Candidate;
     let _update = self.update_lock.lock().await;
     anyhow::ensure!(!worker.worker_id.trim().is_empty(), "worker id must not be empty");
@@ -316,14 +351,19 @@ impl WorkerPool {
       }
       routing.weights.fill(0);
     }
+    let initial_percent = policy.as_ref().map_or(0, |policy| policy.initial_percent);
     if let Some(baseline) = baseline {
+      let policy = policy.context("missing rollout policy")?;
+      let duration_seconds = policy.validate()?;
       *routing.stats[baseline].state.write() = WorkerState::Stale;
       routing.stats[baseline].keep_alive.store(false, Ordering::Release);
-      routing.weights[baseline] = 90;
+      routing.weights[baseline] = 100 - initial_percent;
       routing.ab_test = Some(AbTest {
         baseline_worker_id: routing.workers[baseline].worker_id.clone(),
         worker_id: worker.worker_id.clone(),
         started: Instant::now(),
+        policy,
+        duration_seconds,
       });
       routing.stats[baseline].changed.notify_waiters();
     }
@@ -343,7 +383,7 @@ impl WorkerPool {
     routing.weights.push(match mode {
       RegistrationMode::Current => 1,
       RegistrationMode::Candidate => 0,
-      RegistrationMode::AbTest => 10,
+      RegistrationMode::AbTest => initial_percent,
     });
     if !candidate {
       routing.total_weight = if baseline.is_some() { 100 } else { 1 };
@@ -701,12 +741,24 @@ impl RequestDispatcher for WorkerPool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::routing::RolloutStage;
+  use std::time::Duration;
+  const AB_TEST_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 
   fn experiment(started: Instant) -> AbTest {
     AbTest {
       baseline_worker_id: "old".into(),
       worker_id: "new".into(),
       started,
+      policy: RolloutPolicy {
+        initial_percent: 10,
+        stages: vec![RolloutStage {
+          duration_seconds: AB_TEST_DURATION.as_secs(),
+          traffic_percent: 90,
+        }],
+        completion_percent: 100,
+      },
+      duration_seconds: AB_TEST_DURATION.as_secs(),
     }
   }
 
@@ -719,13 +771,143 @@ mod tests {
       (6 * 3600, 30, false),
       (12 * 3600, 50, false),
       (24 * 3600 - 1, 89, false),
-      (24 * 3600, 90, true),
-      (48 * 3600, 90, true),
+      (24 * 3600, 100, true),
+      (48 * 3600, 100, true),
     ] {
       let status = ramp.status(start + Duration::from_secs(seconds));
       assert_eq!(status.traffic_percent, percent);
       assert_eq!(status.elapsed_seconds == status.duration_seconds, complete);
       assert!(status.elapsed_seconds <= status.duration_seconds);
+    }
+  }
+
+  #[test]
+  fn policies_support_longer_rollouts_holds_and_decreasing_traffic() {
+    let start = Instant::now();
+    let mut ramp = experiment(start);
+    ramp.policy = RolloutPolicy {
+      initial_percent: 10,
+      stages: vec![
+        RolloutStage {
+          duration_seconds: 36 * 3600,
+          traffic_percent: 50,
+        },
+        RolloutStage {
+          duration_seconds: 36 * 3600,
+          traffic_percent: 90,
+        },
+      ],
+      completion_percent: 100,
+    };
+    ramp.duration_seconds = ramp.policy.validate().unwrap();
+    for (hours, percent) in [(0, 10), (18, 30), (36, 50), (54, 70), (72, 100), (100, 100)] {
+      assert_eq!(ramp.progress(start + Duration::from_secs(hours * 3600)).1, percent);
+    }
+    ramp.policy = RolloutPolicy {
+      initial_percent: 60,
+      stages: vec![
+        RolloutStage {
+          duration_seconds: 3600,
+          traffic_percent: 60,
+        },
+        RolloutStage {
+          duration_seconds: 2 * 3600,
+          traffic_percent: 20,
+        },
+      ],
+      completion_percent: 0,
+    };
+    ramp.duration_seconds = ramp.policy.validate().unwrap();
+    assert_eq!(ramp.progress(start + Duration::from_secs(1800)).1, 60);
+    assert_eq!(ramp.progress(start + Duration::from_secs(2 * 3600)).1, 40);
+    assert_eq!(ramp.progress(start + Duration::from_secs(3 * 3600)).1, 0);
+  }
+
+  #[test]
+  fn invalid_policies_are_rejected() {
+    let valid = experiment(Instant::now()).policy;
+    for invalid in [
+      RolloutPolicy {
+        initial_percent: 0,
+        ..valid.clone()
+      },
+      RolloutPolicy {
+        completion_percent: 101,
+        ..valid.clone()
+      },
+      RolloutPolicy {
+        stages: vec![],
+        ..valid.clone()
+      },
+      RolloutPolicy {
+        stages: vec![RolloutStage {
+          duration_seconds: 0,
+          traffic_percent: 50,
+        }],
+        ..valid.clone()
+      },
+      RolloutPolicy {
+        stages: vec![RolloutStage {
+          duration_seconds: 1,
+          traffic_percent: 100,
+        }],
+        ..valid.clone()
+      },
+      RolloutPolicy {
+        stages: vec![
+          RolloutStage {
+            duration_seconds: u64::MAX,
+            traffic_percent: 50,
+          },
+          RolloutStage {
+            duration_seconds: 1,
+            traffic_percent: 90,
+          },
+        ],
+        ..valid
+      },
+    ] {
+      assert!(invalid.validate().is_err());
+    }
+  }
+
+  #[test]
+  fn completion_can_keep_a_split_or_return_traffic_to_the_baseline() {
+    for (percent, main) in [(90, "new"), (0, "old")] {
+      let start = Instant::now();
+      let pool = WorkerPool::new(vec![
+        WorkerEndpoint {
+          worker_id: "old".into(),
+          socket_path: "/tmp/old.sock".into(),
+          weight: 90,
+        },
+        WorkerEndpoint {
+          worker_id: "new".into(),
+          socket_path: "/tmp/new.sock".into(),
+          weight: 10,
+        },
+      ])
+      .unwrap();
+      let mut rollout = experiment(start);
+      rollout.policy.completion_percent = percent;
+      {
+        let mut routing = pool.routing.write();
+        routing.main_worker_id = Some("new".into());
+        *routing.stats[0].state.write() = WorkerState::Stale;
+        *routing.stats[1].state.write() = WorkerState::Current;
+        routing.ab_test = Some(rollout);
+        routing.advance_ab_test(start + AB_TEST_DURATION);
+        assert!(routing.ab_test.is_none());
+        assert_eq!(routing.main_worker_id.as_deref(), Some(main));
+        assert_eq!(routing.weights, vec![100 - percent, percent]);
+      }
+      let mut counts = [0, 0];
+      for _ in 0..100 {
+        let (worker, mut lease) = pool.select().unwrap();
+        counts[usize::from(worker.worker_id == "new")] += 1;
+        lease.finish();
+      }
+      assert_eq!(counts, [100 - percent, percent]);
     }
   }
 

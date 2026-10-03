@@ -21,6 +21,7 @@ mod migration;
 mod onboarding;
 mod proxy;
 mod requests;
+mod rollout;
 mod serve;
 mod sessions;
 mod smoke;

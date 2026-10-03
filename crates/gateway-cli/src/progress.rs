@@ -1062,6 +1062,7 @@ mod tests {
       elapsed_seconds: 60,
       duration_seconds: 24 * 3600,
       traffic_percent: 10,
+      rollout_policy: None,
     });
     footer.refresh();
     assert_eq!(
@@ -1083,6 +1084,7 @@ mod tests {
       elapsed_seconds: 0,
       duration_seconds: 24 * 3600,
       traffic_percent: 10,
+      rollout_policy: None,
     });
     footer.refresh();
     assert_eq!(

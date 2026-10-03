@@ -26,10 +26,9 @@ pub struct ServeArgs {
   /// Also expose the legacy proxy through the stable frontend.
   #[arg(long)]
   pub with_proxy: bool,
-  /// Ramp this worker from 10% to 90% of requests over 24 hours.
-  #[arg(long)]
-  #[serde(default)]
-  pub ab_test: bool,
+  #[command(flatten)]
+  #[serde(flatten)]
+  pub rollout: super::rollout::RolloutArgs,
   /// Override the projected proxy listener's static route mode.
   #[arg(long, value_enum, requires = "with_proxy")]
   pub proxy_route_mode: Option<RouteModeArg>,
@@ -50,7 +49,11 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
 }
 
 pub(super) async fn run_direct(cfg_path: Option<PathBuf>, args: ServeArgs) -> Result<()> {
-  anyhow::ensure!(!args.ab_test, "--ab-test requires the Unix frontend/worker runtime");
+  anyhow::ensure!(
+    !args.rollout.ab_test,
+    "--ab-test requires the Unix frontend/worker runtime"
+  );
+  args.rollout.policy()?;
   let config = tokn_config::load_config(cfg_path.as_deref())?;
   let resolved_cfg_path = config.path().to_path_buf();
   match config.schema() {
@@ -696,7 +699,7 @@ client_auth = "none"
       host: None,
       port: None,
       with_proxy: false,
-      ab_test: false,
+      rollout: Default::default(),
       proxy_route_mode: None,
       insecure_allow_remote: false,
       no_proxy: false,
@@ -1260,7 +1263,7 @@ default_connect = "{default_connect}"
       host: None,
       port: None,
       with_proxy: true,
-      ab_test: false,
+      rollout: Default::default(),
       proxy_route_mode: None,
       insecure_allow_remote: false,
       no_proxy: false,

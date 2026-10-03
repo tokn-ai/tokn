@@ -2,7 +2,7 @@ use super::protocol::CONTEXT_HEADER;
 use super::*;
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
 use crate::frontend::Frontend;
-use crate::routing::{RoutingControl, WorkerState};
+use crate::routing::{RolloutPolicy, RolloutStage, RoutingControl, WorkerState};
 use crate::v2::{build_worker_runtime_states, LiveRuntime};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -747,10 +747,31 @@ async fn ab_test_registration_shares_traffic_and_manual_weights_cancel_the_ramp(
   )
   .await;
   let pool = WorkerPool::empty(compiled.gateway()).unwrap();
-  assert!(pool.register_ab_test(new.endpoint("new", 1)).await.is_err());
+  let policy = RolloutPolicy {
+    initial_percent: 10,
+    stages: vec![RolloutStage {
+      duration_seconds: 24 * 3600,
+      traffic_percent: 90,
+    }],
+    completion_percent: 100,
+  };
+  assert!(pool
+    .register_rollout(new.endpoint("new", 1), policy.clone())
+    .await
+    .is_err());
   assert!(pool.status().workers.is_empty());
   pool.register(old.endpoint("old", 1)).await.unwrap();
-  pool.register_ab_test(new.endpoint("new", 1)).await.unwrap();
+  let mut invalid = policy.clone();
+  invalid.initial_percent = 0;
+  assert!(pool.register_rollout(new.endpoint("new", 1), invalid).await.is_err());
+  let unchanged = pool.status();
+  assert_eq!(unchanged.workers.len(), 1);
+  assert_eq!(unchanged.main_worker_id.as_deref(), Some("old"));
+  assert!(unchanged.ab_test.is_none());
+  pool
+    .register_rollout(new.endpoint("new", 1), policy.clone())
+    .await
+    .unwrap();
   let report = pool.status();
   assert_eq!(report.main_worker_id.as_deref(), Some("new"));
   assert_eq!(report.workers[0].state, WorkerState::Stale);
@@ -782,7 +803,7 @@ async fn ab_test_registration_shares_traffic_and_manual_weights_cancel_the_ramp(
   assert_eq!(pool.status().main_worker_id.as_deref(), Some("old"));
   assert_eq!(pool.status().workers[1].weight, 0);
   pool.disconnect("new");
-  pool.register_ab_test(new.endpoint("new", 1)).await.unwrap();
+  pool.register_rollout(new.endpoint("new", 1), policy).await.unwrap();
   pool.retire("old").unwrap();
   pool.advance_ab_test();
   assert!(pool.status().ab_test.is_none());

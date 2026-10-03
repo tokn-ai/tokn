@@ -901,6 +901,8 @@ existing requests finish before exit. Press Ctrl-C again to exit immediately.
 
 Use `worker start --ab-test` or `serve --ab-test` to ramp a new worker from
 10% toward 90% over 24 hours, then switch to 100% and drain the baseline.
+Set `--ab-test-duration 72h` for a longer ramp, or `--ab-test-policy rollout.toml`
+for custom stages. Policies are initialized at worker startup and stay fixed.
 Use `worker start --candidate` for A/B experiments with manual traffic weights.
 See [request-level version dispatch](docs/version-dispatch.md) for commands,
 configuration, compatibility, and process lifecycle.

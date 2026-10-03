@@ -489,9 +489,24 @@ base_url = "http://{old_address}/v1"
 
 #[tokio::test]
 async fn ab_test_flags_keep_idle_baseline_available_and_interrupt_cancels_the_ramp() {
-  for command in [&["serve", "--ab-test"][..], &["worker", "start", "--ab-test"][..]] {
+  for custom_policy in [false, true] {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("config.toml");
+    let policy_path = home.path().join("rollout.toml");
+    let policy_source =
+      "initial_percent = 10\ncompletion_percent = 100\n[[stages]]\nduration_seconds = 259200\ntraffic_percent = 90\n";
+    fs::write(&policy_path, policy_source).unwrap();
+    let command = if custom_policy {
+      vec![
+        "worker",
+        "start",
+        "--ab-test",
+        "--ab-test-policy",
+        policy_path.to_str().unwrap(),
+      ]
+    } else {
+      vec!["serve", "--ab-test", "--ab-test-duration", "72h"]
+    };
     let address = free_address();
     fs::write(
       &path,
@@ -515,7 +530,7 @@ client_auth = "none"
     let mut baseline = start(home.path(), &path);
     ready(&mut baseline, address, home.path()).await;
     let baseline_id = workers(address).await["main_worker_id"].clone();
-    let mut candidate = start_command(home.path(), &path, command, "ab-stderr.log");
+    let mut candidate = start_command(home.path(), &path, &command, "ab-stderr.log");
     tokio::time::timeout(WAIT, async {
       while !workers(address).await["ab_test"].is_object() {
         assert!(
@@ -531,8 +546,20 @@ client_auth = "none"
     let report = workers(address).await;
     assert_eq!(report["ab_test"]["baseline_worker_id"], baseline_id);
     assert_eq!(report["ab_test"]["traffic_percent"], 10);
+    assert_eq!(report["ab_test"]["duration_seconds"], 72 * 3600);
+    assert_eq!(
+      report["ab_test"]["rollout_policy"]["stages"][0]["duration_seconds"],
+      72 * 3600
+    );
     assert_eq!(report["workers"][0]["weight"], 90);
     assert_eq!(report["workers"][1]["weight"], 10);
+    if custom_policy {
+      fs::write(&policy_path, policy_source.replace("259200", "129600")).unwrap();
+      assert_eq!(
+        workers(address).await["ab_test"]["rollout_policy"],
+        report["ab_test"]["rollout_policy"]
+      );
+    }
     assert!(
       baseline.try_wait().unwrap().is_none(),
       "idle baseline must survive the experiment"
