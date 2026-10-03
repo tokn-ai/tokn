@@ -506,6 +506,10 @@ impl Provider for RecordingProvider {
         .expect("RecordingProvider::chat: no canned response armed"),
     )
   }
+
+  async fn responses(&self, ctx: RequestCtx<'_>) -> ProviderResult<reqwest::Response> {
+    self.chat(ctx).await
+  }
 }
 
 pub fn recording_handle(

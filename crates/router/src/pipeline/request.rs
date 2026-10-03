@@ -9,6 +9,7 @@ use tokn_accounts::{AccountHandle, EndpointAcquire};
 use tokn_config::RouteMode;
 use tokn_core::pipeline::{ParsedRequest, RequestMeta};
 use tokn_core::provider::{ProviderRequestKind, TemplateVars};
+use tokn_core::request_classification::classify_request;
 use tokn_core::AgentId;
 use tokn_headers::agent::build_agent_headers;
 use tokn_headers::inbound::build_template_vars;
@@ -112,6 +113,7 @@ fn prepare_dry_run(
   raw_body: Bytes,
   content_encoding: Option<crate::api::codec::ContentEncodingKind>,
 ) -> crate::provider::Result<PreparedDryRun> {
+  let classification = classify_request(&meta.endpoint.into(), &body);
   let mut upstream_body = rewrite_model(&body, &meta.upstream_model);
   if meta.upstream_endpoint != meta.endpoint {
     upstream_body =
@@ -124,6 +126,11 @@ fn prepare_dry_run(
   if let Some(transformer) = account.provider.input_transformer() {
     upstream_body = transformer.transform_input(meta.upstream_endpoint, upstream_body)?;
   }
+  tokn_requests::stages::convert_request::apply_compaction_priority(
+    account.provider.info().id.as_str(),
+    classification,
+    &mut upstream_body,
+  );
   let debug_outbound_body = Bytes::from(serde_json::to_vec(&upstream_body).unwrap_or_default());
   let _upstream_wire_body = if upstream_body == body {
     raw_body
@@ -332,6 +339,31 @@ mod tests {
   fn core_account(cfg: AccountCfg) -> AccountConfig {
     let raw = toml::to_string(&cfg).unwrap();
     toml::from_str(&raw).unwrap()
+  }
+
+  #[test]
+  fn dry_run_prioritizes_codex_compaction() {
+    let mut account = openai_account();
+    account.provider = crate::provider::ID_CODEX.into();
+    let state = build_state(&Config::default(), &[core_account(account)], Arc::new(EventBus::noop())).unwrap();
+    let body = serde_json::json!({
+      "model": "gpt-6.1-sol",
+      "input": [{"type": "compaction_trigger"}],
+      "service_tier": "auto"
+    });
+    let out = dry_run_request(
+      &state,
+      DryRunEndpoint::Responses,
+      reqwest::header::HeaderMap::new(),
+      body.clone(),
+      Bytes::from(serde_json::to_vec(&body).unwrap()),
+      None,
+    )
+    .unwrap();
+
+    assert_eq!(out.provider_id, crate::provider::ID_CODEX);
+    let body: Value = serde_json::from_slice(&out.body).unwrap();
+    assert_eq!(body["service_tier"], "priority");
   }
 
   #[test]

@@ -15,11 +15,13 @@
 //! [`InputTransformer`]: tokn_core::pipeline::InputTransformer
 //! [`Send`]: crate::pipeline::stages::SendStage
 
+mod compaction;
 mod default;
 mod generation;
 mod noop;
 mod passthrough;
 
+pub use compaction::apply_compaction_priority;
 pub use default::DefaultConvertRequest;
 pub use noop::NoopConvertRequest;
 pub use passthrough::PassthroughConvertRequest;

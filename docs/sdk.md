@@ -109,8 +109,10 @@ Unsupported explicit controls fail clearly after routing rather than being
 silently dropped or reinterpreted. Raw endpoint clients remain the escape
 hatch for an exact provider wire shape.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload
-verbatim, so they reject typed `top_k` and reasoning controls that would
+`passthrough` and `switch` profiles preserve the generated Responses payload,
+except detected compaction requests sent to Codex always use
+`service_tier: "priority"`, overriding any incoming tier. These profiles
+reject typed `top_k` and reasoning controls that would
 require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
 the provider-neutral control API.
 

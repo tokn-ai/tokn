@@ -1,5 +1,5 @@
-//! Observational request purposes. Classification does not select a route or
-//! alter the request, and missing evidence leaves the purpose unknown.
+//! Request purposes for inspection and provider request policies.
+//! Missing evidence leaves the purpose unknown.
 
 use crate::provider::Endpoint;
 use crate::request_event::RequestEndpoint;

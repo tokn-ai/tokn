@@ -32,6 +32,80 @@ const HEADERS_OUTPUT_CODEX_RESPONSES_OPENCODE_YAML: &str =
 const HEADERS_OUTPUT_COPILOT_RESPONSES_CODEX_CLI_YAML: &str =
   include_str!("fixtures/headers/output/copilot_responses_codex-cli.yaml");
 
+#[tokio::test]
+async fn codex_compaction_clears_stale_digests_before_provider_dispatch() {
+  use bytes::Bytes;
+  use tokn_requests::stage_traits::{ConvertRequestStage, SendStage};
+  use tokn_requests::stages::{PassthroughBuildHeaders, PassthroughConvertRequest};
+
+  for tier in ["auto", "priority"] {
+    let (handle, seen_headers) = recording_handle("codex", "acct-codex", ok_response(200, r#"{"output":[]}"#));
+    let body = serde_json::json!({
+      "model": "gpt-6.1-sol", "stream": false,
+      "input": [{"type": "compaction_trigger"}], "service_tier": tier
+    });
+    let decoded = Bytes::from(serde_json::to_vec(&body).unwrap());
+    let mut headers = tokn_headers::HeaderMap::new();
+    for name in ["content-md5", "digest", "content-digest", "repr-digest"] {
+      headers.insert(name, "inbound-digest");
+    }
+    let ctx = tokn_requests::PipelineCtx::new(
+      "req-compaction-digests",
+      Endpoint::Responses.into(),
+      Arc::new(tokn_requests::EventBus::new(16)),
+    );
+    let extracted = DefaultExtract
+      .extract(
+        &ctx,
+        tokn_requests::RawInbound {
+          request_endpoint: Endpoint::Responses.into(),
+          headers,
+          raw_body: decoded.clone(),
+          decoded_body: decoded,
+          body_json: body,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    let resolved = Resolved {
+      agent_id: None,
+      model: extracted.model.clone(),
+      upstream_model: extracted.model.clone(),
+      route: ResolvedRoute::operation(Endpoint::Responses, Endpoint::Responses),
+      account_id: "acct-codex".into(),
+      provider_id: "codex".into(),
+      account_handle: handle,
+    };
+    let headers = PassthroughBuildHeaders::router_auth()
+      .build_headers(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    let converted = PassthroughConvertRequest
+      .convert_request(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    DefaultSend::new(reqwest::Client::new())
+      .send(&ctx, &extracted, &resolved, &headers, &converted)
+      .await
+      .unwrap();
+
+    let captured = seen_headers.lock().unwrap().clone().unwrap();
+    for name in ["content-md5", "digest", "content-digest", "repr-digest"] {
+      assert_eq!(
+        captured.get(name).map(|value| value.as_str()),
+        if tier == "priority" {
+          Some("inbound-digest")
+        } else {
+          None
+        }
+      );
+    }
+    let body: serde_json::Value = serde_json::from_slice(&converted.upstream_wire_body).unwrap();
+    assert_eq!(body["service_tier"], "priority");
+  }
+}
+
 struct AgentHeaderCase {
   name: &'static str,
   agent_id: AgentId,

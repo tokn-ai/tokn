@@ -69,6 +69,10 @@ impl SendStage for DefaultSend {
     // as `Record::UpstreamReq` / `Record::UpstreamResp` events so the
     // persistence handler can write wire-accurate values into the row.
     let capture = new_outbound_capture();
+    let mut client_headers = headers.headers.clone();
+    if body.upstream_wire_body != extracted.raw_body {
+      super::remove_body_digests(&mut client_headers);
+    }
     let req_ctx = RequestCtx {
       endpoint: upstream_endpoint,
       http: &self.http,
@@ -78,7 +82,7 @@ impl SendStage for DefaultSend {
       stream: extracted.stream,
       initiator,
       inbound_headers: &inbound_headers,
-      client_headers: Some(headers.headers.clone()),
+      client_headers: Some(client_headers),
       outbound: Some(capture.clone()),
       vars: headers.vars.clone(),
       agent_id: headers.agent_id.clone(),

@@ -37,6 +37,7 @@ use tokn_core::provider::{AuthKind, ModelCache, Provider, ProviderInfo, Provider
 pub mod keys {
   pub const HOST: &str = "proxy.host";
   pub const PROVIDER_ID: &str = "proxy.provider_id";
+  pub const PROVIDER_DRIVER_ID: &str = "proxy.provider_driver_id";
   pub const ACCOUNT_ID: &str = "proxy.account_id";
   pub const PATH: &str = "proxy.path";
 }

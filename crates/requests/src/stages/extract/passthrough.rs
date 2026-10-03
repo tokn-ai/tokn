@@ -3,12 +3,13 @@
 //! The contract differs from [`DefaultExtract`](super::DefaultExtract) on
 //! one axis: we must **not** treat the inbound JSON body as authoritative
 //! and we must **not** keep it around as `Arc<Value>` for downstream
-//! stages to re-serialize. The body bytes are forwarded verbatim by
-//! [`PassthroughConvertRequest`](crate::stages::PassthroughConvertRequest).
+//! stages to re-serialize. Conversion normally forwards the original bytes;
+//! detected Codex compactions receive a scoped priority-tier override.
 //!
 //! Strategy: retain the typed metadata peek for model and stream, then parse
 //! the decoded bytes separately for observational classification. Both values
-//! are discarded; neither parse affects forwarding. The full body bytes remain
+//! are discarded; classification can select the compaction priority policy.
+//! The full body bytes remain
 //! in `raw_body` / `decoded_body` and
 //! `body_json` is set to `Value::Null` to signal "do not consult".
 //!
