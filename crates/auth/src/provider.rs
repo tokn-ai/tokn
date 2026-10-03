@@ -335,6 +335,10 @@ pub type Result<T> = std::result::Result<T, AuthError>;
 /// provider crate exposes a `provider_auth() -> &'static dyn ProviderAuth`
 /// accessor; `tokn-auth` builds a static dispatch table at startup.
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ProviderAuth: Send + Sync {
   /// Provider id this impl handles (e.g. `"github-copilot"`). Must match
   /// [`AccountConfig::provider`] exactly.

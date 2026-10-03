@@ -521,6 +521,10 @@ impl HeaderPatchCtx<'_> {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait Provider: Send + Sync {
   fn id(&self) -> &str;
   fn info(&self) -> &ProviderInfo;

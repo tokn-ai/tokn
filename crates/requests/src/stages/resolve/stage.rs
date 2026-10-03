@@ -40,6 +40,10 @@ pub enum SelectorOutcome {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait AccountSelector: Send + Sync {
   async fn select(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<SelectorOutcome, PipelineError>;
 }

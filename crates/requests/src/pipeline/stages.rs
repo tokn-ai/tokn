@@ -637,16 +637,28 @@ impl std::fmt::Debug for ConvertedResponse {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ExtractStage: Send + Sync {
   async fn extract(&self, ctx: &PipelineCtx, raw: RawInbound) -> Result<Extracted, PipelineError>;
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ResolveStage: Send + Sync {
   async fn resolve(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<Resolved, PipelineError>;
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait BuildHeadersStage: Send + Sync {
   async fn build_headers(
     &self,
@@ -657,6 +669,10 @@ pub trait BuildHeadersStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ConvertRequestStage: Send + Sync {
   async fn convert_request(
     &self,
@@ -667,6 +683,10 @@ pub trait ConvertRequestStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait SendStage: Send + Sync {
   async fn send(
     &self,
@@ -679,6 +699,10 @@ pub trait SendStage: Send + Sync {
 }
 
 #[async_trait]
+#[allow(
+  clippy::double_must_use,
+  reason = "async_trait adds must_use to methods returning must-use futures"
+)]
 pub trait ConvertResponseStage: Send + Sync {
   async fn convert_buffered(
     &self,
