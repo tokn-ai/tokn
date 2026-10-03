@@ -13,7 +13,7 @@ pub struct RoutingReport {
 }
 
 /// Frontend-owned linear traffic ramp, present until completion or cancellation.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AbTestStatus {
   pub baseline_worker_id: String,
   pub worker_id: String,

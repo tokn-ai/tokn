@@ -138,7 +138,11 @@ The frontend owns the monotonic clock and updates weights independently of
 request arrivals. This rollout is driven by elapsed time, without an error-rate
 or latency threshold. The `ab_test` object in `/admin/workers` shows the worker
 IDs, elapsed and total seconds, and the new worker's traffic percentage; it is
-removed after completion or cancellation.
+removed after completion or cancellation. The worker's terminal footer also shows
+`ab=10%/90% elapsed=00:01/24:00`: the split is new/baseline and times are hours
+and minutes. It refreshes every five seconds even without requests, and clears
+when the experiment ends. The frontend must support banner status queries;
+restart it with this version to enable them.
 
 A manual weight update cancels the automatic ramp. Starting an ordinary worker
 also cancels it and replaces both versions. Stopping either participating worker
