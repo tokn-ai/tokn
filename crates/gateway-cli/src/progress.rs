@@ -21,7 +21,7 @@ use time::{macros::format_description, OffsetDateTime};
 use tokn_core::db::Usage;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::request_classification::RequestClassification;
-use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+use tokn_core::request_event::{ConvertedRequestSummary, RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
 
 /// Process-wide [`MultiProgress`] shared between [`ProgressEventHandler`]
 /// and the tracing log writer (so log lines suspend the bars during
@@ -39,6 +39,7 @@ struct RequestState {
   started: Instant,
   provider: String,
   model: String,
+  priority: bool,
   account: String,
   endpoint: String,
   request_classification: Option<RequestClassification>,
@@ -56,6 +57,7 @@ impl RequestState {
       started: Instant::now(),
       provider: String::new(),
       model: String::new(),
+      priority: false,
       account: String::new(),
       endpoint,
       request_classification: None,
@@ -80,6 +82,34 @@ impl RequestState {
     format!("{}{}", style(&self.endpoint).dim(), classification)
   }
 
+  fn update_priority(&mut self, request: &ConvertedRequestSummary) {
+    if request.upstream_body.is_object() {
+      self.priority = request
+        .upstream_body
+        .get("service_tier")
+        .and_then(serde_json::Value::as_str)
+        == Some("priority");
+    } else {
+      // Relay summaries keep a null body sentinel; the debug bytes are
+      // decoded JSON even when the wire request uses gzip or zstd.
+      #[derive(serde::Deserialize)]
+      struct ServiceTierPeek {
+        service_tier: Option<String>,
+      }
+      self.priority = serde_json::from_slice::<ServiceTierPeek>(&request.debug_outbound_body)
+        .is_ok_and(|body| body.service_tier.as_deref() == Some("priority"));
+    }
+  }
+
+  fn render_model(&self) -> String {
+    let model = style(truncate(&self.model, 28)).cyan();
+    if self.priority {
+      format!("{model} {}", style("⚡").yellow())
+    } else {
+      model.to_string()
+    }
+  }
+
   fn render_in_flight(&self, request_id: &str) -> String {
     let elapsed = self.started.elapsed().as_secs_f64();
     let speed_kbs = if elapsed > 0.05 {
@@ -96,7 +126,7 @@ impl RequestState {
       "[{}] {} {} {}{} {} sent={:.1}kB recv={:.1}kB {:.1}kB/s elapsed={:.1}s",
       style(Self::id_short(request_id)).dim(),
       style(&self.provider).blue(),
-      style(truncate(&self.model, 28)).cyan(),
+      self.render_model(),
       style(truncate(&self.account, 16)).magenta(),
       attempt_part,
       self.render_endpoint(),
@@ -154,7 +184,7 @@ impl RequestState {
         style("✓").green().bold(),
         status_part,
         style(&self.provider).blue(),
-        style(truncate(&self.model, 28)).cyan(),
+        self.render_model(),
         style(truncate(&self.account, 16)).magenta(),
         self.render_endpoint(),
         (self.sent_bytes as f64) / 1024.0,
@@ -175,7 +205,7 @@ impl RequestState {
         style("✗").red().bold(),
         status_part,
         style(&self.provider).blue(),
-        style(truncate(&self.model, 28)).cyan(),
+        self.render_model(),
         style(truncate(&self.account, 16)).magenta(),
         self.render_endpoint(),
         (self.sent_bytes as f64) / 1024.0,
@@ -193,7 +223,7 @@ impl RequestState {
     let model_part = if self.model.is_empty() {
       String::new()
     } else {
-      format!(" {}", style(truncate(&self.model, 28)).cyan())
+      format!(" {}", self.render_model())
     };
     let account_part = if self.account.is_empty() {
       String::new()
@@ -465,6 +495,12 @@ impl ProgressEventHandler {
         if let Some(state) = self.bars.get_mut(&composite_id) {
           state.request.provider = s.provider_id.to_string();
           state.request.account = s.account_id.to_string();
+        }
+        self.refresh(&composite_id);
+      }
+      RequestEventPayload::Stage(StageEvent::ConvertRequest(s)) => {
+        if let Some(state) = self.bars.get_mut(&composite_id) {
+          state.request.update_priority(s);
         }
         self.refresh(&composite_id);
       }
@@ -838,6 +874,11 @@ impl ProgressLogEventHandler {
           state.account = s.account_id.to_string();
         }
       }
+      RequestEventPayload::Stage(StageEvent::ConvertRequest(s)) => {
+        if let Some(state) = self.requests.get_mut(&composite_id) {
+          state.update_priority(s);
+        }
+      }
       RequestEventPayload::Record(RecordEvent::UpstreamReq { body, .. }) => {
         if let Some(state) = self.requests.get_mut(&composite_id) {
           state.sent_bytes = body.len() as u64;
@@ -969,6 +1010,73 @@ mod tests {
   }
 
   #[test]
+  fn progress_handlers_follow_outbound_priority_without_matching_history() {
+    let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
+    let mut tty = ProgressEventHandler::new();
+    let mut log = ProgressLogEventHandler::new(&dir).unwrap();
+    let cases: &[(&[u8], bool)] = &[
+      (br#"{"service_tier":"priority","input":"hello"}"#, true),
+      (br#"{"service_tier":"flex"}"#, false),
+      (br#"{"service_tier":"default"}"#, false),
+      (br#"{"input":[{"service_tier":"priority"}]}"#, false),
+      (br#"{"service_tier":true}"#, false),
+      (br#"{"service_tier":"priority""#, false),
+      (br#"{}"#, false),
+    ];
+    for &(body, priority) in cases {
+      for parsed in [false, true] {
+        let upstream_body = if parsed {
+          serde_json::from_slice(body).unwrap_or(serde_json::Value::Null)
+        } else {
+          serde_json::Value::Null
+        };
+        for payload in [
+          RequestEventPayload::Stage(StageEvent::Started {
+            request_endpoint: RequestEndpoint::custom("responses"),
+          }),
+          extract_event(None),
+          RequestEventPayload::Stage(StageEvent::ConvertRequest(ConvertedRequestSummary {
+            upstream_body: Arc::new(upstream_body),
+            upstream_wire_body: Bytes::copy_from_slice(body),
+            debug_outbound_body: Bytes::copy_from_slice(body),
+            content_encoding: None,
+          })),
+        ] {
+          let event = req(payload);
+          tty.handle_request(&event);
+          log.handle_request(&event);
+        }
+        let state = &tty.bars.get("req-1").unwrap().request;
+        assert_eq!(state.priority, priority);
+        assert_eq!(log.requests.get("req-1").unwrap().priority, priority);
+        assert_eq!(tty.bars.get("req-1").unwrap().bar.message().contains("⚡"), priority);
+        for rendered in [
+          state.render_in_flight("req-1"),
+          state.render_completed("req-1", true, 1, Some(200), 0, None),
+          state.render_completed("req-1", false, 1, Some(500), 0, Some("failed")),
+          state.render_interrupted("req-1"),
+          state.render_waiting_for_usage("req-1"),
+        ] {
+          assert_eq!(rendered.contains("⚡"), priority);
+          if priority {
+            assert!(console::strip_ansi_codes(&rendered).contains("gpt-test ⚡"));
+          }
+        }
+        let complete = req(RequestEventPayload::Stage(StageEvent::Completed {
+          success: false,
+          attempts: 1,
+        }));
+        tty.handle_request(&complete);
+        log.handle_request(&complete);
+        let content = std::fs::read_to_string(progress_log_path(&dir)).unwrap();
+        assert_eq!(content.lines().last().unwrap().contains("⚡"), priority);
+      }
+    }
+    drop(log);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
   fn tty_extract_event_labels_all_request_states() {
     let mut handler = ProgressEventHandler::new();
     handler.handle_request(&req(RequestEventPayload::Stage(StageEvent::Started {
@@ -1049,6 +1157,10 @@ mod tests {
 
   #[tokio::test]
   async fn passthrough_compaction_trigger_reaches_progress_handlers_on_retry_attempt() {
+    use tokn_requests::pipeline::stages::{ConvertRequestStage, ResolveStage};
+    use tokn_requests::stages::resolve::proxy::keys;
+    use tokn_requests::stages::{PassthroughConvertRequest, ProxyResolve};
+    use tokn_requests::utils::codec::{encode_body_bytes, ContentEncodingKind};
     let dir = std::env::temp_dir().join(format!("tokn-router-progress-test-{}", uuid::Uuid::new_v4()));
     let mut tty = ProgressEventHandler::new();
     let mut log = ProgressLogEventHandler::new(&dir).unwrap();
@@ -1060,11 +1172,20 @@ mod tests {
       1,
       endpoint.clone(),
       bus,
-      Arc::new(RunConfig::default()),
+      Arc::new(
+        RunConfig::builder()
+          .with_str(keys::HOST, "chatgpt.com")
+          .with_str(keys::PROVIDER_ID, "codex")
+          .with_str(keys::PATH, endpoint.as_str())
+          .build(),
+      ),
     );
     let body = Bytes::from_static(
       br#"{"model":"gpt-test","stream":true,"input":[{"role":"user","content":"Continue the task."},{"type":"compaction_trigger"}]}"#,
     );
+    let raw_body = encode_body_bytes(&body, Some(ContentEncodingKind::Zstd)).unwrap();
+    let mut headers = tokn_headers::HeaderMap::new();
+    headers.insert("content-encoding", "zstd");
     ctx.emit_stage(StageEvent::Started {
       request_endpoint: endpoint.clone(),
     });
@@ -1073,8 +1194,8 @@ mod tests {
         &ctx,
         RawInbound {
           request_endpoint: endpoint,
-          headers: tokn_headers::HeaderMap::new(),
-          raw_body: body.clone(),
+          headers,
+          raw_body: raw_body.clone(),
           decoded_body: body.clone(),
           body_json: serde_json::Value::Null,
           request_id: Some(ctx.request_id.clone()),
@@ -1082,17 +1203,28 @@ mod tests {
       )
       .await
       .unwrap();
-    assert_eq!(extracted.raw_body, body);
+    assert_eq!(extracted.raw_body, raw_body);
     assert_eq!(*extracted.body_json, serde_json::Value::Null);
     ctx.emit_stage(StageEvent::Extract(ExtractedSummary::from(&extracted)));
+    let resolved = ProxyResolve.resolve(&ctx, &extracted).await.unwrap();
+    let converted = PassthroughConvertRequest
+      .convert_request(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    assert_eq!(converted.upstream_body["service_tier"], "priority");
+    assert_eq!(converted.content_encoding, Some(ContentEncodingKind::Zstd));
+    ctx.emit_stage(StageEvent::ConvertRequest(ConvertedRequestSummary::from(&converted)));
 
-    for _ in 0..2 {
+    for _ in 0..3 {
       let event = events.try_recv().unwrap();
       tty.handle(event.as_ref());
       log.handle(event.as_ref());
     }
     let attempt_id = "req-compaction-trigger:1";
     let state = &tty.bars.get(attempt_id).unwrap().request;
+    assert!(state.priority);
+    assert!(console::strip_ansi_codes(&state.render_in_flight(attempt_id)).contains("gpt-test ⚡"));
+    assert!(log.requests.get(attempt_id).unwrap().priority);
     assert_eq!(
       state.request_classification,
       Some(RequestClassification {
@@ -1119,6 +1251,7 @@ mod tests {
     let content = std::fs::read_to_string(progress_log_path(&dir)).unwrap();
     assert!(content.contains("/backend-api/codex/responses [compaction] sent="));
     assert!(content.contains("error=failed"));
+    assert!(content.contains("⚡"));
 
     drop(log);
     std::fs::remove_dir_all(&dir).unwrap();

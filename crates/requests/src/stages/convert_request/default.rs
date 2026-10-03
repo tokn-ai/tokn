@@ -13,7 +13,8 @@
 //!    generation controls into the selected endpoint/provider dialect.
 //! 4. **Provider [`InputTransformer`]** — give the provider a final
 //!    say (e.g. inject the `thinking` block for `glm-4.6`).
-//! 5. **Serialize + re-encode** — produce `debug_outbound_body` (the
+//! 5. **Compaction priority** — force priority processing for Codex compaction.
+//! 6. **Serialize + re-encode** — produce `debug_outbound_body` (the
 //!    uncompressed JSON, useful for logs and tests) and
 //!    `upstream_wire_body` (re-compressed with the same codec the
 //!    inbound used, when any). When the body hasn't changed and an
@@ -23,6 +24,8 @@
 //! Failures map to permanent [`PipelineError`]s — the upstream body
 //! shape isn't going to change between retries.
 
+use super::apply_compaction_priority;
+use super::compaction::compaction_provider_id;
 use super::generation::{ensure_model_supports_effort, ensure_model_supports_reasoning, lower_generation_options};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
@@ -101,6 +104,12 @@ impl ConvertRequestStage for DefaultConvertRequest {
         .transform_input(upstream_endpoint, upstream_body)
         .map_err(|source| perm(RequestsError::ProviderInputTransformer { source }))?;
     }
+
+    apply_compaction_priority(
+      compaction_provider_id(ctx, resolved),
+      extracted.request_classification,
+      &mut upstream_body,
+    );
 
     let debug_outbound_body = Bytes::from(
       serde_json::to_vec(&upstream_body).map_err(|source| perm(RequestsError::SerializeUpstreamBody { source }))?,
@@ -206,6 +215,40 @@ mod tests {
       provider_id: smol_str::SmolStr::from(handle.provider.id()),
       account_handle: handle,
     }
+  }
+
+  #[tokio::test]
+  async fn prioritizes_compaction_after_endpoint_conversion() {
+    use tokn_core::request_classification::classify_request;
+
+    let body = serde_json::json!({
+      "model": "input-model", "service_tier": "flex",
+      "messages": [{"role": "user", "content":
+        "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task."
+      }]
+    });
+    let raw = Bytes::from(serde_json::to_vec(&body).unwrap());
+    let mut extracted = extracted_with(body.clone(), None, raw, None);
+    extracted.request_classification = classify_request(&Endpoint::ChatCompletions.into(), &body);
+    let resolved = resolved_with(
+      mock_handle("acct", "codex"),
+      Endpoint::ChatCompletions,
+      Endpoint::Responses,
+      "gpt-6.1-sol",
+    );
+
+    let out = DefaultConvertRequest
+      .convert_request(&ctx(), &extracted, &resolved)
+      .await
+      .unwrap();
+    assert_eq!(out.upstream_body["service_tier"], "priority");
+    assert_eq!(out.upstream_body["model"], "gpt-6.1-sol");
+    assert!(out.upstream_body.get("input").is_some());
+    assert_eq!(extracted.body_json["service_tier"], "flex");
+    assert_eq!(
+      serde_json::from_slice::<Value>(&out.upstream_wire_body).unwrap(),
+      *out.upstream_body
+    );
   }
 
   #[tokio::test]

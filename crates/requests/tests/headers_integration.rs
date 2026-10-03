@@ -32,6 +32,139 @@ const HEADERS_OUTPUT_CODEX_RESPONSES_OPENCODE_YAML: &str =
 const HEADERS_OUTPUT_COPILOT_RESPONSES_CODEX_CLI_YAML: &str =
   include_str!("fixtures/headers/output/copilot_responses_codex-cli.yaml");
 
+#[tokio::test]
+async fn send_compaction_policy_updates_only_codex_compaction_headers_and_body_digests() {
+  use bytes::Bytes;
+  use tokn_requests::stage_traits::{ConvertRequestStage, SendStage};
+  use tokn_requests::stages::{PassthroughBuildHeaders, PassthroughConvertRequest};
+
+  let stale_hint = "model=stale-model;tier=default;region=test;tier=flex;sticky=on";
+  for (provider_id, compaction, tier, inbound_hint) in [
+    ("codex", true, "auto", Some(stale_hint)),
+    ("codex", true, "priority", Some(stale_hint)),
+    ("codex", true, "priority", None),
+    ("codex", false, "priority", Some(stale_hint)),
+    ("openai", true, "priority", Some(stale_hint)),
+  ] {
+    let prioritizes = provider_id == "codex" && compaction;
+    let (handle, seen_headers) = recording_handle(provider_id, "acct-test", ok_response(200, r#"{"output":[]}"#));
+    let body = serde_json::json!({
+      "model": "gpt-6.1-sol", "stream": false,
+      "input": if compaction { serde_json::json!([{"type": "compaction_trigger"}]) } else { serde_json::json!([]) },
+      "service_tier": tier
+    });
+    let decoded = Bytes::from(serde_json::to_vec_pretty(&body).unwrap());
+    let original_wire_body = decoded.clone();
+    let mut headers = tokn_headers::HeaderMap::new();
+    for name in ["content-md5", "digest", "content-digest", "repr-digest"] {
+      headers.insert(name, "inbound-digest");
+    }
+    if let Some(hint) = inbound_hint {
+      headers.insert("x-codex-routing-hint", hint);
+    }
+    let ctx = tokn_requests::PipelineCtx::new(
+      "req-compaction-digests",
+      Endpoint::Responses.into(),
+      Arc::new(tokn_requests::EventBus::new(16)),
+    );
+    let extracted = DefaultExtract
+      .extract(
+        &ctx,
+        tokn_requests::RawInbound {
+          request_endpoint: Endpoint::Responses.into(),
+          headers,
+          raw_body: decoded.clone(),
+          decoded_body: decoded,
+          body_json: body,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    let resolved = Resolved {
+      agent_id: None,
+      model: extracted.model.clone(),
+      upstream_model: extracted.model.clone(),
+      route: ResolvedRoute::operation(Endpoint::Responses, Endpoint::Responses),
+      account_id: "acct-test".into(),
+      provider_id: provider_id.into(),
+      account_handle: handle,
+    };
+    let headers = PassthroughBuildHeaders::router_auth()
+      .build_headers(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    let converted = PassthroughConvertRequest
+      .convert_request(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    DefaultSend::new(reqwest::Client::new())
+      .send(&ctx, &extracted, &resolved, &headers, &converted)
+      .await
+      .unwrap();
+
+    let captured = seen_headers.lock().unwrap().clone().unwrap();
+    for name in ["content-md5", "digest", "content-digest", "repr-digest"] {
+      assert_eq!(
+        captured.get(name).map(|value| value.as_str()),
+        if prioritizes && tier != "priority" {
+          None
+        } else {
+          Some("inbound-digest")
+        }
+      );
+    }
+    if prioritizes {
+      let directives: Vec<_> = captured
+        .get("x-codex-routing-hint")
+        .expect("Codex compaction should have a routing hint")
+        .as_str()
+        .split(';')
+        .map(str::trim)
+        .collect();
+      assert_eq!(
+        directives
+          .iter()
+          .copied()
+          .filter(|directive| directive.starts_with("model="))
+          .collect::<Vec<_>>(),
+        ["model=gpt-6.1-sol"]
+      );
+      assert_eq!(
+        directives
+          .iter()
+          .copied()
+          .filter(|directive| directive.starts_with("tier="))
+          .collect::<Vec<_>>(),
+        ["tier=priority"]
+      );
+      let unrelated = directives
+        .iter()
+        .copied()
+        .filter(|directive| !directive.starts_with("model=") && !directive.starts_with("tier="))
+        .collect::<Vec<_>>();
+      assert_eq!(
+        unrelated,
+        if inbound_hint.is_some() {
+          vec!["region=test", "sticky=on"]
+        } else {
+          vec![]
+        }
+      );
+    } else {
+      assert_eq!(
+        captured.get("x-codex-routing-hint").map(|value| value.as_str()),
+        inbound_hint
+      );
+    }
+    let body: serde_json::Value = serde_json::from_slice(&converted.upstream_wire_body).unwrap();
+    assert_eq!(body["service_tier"], "priority");
+    if !prioritizes || tier == "priority" {
+      assert_eq!(converted.upstream_wire_body, original_wire_body);
+    }
+  }
+}
+
 struct AgentHeaderCase {
   name: &'static str,
   agent_id: AgentId,
@@ -308,4 +441,83 @@ async fn full_pipeline_codex_headers_are_captured_after_build_and_patch() {
     Some("req-headers"),
     "captured Codex request id should come from this pipeline run"
   );
+}
+
+#[tokio::test]
+async fn managed_codex_compaction_routing_hint_matches_rewritten_wire_model() {
+  use bytes::Bytes;
+  use tokn_core::request_event::RecordEvent;
+
+  let server = MockLlmServer::start(MockLlmConfig::default().with_auth(MockAuthConfig::bearer(["atk-codex"]))).await;
+  let (bus, log) = capture_bus();
+  let selector = Arc::new(HeaderScenarioSelector {
+    provider_id: "codex",
+    endpoint: Endpoint::Responses,
+    model: "gpt-6.1-sol",
+    handle: codex_handle(server.base_url()),
+  });
+  let profile = Arc::new(Profile::full(
+    "managed-codex-compaction-routing-hint",
+    Arc::new(FixedAgentExtract {
+      agent_id: AgentId::CodexCli,
+    }),
+    Arc::new(PoolResolve::new(selector)),
+    Arc::new(DefaultBuildHeaders::with_provider_defaults()),
+    Arc::new(DefaultConvertRequest),
+    Arc::new(DefaultSend::new(reqwest::Client::new())),
+    Arc::new(DefaultConvertResponse::new()),
+  ));
+  let runner = PipelineRunner::new(profile, bus);
+  let mut headers = headers_from_fixture(HEADERS_INPUT_CODEX_CLI_YAML);
+  headers.insert("x-codex-routing-hint", "model=stale-model;tier=default;region=test");
+  headers.append("x-codex-routing-hint", "tier=flex;sticky=on");
+  let body = serde_json::json!({
+    "model": "client-model-alias",
+    "input": [{"type": "compaction_trigger"}],
+    "service_tier": "auto",
+    "stream": false,
+  });
+  let decoded = Bytes::from(serde_json::to_vec(&body).unwrap());
+  let response = runner
+    .run(tokn_requests::RawInbound {
+      request_endpoint: Endpoint::Responses.into(),
+      headers,
+      raw_body: decoded.clone(),
+      decoded_body: decoded,
+      body_json: body,
+      request_id: Some("req-managed-compaction-routing-hint".into()),
+    })
+    .await
+    .expect("managed Codex compaction pipeline should succeed");
+  assert_eq!(response.status, 200);
+
+  let captured = server
+    .last_request()
+    .expect("mock server should capture the managed Codex request");
+  let wire_body: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+  assert_eq!(wire_body["model"], "gpt-6.1-sol");
+  assert_eq!(wire_body["service_tier"], "priority");
+  let wire_hint = captured
+    .header("x-codex-routing-hint")
+    .expect("routing hint should survive Codex header normalization");
+  let mut directives: Vec<_> = wire_hint.split(';').map(str::trim).collect();
+  directives.sort_unstable();
+  assert_eq!(
+    directives,
+    ["model=gpt-6.1-sol", "region=test", "sticky=on", "tier=priority"]
+  );
+
+  let events = drain_until_completed(&log).await;
+  let (recorded_headers, recorded_body) = events
+    .iter()
+    .find_map(|event| match &event.payload {
+      EventPayload::Record(RecordEvent::UpstreamReq { headers, body, .. }) => Some((headers, body)),
+      _ => None,
+    })
+    .expect("managed Codex request should emit a wire-accurate UpstreamReq record");
+  assert_eq!(
+    recorded_headers.get("x-codex-routing-hint").map(|value| value.as_str()),
+    Some(wire_hint)
+  );
+  assert_eq!(recorded_body, &captured.body);
 }

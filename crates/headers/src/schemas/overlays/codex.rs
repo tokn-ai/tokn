@@ -6,13 +6,16 @@
 //! SCOPE: this overlay models **outbound** headers the router injects /
 //! validates when forwarding to `chatgpt.com`. The codex-cli-native
 //! inbound headers (`originator`, `version`, `session_id`, `thread_id`,
-//! `x-codex-*`) are modelled directly on `CodexCliHeaders`.
+//! `x-codex-*`) are modelled directly on `CodexCliHeaders`. Routing hints also
+//! belong to this overlay so other personas retain the upstream directives.
 
 use crate::error::Error;
 use crate::keys;
 use crate::map::HeaderMap;
 use crate::name::HeaderName;
-use crate::schema::{from_inbound_or, opt_from_inbound, optional, put, put_opt, required, HeaderSchema};
+use crate::schema::{
+  from_inbound_or, opt_from_inbound, optional, optional_joined, put, put_opt, required, HeaderSchema,
+};
 use crate::vars::TemplateVars;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -27,6 +30,8 @@ pub struct CodexOverlay {
   pub chatgpt_account_id: Option<SmolStr>,
   #[serde(rename = "X-Session-Id")]
   pub session_id: Option<SmolStr>,
+  #[serde(rename = "x-codex-routing-hint", skip_serializing_if = "Option::is_none")]
+  pub routing_hint: Option<SmolStr>,
 }
 
 impl HeaderSchema for CodexOverlay {
@@ -36,6 +41,7 @@ impl HeaderSchema for CodexOverlay {
       openai_intent: optional(map, &keys::OPENAI_INTENT),
       chatgpt_account_id: optional(map, &keys::CHATGPT_ACCOUNT_ID),
       session_id: optional(map, &keys::X_SESSION_ID),
+      routing_hint: optional_joined(map, &keys::X_CODEX_ROUTING_HINT, ";"),
     })
   }
   fn dump(&self) -> HeaderMap {
@@ -44,14 +50,16 @@ impl HeaderSchema for CodexOverlay {
     put_opt(&mut m, &keys::OPENAI_INTENT, &self.openai_intent);
     put_opt(&mut m, &keys::CHATGPT_ACCOUNT_ID, &self.chatgpt_account_id);
     put_opt(&mut m, &keys::X_SESSION_ID, &self.session_id);
+    put_opt(&mut m, &keys::X_CODEX_ROUTING_HINT, &self.routing_hint);
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 4] = [
+    static NAMES: [&HeaderName; 5] = [
       &keys::OPENAI_BETA,
       &keys::OPENAI_INTENT,
       &keys::CHATGPT_ACCOUNT_ID,
       &keys::X_SESSION_ID,
+      &keys::X_CODEX_ROUTING_HINT,
     ];
     &NAMES
   }
@@ -72,6 +80,7 @@ impl CodexOverlay {
         .session_id
         .clone()
         .or_else(|| opt_from_inbound(inbound, &keys::X_SESSION_ID)),
+      routing_hint: optional_joined(inbound, &keys::X_CODEX_ROUTING_HINT, ";"),
     }
   }
 
@@ -96,6 +105,11 @@ impl CodexOverlay {
         map.insert(&keys::X_SESSION_ID, v.to_string());
       }
     }
+    if let Some(v) = &self.routing_hint {
+      if !map.contains_key(&keys::X_CODEX_ROUTING_HINT) {
+        map.insert(&keys::X_CODEX_ROUTING_HINT, v.to_string());
+      }
+    }
   }
 }
 
@@ -110,6 +124,7 @@ mod tests {
       openai_intent: Some("assistants".into()),
       chatgpt_account_id: Some("acct_99".into()),
       session_id: Some("ses_codex".into()),
+      routing_hint: Some("model=gpt-6.1-sol;tier=priority;shard=example".into()),
     };
     assert_eq!(CodexOverlay::parse(&h.dump()).unwrap(), h);
   }
@@ -121,6 +136,7 @@ mod tests {
     assert!(h.openai_intent.is_none());
     assert!(h.chatgpt_account_id.is_none());
     assert!(h.session_id.is_none());
+    assert!(h.routing_hint.is_none());
   }
 
   #[test]
@@ -128,9 +144,16 @@ mod tests {
     let mut inbound = HeaderMap::new();
     inbound.insert(&keys::OPENAI_BETA, "responses=v2");
     inbound.insert(&keys::OPENAI_INTENT, "assistants");
+    inbound.insert(&keys::X_CODEX_ROUTING_HINT, "model=gpt-6.1-sol;shard=example");
+    inbound.append(&keys::X_CODEX_ROUTING_HINT, "sticky=on");
     let h = CodexOverlay::build(&TemplateVars::default(), &inbound);
     assert_eq!(h.openai_beta.as_str(), "responses=v2");
     assert_eq!(h.openai_intent.as_deref(), Some("assistants"));
+    assert_eq!(
+      h.routing_hint.as_deref(),
+      Some("model=gpt-6.1-sol;shard=example;sticky=on")
+    );
+    assert_eq!(CodexOverlay::parse(&inbound).unwrap().routing_hint, h.routing_hint);
   }
 
   #[test]
@@ -156,6 +179,7 @@ mod tests {
       openai_intent: None,
       chatgpt_account_id: Some("acct_abc".into()),
       session_id: Some("ses_xyz".into()),
+      routing_hint: Some("model=gpt-6.1-sol;shard=example".into()),
     };
     overlay.apply_to(&mut map, &TemplateVars::default());
 
@@ -164,6 +188,10 @@ mod tests {
     assert_eq!(map.get(&keys::X_SESSION_ID).unwrap().as_str(), "preexisting");
     // chatgpt-account-id absent originally — overlay fills it in.
     assert_eq!(map.get(&keys::CHATGPT_ACCOUNT_ID).unwrap().as_str(), "acct_abc");
+    assert_eq!(
+      map.get(&keys::X_CODEX_ROUTING_HINT).unwrap().as_str(),
+      "model=gpt-6.1-sol;shard=example"
+    );
     // None-valued optional not inserted.
     assert!(!map.contains_key(&keys::OPENAI_INTENT));
   }

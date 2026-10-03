@@ -19,6 +19,191 @@ struct CapturedRequest {
 }
 
 #[tokio::test]
+async fn custom_codex_client_relays_prioritize_compaction_on_api_and_proxy() {
+  let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(2);
+  let upstream = Router::new()
+    .route(
+      "/{*path}",
+      any(
+        |State(capture_tx): State<tokio::sync::mpsc::Sender<CapturedRequest>>,
+         uri: Uri,
+         headers: HeaderMap,
+         body: Bytes| async move {
+          capture_tx.send(CapturedRequest { uri, headers, body }).await.unwrap();
+          axum::Json(serde_json::json!({"id": "compacted", "output": []}))
+        },
+      ),
+    )
+    .with_state(capture_tx);
+  let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let upstream_addr = upstream_listener.local_addr().unwrap();
+  let upstream_task = tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
+
+  let proxy_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = proxy_probe.local_addr().unwrap();
+  drop(proxy_probe);
+  let config = format!(
+    r#"
+schema_version = 2
+
+[listeners.api]
+kind = "llm_api"
+bind = "127.0.0.1:4141"
+client_auth = "none"
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "relay" }}
+default_connect = "reject"
+
+[profiles.relay]
+route = "relay"
+binding = {{ endpoints = ["responses"] }}
+
+[routes.relay]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "work-codex" }}
+credentials = {{ kind = "client" }}
+
+[providers.work-codex]
+driver = "codex"
+base_url = "http://{upstream_addr}/backend-api/codex"
+"#
+  );
+  let plan = tokn_config::v2::parse(&config, Path::new("custom-codex-client-relay.toml")).unwrap();
+  let mut states =
+    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
+      .unwrap();
+  let app = tokn_router::v2::router(states.llm_api.pop().unwrap());
+  let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(
+    states.forward_proxy.pop().unwrap(),
+    proxy_addr,
+    async {
+      let _ = shutdown_rx.await;
+    },
+  ));
+  tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    loop {
+      if tokio::net::TcpStream::connect(proxy_addr).await.is_ok() {
+        break;
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .expect("proxy listener should start");
+
+  let body = br#"{"model":"gpt-test","input":[{"type":"compaction_trigger"}],"service_tier":"auto"}"#;
+  let response = app
+    .clone()
+    .oneshot(
+      Request::post("/relay/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer client-key")
+        .header(
+          "x-codex-routing-hint",
+          "model=stale-model;tier=default;region=test;tier=flex",
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  let api_request = capture_rx.recv().await.unwrap();
+  assert!(api_request.uri.path().ends_with("/responses"));
+  assert_eq!(api_request.headers["authorization"], "Bearer client-key");
+  let api_body: serde_json::Value = serde_json::from_slice(&api_request.body).unwrap();
+  assert_eq!(api_body["service_tier"], "priority");
+  assert_priority_routing_hint(&api_request.headers, "gpt-test", &["region=test"]);
+
+  let ordinary_body = br#"{ "model": "gpt-test", "input": [], "service_tier": "priority" }"#;
+  let ordinary_hint = "model=stale-model;tier=default;region=test";
+  let response = app
+    .oneshot(
+      Request::post("/relay/v1/responses")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer client-key")
+        .header("x-codex-routing-hint", ordinary_hint)
+        .body(Body::from(ordinary_body.as_slice()))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  let ordinary_request = capture_rx.recv().await.unwrap();
+  assert_eq!(ordinary_request.headers["x-codex-routing-hint"], ordinary_hint);
+  assert_eq!(ordinary_request.body.as_ref(), ordinary_body);
+
+  let client = reqwest::Client::builder()
+    .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
+    .build()
+    .unwrap();
+  let response = client
+    .post("http://original.example/v1/responses/compact")
+    .header("content-type", "application/json")
+    .header("authorization", "Bearer client-key")
+    .body(body.as_slice())
+    .send()
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  response.bytes().await.unwrap();
+  let proxy_request = capture_rx.recv().await.unwrap();
+  assert!(proxy_request.uri.path().ends_with("/responses/compact"));
+  assert_eq!(proxy_request.headers["authorization"], "Bearer client-key");
+  assert_eq!(
+    proxy_request.headers["content-length"].to_str().unwrap(),
+    proxy_request.body.len().to_string()
+  );
+  let proxy_body: serde_json::Value = serde_json::from_slice(&proxy_request.body).unwrap();
+  assert_eq!(proxy_body["service_tier"], "priority");
+  assert_priority_routing_hint(&proxy_request.headers, "gpt-test", &[]);
+
+  drop(client);
+  shutdown_tx.send(()).unwrap();
+  proxy_task.await.unwrap().unwrap();
+  upstream_task.abort();
+}
+
+fn assert_priority_routing_hint(headers: &HeaderMap, model: &str, unrelated: &[&str]) {
+  let directives: Vec<_> = headers["x-codex-routing-hint"]
+    .to_str()
+    .unwrap()
+    .split(';')
+    .map(str::trim)
+    .collect();
+  let expected_model = format!("model={model}");
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| directive.starts_with("model="))
+      .collect::<Vec<_>>(),
+    [expected_model.as_str()]
+  );
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| directive.starts_with("tier="))
+      .collect::<Vec<_>>(),
+    ["tier=priority"]
+  );
+  assert_eq!(
+    directives
+      .iter()
+      .copied()
+      .filter(|directive| !directive.starts_with("model=") && !directive.starts_with("tier="))
+      .collect::<Vec<_>>(),
+    unrelated
+  );
+}
+
+#[tokio::test]
 async fn explicit_managed_destinations_forward_unlisted_ids_and_keep_access_constraints() {
   let (capture_tx, mut capture_rx) = tokio::sync::mpsc::channel(8);
   let upstream = Router::new()

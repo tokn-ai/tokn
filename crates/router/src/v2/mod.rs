@@ -46,9 +46,9 @@ use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_core::AgentId;
 use tokn_policy::{
-  ClientAuthPlan, ConnectAction, CredentialPolicy, ForwardProxyListenerPlan, GatewayPlan, HttpAction, HttpMatch,
-  IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector, ProfileId, ProviderId,
-  RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity,
+  ClientAuthPlan, ConnectAction, CredentialPolicy, DriverId, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
+  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector, ProfileId,
+  ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
@@ -79,6 +79,7 @@ enum ProxyDestination {
   Managed,
   Fixed {
     provider: ProviderId,
+    driver: DriverId,
     base: CanonicalUpstreamUrl,
   },
   Original,
@@ -186,11 +187,16 @@ pub struct ForwardProxyState {
   discovery: Arc<discovery::DiscoveryRuntime>,
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
-  identity: Arc<AccountIdentityResolver>,
-  provider_registry: Arc<Registry>,
+  identity: Arc<ProxyIdentitySources>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
   outbound: tokn_core::util::http::HttpClientOptions,
   request_limits: tokn_config::v2::RequestLimitsPlan,
+}
+
+struct ProxyIdentitySources {
+  accounts: AccountIdentityResolver,
+  registry: Registry,
+  provider_drivers: Arc<BTreeMap<ProviderId, DriverId>>,
 }
 
 impl ForwardProxyState {
@@ -351,10 +357,15 @@ impl ForwardProxyState {
       )
       .with_str(V2_PROXY_ORIGIN_KEY, origin.clone());
     config = match &runtime.proxy_destination {
-      ProxyDestination::Fixed { provider, .. } => config.with_str(
-        tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
-        provider.to_string(),
-      ),
+      ProxyDestination::Fixed { provider, driver, .. } => config
+        .with_str(
+          tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
+          provider.to_string(),
+        )
+        .with_str(
+          tokn_requests::stages::resolve::proxy::keys::PROVIDER_DRIVER_ID,
+          driver.to_string(),
+        ),
       ProxyDestination::Original if runtime.credential_policy == CredentialPolicy::Client => {
         with_original_proxy_identity(
           config,
@@ -362,7 +373,6 @@ impl ForwardProxyState {
           &destination,
           ingress.host().as_str(),
           &self.identity,
-          &self.provider_registry,
         )
       }
       ProxyDestination::Managed | ProxyDestination::Original => {
@@ -773,6 +783,7 @@ struct LinkedRuntimes {
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   discovery: Arc<discovery::DiscoveryRuntime>,
   mounts: Arc<mounts::ApiMounts>,
+  provider_drivers: Arc<BTreeMap<ProviderId, DriverId>>,
 }
 
 /// Build one shared v2 runtime generation for every configured listener.
@@ -818,8 +829,11 @@ fn build_runtime_states_inner(
   let outbound = service.outbound().to_http_client_options();
   let request_limits = service.request_limits();
   let linked = build_profile_runtimes(plan.clone(), accounts, events.clone(), &outbound, PipelineMode::Full)?;
-  let identity = Arc::new(AccountIdentityResolver::from_accounts(accounts));
-  let provider_registry = Arc::new(Registry::builtin());
+  let identity = Arc::new(ProxyIdentitySources {
+    accounts: AccountIdentityResolver::from_accounts(accounts),
+    registry: Registry::builtin(),
+    provider_drivers: linked.provider_drivers.clone(),
+  });
   let mut llm_api = Vec::new();
   let mut forward_proxy = Vec::new();
   for (listener_id, listener) in plan.listeners() {
@@ -849,7 +863,6 @@ fn build_runtime_states_inner(
           access: access.clone(),
           events: events.clone(),
           identity: identity.clone(),
-          provider_registry: provider_registry.clone(),
           ca,
           outbound: outbound.clone(),
           request_limits,
@@ -1101,6 +1114,7 @@ fn build_profile_runtimes(
         let proxy_destination = match linked_destination {
           Some(destination) => ProxyDestination::Fixed {
             provider: destination.provider_id().clone(),
+            driver: destination.driver_id().clone(),
             base: destination.target().base_url().clone(),
           },
           None => ProxyDestination::Original,
@@ -1124,6 +1138,12 @@ fn build_profile_runtimes(
     profiles: Arc::new(profiles),
     discovery,
     mounts: Arc::new(mounts::ApiMounts::new(&plan)?),
+    provider_drivers: Arc::new(
+      providers
+        .destinations()
+        .map(|(provider, destination)| (provider.clone(), destination.driver_id().clone()))
+        .collect(),
+    ),
   })
 }
 
@@ -1328,14 +1348,20 @@ fn with_original_proxy_identity(
   headers: &HeaderMap,
   destination: &reqwest::Url,
   fallback_provider_id: &str,
-  identity: &AccountIdentityResolver,
-  provider_registry: &Registry,
+  identity: &ProxyIdentitySources,
 ) -> RunConfigBuilder {
-  let resolved = identity.resolve(headers, destination.as_str(), provider_registry);
+  let resolved = identity
+    .accounts
+    .resolve(headers, destination.as_str(), &identity.registry);
+  let provider_id = resolved.provider_id.unwrap_or_else(|| fallback_provider_id.to_string());
+  // Identity keeps the configured provider name for attribution, while
+  // request policies consume its linked driver independently of that name.
+  let driver_id = identity.provider_drivers.get(provider_id.as_str());
   config
-    .with_str(
-      tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
-      resolved.provider_id.unwrap_or_else(|| fallback_provider_id.to_string()),
+    .with_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID, provider_id)
+    .with_str_opt(
+      tokn_requests::stages::resolve::proxy::keys::PROVIDER_DRIVER_ID,
+      driver_id.map(DriverId::as_str),
     )
     .with_str_opt(
       tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID,
@@ -1590,6 +1616,10 @@ async fn handle(
       .with_str(
         tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID,
         destination.provider_id().to_string(),
+      )
+      .with_str(
+        tokn_requests::stages::resolve::proxy::keys::PROVIDER_DRIVER_ID,
+        destination.driver_id().to_string(),
       )
       .with_str(tokn_requests::stages::resolve::proxy::keys::PATH, path.clone())
       .with_str(tokn_requests::stages::send::proxy::send_keys::PATH, path)
@@ -2100,8 +2130,11 @@ allow_insecure_public = true
     account.id = "codex-primary".into();
     account.api_key = None;
     account.access_token = Some(Secret::new(token.into()));
-    let identity = AccountIdentityResolver::from_accounts(&[account]);
-    let registry = Registry::builtin();
+    let identity = ProxyIdentitySources {
+      accounts: AccountIdentityResolver::from_accounts(&[account]),
+      registry: Registry::builtin(),
+      provider_drivers: Arc::new(BTreeMap::new()),
+    };
     let destination = reqwest::Url::parse("https://chatgpt.com/backend-api/codex/responses").unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -2109,15 +2142,8 @@ allow_insecure_public = true
       format!("Bearer {token}").parse().unwrap(),
     );
 
-    let config = with_original_proxy_identity(
-      RunConfig::builder(),
-      &headers,
-      &destination,
-      "chatgpt.com",
-      &identity,
-      &registry,
-    )
-    .build();
+    let config =
+      with_original_proxy_identity(RunConfig::builder(), &headers, &destination, "chatgpt.com", &identity).build();
 
     assert_eq!(
       config.get_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID),
@@ -2132,8 +2158,11 @@ allow_insecure_public = true
   #[test]
   fn original_client_proxy_identity_fingerprints_unknown_bearer_and_uses_bare_host_fallback() {
     let token = "unknown-client-token-that-is-long-enough-to-fingerprint";
-    let identity = AccountIdentityResolver::default();
-    let registry = Registry::builtin();
+    let identity = ProxyIdentitySources {
+      accounts: AccountIdentityResolver::default(),
+      registry: Registry::builtin(),
+      provider_drivers: Arc::new(BTreeMap::new()),
+    };
     let destination = reqwest::Url::parse("https://unregistered.example/v1/responses").unwrap();
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -2147,7 +2176,6 @@ allow_insecure_public = true
       &destination,
       "unregistered.example",
       &identity,
-      &registry,
     )
     .build();
 
@@ -2158,6 +2186,106 @@ allow_insecure_public = true
     assert!(config
       .get_str(tokn_requests::stages::resolve::proxy::keys::ACCOUNT_ID)
       .is_some_and(|account_id| account_id.starts_with("account_fp_")));
+  }
+
+  #[tokio::test]
+  async fn original_client_proxy_uses_linked_codex_driver_with_custom_provider_identity() {
+    use tokn_requests::pipeline::ctx::PipelineCtx;
+    use tokn_requests::pipeline::stages::{ConvertRequestStage, ExtractStage, ResolveStage};
+    use tokn_requests::stages::ProxyResolve;
+
+    let plan = tokn_config::v2::parse(
+      r#"
+schema_version = 2
+
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "127.0.0.1:4142"
+client_auth = "none"
+default_http_action = { kind = "route", profile = "relay" }
+default_connect = "reject"
+
+[profiles.relay]
+route = "relay"
+
+[routes.relay]
+kind = "relay"
+destination = { kind = "original" }
+credentials = { kind = "client" }
+
+[providers.work-codex]
+driver = "codex"
+base_url = "https://custom.example/backend-api/codex"
+"#,
+      std::path::Path::new("original-custom-codex-relay.toml"),
+    )
+    .unwrap();
+    let token = "known-custom-codex-token";
+    let mut account = account_for_provider("work-codex");
+    account.api_key = None;
+    account.access_token = Some(Secret::new(token.into()));
+    let mut states = build_runtime_states(
+      plan,
+      &[account],
+      Arc::new(tokn_access::AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap();
+    let state = states.forward_proxy.pop().unwrap();
+    let destination = reqwest::Url::parse("https://custom.example/backend-api/codex/responses").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+      axum::http::header::AUTHORIZATION,
+      format!("Bearer {token}").parse().unwrap(),
+    );
+    let config = with_original_proxy_identity(
+      RunConfig::builder()
+        .with_str(tokn_requests::stages::resolve::proxy::keys::HOST, "custom.example")
+        .with_str(tokn_requests::stages::resolve::proxy::keys::PATH, destination.path()),
+      &headers,
+      &destination,
+      "custom.example",
+      &state.identity,
+    )
+    .build();
+    assert_eq!(
+      config.get_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_ID),
+      Some("work-codex")
+    );
+    assert_eq!(
+      config.get_str(tokn_requests::stages::resolve::proxy::keys::PROVIDER_DRIVER_ID),
+      Some("codex")
+    );
+
+    let endpoint = tokn_core::request_event::RequestEndpoint::custom(destination.path());
+    let ctx = PipelineCtx::new_with_config(
+      "req-custom-original",
+      endpoint.clone(),
+      Arc::new(EventBus::noop()),
+      Arc::new(config),
+    );
+    let body = Bytes::from_static(br#"{"input":[{"type":"compaction_trigger"}],"service_tier":"flex"}"#);
+    let extracted = PassthroughExtract
+      .extract(
+        &ctx,
+        RawInbound {
+          request_endpoint: endpoint,
+          headers: (&headers).into(),
+          raw_body: body.clone(),
+          decoded_body: body,
+          body_json: serde_json::Value::Null,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap();
+    let resolved = ProxyResolve.resolve(&ctx, &extracted).await.unwrap();
+    let converted = PassthroughConvertRequest
+      .convert_request(&ctx, &extracted, &resolved)
+      .await
+      .unwrap();
+    assert_eq!(resolved.provider_id, "work-codex");
+    assert_eq!(converted.upstream_body["service_tier"], "priority");
   }
 
   #[tokio::test]

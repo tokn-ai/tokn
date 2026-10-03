@@ -6,13 +6,15 @@
 //! from [`PipelineCtx::config`]), the HTTP method is the inbound method
 //! (also in the bag), and the headers are the pre-pruned [`BuiltHeaders`]
 //! from [`PassthroughBuildHeaders`](super::super::build_headers::PassthroughBuildHeaders)
-//! — including the client's own `Authorization`, which we preserve
-//! verbatim. No auth injection, no URL rewriting, no provider hooks.
+//! — including the client's own `Authorization` in passthrough mode.
+//! Switch mode patches credentials from the selected router account.
 //!
 //! The body sent on the wire is `ConvertedRequest::upstream_wire_body`,
-//! which for the passthrough variant is the inbound raw bytes
-//! ([`PassthroughConvertRequest`](super::super::convert_request::PassthroughConvertRequest)
-//! returns them verbatim).
+//! normally the inbound raw bytes. The Codex compaction policy in
+//! [`PassthroughConvertRequest`](super::super::convert_request::PassthroughConvertRequest)
+//! may inject the priority service tier and re-encode the body. When wire
+//! bytes change, this stage updates Content-Length and drops inherited
+//! body digests before dispatch and upstream request recording.
 //!
 //! By default, 5xx responses remain recoverable pipeline errors for legacy
 //! retry behavior. V2 account-pool callers opt into forwarding every received
@@ -32,6 +34,7 @@ use tokn_core::provider::HeaderPatchCtx;
 use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
+use super::remove_body_digests;
 use crate::stages::resolve::proxy::keys;
 
 fn proxy_send_error_hint(err_text: &str, has_inner_source: bool) -> &'static str {
@@ -166,6 +169,17 @@ impl SendStage for ProxySend {
     // HTTP/1.1 and strict upstream CDNs may close the connection without
     // returning a response.
     outbound_headers.remove(&tokn_headers::keys::HOST);
+    super::patch_compaction_routing_hint(ctx, extracted, resolved, body, &mut outbound_headers);
+    if body.upstream_wire_body != extracted.raw_body {
+      // A request policy may rewrite and re-encode an otherwise opaque
+      // proxy body. Its inherited length must match the encoded bytes
+      // both on the wire and in the persisted upstream request record.
+      outbound_headers.insert(
+        &tokn_headers::keys::CONTENT_LENGTH,
+        body.upstream_wire_body.len().to_string(),
+      );
+      remove_body_digests(&mut outbound_headers);
+    }
 
     let mut req = self.http.request(method.clone(), &url);
     for (name, value) in outbound_headers.iter() {
@@ -266,15 +280,18 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::event::EventBus;
+  use crate::event::{EventBus, EventPayload, RecordEvent};
   use crate::pipeline::config::RunConfig;
   use crate::pipeline::stages::ResolveStage;
   use crate::pipeline::stages::{BuiltHeaders, ConvertedRequest, Extracted, Resolved, ResolvedRoute};
   use crate::stages::resolve::proxy::ProxyResolve;
+  use crate::stages::send::BODY_DIGEST_HEADERS;
   use crate::test_support::{mock_handle_with_provider, MockProvider};
+  use crate::utils::codec::{decode_body_bytes, encode_body_bytes, ContentEncodingKind};
   use bytes::Bytes;
-  use serde_json::Value;
+  use serde_json::{json, Value};
   use std::sync::Arc;
+  use std::time::Duration;
   use tokio::io::{AsyncReadExt, AsyncWriteExt};
   use tokn_core::provider::{Endpoint, ProviderRequestKind};
   use tokn_headers::{HeaderName, HeaderValue};
@@ -359,9 +376,25 @@ mod tests {
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
     tokio::spawn(async move {
       let (mut stream, _) = listener.accept().await.unwrap();
-      let mut buf = vec![0_u8; 8192];
-      let n = stream.read(&mut buf).await.unwrap();
-      buf.truncate(n);
+      let mut buf = Vec::new();
+      loop {
+        let mut chunk = [0_u8; 8192];
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "proxy closed before sending the complete request");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+          let headers = std::str::from_utf8(&buf[..end]).unwrap();
+          let length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .unwrap_or(0);
+          if buf.len() >= end + 4 + length {
+            break;
+          }
+        }
+      }
       stream
         .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
         .await
@@ -531,5 +564,151 @@ mod tests {
     assert_eq!(raw_req.matches("\r\nhost: ").count(), 1);
     assert!(raw_req.contains(&format!("\r\nhost: {addr}\r\n").to_ascii_lowercase()));
     assert!(!raw_req.contains("stale.example.test"));
+  }
+
+  #[tokio::test]
+  async fn corrects_content_length_for_reencoded_proxy_body() {
+    for encoding in [ContentEncodingKind::Gzip, ContentEncodingKind::Zstd] {
+      let inbound_body = json!({
+        "model": "gpt-6.1-sol",
+        "stream": true,
+        "input": [{"type": "compaction_trigger"}]
+      });
+      let inbound_decoded = Bytes::from(serde_json::to_vec(&inbound_body).unwrap());
+      let inbound_wire = encode_body_bytes(&inbound_decoded, Some(encoding)).unwrap();
+      let mut upstream_body = inbound_body;
+      upstream_body["service_tier"] = json!("priority");
+      let upstream_decoded = Bytes::from(serde_json::to_vec(&upstream_body).unwrap());
+      let upstream_wire = encode_body_bytes(&upstream_decoded, Some(encoding)).unwrap();
+      assert_ne!(inbound_wire.len(), upstream_wire.len());
+
+      let (addr, rx) = one_shot_raw_http_server().await;
+      let ctx = ctx_with(
+        RunConfig::builder()
+          .with_str(keys::HOST, addr.to_string())
+          .with_str(keys::PROVIDER_ID, "codex")
+          .with_str(send_keys::PATH, "/backend-api/codex/responses")
+          .with_str(send_keys::SCHEME, "http")
+          .build(),
+      );
+      let mut events = ctx.events.subscribe();
+      let resolved = fake_resolved(&ctx).await;
+      let mut extracted = fake_extracted();
+      extracted.request_classification =
+        tokn_core::request_classification::classify_request(&Endpoint::Responses.into(), &upstream_body);
+      extracted.raw_body = inbound_wire.clone();
+      extracted.decoded_body = inbound_decoded;
+      extracted.content_encoding = Some(encoding);
+      let mut headers = fake_headers();
+      headers.headers.insert("x-codex-routing-hint", "model=gpt-6.1-sol");
+      headers
+        .headers
+        .insert(&tokn_headers::keys::CONTENT_LENGTH, inbound_wire.len().to_string());
+      headers
+        .headers
+        .insert(&tokn_headers::keys::CONTENT_ENCODING, encoding.as_str());
+      for name in BODY_DIGEST_HEADERS {
+        headers.headers.insert(*name, "stale-digest");
+      }
+      let body = ConvertedRequest {
+        upstream_body: Arc::new(upstream_body),
+        upstream_wire_body: upstream_wire.clone(),
+        debug_outbound_body: upstream_decoded.clone(),
+        content_encoding: Some(encoding),
+      };
+      let send = ProxySend::new(
+        reqwest::Client::builder()
+          .timeout(Duration::from_secs(5))
+          .build()
+          .unwrap(),
+      );
+      let sent = send.send(&ctx, &extracted, &resolved, &headers, &body).await.unwrap();
+      assert_eq!(sent.status, 200);
+
+      let raw_req = rx.await.unwrap();
+      let header_end = raw_req.windows(4).position(|window| window == b"\r\n\r\n").unwrap();
+      let wire_headers = std::str::from_utf8(&raw_req[..header_end])
+        .unwrap()
+        .to_ascii_lowercase();
+      assert_eq!(wire_headers.matches("\r\ncontent-length:").count(), 1);
+      assert!(wire_headers.contains(&format!("\r\ncontent-length: {}", upstream_wire.len())));
+      assert!(wire_headers.contains(&format!("\r\ncontent-encoding: {}", encoding.as_str())));
+      assert!(wire_headers.contains("\r\nx-codex-routing-hint: model=gpt-6.1-sol;tier=priority"));
+      for name in BODY_DIGEST_HEADERS {
+        assert!(!wire_headers.contains(&format!("\r\n{name}:")));
+      }
+      let wire_body = Bytes::copy_from_slice(&raw_req[header_end + 4..]);
+      assert_eq!(wire_body, upstream_wire);
+      assert_eq!(decode_body_bytes(wire_body, Some(encoding)).unwrap(), upstream_decoded);
+
+      let event = events.recv().await.unwrap();
+      let tokn_core::event::Event::Requests(request) = event.as_ref() else {
+        panic!("expected an upstream request event");
+      };
+      let EventPayload::Record(RecordEvent::UpstreamReq { headers, body, .. }) = &request.payload else {
+        panic!("expected the upstream request record");
+      };
+      assert_eq!(
+        headers.get(&tokn_headers::keys::CONTENT_LENGTH).unwrap().as_str(),
+        upstream_wire.len().to_string()
+      );
+      assert_eq!(*body, upstream_wire);
+      assert_eq!(
+        headers.get("x-codex-routing-hint").unwrap().as_str(),
+        "model=gpt-6.1-sol;tier=priority"
+      );
+      for name in BODY_DIGEST_HEADERS {
+        assert!(!headers.contains_key(*name));
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn preserves_content_length_when_proxy_body_is_unchanged() {
+    let (addr, rx) = one_shot_raw_http_server().await;
+    let ctx = ctx_with(
+      RunConfig::builder()
+        .with_str(keys::HOST, addr.to_string())
+        .with_str(send_keys::SCHEME, "http")
+        .build(),
+    );
+    let mut events = ctx.events.subscribe();
+    let resolved = fake_resolved(&ctx).await;
+    let body = fake_body();
+    let mut extracted = fake_extracted();
+    extracted.raw_body = body.upstream_wire_body.clone();
+    let mut headers = fake_headers();
+    let original_length = format!("00{}", body.upstream_wire_body.len());
+    headers
+      .headers
+      .insert(&tokn_headers::keys::CONTENT_LENGTH, original_length.clone());
+    for name in BODY_DIGEST_HEADERS {
+      headers.headers.insert(*name, "original-digest");
+    }
+    let send = ProxySend::new(
+      reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap(),
+    );
+    let sent = send.send(&ctx, &extracted, &resolved, &headers, &body).await.unwrap();
+    assert_eq!(sent.status, 200);
+
+    let raw_req = rx.await.unwrap();
+    assert!(raw_req.ends_with(&body.upstream_wire_body));
+    let event = events.recv().await.unwrap();
+    let tokn_core::event::Event::Requests(request) = event.as_ref() else {
+      panic!("expected an upstream request event");
+    };
+    let EventPayload::Record(RecordEvent::UpstreamReq { headers, .. }) = &request.payload else {
+      panic!("expected the upstream request record");
+    };
+    assert_eq!(
+      headers.get(&tokn_headers::keys::CONTENT_LENGTH).unwrap().as_str(),
+      original_length
+    );
+    for name in BODY_DIGEST_HEADERS {
+      assert_eq!(headers.get(*name).unwrap().as_str(), "original-digest");
+    }
   }
 }
