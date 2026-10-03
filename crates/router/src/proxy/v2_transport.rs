@@ -1,7 +1,8 @@
 use super::connect_proxy::{connect_upstream, ConnectProxy};
+use super::ingress::IngressSource;
 use crate::api::error::ApiError;
 use crate::server::shutdown_requested;
-use crate::v2::{InboundConnectionInfo, LiveForwardProxyState, ProxyAuthenticationError};
+use crate::v2::{InboundConnectionInfo, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
@@ -38,7 +39,7 @@ struct ConnectUpgrade {
 pub(super) async fn handle_v2_client(
   stream: TcpStream,
   peer: SocketAddr,
-  state: LiveForwardProxyState,
+  state: IngressSource,
   outbound_proxy: Arc<ConnectProxy>,
   mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
@@ -75,7 +76,7 @@ pub(super) async fn handle_v2_client(
 }
 
 async fn handle_request(
-  state: LiveForwardProxyState,
+  state: IngressSource,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
   connection: InboundConnectionInfo,
@@ -92,7 +93,7 @@ async fn handle_request(
 }
 
 async fn handle_request_inner(
-  live: LiveForwardProxyState,
+  live: IngressSource,
   outbound_proxy: Arc<ConnectProxy>,
   upgrades: mpsc::Sender<ConnectUpgrade>,
   connection: InboundConnectionInfo,
@@ -127,7 +128,9 @@ async fn handle_request_inner(
       if let Err(error) = strip_hop_by_hop_headers(request.headers_mut()) {
         return ApiError::bad_request(error.to_string()).into_response();
       }
-      state.dispatch_http(&ingress, "http", access, connection, request).await
+      state
+        .dispatch_http(&ingress, "http", access, connection, request.map(Body::new))
+        .await
     }
     Admission::Connect(ingress) => {
       let transport = match state.connect_action_for(&ingress) {
@@ -200,11 +203,7 @@ fn admit_direct_http(request: &Request<hyper::body::Incoming>) -> Result<Ingress
   Ok(ingress)
 }
 
-async fn run_connect(
-  upgrade: ConnectUpgrade,
-  state: LiveForwardProxyState,
-  mut shutdown: watch::Receiver<bool>,
-) -> Result<()> {
+async fn run_connect(upgrade: ConnectUpgrade, state: IngressSource, mut shutdown: watch::Receiver<bool>) -> Result<()> {
   let upgraded = upgrade.on_upgrade.await.context("upgrade downstream CONNECT")?;
   let downstream = TokioIo::new(upgraded);
   match upgrade.transport {
@@ -247,7 +246,7 @@ async fn run_connect(
                 match strip_hop_by_hop_headers(request.headers_mut()) {
                   Ok(()) => {
                     state
-                      .dispatch_http(&ingress, "https", access, connection, request)
+                      .dispatch_http(&ingress, "https", access, connection, request.map(Body::new))
                       .await
                   }
                   Err(error) => ApiError::bad_request(error.to_string()).into_response(),

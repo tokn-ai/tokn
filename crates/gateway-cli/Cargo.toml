@@ -1,5 +1,6 @@
 [package]
 name = "tokn-gateway-cli"
+default-run = "tokn-gateway"
 version.workspace = true
 edition.workspace = true
 documentation.workspace = true
@@ -50,6 +51,7 @@ futures-util = { workspace = true }
 http = { workspace = true }
 humantime = { workspace = true }
 indicatif = { workspace = true }
+libc = { workspace = true }
 inquire = { workspace = true }
 notify = { workspace = true }
 parking_lot = { workspace = true }
