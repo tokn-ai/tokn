@@ -15,13 +15,14 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use time::{macros::format_description, OffsetDateTime};
 use tokn_core::db::Usage;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{ConvertedRequestSummary, RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+use tokn_router::routing::AbTestStatus;
 
 /// Process-wide [`MultiProgress`] shared between [`ProgressEventHandler`]
 /// and the tracing log writer (so log lines suspend the bars during
@@ -333,6 +334,70 @@ fn format_usage(u: &Usage) -> String {
   }
 }
 
+// The worker control loop updates this display even when request events are idle.
+// Keep a weak reference so shutdown does not retain or resurrect a finished bar.
+static LIVE_FOOTER: OnceLock<Mutex<Weak<Mutex<SessionFooter>>>> = OnceLock::new();
+
+struct SessionFooter {
+  bar: ProgressBar,
+  in_flight: u64,
+  completed: u64,
+  errors: u64,
+  ab_test: Option<AbTestStatus>,
+}
+
+impl SessionFooter {
+  fn message(&self) -> String {
+    let errors_part = if self.errors > 0 {
+      format!("errors={}", style(self.errors).red())
+    } else {
+      format!("errors={}", self.errors)
+    };
+    let ab_test_part = self
+      .ab_test
+      .as_ref()
+      .map(|status| {
+        let elapsed = status.elapsed_seconds.min(status.duration_seconds) / 60;
+        let duration = status.duration_seconds / 60;
+        format!(
+          " ab={}%/{}% elapsed={:02}:{:02}/{:02}:{:02}",
+          status.traffic_percent,
+          100u32.saturating_sub(status.traffic_percent),
+          elapsed / 60,
+          elapsed % 60,
+          duration / 60,
+          duration % 60
+        )
+      })
+      .unwrap_or_default();
+    format!(
+      "─── in-flight={} completed={} {}{} ───",
+      style(self.in_flight).bold(),
+      style(self.completed).green(),
+      errors_part,
+      ab_test_part
+    )
+  }
+
+  fn refresh(&self) {
+    if self.bar.is_finished() {
+      return;
+    }
+    self.bar.set_message(self.message());
+    self.bar.tick();
+  }
+}
+
+pub fn set_ab_test_status(status: Option<AbTestStatus>) {
+  let footer = LIVE_FOOTER.get().and_then(|slot| slot.lock().ok()?.upgrade());
+  if let Some(footer) = footer {
+    if let Ok(mut footer) = footer.lock() {
+      footer.ab_test = status;
+      footer.refresh();
+    }
+  }
+}
+
 pub struct ProgressEventHandler {
   multi: MultiProgress,
   bars: HashMap<String, BarState>,
@@ -341,6 +406,7 @@ pub struct ProgressEventHandler {
   style: ProgressStyle,
   /// Persistent footer bar (last line) showing session counters.
   footer: ProgressBar,
+  footer_display: Arc<Mutex<SessionFooter>>,
   /// Session counters.
   in_flight: u64,
   completed: u64,
@@ -358,6 +424,16 @@ impl ProgressEventHandler {
     let footer = multi.add(ProgressBar::new_spinner());
     let footer_style = ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
     footer.set_style(footer_style);
+    let footer_display = Arc::new(Mutex::new(SessionFooter {
+      bar: footer.clone(),
+      in_flight: 0,
+      completed: 0,
+      errors: 0,
+      ab_test: None,
+    }));
+    if let Ok(mut slot) = LIVE_FOOTER.get_or_init(|| Mutex::new(Weak::new())).lock() {
+      *slot = Arc::downgrade(&footer_display);
+    }
 
     let handler = Self {
       multi,
@@ -365,6 +441,7 @@ impl ProgressEventHandler {
       pending: HashMap::new(),
       style,
       footer,
+      footer_display,
       in_flight: 0,
       completed: 0,
       errors: 0,
@@ -439,19 +516,12 @@ impl ProgressEventHandler {
   }
 
   fn refresh_footer(&self) {
-    let errors_part = if self.errors > 0 {
-      format!("errors={}", style(self.errors).red())
-    } else {
-      format!("errors={}", self.errors)
-    };
-    let msg = format!(
-      "─── in-flight={} completed={} {} ───",
-      style(self.in_flight).bold(),
-      style(self.completed).green(),
-      errors_part,
-    );
-    self.footer.set_message(msg);
-    self.footer.tick();
+    if let Ok(mut footer) = self.footer_display.lock() {
+      footer.in_flight = self.in_flight;
+      footer.completed = self.completed;
+      footer.errors = self.errors;
+      footer.refresh();
+    }
   }
 }
 
@@ -628,7 +698,10 @@ impl EventHandler for ProgressEventHandler {
       interrupted_part,
     );
     let _ = self.multi.println(summary);
-    self.footer.finish_and_clear();
+    // Stop status updates from redrawing this footer during persistence cleanup.
+    if let Ok(footer) = self.footer_display.lock() {
+      footer.bar.finish_and_clear();
+    }
   }
 }
 
@@ -970,6 +1043,56 @@ mod tests {
   use tokn_requests::pipeline::stages::ExtractStage;
   use tokn_requests::stages::PassthroughExtract;
   use tokn_requests::{EventBus, PipelineCtx, RawInbound, RunConfig};
+
+  #[test]
+  fn ab_footer_updates_while_idle_and_clears_without_changing_counters() {
+    let mut footer = SessionFooter {
+      bar: ProgressBar::hidden(),
+      in_flight: 2,
+      completed: 255,
+      errors: 3,
+      ab_test: None,
+    };
+    footer.refresh();
+    let counters = console::strip_ansi_codes(&footer.bar.message()).into_owned();
+    assert_eq!(counters, "─── in-flight=2 completed=255 errors=3 ───");
+    footer.ab_test = Some(AbTestStatus {
+      baseline_worker_id: "old".into(),
+      worker_id: "new".into(),
+      elapsed_seconds: 60,
+      duration_seconds: 24 * 3600,
+      traffic_percent: 10,
+      rollout_policy: None,
+    });
+    footer.refresh();
+    assert_eq!(
+      console::strip_ansi_codes(&footer.bar.message()),
+      "─── in-flight=2 completed=255 errors=3 ab=10%/90% elapsed=00:01/24:00 ───"
+    );
+    let status = footer.ab_test.as_mut().unwrap();
+    status.elapsed_seconds = 12 * 3600;
+    status.traffic_percent = 50;
+    footer.refresh();
+    assert!(footer.bar.message().contains("ab=50%/50% elapsed=12:00/24:00"));
+    footer.ab_test = None;
+    footer.refresh();
+    assert_eq!(console::strip_ansi_codes(&footer.bar.message()), counters);
+    footer.bar.finish_and_clear();
+    footer.ab_test = Some(AbTestStatus {
+      baseline_worker_id: "old".into(),
+      worker_id: "new".into(),
+      elapsed_seconds: 0,
+      duration_seconds: 24 * 3600,
+      traffic_percent: 10,
+      rollout_policy: None,
+    });
+    footer.refresh();
+    assert_eq!(
+      console::strip_ansi_codes(&footer.bar.message()),
+      counters,
+      "finished footer must not redraw"
+    );
+  }
 
   fn req(payload: RequestEventPayload) -> RequestEvent {
     req_with_id("req-1", payload)

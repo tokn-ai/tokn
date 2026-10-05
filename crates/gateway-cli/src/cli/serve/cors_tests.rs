@@ -88,6 +88,7 @@ async fn cors_reload_reads_both_schemas_and_preserves_permissions_after_invalid_
       host: None,
       port: None,
       with_proxy: false,
+      rollout: Default::default(),
       proxy_route_mode: None,
       insecure_allow_remote: false,
       no_proxy: false,

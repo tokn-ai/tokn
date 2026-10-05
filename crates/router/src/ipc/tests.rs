@@ -2,7 +2,7 @@ use super::protocol::CONTEXT_HEADER;
 use super::*;
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
 use crate::frontend::Frontend;
-use crate::routing::{RoutingControl, WorkerState};
+use crate::routing::{RolloutPolicy, RolloutStage, RoutingControl, WorkerState};
 use crate::v2::{build_worker_runtime_states, LiveRuntime};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -721,6 +721,96 @@ async fn retiring_current_promotes_busy_stale_without_interrupting_either_stream
   pool.retire("old").unwrap();
   assert!(pool.status().main_worker_id.is_none());
   pool.wait_retired("old").await.unwrap();
+  pool.disconnect("old");
+  old.stop().await;
+  new.stop().await;
+}
+
+#[tokio::test]
+async fn ab_test_registration_shares_traffic_and_manual_weights_cancel_the_ramp() {
+  let ca = tempfile::tempdir().unwrap();
+  let compiled = config(address(), address(), ca.path(), "127.0.0.1:1".parse().unwrap());
+  let old = Worker::start(
+    compiled.gateway().clone(),
+    Arc::new(FixtureDispatcher {
+      stream: parking_lot::Mutex::new(None),
+      contexts: parking_lot::Mutex::new(Vec::new()),
+    }),
+  )
+  .await;
+  let new = Worker::start(
+    compiled.gateway().clone(),
+    Arc::new(FixtureDispatcher {
+      stream: parking_lot::Mutex::new(None),
+      contexts: parking_lot::Mutex::new(Vec::new()),
+    }),
+  )
+  .await;
+  let pool = WorkerPool::empty(compiled.gateway()).unwrap();
+  let policy = RolloutPolicy {
+    initial_percent: 10,
+    stages: vec![RolloutStage {
+      duration_seconds: 24 * 3600,
+      traffic_percent: 90,
+    }],
+    completion_percent: 100,
+  };
+  assert!(pool
+    .register_rollout(new.endpoint("new", 1), policy.clone())
+    .await
+    .is_err());
+  assert!(pool.status().workers.is_empty());
+  pool.register(old.endpoint("old", 1)).await.unwrap();
+  let mut invalid = policy.clone();
+  invalid.initial_percent = 0;
+  assert!(pool.register_rollout(new.endpoint("new", 1), invalid).await.is_err());
+  let unchanged = pool.status();
+  assert_eq!(unchanged.workers.len(), 1);
+  assert_eq!(unchanged.main_worker_id.as_deref(), Some("old"));
+  assert!(unchanged.ab_test.is_none());
+  pool
+    .register_rollout(new.endpoint("new", 1), policy.clone())
+    .await
+    .unwrap();
+  let report = pool.status();
+  assert_eq!(report.main_worker_id.as_deref(), Some("new"));
+  assert_eq!(report.workers[0].state, WorkerState::Stale);
+  assert_eq!(report.workers[0].weight, 90);
+  assert_eq!(report.workers[1].state, WorkerState::Current);
+  assert_eq!(report.workers[1].weight, 10);
+  let ramp = report.ab_test.unwrap();
+  assert_eq!(ramp.baseline_worker_id, "old");
+  assert_eq!(ramp.worker_id, "new");
+  assert_eq!(ramp.duration_seconds, 24 * 60 * 60);
+  assert_eq!(ramp.traffic_percent, 10);
+  assert!(
+    tokio::time::timeout(Duration::from_millis(20), pool.wait_retired("old"))
+      .await
+      .is_err()
+  );
+  for _ in 0..100 {
+    let response = pool.dispatch(context(), request()).await.unwrap();
+    assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "fixture");
+  }
+  assert_eq!(pool.status().workers[0].requests, 90);
+  assert_eq!(pool.status().workers[1].requests, 10);
+  pool
+    .update_weights(BTreeMap::from([("old".into(), 1), ("new".into(), 0)]))
+    .await
+    .unwrap();
+  pool.advance_ab_test();
+  assert!(pool.status().ab_test.is_none());
+  assert_eq!(pool.status().main_worker_id.as_deref(), Some("old"));
+  assert_eq!(pool.status().workers[1].weight, 0);
+  pool.disconnect("new");
+  pool.register_rollout(new.endpoint("new", 1), policy).await.unwrap();
+  pool.retire("old").unwrap();
+  pool.advance_ab_test();
+  assert!(pool.status().ab_test.is_none());
+  assert_eq!(pool.status().main_worker_id.as_deref(), Some("new"));
+  let response = pool.dispatch(context(), request()).await.unwrap();
+  assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), "fixture");
+  pool.disconnect("new");
   pool.disconnect("old");
   old.stop().await;
   new.stop().await;
