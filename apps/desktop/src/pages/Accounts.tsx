@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ChevronRight, Plus, RefreshCw, Search } from "lucide-react";
+import { useRef, useState } from "react";
+import { Plus, RefreshCw, Search } from "lucide-react";
 import { api } from "../lib/tauri";
 import { useResource } from "../lib/useResource";
 import type {
@@ -8,7 +8,8 @@ import type {
   AccountSummary,
 } from "../lib/types";
 import { Empty, ErrorMessage, PageHeading } from "../components/Feedback";
-import { AccountUsage } from "../components/AccountUsage";
+import { Modal } from "../components/Modal";
+import { AccountList } from "../components/accounts/AccountList";
 import { AddAccount } from "../components/accounts/AddAccount";
 import {
   AccountDetails,
@@ -29,6 +30,7 @@ function hasChanges(account: AccountSummary, draft?: AccountDraft) {
 
 export function Accounts() {
   const accounts = useResource(api.accounts);
+  const directory = useRef<HTMLDivElement>(null);
   const [selected, setSelected] = useState("");
   const [adding, setAdding] = useState(false);
   const [working, setWorking] = useState(false);
@@ -38,7 +40,7 @@ export function Accounts() {
   const [activation_filter, setActivationFilter] = useState<
     AccountActivation | ""
   >("");
-  const [drafts, setDrafts] = useState<Record<string, AccountDraft>>({});
+  const [drafts, setDrafts] = useState(() => new Map<string, AccountDraft>());
   const all_accounts = accounts.data ?? [];
   const providers = [
     ...new Set(all_accounts.map((account) => account.provider)),
@@ -51,14 +53,16 @@ export function Accounts() {
         .toLowerCase()
         .includes(search.trim().toLowerCase()),
   );
-  const account =
-    visible.find((account) => account.id === selected) ?? visible[0];
-  const draft_count = all_accounts.filter((item) =>
-    hasChanges(item, drafts[item.id]),
-  ).length;
+  const account = all_accounts.find((item) => item.id === selected);
+  const draft_ids = new Set(
+    all_accounts
+      .filter((item) => hasChanges(item, drafts.get(item.id)))
+      .map((item) => item.id),
+  );
+  const draft_count = draft_ids.size;
 
   function updateDraft(id: string, draft: AccountDraft) {
-    setDrafts((current) => ({ ...current, [id]: draft }));
+    setDrafts((current) => new Map(current).set(id, draft));
   }
 
   async function saved(edit?: AccountEdit) {
@@ -68,10 +72,16 @@ export function Accounts() {
         ? "removed"
         : "saved";
     if (edit) {
+      if (edit.action === "remove") {
+        setSelected("");
+        requestAnimationFrame(() =>
+          directory.current?.focus({ preventScroll: true }),
+        );
+      }
       // The backend has confirmed this mutation. Keep that truth visible even
       // if the following read fails; disabling preserves the stored tier.
-      accounts.setData(
-        all_accounts.flatMap((item) => {
+      accounts.setData((current) =>
+        (current ?? []).flatMap((item) => {
           if (item.id !== edit.id) return [item];
           if (edit.action === "remove") return [];
           return [
@@ -86,8 +96,8 @@ export function Accounts() {
         }),
       );
       setDrafts((current) => {
-        const next = { ...current };
-        delete next[edit.id];
+        const next = new Map(current);
+        next.delete(edit.id);
         return next;
       });
     }
@@ -127,7 +137,7 @@ export function Accounts() {
   }
 
   return (
-    <div className="accounts-page">
+    <div className="accounts-page" ref={directory} tabIndex={-1}>
       <PageHeading
         eyebrow="PROVIDER ACCESS"
         title="Accounts"
@@ -207,7 +217,8 @@ export function Accounts() {
         <p className="accounts-draft-note" role="status">
           <span className="accounts-draft-dot" />
           {draft_count} {draft_count === 1 ? "account has" : "accounts have"}{" "}
-          unsaved edits. Drafts are kept as you switch accounts or filters.
+          unsaved edits. Drafts stay here when you close a panel or switch
+          pages.
         </p>
       )}
       {accounts.loading && !accounts.data ? (
@@ -219,7 +230,11 @@ export function Accounts() {
           <div className="accounts-empty-symbol">+</div>
           <h2>Connect your first provider</h2>
           <p>Sign in or import a credential to start routing requests.</p>
-          <button className="primary" onClick={() => setAdding(true)}>
+          <button
+            className="primary"
+            disabled={working}
+            onClick={() => setAdding(true)}
+          >
             <Plus size={16} />
             Add account
           </button>
@@ -229,73 +244,39 @@ export function Accounts() {
           <Search size={25} />
           <h2>No accounts match</h2>
           <p>Try another search or reset the filters.</p>
-          <button onClick={clearFilters}>Clear filters</button>
+          <button disabled={working} onClick={clearFilters}>
+            Clear filters
+          </button>
         </div>
       ) : (
-        <div className="accounts-workspace">
-          <section className="accounts-list" aria-label="Provider accounts">
-            <div className="accounts-list-heading">
-              <strong>Your accounts</strong>
-              <span>
-                {visible.length} of {all_accounts.length}
-              </span>
-            </div>
-            {providers
-              .filter((provider) =>
-                visible.some((item) => item.provider === provider),
-              )
-              .map((provider) => (
-                <section className="accounts-provider-group" key={provider}>
-                  <h3>
-                    {provider}
-                    <span>
-                      {
-                        visible.filter((item) => item.provider === provider)
-                          .length
-                      }
-                    </span>
-                  </h3>
-                  {visible
-                    .filter((item) => item.provider === provider)
-                    .map((item) => (
-                      <button
-                        key={item.id}
-                        disabled={working}
-                        className={`accounts-list-row ${account.id === item.id ? "is-selected" : ""}`}
-                        aria-pressed={account.id === item.id}
-                        onClick={() => setSelected(item.id)}
-                      >
-                        <span className="accounts-list-identity">
-                          <strong>{item.label || item.id}</strong>
-                          <small>{item.username || item.id}</small>
-                          <span className="accounts-list-state">
-                            <span
-                              className={`account-activation account-activation-${activationOf(item)}`}
-                            >
-                              {activationOf(item)}
-                            </span>
-                            {item.credential_status !== "stored" && (
-                              <span className="accounts-credential-warning">
-                                Credential {item.credential_status}
-                              </span>
-                            )}
-                            {hasChanges(item, drafts[item.id]) && (
-                              <span className="accounts-unsaved">Unsaved</span>
-                            )}
-                          </span>
-                        </span>
-                        <ChevronRight size={15} aria-hidden="true" />
-                      </button>
-                    ))}
-                </section>
-              ))}
-          </section>
+        <AccountList
+          accounts={visible}
+          total_count={all_accounts.length}
+          draft_ids={draft_ids}
+          working={working}
+          onOpen={(id) => {
+            setMessage("");
+            setSelected(id);
+          }}
+        />
+      )}
+      {account && (
+        <Modal
+          title={account.label || account.id}
+          description={`${account.provider} · ${account.username || account.id}`}
+          class_name="account-panel"
+          return_focus={directory}
+          busy={working}
+          onClose={() => setSelected("")}
+        >
           <AccountDetails
             key={account.id}
             account={account}
             working={working}
+            message={message}
+            load_error={accounts.error}
             draft={
-              drafts[account.id] ?? {
+              drafts.get(account.id) ?? {
                 label: account.label ?? "",
                 activation: activationOf(account),
               }
@@ -305,9 +286,8 @@ export function Accounts() {
             onChecked={accounts.refresh}
             onBusyChange={setWorking}
           />
-        </div>
+        </Modal>
       )}
-      {!!all_accounts.length && <AccountUsage account={account} />}
     </div>
   );
 }

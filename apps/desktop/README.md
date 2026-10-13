@@ -24,7 +24,8 @@ builds do not require WebKit/GTK or other desktop libraries.
 - **Overview:** check the first loopback `llm_api` listener (sorted by listener
   ID), start the bundled gateway, stop a gateway owned by this app, and view
   recorded usage for the past 24 hours.
-- **Accounts:** search accounts grouped by provider; edit labels and shared
+- **Accounts:** search a full-width list grouped by provider; open an account in
+  a floating panel with Settings, Credentials, and Usage tabs. Edit labels and shared
   active/fallback/disabled state; filter by provider and activation; remove accounts; check authentication and live
   provider quota separately from recorded local usage. Add accounts in
   a floating modal with device-code login or supported credential imports (paste, environment, file,
@@ -53,8 +54,10 @@ builds do not require WebKit/GTK or other desktop libraries.
   opening Activity never creates or migrates a database.
 
 Pages load on their first visit and retain their state when switching screens.
-Account drafts survive account selection and filtering; each unsaved account is
-marked in the list. Routing keeps its editor draft until saved or explicitly
+Account drafts survive closing the panel, account selection, and filtering; each
+unsaved account is marked in the list. Closing with Escape or the backdrop returns
+to the list. Dismissal is disabled during account operations; successful removal
+returns to the list. Provider quota checks remain on demand. Routing keeps its editor draft until saved or explicitly
 reloaded. Use Command/Ctrl + 1–4 to switch between Overview, Activity, Accounts,
 and Routing when focus is outside an editor and no dialog is open.
 

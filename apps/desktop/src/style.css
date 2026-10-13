@@ -556,6 +556,12 @@ td button {
   margin: 0;
   font-size: 20px;
 }
+.modal-description {
+  margin: 6px 0 0;
+  color: var(--ui-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .modal-heading button {
   min-height: 30px;
   padding: 6px;

@@ -4,7 +4,7 @@ export function useResource<T>(load: () => Promise<T>) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const generation = useRef(0);
-  const setData = useCallback((value: T) => {
+  const setData = useCallback((value: T | ((current: T | undefined) => T)) => {
     // A saved document or pushed status supersedes any in-flight read.
     generation.current++;
     setValue(value);
