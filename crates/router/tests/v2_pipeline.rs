@@ -39,9 +39,8 @@ async fn custom_codex_client_relays_prioritize_compaction_on_api_and_proxy() {
   let upstream_addr = upstream_listener.local_addr().unwrap();
   let upstream_task = tokio::spawn(async move { axum::serve(upstream_listener, upstream).await.unwrap() });
 
-  let proxy_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = proxy_probe.local_addr().unwrap();
-  drop(proxy_probe);
+  let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = proxy_listener.local_addr().unwrap();
   let config = format!(
     r#"
 schema_version = 2
@@ -78,23 +77,13 @@ base_url = "http://{upstream_addr}/backend-api/codex"
       .unwrap();
   let app = tokn_router::v2::router(states.llm_api.pop().unwrap());
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(
     states.forward_proxy.pop().unwrap(),
-    proxy_addr,
+    proxy_listener,
     async {
       let _ = shutdown_rx.await;
     },
   ));
-  tokio::time::timeout(std::time::Duration::from_secs(5), async {
-    loop {
-      if tokio::net::TcpStream::connect(proxy_addr).await.is_ok() {
-        break;
-      }
-      tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-  })
-  .await
-  .expect("proxy listener should start");
 
   let body = br#"{"model":"gpt-test","input":[{"type":"compaction_trigger"}],"service_tier":"auto"}"#;
   let response = app

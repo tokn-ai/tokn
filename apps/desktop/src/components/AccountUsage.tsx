@@ -1,51 +1,93 @@
+import { RefreshCw } from "lucide-react";
 import { Empty, ErrorMessage, number } from "./Feedback";
 import { api } from "../lib/tauri";
+import type { AccountSummary } from "../lib/types";
 import { useResource } from "../lib/useResource";
-export function AccountUsage() {
+
+export function AccountUsage({
+  account,
+  disabled = false,
+}: {
+  account: AccountSummary;
+  disabled?: boolean;
+}) {
   const usage = useResource(api.usage);
+  const rows = (usage.data ?? []).filter((row) => row.account === account.id);
   return (
-    <>
-      <ErrorMessage error={usage.error} />
-      <div className="section-label">
-        <h3>Model usage</h3>
-        <span>Recorded locally · not remaining provider quota</span>
+    <section
+      className="account-usage"
+      aria-label={`Recorded usage for ${account.id}`}
+    >
+      <div className="account-usage-heading">
+        <div>
+          <h3>Recorded usage</h3>
+          <p>Past 24 hours · this account</p>
+        </div>
+        <button
+          disabled={disabled || usage.loading}
+          onClick={() => void usage.refresh()}
+        >
+          <RefreshCw size={15} />
+          {usage.loading ? "Refreshing…" : usage.error ? "Retry" : "Refresh"}
+        </button>
       </div>
-      {usage.loading ? (
+      <ErrorMessage error={usage.error} />
+      {usage.error && usage.data && (
+        <p className="account-usage-stale" role="status">
+          Refresh failed. Previously loaded usage is shown below.
+        </p>
+      )}
+      {usage.loading && !usage.data ? (
         <Empty>Loading usage…</Empty>
-      ) : !usage.data?.length ? (
-        <Empty>No recorded usage in the past 24 hours.</Empty>
+      ) : usage.error && !usage.data ? (
+        <p className="account-help">
+          Recorded usage could not be loaded. Retry to check this account’s
+          activity.
+        </p>
+      ) : !rows.length ? (
+        <p className="account-usage-empty">
+          No recorded usage for this account in the past 24 hours.
+        </p>
       ) : (
-        <div className="table-wrap">
+        <div className="account-usage-table">
           <table>
             <thead>
               <tr>
-                <th>Model / account</th>
-                <th>Requests</th>
-                <th>Input</th>
-                <th>Output</th>
-                <th>Cache read</th>
+                <th scope="col">Model</th>
+                <th scope="col">Requests</th>
+                <th scope="col">Input tokens</th>
+                <th scope="col">Output tokens</th>
+                <th scope="col">Cache read</th>
               </tr>
             </thead>
             <tbody>
-              {usage.data.map((row, index) => (
-                <tr key={index}>
+              {rows.map((row) => (
+                <tr key={`${row.model}-${row.provider}-${row.account}`}>
                   <td>
-                    {row.model}
-                    <small>
-                      {row.provider ?? "Unassigned"} /{" "}
-                      {row.account ?? "Unassigned"}
-                    </small>
+                    <strong>{row.model}</strong>
+                    <small>{row.provider ?? "Unassigned"}</small>
                   </td>
-                  <td>{number(row.requests)}</td>
-                  <td>{number(row.input_tokens)}</td>
-                  <td>{number(row.output_tokens)}</td>
-                  <td>{number(row.cached_tokens)}</td>
+                  <td title={row.requests.toLocaleString()}>
+                    {number(row.requests)}
+                  </td>
+                  <td title={row.input_tokens.toLocaleString()}>
+                    {number(row.input_tokens)}
+                  </td>
+                  <td title={row.output_tokens.toLocaleString()}>
+                    {number(row.output_tokens)}
+                  </td>
+                  <td title={row.cached_tokens.toLocaleString()}>
+                    {number(row.cached_tokens)}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
       )}
-    </>
+      <p className="account-help account-usage-footnote">
+        Provider quota is checked separately from this recorded usage.
+      </p>
+    </section>
   );
 }

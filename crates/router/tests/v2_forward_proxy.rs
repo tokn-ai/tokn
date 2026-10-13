@@ -20,9 +20,8 @@ async fn v2_forward_proxy_authenticates_and_applies_connect_policy() {
     stream.write_all(b"pong").await.unwrap();
   });
 
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let config = format!(
     r#"
 schema_version = 2
@@ -55,10 +54,9 @@ hosts = ["blocked.example"]
     .pop()
     .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut unauthenticated_get = TcpStream::connect(proxy_addr).await.unwrap();
   unauthenticated_get
@@ -170,9 +168,8 @@ async fn v2_forward_proxy_routes_absolute_http_transparently() {
     request
   });
 
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let config = format!(
     r#"
 schema_version = 2
@@ -212,10 +209,9 @@ access_token = "codex-client-token"
     .pop()
     .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
   let client_addr = client.local_addr().unwrap();
@@ -323,9 +319,8 @@ access_token = "codex-client-token"
 
 #[tokio::test]
 async fn v2_forward_proxy_rejects_bodies_over_the_configured_limit() {
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let config = format!(
     r#"
 schema_version = 2
@@ -355,10 +350,9 @@ credentials = {{ kind = "client" }}
       .pop()
       .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
   client
@@ -381,9 +375,8 @@ credentials = {{ kind = "client" }}
 
 #[tokio::test]
 async fn v2_forward_proxy_intercepts_tls_and_reuses_http_policy() {
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let ca = tempfile::tempdir().unwrap();
   let ca_dir = toml_string(&ca.path().to_string_lossy());
   let config = format!(
@@ -408,10 +401,9 @@ ca_dir = {ca_dir}
       .unwrap();
   let cert_path = ca.path().join("ca.crt");
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut tls = connect_intercepted_tls(proxy_addr, "api.example.test", &cert_path).await;
   tls
@@ -454,9 +446,8 @@ async fn v2_forward_proxy_rejects_intercepted_websocket_before_dispatch() {
       .unwrap();
   });
 
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let ca = tempfile::tempdir().unwrap();
   let ca_dir = toml_string(&ca.path().to_string_lossy());
   let config = format!(
@@ -494,10 +485,9 @@ base_url = "http://{upstream_addr}/v1"
     .unwrap();
   let cert_path = ca.path().join("ca.crt");
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut tls = connect_intercepted_tls(proxy_addr, "api.example.test", &cert_path).await;
   tls
@@ -545,9 +535,8 @@ async fn v2_forward_proxy_relay_selects_provider_from_original_origin() {
     request
   });
 
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let config = format!(
     r#"
 schema_version = 2
@@ -596,10 +585,9 @@ api_key = "router-secret"
   .pop()
   .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
   client
@@ -642,9 +630,8 @@ api_key = "router-secret"
 async fn v2_forward_proxy_shutdown_cancels_an_active_tunnel() {
   let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let upstream_addr = upstream.local_addr().unwrap();
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let proxy_addr = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let proxy_addr = listener.local_addr().unwrap();
   let plan = tokn_config::v2::parse(
     &format!(
       r#"
@@ -668,10 +655,9 @@ default_connect = "tunnel"
       .pop()
       .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-  let proxy_task = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+  let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
   }));
-  wait_for_listener(proxy_addr).await;
 
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
   client
@@ -706,9 +692,8 @@ default_connect = "tunnel"
 
 #[tokio::test]
 async fn shutdown_cancels_an_unfinished_intercepted_tls_handshake() {
-  let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-  let address = probe.local_addr().unwrap();
-  drop(probe);
+  let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+  let address = listener.local_addr().unwrap();
   let ca = tempfile::tempdir().unwrap();
   let ca_dir = toml_string(&ca.path().to_string_lossy());
   let plan = tokn_config::v2::parse(
@@ -734,10 +719,9 @@ ca_dir = {ca_dir}
       .pop()
       .unwrap();
   let (stop, stopped) = tokio::sync::oneshot::channel();
-  let server = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, address, async {
+  let server = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     stopped.await.unwrap();
   }));
-  wait_for_listener(address).await;
   let mut client = TcpStream::connect(address).await.unwrap();
   client
     .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
@@ -783,9 +767,8 @@ async fn shutdown_drains_direct_and_intercepted_http_responses() {
       released.await.unwrap();
       stream.write_all(last).await.unwrap();
     });
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = probe.local_addr().unwrap();
-    drop(probe);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
     let ca = tempfile::tempdir().unwrap();
     let ca_dir = toml_string(&ca.path().to_string_lossy());
     let config = format!(
@@ -817,10 +800,9 @@ base_url = "http://{upstream_addr}/v1"
         .pop()
         .unwrap();
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let server = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
       stopped.await.unwrap();
     }));
-    wait_for_listener(proxy_addr).await;
     let mut client: Box<dyn TestStream> = if intercept {
       Box::new(connect_intercepted_tls(proxy_addr, "api.example.test", &ca.path().join("ca.crt")).await)
     } else {
@@ -883,9 +865,8 @@ async fn profile_owned_proxy_pools_and_client_relays_enforce_route_provider_rest
     }
   });
   for credentials in ["account_pool", "client"] {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let proxy_addr = probe.local_addr().unwrap();
-    drop(probe);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
     let pool = if credentials == "account_pool" {
       "account_pool = { accounts = ['allowed-account', 'blocked-account'] }"
     } else {
@@ -935,10 +916,9 @@ base_url = "http://{blocked_addr}/v1"
     .pop()
     .unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let proxy = tokio::spawn(tokn_router::v2::serve_forward_proxy(state, proxy_addr, async {
+    let proxy = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
       let _ = shutdown_rx.await;
     }));
-    wait_for_listener(proxy_addr).await;
     // Account relays preserve the existing unowned-origin 400 response;
     // restricted client relays report a provider-policy denial.
     let denied = if credentials == "account_pool" {
@@ -1037,16 +1017,6 @@ async fn connect_intercepted_tls(
     .connect(server_name, client)
     .await
     .unwrap()
-}
-
-async fn wait_for_listener(addr: std::net::SocketAddr) {
-  for _ in 0..50 {
-    if TcpStream::connect(addr).await.is_ok() {
-      return;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-  }
-  panic!("proxy listener did not start at {addr}");
 }
 
 fn toml_string(value: &str) -> String {

@@ -1915,10 +1915,18 @@ class InspectApp extends LitElement {
         : this.requested_session_id !== undefined;
     return html`
       <header class="app-header">
-        <p class="read-only-label">Local · read only</p>
-        <p class="sensitive-notice">
-          History may contain sensitive prompts and responses.
-        </p>
+        <div>
+          <p class="activity-eyebrow">OBSERVABILITY</p>
+          <h1>Activity</h1>
+          <p class="activity-description">
+            Follow a request. Understand the conversation.
+          </p>
+        </div>
+        <span
+          class="activity-readonly"
+          title="Browse local history without changing stored requests or sessions."
+          >Read only</span
+        >
       </header>
       <main class="app-shell">
         <div class="shell-navigation">
@@ -1939,7 +1947,7 @@ class InspectApp extends LitElement {
             </button>
           </nav>
           <span class="data-path" title=${data_path ?? ""}
-            >${data_path ?? "Loading data source…"}</span
+            >${data_path ? "Stored on this device" : "Loading data source…"}</span
           >
         </div>
         ${
