@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ArrowRight,
   Check,
-  ChevronDown,
+  ArrowLeft,
   FileCode2,
   Info,
   RefreshCw,
@@ -10,7 +10,10 @@ import {
 } from "lucide-react";
 import { api } from "../lib/tauri";
 import { useResource } from "../lib/useResource";
-import { ErrorMessage, PageHeading } from "../components/Feedback";
+import { Empty, ErrorMessage, PageHeading } from "../components/Feedback";
+import { Modal } from "../components/Modal";
+import { RoutingBrowser } from "../components/routing/RoutingBrowser";
+import { RoutingEditor } from "../components/routing/RoutingEditor";
 import "./routing.css";
 
 type ApplyState = "unknown" | "pending" | "applied" | "unconfirmed";
@@ -24,22 +27,18 @@ export function Routing() {
   const [apply_state, setApplyState] = useState<ApplyState>("unknown");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  const [cursor, setCursor] = useState({ line: 1, column: 1 });
-  const line_numbers = useRef<HTMLDivElement>(null);
+  const [view, setView] = useState<"browse" | "advanced">("browse");
+  const [confirm_reload, setConfirmReload] = useState(false);
 
   useEffect(() => {
     if (resource.data) {
       setDraft(resource.data.routing_toml);
-      setCursor({ line: 1, column: 1 });
     }
   }, [resource.data]);
 
   const dirty = !!resource.data && draft !== resource.data.routing_toml;
   const busy = operation !== null;
   const document = resource.data;
-  const filename = document?.config_path.split(/[\\/]/).pop();
-  const line_count = draft.split("\n").length;
-  const editor_disabled = !document || busy || resource.loading;
   const [status_title, status_description] = (() => {
     if (operation === "saving")
       return [
@@ -82,12 +81,6 @@ export function Routing() {
     }
   })();
 
-  function updateCursor(element: HTMLTextAreaElement) {
-    const before = element.value.slice(0, element.selectionStart);
-    const lines = before.split("\n");
-    setCursor({ line: lines.length, column: lines.at(-1)!.length + 1 });
-  }
-
   async function save() {
     if (!document || !dirty || busy || resource.loading) return;
     setOperation("saving");
@@ -125,13 +118,6 @@ export function Routing() {
 
   async function readFromDisk() {
     if (busy || resource.loading) return;
-    if (
-      dirty &&
-      !window.confirm(
-        "Discard your unsaved routing changes and reload from disk?",
-      )
-    )
-      return;
     setError("");
     setMessage("");
     setApplyState("unknown");
@@ -140,21 +126,38 @@ export function Routing() {
 
   return (
     <div className="routing-page">
-      <PageHeading eyebrow="GATEWAY CONFIGURATION" title="Routing">
-        <button
-          type="button"
-          className="routing-refresh"
-          disabled={busy || resource.loading}
-          onClick={() => void readFromDisk()}
-        >
-          <RefreshCw size={15} />
-          Reload from disk
-        </button>
+      <PageHeading
+        eyebrow="GATEWAY CONFIGURATION"
+        title="Routing"
+        description="Choose how requests reach your providers."
+      >
+        <div className="actions routing-page-actions">
+          <button
+            type="button"
+            className="routing-refresh"
+            disabled={busy || resource.loading}
+            onClick={() =>
+              dirty ? setConfirmReload(true) : void readFromDisk()
+            }
+          >
+            <RefreshCw size={15} />
+            Reload from disk
+          </button>
+          <button
+            type="button"
+            disabled={!document || busy || resource.loading}
+            aria-pressed={view === "advanced"}
+            onClick={() => setView(view === "browse" ? "advanced" : "browse")}
+          >
+            {view === "advanced" ? (
+              <ArrowLeft size={15} />
+            ) : (
+              <FileCode2 size={15} />
+            )}
+            {view === "advanced" ? "Back to routes" : "Advanced editor"}
+          </button>
+        </div>
       </PageHeading>
-      <p className="routing-intro">
-        Choose how requests reach your providers. Edit your policy, save it,
-        then apply it when you’re ready.
-      </p>
 
       <ErrorMessage error={error || resource.error} />
       {message && (
@@ -170,8 +173,9 @@ export function Routing() {
           <div>
             <strong>Configuration fragments can override this policy</strong>
             <p>
-              You’re editing the primary file. These fragments load afterwards
-              and may override its profiles and model scores.
+              The list includes these fragments. Advanced edits only the primary
+              file; fragments load afterwards and may override its profiles and
+              model scores.
             </p>
             <details>
               <summary>
@@ -190,118 +194,97 @@ export function Routing() {
         </div>
       )}
 
-      <section
-        className="routing-editor"
-        aria-label="Routing policy editor"
-        aria-busy={resource.loading || operation === "saving"}
-      >
-        <div className="routing-editor-header">
-          <div className="routing-file">
-            <FileCode2 size={18} aria-hidden="true" />
-            <strong>{filename || "Configuration"}</strong>
-            {document && (
-              <span className="routing-schema">
-                {document.schema === "v2" ? "v2" : "Legacy"}
-              </span>
-            )}
-          </div>
-          <span className="routing-language">TOML</span>
-        </div>
-
-        <div className="routing-editor-body">
-          <div className="routing-gutter" aria-hidden="true">
-            <div className="routing-line-numbers" ref={line_numbers}>
-              <pre>
-                {Array.from(
-                  { length: line_count },
-                  (_, index) => index + 1,
-                ).join("\n")}
-              </pre>
-            </div>
-          </div>
-          <textarea
-            className="routing-input"
-            aria-label="Routing configuration in TOML"
-            aria-describedby="routing-editor-help"
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-            wrap="off"
-            value={draft}
-            disabled={editor_disabled}
-            onChange={(event) => {
-              setDraft(event.target.value);
-              setMessage("");
-              updateCursor(event.currentTarget);
-            }}
-            onClick={(event) => updateCursor(event.currentTarget)}
-            onKeyUp={(event) => updateCursor(event.currentTarget)}
-            onScroll={(event) => {
-              if (line_numbers.current)
-                line_numbers.current.scrollTop = event.currentTarget.scrollTop;
-            }}
-            placeholder={
-              resource.loading
-                ? "Loading your routing policy…"
-                : document
-                  ? "No routing policy sections are configured yet."
-                  : "Reload from disk to load your configuration."
-            }
-          />
-        </div>
-        <div className="routing-editor-footer">
-          <span id="routing-editor-help">
-            Validated against your complete configuration before saving
-          </span>
+      {dirty && view === "browse" && (
+        <div className="routing-draft-notice" role="status">
           <span>
-            Ln {cursor.line}, Col {cursor.column}
+            You have unsaved edits in Advanced. This list shows the saved
+            configuration.
           </span>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => setView("advanced")}
+          >
+            Return to draft
+          </button>
         </div>
-      </section>
-
-      {document && (
-        <p className="routing-path" title={document.config_path}>
-          {document.config_path}
-        </p>
       )}
-
-      <details className="routing-guide">
-        <summary>
-          <span>
-            <Info size={16} aria-hidden="true" />A quick guide to routing policy
-          </span>
-          <ChevronDown size={16} aria-hidden="true" />
-        </summary>
-        <div className="routing-guide-content">
-          <dl>
-            <div>
-              <dt>Defaults</dt>
-              <dd>Set the policy requests use when no profile is selected.</dd>
-            </div>
-            <div>
-              <dt>Profiles</dt>
-              <dd>Define named policies for different agents or workflows.</dd>
-            </div>
-            {document?.schema === "v2" && (
-              <div>
-                <dt>Routes</dt>
-                <dd>Define the routing options referenced by your policies.</dd>
+      {document ? (
+        <>
+          <div hidden={view !== "browse"}>
+            {document.overview ? (
+              <RoutingBrowser
+                overview={document.overview}
+                schema={document.schema}
+                config_path={document.config_path}
+                disabled={busy || resource.loading}
+                onEdit={() => setView("advanced")}
+              />
+            ) : (
+              <div className="routing-overview-unavailable">
+                <h2>Routing summary unavailable</h2>
+                <p>
+                  Your configuration is still available in Advanced. Correct its
+                  policy and save to rebuild this list.
+                </p>
+                <ErrorMessage
+                  error={
+                    document.overview_error ||
+                    "The saved policy could not be summarized."
+                  }
+                />
+                <button type="button" onClick={() => setView("advanced")}>
+                  Open Advanced editor
+                </button>
               </div>
             )}
-            <div>
-              <dt>Model scores</dt>
-              <dd>
-                Prefer providers for exact model IDs or trailing wildcards such
-                as <code>gpt-*</code>. Higher provider scores win.
-              </dd>
-            </div>
-          </dl>
-          <p>
-            Listener and service settings stay in your config file. Saving
-            updates the file; applying asks the running gateway to reload it.
+          </div>
+          <div hidden={view !== "advanced"}>
+            <RoutingEditor
+              document={document}
+              draft={draft}
+              visible={view === "advanced"}
+              disabled={busy || resource.loading}
+              onChange={(value) => {
+                setDraft(value);
+                setMessage("");
+              }}
+            />
+          </div>
+        </>
+      ) : (
+        <Empty>
+          {resource.loading
+            ? "Loading routing configuration…"
+            : "Configuration could not be loaded. Reload from disk to try again."}
+        </Empty>
+      )}
+      {confirm_reload && (
+        <Modal
+          title="Reload routing configuration?"
+          onClose={() => setConfirmReload(false)}
+        >
+          <p className="routing-confirm-description">
+            This replaces your unsaved routing draft with the file on disk. Your
+            draft is kept if the file cannot be read.
           </p>
-        </div>
-      </details>
+          <div className="actions routing-confirm-actions">
+            <button type="button" onClick={() => setConfirmReload(false)}>
+              Keep editing
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={() => {
+                setConfirmReload(false);
+                void readFromDisk();
+              }}
+            >
+              Discard draft & reload
+            </button>
+          </div>
+        </Modal>
+      )}
 
       <div className="routing-save-bar">
         <div className="routing-save-state" role="status">

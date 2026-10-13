@@ -27,6 +27,7 @@ tokn-config = { package = "tokn-router-config", path = "../../../crates/config" 
 tokn-accounts = { path = "../../../crates/accounts" }
 tokn-auth = { path = "../../../crates/auth" }
 tokn-persistence = { path = "../../../crates/persistence" }
+tokn-policy = { path = "../../../crates/policy" }
 
 tempfile = "3"
 

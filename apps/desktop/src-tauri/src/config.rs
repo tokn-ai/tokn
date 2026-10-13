@@ -7,6 +7,9 @@ use std::{
 };
 use toml_edit::DocumentMut;
 
+mod routing;
+pub use routing::RoutingOverview;
+
 const SECTIONS: &[&str] = &["defaults", "profiles", "routes", "model_scores"];
 
 #[derive(Serialize)]
@@ -16,6 +19,8 @@ pub struct RoutingDocument {
   pub schema: String,
   pub overlay_paths: Vec<String>,
   pub routing_toml: String,
+  pub overview: Option<RoutingOverview>,
+  pub overview_error: Option<String>,
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -64,8 +69,8 @@ pub fn address() -> Result<SocketAddr> {
   }
 }
 
-fn overlays(path: &Path) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-  if tokn_config::detect_config_schema(path)? != tokn_config::ConfigSchema::Legacy {
+fn overlays(path: &Path, schema: tokn_config::ConfigSchema) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+  if schema != tokn_config::ConfigSchema::Legacy {
     return Ok(Vec::new());
   }
   let directory = tokn_config::paths::config_fragment_dir(path);
@@ -99,9 +104,13 @@ fn revision(contents: &str) -> String {
 
 pub fn read_at(path: &Path) -> Result<RoutingDocument> {
   let contents = std::fs::read_to_string(path)?;
-  let schema = tokn_config::detect_config_schema(path)?;
-  let overlays = overlays(path)?;
   let document: DocumentMut = contents.parse()?;
+  let schema = document_schema(&document)?;
+  let overlays = overlays(path, schema)?;
+  let (overview, overview_error) = match routing::summarize(path, &contents, &document, &overlays, schema) {
+    Ok(overview) => (Some(overview), None),
+    Err(error) => (None, Some(format!("{error:#}"))),
+  };
   let mut routing = DocumentMut::new();
   for section in SECTIONS {
     if let Some(value) = document.get(section) {
@@ -119,13 +128,28 @@ pub fn read_at(path: &Path) -> Result<RoutingDocument> {
     .into(),
     overlay_paths: overlays.iter().map(|(path, _)| path.display().to_string()).collect(),
     routing_toml: routing.to_string(),
+    overview,
+    overview_error,
   })
+}
+
+fn document_schema(document: &DocumentMut) -> Result<tokn_config::ConfigSchema> {
+  match document.get("schema_version") {
+    None => Ok(tokn_config::ConfigSchema::Legacy),
+    Some(marker) => match marker.as_integer() {
+      Some(version) if version == i64::from(tokn_config::v2::SCHEMA_VERSION) => Ok(tokn_config::ConfigSchema::V2),
+      Some(version) => bail!("Unsupported configuration schema version: {version}"),
+      None => bail!("Configuration schema_version must be an integer"),
+    },
+  }
 }
 
 pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Result<RoutingDocument> {
   let lock = tokn_config::lock_config_file(path)?;
   let original = std::fs::read_to_string(path)?;
-  let overlays = overlays(path)?;
+  let mut document: DocumentMut = original.parse()?;
+  let schema = document_schema(&document)?;
+  let overlays = overlays(path, schema)?;
   if snapshot_revision(&original, &overlays) != expected_revision {
     bail!("Configuration changed on disk. Reload before saving; your draft has been retained.");
   }
@@ -135,7 +159,6 @@ pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Resu
       bail!("Only defaults, profiles, routes and model_scores can be edited here (found {key})");
     }
   }
-  let mut document: DocumentMut = original.parse()?;
   for section in SECTIONS {
     document.remove(section);
     if let Some(value) = routing.get(section) {
@@ -143,7 +166,7 @@ pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Resu
     }
   }
   let candidate = document.to_string();
-  match tokn_config::detect_config_schema(path)? {
+  match schema {
     tokn_config::ConfigSchema::V2 => {
       tokn_config::v2::parse_config(&candidate, path)?;
     }
@@ -151,23 +174,10 @@ pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Resu
       if routing.contains_key("routes") {
         bail!("Legacy configuration uses defaults and profiles, not routes");
       }
-      // Validate the candidate together with exact fragment snapshots without
-      // changing the live primary or fragment files.
-      let stage = tempfile::tempdir()?;
-      let staged_path = stage.path().join("config.toml");
-      std::fs::write(&staged_path, &candidate)?;
-      let staged_fragments = stage.path().join("config.d");
-      std::fs::create_dir(&staged_fragments)?;
-      for (source, bytes) in &overlays {
-        std::fs::write(
-          staged_fragments.join(source.file_name().context("Invalid fragment filename")?),
-          bytes,
-        )?;
-      }
-      tokn_config::Config::load(Some(&staged_path))?;
+      routing::load_legacy_snapshot(path, &candidate, &overlays)?;
     }
   }
-  if snapshot_revision(&original, &self::overlays(path)?) != expected_revision {
+  if snapshot_revision(&original, &self::overlays(path, schema)?) != expected_revision {
     bail!("Configuration fragments changed during validation. Reload before saving.");
   }
   lock.replace_contents_if_unchanged(Some(original.as_bytes()), candidate.as_bytes())?;
