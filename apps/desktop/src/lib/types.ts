@@ -13,6 +13,38 @@ export interface RoutingDocument {
   routing_toml: string;
   schema: string;
   overlay_paths: string[];
+  overview: RoutingOverview | null;
+  overview_error: string | null;
+}
+export interface RoutingOverview {
+  profiles: RoutingProfileSummary[];
+  routes: RoutingRouteSummary[];
+  model_score_count: number;
+}
+export interface RoutingSource {
+  path: string;
+  section: string;
+  generated: boolean;
+}
+export interface RoutingSummaryField {
+  label: string;
+  value: string;
+}
+export interface RoutingProfileSummary {
+  id: string;
+  route_id: string | null;
+  route_kind: string;
+  api_path: string | null;
+  source: RoutingSource;
+  fields: RoutingSummaryField[];
+}
+export interface RoutingRouteSummary {
+  id: string;
+  kind: string;
+  target: string;
+  source: RoutingSource;
+  fields: RoutingSummaryField[];
+  used_by: string[];
 }
 export interface AccountSummary {
   id: string;

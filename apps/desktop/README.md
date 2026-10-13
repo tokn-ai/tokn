@@ -38,8 +38,14 @@ builds do not require WebKit/GTK or other desktop libraries.
   failures clearly distinguish saved credentials from unapplied runtime changes.
   Token refreshes are persisted before quota probes, including when quota fails.
   Quota checks are on demand and report unsupported/unavailable separately from zero.
-- **Routing:** edit the `defaults`, `profiles`, `routes` and `model_scores`
-  sections as TOML. Save validates the complete candidate with the existing configuration
+- **Routing:** browse searchable profiles and routes from the saved configuration,
+  with floating details for account pools, API paths, providers, model selection,
+  retries, and shared route references. Summaries include generated defaults and
+  legacy fragments, with each entry's source shown. They describe the saved
+  policy, not the currently running gateway. Advanced edits the `defaults`,
+  `profiles`, `routes` and `model_scores` sections as TOML; drafts survive switching
+  back to the list. If the summary fails, the loaded TOML remains available in the editor.
+  Save validates the complete candidate with the existing configuration
   validator (including legacy fragments) and uses a locked, atomic replacement with a revision check.
   Unrelated sections and their comments are retained. Apply separately calls
   the local admin reload endpoint; reload failure leaves the saved file in

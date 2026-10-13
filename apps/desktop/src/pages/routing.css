@@ -2,11 +2,52 @@
   min-width: 0;
 }
 
-.routing-intro {
-  max-width: 640px;
-  margin: -13px 0 28px;
+.routing-page-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.routing-draft-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  margin-bottom: 18px;
+  border: 1px solid var(--ui-border);
+  border-radius: 9px;
+  background: var(--ui-surface-raised);
   color: var(--ui-muted);
-  font-size: 14px;
+  font-size: 12px;
+}
+
+.routing-draft-notice button {
+  flex-shrink: 0;
+  font-size: 12px;
+}
+
+.routing-overview-unavailable {
+  padding: 28px;
+  border: 1px solid var(--ui-border);
+  border-radius: 12px;
+  background: var(--ui-surface);
+}
+
+.routing-overview-unavailable h2 {
+  margin: 0 0 10px;
+  font-size: 17px;
+}
+
+.routing-overview-unavailable > p,
+.routing-confirm-description {
+  margin: 0 0 20px;
+  color: var(--ui-muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.routing-confirm-actions {
+  justify-content: flex-end;
 }
 
 .routing-refresh {
@@ -345,6 +386,12 @@
 }
 
 @media (max-width: 1080px) {
+  .routing-draft-notice {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
   .routing-save-bar {
     align-items: flex-start;
     flex-direction: column;
