@@ -10,6 +10,7 @@ pub use model_refresh::ModelRefreshGuard;
 
 use crate::api::error::ApiError;
 use crate::api::identity::AccountIdentityResolver;
+use anyhow::Context;
 use arc_swap::ArcSwap;
 use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
@@ -458,6 +459,21 @@ pub async fn serve_forward_proxy<F>(state: ForwardProxyState, bind: SocketAddr, 
 where
   F: Future<Output = ()> + Send,
 {
+  let listener = tokio::net::TcpListener::bind(bind)
+    .await
+    .with_context(|| format!("bind {bind}"))?;
+  serve_bound_forward_proxy(state, listener, shutdown).await
+}
+
+/// Serve an already-bound listener without releasing its reserved address.
+pub async fn serve_bound_forward_proxy<F>(
+  state: ForwardProxyState,
+  listener: tokio::net::TcpListener,
+  shutdown: F,
+) -> anyhow::Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
   let outbound = state.outbound.clone();
   let live = LiveRuntime::new(
     RuntimeStates {
@@ -471,7 +487,7 @@ where
     .into_iter()
     .next()
     .expect("a runtime created with one forward proxy exposes it");
-  crate::proxy::serve_v2_policy(bind, outbound, state.into(), shutdown).await
+  crate::proxy::serve_bound_v2_policy(listener, outbound, state.into(), shutdown).await
 }
 
 pub async fn serve_live_forward_proxy<F>(
