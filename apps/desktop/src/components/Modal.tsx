@@ -1,4 +1,5 @@
 import { useId, useLayoutEffect, useRef, type ReactNode } from "react";
+import { X } from "lucide-react";
 
 export function Modal({
   title,
@@ -32,8 +33,13 @@ export function Modal({
     >
       <header className="modal-heading">
         <h2 id={title_id}>{title}</h2>
-        <button type="button" disabled={busy} onClick={onClose}>
-          Close
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onClose}
+          aria-label="Close dialog"
+        >
+          <X size={18} />
         </button>
       </header>
       {children}

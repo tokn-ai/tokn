@@ -1,7 +1,10 @@
+import { AlertCircle } from "lucide-react";
+
 export function ErrorMessage({ error }: { error: string }) {
   return error ? (
     <div className="notice error" role="alert">
-      {error}
+      <AlertCircle size={17} aria-hidden="true" />
+      <span>{error}</span>
     </div>
   ) : null;
 }
@@ -11,10 +14,12 @@ export function Empty({ children }: { children: React.ReactNode }) {
 export function PageHeading({
   eyebrow,
   title,
+  description,
   children,
 }: {
   eyebrow: string;
   title: string;
+  description?: string;
   children?: React.ReactNode;
 }) {
   return (
@@ -22,6 +27,7 @@ export function PageHeading({
       <div>
         <p className="eyebrow">{eyebrow}</p>
         <h1>{title}</h1>
+        {description && <p className="page-description">{description}</p>}
       </div>
       {children}
     </header>

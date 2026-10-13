@@ -53,7 +53,7 @@ input:focus-visible,
 select:focus-visible,
 summary:focus-visible,
 [tabindex]:focus-visible {
-  outline: 2px solid var(--ui-text);
+  outline: 2px solid var(--ui-accent);
   outline-offset: 2px;
 }
 
@@ -65,9 +65,10 @@ p {
 }
 
 h1 {
-  font-size: 1rem;
-  line-height: 1.2;
-  letter-spacing: -0.01em;
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.9px;
 }
 
 h2 {
@@ -98,15 +99,31 @@ h3 {
   align-items: center;
   justify-content: space-between;
   gap: 1rem;
-  min-height: 3.8rem;
-  border-bottom: 1px solid var(--border);
-  padding: 0.7rem clamp(1rem, 2.4vw, 2rem);
-  background: var(--ui-surface);
+  padding: 28px 28px 20px;
+  background: var(--background);
 }
 
-.sensitive-notice {
-  color: var(--warning);
-  font-size: 0.75rem;
+.activity-eyebrow {
+  margin-bottom: 8px;
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 1.25px;
+  font-weight: 600;
+}
+
+.activity-description {
+  margin-top: 7px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.activity-readonly {
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  background: var(--panel);
 }
 
 .app-shell {
@@ -114,7 +131,7 @@ h3 {
   grid-template-rows: auto auto minmax(0, 1fr);
   min-width: 0;
   min-height: 0;
-  padding: 0 clamp(1rem, 2.4vw, 2rem) clamp(1rem, 2vw, 1.5rem);
+  padding: 0 28px 24px;
 }
 
 .shell-navigation {
@@ -129,15 +146,17 @@ h3 {
 .view-navigation {
   display: flex;
   align-self: stretch;
+  gap: 8px;
 }
 
 .view-navigation button {
   border: 0;
   border-bottom: 2px solid transparent;
-  padding: 0.78rem 1rem 0.68rem;
+  padding: 0.78rem 0.9rem 0.68rem;
   color: var(--muted);
   background: transparent;
-  font-weight: 650;
+  font-weight: 550;
+  font-size: 12px;
 }
 
 .view-navigation button:hover {
@@ -146,14 +165,13 @@ h3 {
 
 .view-navigation button[aria-current="page"] {
   border-bottom-color: var(--accent);
-  color: var(--ui-text);
+  color: var(--accent);
 }
 
 .data-path {
   min-width: 0;
   overflow: hidden;
   color: var(--faint);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.68rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -161,10 +179,10 @@ h3 {
 
 .request-toolbar {
   display: grid;
-  grid-template-columns: auto minmax(25rem, 1fr);
+  grid-template-columns: 1fr;
   align-items: end;
-  gap: 0.65rem 1.2rem;
-  padding: 0.75rem 0;
+  gap: 12px;
+  padding: 16px 0;
 }
 
 .toolbar-primary {
@@ -197,7 +215,7 @@ h3 {
   border-radius: 0;
   padding: 0.48rem 0.65rem;
   color: var(--text);
-  background: var(--panel-raised);
+  background: var(--panel);
 }
 
 .day-navigation .icon-button:first-child {
@@ -293,8 +311,8 @@ h3 {
 .filter-bar {
   display: grid;
   grid-template-columns:
-    minmax(12rem, 1fr) minmax(8rem, 0.4fr) minmax(12rem, 0.7fr)
-    7.5rem auto auto auto;
+    minmax(10rem, 1fr) minmax(7rem, 0.4fr) minmax(9rem, 0.7fr)
+    6.5rem auto auto auto;
   gap: 0.45rem;
 }
 
@@ -310,7 +328,8 @@ h3 {
   border-radius: 0.45rem;
   padding: 0.5rem 0.65rem;
   color: var(--text);
-  background: var(--panel-raised);
+  background: var(--panel);
+  font-size: 12px;
 }
 
 .filter-bar select {
@@ -363,13 +382,13 @@ h3 {
 
 .viewer-grid {
   display: grid;
-  grid-template-columns: minmax(22rem, 0.82fr) minmax(0, 1.55fr);
+  grid-template-columns: minmax(18rem, 0.82fr) minmax(0, 1.55fr);
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 0.65rem;
   background: var(--panel);
-  box-shadow: 0 1rem 3.5rem var(--ui-shadow);
+  box-shadow: 0 2px 6px var(--ui-shadow);
 }
 
 .sidebar,
@@ -517,6 +536,7 @@ h3 {
 
 .request-row.selected,
 .session-row.selected {
+  background: var(--accent-surface);
   box-shadow: inset 3px 0 var(--accent);
 }
 
@@ -2453,6 +2473,22 @@ dd {
 }
 
 @media (max-width: 1100px) {
+  .filter-bar {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
+  }
+
+  .filter-bar .search-field {
+    grid-column: span 2;
+  }
+
+  .app-header {
+    padding-inline: 20px;
+  }
+
+  .app-shell {
+    padding-inline: 20px;
+  }
+
   .session-toolbar {
     grid-template-columns: minmax(16rem, 1fr) auto;
     gap: 0.55rem 1rem;

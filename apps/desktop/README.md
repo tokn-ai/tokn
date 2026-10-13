@@ -25,8 +25,8 @@ builds do not require WebKit/GTK or other desktop libraries.
   ID), start the bundled gateway, stop a gateway owned by this app, and view
   recorded usage for the past 24 hours.
 - **Accounts:** search accounts grouped by provider; edit labels and shared
-  active/fallback/disabled state; remove accounts; check authentication and live
-  provider quota separately from recorded local usage. Add accounts using provider
+  active/fallback/disabled state; filter by provider and activation; remove accounts; check authentication and live
+  provider quota separately from recorded local usage. Add accounts in
   a floating modal with device-code login or supported credential imports (paste, environment, file,
   and provider-specific sources). Device login shows progress and can be cancelled.
   Stored credentials are never returned to the frontend; pasted credentials are
@@ -44,14 +44,19 @@ builds do not require WebKit/GTK or other desktop libraries.
   the local admin reload endpoint; reload failure leaves the saved file in
   place and reports that the running configuration has not changed. Runtime
   linking can reject a configuration accepted by the structural compiler.
-- **Inspect:** the migrated request/session inspector. Browse UTC request days,
+- **Activity:** the request/session inspector. Browse UTC request days,
   paginate and filter requests, inspect messages and tool definitions, lazily
   load headers and bodies, and browse semantic session trees and usage. The
   existing Lit components run inside the desktop shell with isolated styles;
   native Tauri commands replace the old HTTP API. No inspector listener runs.
   Missing, unavailable and older databases retain their existing error states;
-  opening Inspect never creates or migrates a database.
+  opening Activity never creates or migrates a database.
 
+Pages load on their first visit and retain their state when switching screens.
+Account drafts survive account selection and filtering; each unsaved account is
+marked in the list. Routing keeps its editor draft until saved or explicitly
+reloaded. Use Command/Ctrl + 1–4 to switch between Overview, Activity, Accounts,
+and Routing when focus is outside an editor and no dialog is open.
 
 The app uses `~/.tokn/router/config.toml` and the normal auth store. It supports both
 legacy and v2 configuration with a fixed loopback API port. It does not migrate
@@ -98,9 +103,9 @@ TOKN_DESKTOP_TEST_GATEWAY="$(pwd)/../../target/debug/tokn-gateway" \
 ```
 
 `tokn-gateway inspect` and the standalone `tokn-router-inspect` crate have been
-removed. Use the desktop **Inspect** screen instead. The inspector's existing
+removed. Use the desktop **Activity** screen instead. The inspector's existing
 frontend checks now run from this package; native tests are still run locally.
 UI navigation discards cancelled native query results; a database read already
 in progress finishes on a blocking worker rather than interrupting SQLite.
 
-Appearance is available at the bottom of the sidebar: System follows the operating system, while Light and Dark override it. The preference is saved locally and applies to every page, including Inspect.
+Appearance is available at the bottom of the sidebar: System follows the operating system, while Light and Dark override it. The preference is saved locally and applies to every page, including Activity.
