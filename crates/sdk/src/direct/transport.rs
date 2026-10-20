@@ -98,3 +98,57 @@ pub trait Transport {
 
   async fn send(&mut self, request: Request) -> Result<Response, Self::Error>;
 }
+
+/// A response body read incrementally into caller-provided storage.
+///
+/// Return the number of bytes written, at most `buffer.len()`. For a nonempty
+/// buffer, zero means permanent EOF; wait for data instead of returning zero
+/// when the connection is merely idle. Decode HTTP transfer/content encodings
+/// before returning bytes. The SDK supplies a nonempty buffer on every call.
+///
+/// Reads must be cancellation safe: dropping a pending read must not consume
+/// bytes that a later read cannot recover. Dropping the body must release or
+/// abort the response without requiring it to be drained. A borrowed connection
+/// must not be reused with unread response bytes still on it.
+#[allow(async_fn_in_trait)]
+pub trait StreamBody {
+  type Error;
+
+  async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error>;
+}
+
+/// HTTP status and headers available before reading a streaming body.
+pub struct StreamingResponse<B> {
+  pub status: u16,
+  pub headers: Vec<Header>,
+  pub body: B,
+}
+
+impl<B> fmt::Debug for StreamingResponse<B> {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    f.debug_struct("StreamingResponse")
+      .field("status", &self.status)
+      .field("headers", &self.headers)
+      .finish_non_exhaustive()
+  }
+}
+
+/// Injected HTTP streaming, independent of the buffered [`Transport`] contract.
+///
+/// The body may borrow a socket or driver from `self`; it needs neither `Send`
+/// nor `'static`, and requires no boxed future, executor, or atomics. Implement
+/// both transport traits only if the application needs both request modes.
+///
+/// As with [`Transport`], implementations own DNS, TLS certificate validation,
+/// timeouts, header-size limits, and safe redirect handling. Return non-2xx
+/// responses normally so the SDK can preserve HTTP metadata and a bounded
+/// error body. Do not buffer the entire body before returning.
+#[allow(async_fn_in_trait)]
+pub trait StreamingTransport {
+  type Error;
+  type Body<'a>: StreamBody<Error = Self::Error>
+  where
+    Self: 'a;
+
+  async fn send_stream(&mut self, request: Request) -> Result<StreamingResponse<Self::Body<'_>>, Self::Error>;
+}

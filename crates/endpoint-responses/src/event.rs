@@ -213,6 +213,36 @@ pub enum ResponsesEvent {
 }
 
 impl ResponsesEvent {
+  /// Whether a wire event name has a typed variant in this schema.
+  ///
+  /// Deserialization preserves unknown or incompatible payloads in [`Self::Other`].
+  /// Callers requiring typed validation can use this to distinguish an unknown
+  /// event from a malformed payload for a supported event.
+  pub fn is_known_kind(kind: &str) -> bool {
+    matches!(
+      kind,
+      "response.created"
+        | "response.in_progress"
+        | "response.output_item.added"
+        | "response.output_item.done"
+        | "response.content_part.added"
+        | "response.content_part.done"
+        | "response.output_text.delta"
+        | "response.output_text.done"
+        | "response.reasoning_text.delta"
+        | "response.reasoning_text.done"
+        | "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_text.done"
+        | "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done"
+        | "response.completed"
+        | "response.failed"
+        | "response.incomplete"
+        | "error"
+    )
+  }
+
   pub fn kind(&self) -> &str {
     match self {
       Self::Created { .. } => "response.created",

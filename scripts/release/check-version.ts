@@ -103,7 +103,7 @@ function cargoPackages(manifest_path: string): Record<string, unknown>[] {
   return array(metadata["packages"], "Cargo packages").map((value) => object(value, "Cargo package"));
 }
 
-function checkLock(path: string, expected: string, required_names: Set<string>): void {
+function checkLock(path: string, expected: string, required_names: Set<string>, ignored_names = new Set<string>()): void {
   const names = new Set<string>();
   for (const entry of readText(path).split(/^\s*\[\[package\]\]\s*(?:#.*)?$/m).slice(1)) {
     // Registry packages can coincidentally have the same version as tokn.
@@ -111,6 +111,9 @@ function checkLock(path: string, expected: string, required_names: Set<string>):
       continue;
     }
     const name = tomlString(entry, "name", path);
+    if (ignored_names.has(name)) {
+      continue;
+    }
     if (name !== "tokn" && !name.startsWith("tokn-")) {
       continue;
     }
@@ -228,6 +231,15 @@ function main(): void {
     expectVersion(`apps/desktop/src-tauri/Cargo.toml (${value["name"]})`, value["version"], version);
   }
   checkLock("apps/desktop/src-tauri/Cargo.lock", version, desktop_names);
+  // Fixtures keep their own version; their SDK dependency graph follows VERSION.
+  for (const mode of ["no_std", "std"]) {
+    checkLock(
+      `crates/sdk/tests/${mode}/Cargo.lock`,
+      version,
+      new Set(["tokn-sdk"]),
+      new Set([`tokn-sdk-${mode.replace("_", "-")}-check`]),
+    );
+  }
   for (const path of ["apps/desktop/package.json", "apps/desktop/src-tauri/tauri.conf.json"]) {
     expectVersion(`${path} version`, readJson(path)["version"], version);
   }

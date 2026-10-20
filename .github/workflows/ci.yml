@@ -150,6 +150,7 @@ jobs:
           cargo fmt --manifest-path crates/sdk/tests/no_std/Cargo.toml -- --check
           cargo clippy --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --all-targets -- -D warnings
           cargo test --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml
+          cargo test --locked -p tokn-sdk --no-default-features --lib --test direct --test direct_stream
 
       - name: Build SDK and consumer for bare metal
         run: |
@@ -158,6 +159,29 @@ jobs:
             cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target"
             cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target" --release
           done
+
+  sdk-std:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - name: Cache isolated consumer
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/sdk/tests/std
+
+      - name: Test isolated default-feature consumer
+        run: |
+          cargo fmt --manifest-path crates/sdk/tests/std/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path crates/sdk/tests/std/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/sdk/tests/std/Cargo.toml
 
   test:
     runs-on: ${{ matrix.os }}

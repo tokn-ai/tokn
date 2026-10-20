@@ -1,4 +1,4 @@
-//! Buffered OpenAI requests with caller-supplied networking.
+//! Buffered and streaming OpenAI requests with caller-supplied networking.
 //!
 //! This module only requires `core` and `alloc`. It does not load configuration,
 //! select accounts, convert between provider protocols, or start an executor.
@@ -7,15 +7,24 @@
 //!
 //! Implement [`Transport`] using the device's HTTP/TLS stack. The transport is
 //! responsible for certificate validation, DNS, timeouts, and limiting buffered
-//! response sizes. Streaming requests are rejected by this first buffered API.
+//! response sizes. Implement [`StreamingTransport`] for incremental typed SSE
+//! events with configurable per-event limits.
 
 mod config;
 mod error;
+mod sse;
+mod stream;
+mod stream_error;
 mod transport;
 
 pub use config::{ConfigError, OpenAi, OPENAI_BASE_URL};
 pub use error::Error;
-pub use transport::{BufferedResponse, Header, Request, Response, Transport};
+pub use sse::DecodeError as SseError;
+pub use stream::{EventStream, StreamOptions};
+pub use stream_error::StreamError;
+pub use transport::{
+  BufferedResponse, Header, Request, Response, StreamBody, StreamingResponse, StreamingTransport, Transport,
+};
 
 use alloc::{format, vec};
 use core::fmt;
@@ -49,6 +58,26 @@ impl<T> DirectClient<T> {
 
   pub fn into_transport(self) -> T {
     self.transport
+  }
+
+  fn http_request(&self, operation: &str, body: alloc::vec::Vec<u8>, streaming: bool) -> Request {
+    Request {
+      method: "POST",
+      url: format!("{}/{operation}", self.provider.base_url()),
+      headers: vec![
+        Header::new("authorization", self.provider.authorization()),
+        Header::new("content-type", "application/json"),
+        Header::new(
+          "accept",
+          if streaming {
+            "text/event-stream"
+          } else {
+            "application/json"
+          },
+        ),
+      ],
+      body,
+    }
   }
 }
 
@@ -100,31 +129,12 @@ impl<T: Transport> DirectClient<T> {
     }
     body["stream"] = Value::Bool(false);
     let body = serde_json::to_vec(&body).map_err(Error::Serialize)?;
-    let response = self
-      .transport
-      .send(Request {
-        method: "POST",
-        url: format!("{}/{operation}", self.provider.base_url()),
-        headers: vec![
-          Header::new("authorization", self.provider.authorization()),
-          Header::new("content-type", "application/json"),
-          Header::new("accept", "application/json"),
-        ],
-        body,
-      })
-      .await
-      .map_err(Error::Transport)?;
+    let request = self.http_request(operation, body, false);
+    let response = self.transport.send(request).await.map_err(Error::Transport)?;
     if !(200..300).contains(&response.status) {
       return Err(Error::HttpStatus { response });
     }
-    if response.headers.iter().any(|header| {
-      header.name.eq_ignore_ascii_case("content-type")
-        && header
-          .value
-          .split(';')
-          .next()
-          .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-    }) {
+    if is_event_stream(&response.headers) {
       return Err(Error::UnexpectedStream);
     }
     let data = serde_json::from_slice(&response.body).map_err(Error::Deserialize)?;
@@ -134,4 +144,15 @@ impl<T: Transport> DirectClient<T> {
       data,
     })
   }
+}
+
+fn is_event_stream(headers: &[Header]) -> bool {
+  headers.iter().any(|header| {
+    header.name.eq_ignore_ascii_case("content-type")
+      && header
+        .value
+        .split(';')
+        .next()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+  })
 }
