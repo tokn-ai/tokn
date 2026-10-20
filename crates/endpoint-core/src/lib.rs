@@ -4,6 +4,12 @@
 //! beyond identifying which endpoints exist. Endpoint-specific request,
 //! response, item, and event types live in the per-endpoint crates and
 //! implement the traits exposed here.
+//!
+//! Disable the default `std` feature to use these types with `no_std + alloc`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod endpoint;
 pub mod extras;

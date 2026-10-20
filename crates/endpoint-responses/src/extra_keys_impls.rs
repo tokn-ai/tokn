@@ -2,6 +2,7 @@
 
 #![cfg(debug_assertions)]
 
+use alloc::{string::String, vec::Vec};
 use tokn_endpoint_core::{join_path, push_extras, ExtraKeys};
 
 use crate::content::{InputContentPart, OutputContentPart, ReasoningPart};

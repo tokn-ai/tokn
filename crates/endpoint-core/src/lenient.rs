@@ -1,3 +1,7 @@
+use alloc::{
+  format,
+  string::{String, ToString},
+};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{Map, Value};
 
@@ -119,7 +123,7 @@ where
 /// Drain remaining keys from `root` into `extras`. Call after
 /// [`peel_lenient`] has consumed all declared parameter keys.
 pub fn drain_into_extras(root: &mut Map<String, Value>, extras: &mut Extras) {
-  for (k, v) in std::mem::take(root) {
+  for (k, v) in core::mem::take(root) {
     extras.insert(k, v);
   }
 }

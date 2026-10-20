@@ -8,6 +8,10 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["serde/std", "serde_json/std", "tokn-endpoint-core/std"]
+
 [dependencies]
 tokn-endpoint-core = { workspace = true }
 tokn-endpoint-macros = { workspace = true }

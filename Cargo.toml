@@ -56,11 +56,11 @@ tokn-auth = { version = "0.2.4", path = "crates/auth" }
 tokn-access = { version = "0.2.4", path = "crates/access" }
 tokn-catalogue = { version = "0.2.4", path = "crates/catalogue" }
 tokn-convert = { version = "0.2.4", path = "crates/convert" }
-tokn-endpoint-core = { version = "0.2.4", path = "crates/endpoint-core" }
+tokn-endpoint-core = { version = "0.2.4", path = "crates/endpoint-core", default-features = false }
 tokn-endpoint-macros = { version = "0.2.4", path = "crates/endpoint-macros" }
-tokn-endpoint-chat-completions = { version = "0.2.4", path = "crates/endpoint-chat-completions" }
-tokn-endpoint-responses = { version = "0.2.4", path = "crates/endpoint-responses" }
-tokn-endpoint-messages = { version = "0.2.4", path = "crates/endpoint-messages" }
+tokn-endpoint-chat-completions = { version = "0.2.4", path = "crates/endpoint-chat-completions", default-features = false }
+tokn-endpoint-responses = { version = "0.2.4", path = "crates/endpoint-responses", default-features = false }
+tokn-endpoint-messages = { version = "0.2.4", path = "crates/endpoint-messages", default-features = false }
 tokn-headers = { version = "0.2.4", path = "crates/headers" }
 tokn-router = { version = "0.2.4", path = "crates/router" }
 tokn-service = { version = "0.2.4", path = "crates/service" }
@@ -108,8 +108,8 @@ rustls-pemfile = "2"
 rpassword = "7"
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 same-file = "1.0.6"
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 serde_yaml = "0.9"
 sha2 = "0.11"
 subtle = "2"
@@ -122,7 +122,7 @@ toml = "1"
 toml_edit = "0.25"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "util"] }
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

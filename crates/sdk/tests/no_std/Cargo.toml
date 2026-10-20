@@ -1,0 +1,12 @@
+[package]
+name = "tokn-sdk-no-std-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Keep this consumer isolated from the SDK's std-only test dependencies.
+[workspace]
+
+[dependencies]
+tokn-sdk = { path = "../..", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }

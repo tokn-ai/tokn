@@ -1,8 +1,10 @@
 # Embedded SDKs
 
-The SDKs execute requests in-process through the same configuration,
+With their default features, the SDKs execute requests in-process through the same configuration,
 credentials, account pool, routing, conversion, retry, and provider
 implementations as the gateway. They do not require a gateway process.
+Rust also supports direct OpenAI requests with caller-supplied networking in
+`no_std + alloc` environments.
 
 ## Rust
 
@@ -142,6 +144,101 @@ The façade deliberately hides router `AppState`, account handles, and request
 pipeline stages. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
 when an exact endpoint wire shape is required.
+
+### Direct OpenAI client (`no_std + alloc`)
+
+Disable the default `std` feature to use `DirectClient` without the gateway,
+Tokio, Reqwest, filesystem configuration, or credential stores:
+
+```toml
+[dependencies]
+tokn-sdk = { version = "0.2.4", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+```
+
+`DirectClient` also works with default features enabled, alongside the existing
+`Client`. It accepts the same typed `ResponsesRequest` and `ChatRequest` wire
+schemas and returns `direct::BufferedResponse<T>` with `status`, `headers`, and
+typed `data`. Each call takes `&mut self`, allowing the transport to own a device
+driver or a single connection.
+
+```rust
+use tokn_sdk::{
+  direct::{BufferedResponse, Error, OpenAi, Transport},
+  responses::{ResponsesRequest, ResponsesResponse},
+  DirectClient,
+};
+
+async fn ask<T: Transport>(
+  transport: T,
+  provider: OpenAi,
+) -> Result<BufferedResponse<ResponsesResponse>, Error<T::Error>> {
+  let mut client = DirectClient::new(transport, provider);
+  let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+    "model": "gpt-5",
+    "input": "Say hello.",
+    "max_output_tokens": 64
+  }))
+  .expect("valid request");
+
+  client.responses(&request).await
+}
+```
+
+Create the provider with `OpenAi::new(api_key)?`. The default base URL is
+`https://api.openai.com/v1`. For an explicit OpenAI-compatible service, use
+`OpenAi::new(api_key)?.with_base_url("https://example.com/api/v1")?`.
+Base URLs must use HTTPS; the API path is preserved and trailing slashes are
+removed. The portable URL validator accepts ASCII hosts, optional ports, and
+unescaped paths, and rejects userinfo, queries, fragments, and dot segments.
+
+Implement `direct::Transport` on the application's HTTP/TLS adapter. Its contract is:
+
+```rust
+pub trait Transport {
+  type Error;
+
+  async fn send(&mut self, request: Request) -> Result<Response, Self::Error>;
+}
+```
+
+`Request` contains a method, complete URL, ordered header entries, and JSON body
+bytes. The SDK supplies Bearer authentication, content type, and accept headers.
+Return a `Response` containing status, headers, and buffered body bytes, including
+for non-2xx responses. The SDK checks HTTP status before decoding JSON, and
+`Error::HttpStatus` retains the original response for inspecting provider errors
+and retry headers.
+
+The transport owns DNS, TCP, TLS certificate verification, timeouts, and body
+size limits while receiving data. It must decode HTTP transfer/content encodings.
+Prefer returning redirects as responses; redirects must never forward
+credentials to another origin or downgrade HTTPS. No executor, boxed future,
+`Send` bound, or pointer atomics are required by this client. Firmware supplies
+an allocator and its own executor.
+
+This first direct API supports buffered Responses and Chat Completions with
+static API keys. It rejects `stream: true`. Use native endpoint fields such as
+`max_output_tokens` for Responses or `max_completion_tokens` for Chat Completions.
+The neutral `generate()` builder, routing profiles, automatic retries, OAuth
+refresh, and lifecycle subscriptions belong to the default `std` client.
+Endpoint schema crates also support `no_std + alloc` independently.
+
+Bare-metal checks build both the SDK and an isolated consumer that instantiates
+both endpoints with a transport that does not implement `Send`:
+
+```sh
+rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf
+cargo build --locked -p tokn-sdk --lib --no-default-features --target thumbv6m-none-eabi
+cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv7em-none-eabihf --release
+cargo test --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml
+```
+
+CI covers both targets in debug and release, including a target without pointer
+atomics. The isolated consumer avoids the SDK's native test dependencies enabling
+`std` through Cargo feature unification. These checks verify compilation and a
+host round trip through an in-memory transport; they do not exercise a device's
+network stack or make paid provider calls.
 
 ## Python
 
