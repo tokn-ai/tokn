@@ -4,6 +4,7 @@
 
 use crate::extras::{push_extras, ExtraKeys};
 use crate::tool::{ToolCall, ToolDef};
+use alloc::{string::String, vec::Vec};
 
 impl ExtraKeys for ToolCall {
   fn extra_keys_into(&self, out: &mut Vec<String>, prefix: &str) {

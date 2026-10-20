@@ -1,5 +1,6 @@
+use alloc::string::{String, ToString};
+use core::str::FromStr;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
 
 /// Identifier for the LLM endpoint a payload belongs to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

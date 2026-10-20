@@ -2,34 +2,68 @@
 name = "tokn-sdk"
 version.workspace = true
 edition.workspace = true
-description = "Embedded Rust SDK for routing LLM requests through configured providers"
+description = "Rust SDK for configured LLM routing and no_std direct provider requests"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+# The configured, in-process gateway client. The direct client only needs alloc.
+std = [
+  "dep:anyhow",
+  "dep:arc-swap",
+  "dep:bytes",
+  "dep:eventsource-stream",
+  "dep:futures-util",
+  "dep:smol_str",
+  "dep:tokio",
+  "dep:tokn-auth",
+  "dep:tokn-config",
+  "dep:tokn-convert",
+  "dep:tokn-core",
+  "dep:tokn-headers",
+  "dep:tokn-requests",
+  "dep:tokn-router",
+  "serde/std",
+  "serde_json/std",
+  "thiserror/std",
+  "tokn-endpoint-chat-completions/std",
+  "tokn-endpoint-messages/std",
+  "tokn-endpoint-responses/std",
+]
+
 [dependencies]
-anyhow.workspace = true
-arc-swap.workspace = true
-bytes.workspace = true
-eventsource-stream.workspace = true
-futures-util.workspace = true
+anyhow = { workspace = true, optional = true }
+arc-swap = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+eventsource-stream = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
-smol_str.workspace = true
+smol_str = { workspace = true, optional = true }
 thiserror.workspace = true
-tokio.workspace = true
-tokn-auth.workspace = true
-tokn-config.workspace = true
-tokn-convert.workspace = true
-tokn-core.workspace = true
+tokio = { workspace = true, optional = true }
+tokn-auth = { workspace = true, optional = true }
+tokn-config = { workspace = true, optional = true }
+tokn-convert = { workspace = true, optional = true }
+tokn-core = { workspace = true, optional = true }
 tokn-endpoint-chat-completions.workspace = true
 tokn-endpoint-messages.workspace = true
 tokn-endpoint-responses.workspace = true
-tokn-headers.workspace = true
-tokn-requests.workspace = true
-tokn-router.workspace = true
+tokn-headers = { workspace = true, optional = true }
+tokn-requests = { workspace = true, optional = true }
+tokn-router = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokn-mock-server.workspace = true
+
+[[test]]
+name = "client"
+required-features = ["std"]
+
+[[example]]
+name = "chat"
+required-features = ["std"]

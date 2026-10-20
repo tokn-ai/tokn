@@ -3,6 +3,12 @@
 //! Covers request, response, message item, streaming chunk and event
 //! shapes. Conversion between endpoints lives elsewhere; this crate
 //! only provides serde-friendly types.
+//!
+//! Disable the default `std` feature to use these types with `no_std + alloc`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod content;
 pub mod event;

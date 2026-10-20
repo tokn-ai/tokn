@@ -17,7 +17,7 @@ bytes = { workspace = true }
 directories = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
-serde = { workspace = true }
+serde = { workspace = true, features = ["rc"] }
 serde_json = { workspace = true }
 smol_str = { workspace = true }
 sha2 = { workspace = true }

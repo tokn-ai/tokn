@@ -1,3 +1,6 @@
+use alloc::string::String;
+#[cfg(debug_assertions)]
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use serde_json::{Map, Value};
 
 /// Catch-all map for unknown JSON fields preserved during deserialization.

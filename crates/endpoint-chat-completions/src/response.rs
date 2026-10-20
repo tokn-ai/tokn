@@ -1,3 +1,4 @@
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 use tokn_endpoint_core::{Extras, FinishReason};

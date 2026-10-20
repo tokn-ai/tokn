@@ -1,4 +1,10 @@
 //! Typed wire schemas for the Anthropic Messages API.
+//!
+//! Disable the default `std` feature to use these types with `no_std + alloc`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod content;
 pub mod event;

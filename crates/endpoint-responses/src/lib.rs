@@ -2,6 +2,12 @@
 //!
 //! Covers request, response, input/output items, content parts and
 //! streaming event shapes.
+//!
+//! Disable the default `std` feature to use these types with `no_std + alloc`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod content;
 pub mod event;

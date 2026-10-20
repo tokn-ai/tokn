@@ -8,6 +8,10 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["serde/std", "serde_json/std", "thiserror/std"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
