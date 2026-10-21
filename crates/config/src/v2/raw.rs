@@ -4,11 +4,14 @@
 //! resolution, listener-specific action rules, URL normalization, and other
 //! semantic checks belong to the v2 compiler.
 
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
+#[cfg(not(feature = "std"))]
+type PathBuf = String;
 
-pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_BODY_MAX_BYTES: u64 = 10 * 1024 * 1024;
@@ -488,7 +491,7 @@ const fn default_true() -> bool {
   true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

@@ -1,14 +1,22 @@
 pub mod accumulate;
 pub mod codec;
+pub mod decoder;
 pub mod event;
+#[cfg(feature = "std")]
 pub mod pipeline;
 pub mod responses_emit;
+mod terminal;
+mod transformer;
 pub mod translate;
 
-pub use accumulate::{accumulate, accumulate_bytes, SseAccumulator};
+#[cfg(feature = "std")]
+pub use accumulate::{accumulate, accumulate_bytes};
+pub use accumulate::{accumulate_slice, SseAccumulator};
 pub use codec::{encode_done, encode_sse};
+pub use decoder::{DecodeError, Decoder, Record};
 pub use event::SseEvent;
-pub use pipeline::{
-  observer_channel, EventTransformer, ObserverMsg, ObserverReceiver, ObserverSender, SsePipeline, TapKinds,
-};
+#[cfg(feature = "std")]
+pub use pipeline::{observer_channel, ObserverMsg, ObserverReceiver, ObserverSender, SsePipeline, TapKinds};
+pub use terminal::TerminalState;
+pub use transformer::EventTransformer;
 pub use translate::EndpointTranslator;

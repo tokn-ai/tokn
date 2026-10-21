@@ -1,23 +1,23 @@
-use snafu::Snafu;
+use alloc::string::String;
+use thiserror::Error;
 
-pub type Result<T, E = ConvertError> = std::result::Result<T, E>;
+pub type Result<T, E = ConvertError> = core::result::Result<T, E>;
 
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
+#[derive(Debug, Error)]
 pub enum ConvertError {
-  #[snafu(display("missing required field `{field}`"))]
+  #[error("missing required field `{field}`")]
   MissingField { field: &'static str },
 
-  #[snafu(display("bad `{field}` shape: {message}"))]
+  #[error("bad `{field}` shape: {message}")]
   BadShape { field: &'static str, message: String },
 
-  #[snafu(display("unsupported conversion feature: {message}"))]
+  #[error("unsupported conversion feature: {message}")]
   UnsupportedFeature { message: String },
 
-  #[snafu(display("json conversion failed"))]
+  #[error("json conversion failed")]
   Json { source: serde_json::Error },
 
-  #[snafu(display("sse conversion failed: {message}"))]
+  #[error("sse conversion failed: {message}")]
   Sse { message: String },
 }
 

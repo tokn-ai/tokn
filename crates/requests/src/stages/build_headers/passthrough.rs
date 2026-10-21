@@ -25,28 +25,8 @@ use crate::pipeline::stages::{BuildHeadersStage, BuiltHeaders, Extracted, Resolv
 use async_trait::async_trait;
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
+#[cfg(test)]
 use tokn_headers::HeaderMap;
-
-/// Hop-by-hop header names (lowercase) that must not be forwarded
-/// verbatim to the upstream. `connection` / `keep-alive` are intentionally
-/// omitted so replay flows can pass them through unchanged.
-const HOP_BY_HOP_HEADERS: &[&str] = &[
-  "host",
-  "proxy-authorization",
-  "proxy-connection",
-  "te",
-  "trailer",
-  "transfer-encoding",
-  "upgrade",
-];
-
-/// Router-owned header names (lowercase) that must never leak upstream.
-/// Mirrors `tokn_router::api::is_router_owned_header` — duplicated here
-/// to keep `tokn-requests` free of any dependency on the legacy router
-/// crate.
-fn is_router_owned(name: &str) -> bool {
-  name.starts_with("x-tokn-router-") || name == "x-route-mode" || name == "x-behave-as"
-}
 
 #[derive(Default)]
 pub struct PassthroughBuildHeaders {
@@ -104,20 +84,8 @@ impl BuildHeadersStage for PassthroughBuildHeaders {
     extracted: &Extracted,
     resolved: &Resolved,
   ) -> Result<BuiltHeaders, PipelineError> {
-    let mut out = HeaderMap::new();
-    for (name, value) in extracted.headers.iter() {
-      let lower = name.as_str().to_ascii_lowercase();
-      if is_router_owned(&lower) {
-        continue;
-      }
-      if !self.preserve_client_auth && matches!(lower.as_str(), "authorization" | "x-api-key") {
-        continue;
-      }
-      if HOP_BY_HOP_HEADERS.contains(&lower.as_str()) && !(self.preserve_host && lower == "host") {
-        continue;
-      }
-      out.insert(name.clone(), value.clone());
-    }
+    let out =
+      crate::header_policy::passthrough_headers(&extracted.headers, self.preserve_host, self.preserve_client_auth);
     Ok(BuiltHeaders {
       headers: out,
       vars: build_template_vars(&extracted.headers),

@@ -17,8 +17,9 @@ use crate::schema::{
   from_inbound_or, opt_from_inbound, optional, optional_joined, put, put_opt, required, HeaderSchema,
 };
 use crate::vars::TemplateVars;
+use alloc::string::ToString;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexOverlay {
@@ -54,7 +55,7 @@ impl HeaderSchema for CodexOverlay {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 5] = [
+    const NAMES: [&HeaderName; 5] = [
       &keys::OPENAI_BETA,
       &keys::OPENAI_INTENT,
       &keys::CHATGPT_ACCOUNT_ID,

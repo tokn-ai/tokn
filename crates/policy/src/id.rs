@@ -1,7 +1,10 @@
-use smol_str::SmolStr;
-use std::borrow::Borrow;
-use std::fmt;
-use std::str::FromStr;
+use alloc::string::String;
+#[cfg(test)]
+use alloc::string::ToString;
+use core::borrow::Borrow;
+use core::fmt;
+use core::str::FromStr;
+use tokn_core::types::SmolStr;
 
 /// Error returned when a policy identifier is not in canonical form.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,7 +33,7 @@ impl fmt::Display for InvalidIdentifier {
   }
 }
 
-impl std::error::Error for InvalidIdentifier {}
+impl core::error::Error for InvalidIdentifier {}
 
 fn parse_identifier(kind: &'static str, value: &str) -> Result<SmolStr, InvalidIdentifier> {
   let mut previous_was_separator = false;

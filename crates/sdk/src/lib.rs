@@ -1,21 +1,14 @@
-//! LLM requests through a configured gateway runtime or an injected transport.
+//! One configured client and request pipeline for standard and embedded applications.
 //!
-//! With the default `std` feature, `Client` loads the same configuration and credential files as the
-//! `tokn-gateway` runtime, then executes requests in-process through the shared
-//! account pool, routing, conversion, retry, and provider implementations.
-//!
-//! [`DirectClient`] sends typed OpenAI requests through a caller-supplied
-//! [`direct::Transport`] or [`direct::StreamingTransport`]. Disable default
-//! features to use it with `no_std + alloc`.
+//! The default standard platform loads configuration and credentials from disk.
+//! [`Injected`] uses the same execution model with application-supplied accounts,
+//! model metadata, HTTP transport, monotonic time and timers.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
-#[cfg(feature = "std")]
 mod client;
-pub mod direct;
-#[cfg(feature = "std")]
 mod endpoint;
 #[cfg(feature = "std")]
 mod error;
@@ -23,11 +16,10 @@ mod error;
 mod generate;
 #[cfg(feature = "std")]
 mod response;
+#[cfg(feature = "std")]
+mod std_client;
 
-#[cfg(feature = "std")]
-pub use client::{Client, ClientBuilder, RequestOptions};
-pub use direct::DirectClient;
-#[cfg(feature = "std")]
+pub use client::{BufferedResponse, Client, Platform, PlatformResponse, RequestOptions};
 pub use endpoint::{ChatCompletions, Messages, Responses};
 #[cfg(feature = "std")]
 pub use error::{Error, Result};
@@ -37,7 +29,14 @@ pub use generate::{
   Role, TextStream, Tool, ToolCall, ToolChoice, Usage,
 };
 #[cfg(feature = "std")]
-pub use response::{BufferedResponse, ByteStream, RawResponse, ResponseBody, StreamResponse};
+pub use response::{ByteStream, RawResponse, ResponseBody, StreamResponse};
+#[cfg(feature = "std")]
+pub use std_client::{ClientBuilder, StdPlatform};
+pub use tokn_config as config;
+pub use tokn_core::{account, settings};
+pub use tokn_policy as policy;
+pub use tokn_requests::configured::{Injected, Lifecycle, Limits, Runtime};
+pub use tokn_service::transport;
 
 #[cfg(feature = "std")]
 pub use tokn_core::event::Event;
@@ -45,7 +44,6 @@ pub use tokn_core::event::Event;
 pub use tokn_core::generation::{
   GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary,
 };
-#[cfg(feature = "std")]
 pub use tokn_core::provider::Endpoint;
 #[cfg(feature = "std")]
 pub use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};

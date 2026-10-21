@@ -21,7 +21,7 @@ use crate::schema::{
 };
 use crate::vars::TemplateVars;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodexCliHeaders {
@@ -154,7 +154,7 @@ impl HeaderSchema for CodexCliHeaders {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 25] = [
+    const NAMES: [&HeaderName; 25] = [
       &keys::USER_AGENT,
       &keys::AUTHORIZATION,
       &keys::HOST,

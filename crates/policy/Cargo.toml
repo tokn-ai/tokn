@@ -8,5 +8,9 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["tokn-core/std"]
+
 [dependencies]
-smol_str = { workspace = true }
+tokn-core = { workspace = true, default-features = false }

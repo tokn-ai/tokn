@@ -1,10 +1,11 @@
 use super::accumulate::SseAccumulator;
 use super::event::SseEvent;
-use super::pipeline::EventTransformer;
 use super::responses_emit::ResponsesEmitter;
+use super::transformer::EventTransformer;
 use crate::error::{ConvertError, Result};
 use crate::ir::IrDelta;
 use crate::provider::Endpoint;
+use alloc::{string::String, string::ToString, vec::Vec};
 
 pub struct EndpointTranslator {
   from: Endpoint,
@@ -14,12 +15,31 @@ pub struct EndpointTranslator {
   finished: bool,
 }
 
+fn current_unix_seconds() -> u64 {
+  #[cfg(feature = "std")]
+  {
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|time| time.as_secs())
+      .unwrap_or(0)
+  }
+  #[cfg(not(feature = "std"))]
+  {
+    0
+  }
+}
+
 impl EndpointTranslator {
   pub fn new(from: Endpoint, to: Endpoint) -> Self {
+    Self::with_created_at(from, to, current_unix_seconds())
+  }
+
+  /// Supply the wall-clock timestamp used for synthesized Responses events.
+  pub fn with_created_at(from: Endpoint, to: Endpoint, created_at: u64) -> Self {
     Self {
       from,
       acc: SseAccumulator::new(from),
-      emit: EmitState::new(to),
+      emit: EmitState::new(to, created_at),
       terminal_seen: false,
       finished: false,
     }
@@ -157,14 +177,14 @@ struct EmitState {
 }
 
 impl EmitState {
-  fn new(to: Endpoint) -> Self {
+  fn new(to: Endpoint, created_at: u64) -> Self {
     let id: String = match to {
       Endpoint::ChatCompletions => "chatcmpl-converted".into(),
       Endpoint::Responses => "resp_converted".into(),
       Endpoint::Messages => "msg_converted".into(),
     };
     let responses = if matches!(to, Endpoint::Responses) {
-      Some(ResponsesEmitter::new(id.clone(), String::new()))
+      Some(ResponsesEmitter::with_created_at(id.clone(), String::new(), created_at))
     } else {
       None
     };

@@ -1,5 +1,6 @@
 use super::event::SseEvent;
-use bytes::Bytes;
+use alloc::string::String;
+use tokn_core::types::Bytes;
 
 pub fn encode_sse(event: Option<&str>, data: &str) -> Bytes {
   let mut out = String::new();
@@ -25,7 +26,7 @@ pub fn encode_done() -> Bytes {
   Bytes::from_static(b"data: [DONE]\n\n")
 }
 
-pub(crate) fn encode_event(event: &SseEvent) -> Bytes {
+pub fn encode_event(event: &SseEvent) -> Bytes {
   if event.is_done() {
     encode_done()
   } else {

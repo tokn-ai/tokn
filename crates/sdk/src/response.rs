@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use tokn_headers::HeaderMap;
 use tokn_requests::pipeline::stages::{ConvertedBody, ConvertedResponse};
 
+pub use crate::client::BufferedResponse;
 use crate::{Error, Result};
 
 pub type ByteStream = BoxStream<'static, std::io::Result<Bytes>>;
@@ -91,13 +92,6 @@ impl RawResponse {
   }
 }
 
-#[derive(Debug)]
-pub struct BufferedResponse<T> {
-  pub status: u16,
-  pub headers: HeaderMap,
-  pub data: T,
-}
-
 pub struct StreamResponse {
   pub status: u16,
   pub headers: HeaderMap,
@@ -129,6 +123,17 @@ impl StreamResponse {
       })
       .await
       .map(|output| output.freeze())
+  }
+}
+
+impl crate::PlatformResponse for RawResponse {
+  type Error = crate::Error;
+  type Stream = StreamResponse;
+  fn into_json<T: DeserializeOwned>(self) -> Result<BufferedResponse<T>> {
+    RawResponse::into_json(self)
+  }
+  fn into_stream(self) -> Result<StreamResponse> {
+    RawResponse::into_stream(self)
   }
 }
 

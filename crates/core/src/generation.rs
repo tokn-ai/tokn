@@ -1,4 +1,5 @@
-use std::fmt;
+use alloc::string::{String, ToString};
+use core::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -292,7 +293,7 @@ impl fmt::Display for GenerationOptionsError {
   }
 }
 
-impl std::error::Error for GenerationOptionsError {}
+impl core::error::Error for GenerationOptionsError {}
 
 #[cfg(test)]
 mod tests {

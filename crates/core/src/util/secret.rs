@@ -21,9 +21,10 @@
 //! secrets in the clear is itself a footgun (timing channels). Use
 //! [`Secret::expose`] and a constant-time comparator if you really need it.
 
+use alloc::string::String;
+use core::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::fmt;
 
 #[derive(Clone, Default)]
 pub struct Secret<T>(T);
@@ -64,7 +65,7 @@ pub(crate) fn fingerprint_str(secret: &str) -> String {
   let mut s = String::with_capacity(3 + 16);
   s.push_str("fp:");
   for b in digest.iter().take(8) {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let _ = write!(s, "{b:02x}");
   }
   s
@@ -107,6 +108,7 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use alloc::string::ToString;
 
   #[test]
   fn debug_and_display_redact() {

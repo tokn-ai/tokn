@@ -1,7 +1,7 @@
 //! Errors produced by the headers crate.
 
-use smol_str::SmolStr;
 use thiserror::Error;
+use tokn_core::types::SmolStr;
 
 /// All errors that can be produced when parsing or building headers via the
 /// schema layer.

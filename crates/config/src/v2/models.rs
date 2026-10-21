@@ -1,5 +1,5 @@
+use core::time::Duration;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 /// Background model discovery while the gateway is serving requests.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -40,7 +40,11 @@ impl ModelRefreshPlan {
   pub(super) fn compile(raw: &RawModelRefresh) -> Result<Self, super::CompileError> {
     fn duration(field: &str, seconds: u64) -> Result<Duration, super::CompileError> {
       let value = Duration::from_secs(seconds);
-      if seconds == 0 || std::time::Instant::now().checked_add(value).is_none() {
+      #[cfg(feature = "std")]
+      let representable = std::time::Instant::now().checked_add(value).is_some();
+      #[cfg(not(feature = "std"))]
+      let representable = seconds <= i64::MAX as u64;
+      if seconds == 0 || !representable {
         return Err(super::CompileError::InvalidValue {
           location: format!("service.models.{field}"),
           message: "must be a positive, representable time duration".into(),
@@ -73,7 +77,7 @@ impl ModelRefreshPlan {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

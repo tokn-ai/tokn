@@ -241,10 +241,10 @@ function main(): void {
     );
   }
   checkLock(
-    "crates/engine/tests/no_std/Cargo.lock",
+    "crates/accounts/tests/no_std/Cargo.lock",
     version,
-    new Set(["tokn-engine"]),
-    new Set(["tokn-engine-no-std-check"]),
+    new Set(["tokn-accounts"]),
+    new Set(["tokn-accounts-no-std-check"]),
   );
   for (const path of ["apps/desktop/package.json", "apps/desktop/src-tauri/tauri.conf.json"]) {
     expectVersion(`${path} version`, readJson(path)["version"], version);

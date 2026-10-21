@@ -13,8 +13,8 @@ default = ["lzma"]
 lzma = ["dep:lzma-rust2"]
 
 [dependencies]
-tokn-core = { workspace = true }
-tokn-headers = { workspace = true }
+tokn-core = { workspace = true, features = ["std"] }
+tokn-headers = { workspace = true, features = ["std"] }
 base64 = "0.22"
 bytes = { workspace = true }
 flate2 = { workspace = true }

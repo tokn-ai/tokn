@@ -1,6 +1,10 @@
 pub use crate::util::secret::Secret;
+use alloc::{
+  collections::BTreeMap,
+  string::{String, ToString},
+  vec::Vec,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountConfig {
@@ -52,7 +56,7 @@ pub struct AccountConfig {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub last_refresh: Option<i64>,
   #[serde(default)]
-  pub settings: toml::Table,
+  pub settings: crate::settings::Table,
 }
 
 pub type Account = AccountConfig;

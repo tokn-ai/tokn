@@ -1,5 +1,7 @@
-use crate::util::secret::Secret;
-use crate::HeaderPatchCtx;
+use alloc::string::{String, ToString};
+use tokn_core::provider::HeaderPatchCtx;
+#[cfg(feature = "std")]
+use tokn_core::util::secret::Secret;
 use tokn_headers::keys::{
   ACCEPT, AUTHORIZATION, CHATGPT_ACCOUNT_ID, CONTENT_ENCODING, CONTENT_TYPE, OPENAI_BETA, ORIGINATOR, SESSION_ID_LOWER,
   USER_AGENT, VERSION, X_CODEX_RESPONSES_LITE, X_CODEX_ROUTING_HINT, X_CODEX_TURN_METADATA, X_SESSION_AFFINITY,
@@ -17,11 +19,13 @@ pub struct CodexCliNormalizer;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CodexOpencodeNormalizer;
 
+#[cfg(feature = "std")]
 pub enum Credential {
   ApiKey(Secret<String>),
   AccessToken(Secret<String>),
 }
 
+#[cfg(feature = "std")]
 impl Credential {
   pub fn expose(&self) -> &str {
     match self {
@@ -30,15 +34,14 @@ impl Credential {
   }
 }
 
+#[cfg(feature = "std")]
 pub fn inject_openai_credentials(headers: &mut HeaderMap, token: &str) {
-  headers.insert(&AUTHORIZATION, HeaderValue::from_string(format!("Bearer {token}")));
+  crate::native::inject_credentials(headers, tokn_core::Endpoint::ChatCompletions, token);
 }
 
+#[cfg(feature = "std")]
 pub fn inject_codex_credentials(headers: &mut HeaderMap, token: &str, provider_account_id: Option<&str>) {
-  inject_openai_credentials(headers, token);
-  if let Some(account_id) = provider_account_id.filter(|s| !s.trim().is_empty()) {
-    headers.insert(&CHATGPT_ACCOUNT_ID, HeaderValue::from_string(account_id.to_string()));
-  }
+  crate::native::inject_codex_credentials(headers, token, provider_account_id);
 }
 
 pub fn normalize_openai_platform_headers(headers: &HeaderMap, ctx: &HeaderPatchCtx<'_>) -> HeaderMap {
@@ -202,7 +205,7 @@ fn is_codex_user_agent(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::ProviderRequestKind;
+  use tokn_core::provider::ProviderRequestKind;
   use tokn_headers::TemplateVars;
 
   #[test]
@@ -265,7 +268,7 @@ mod tests {
   fn codex_normalizers_preserve_routing_hint() {
     for agent_id in [AgentId::CodexCli, AgentId::Opencode] {
       let ctx = HeaderPatchCtx {
-        request_kind: ProviderRequestKind::Operation(crate::Endpoint::Responses),
+        request_kind: ProviderRequestKind::Operation(tokn_core::Endpoint::Responses),
         body: &serde_json::Value::Null,
         bearer_token: None,
         content_encoding: None,
@@ -348,7 +351,7 @@ mod tests {
   #[test]
   fn codex_normalizer_selects_shape_from_turn_metadata() {
     let ctx = HeaderPatchCtx {
-      request_kind: ProviderRequestKind::Operation(crate::Endpoint::Responses),
+      request_kind: ProviderRequestKind::Operation(tokn_core::Endpoint::Responses),
       body: &serde_json::Value::Null,
       bearer_token: None,
       content_encoding: None,

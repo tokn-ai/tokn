@@ -16,8 +16,9 @@ use crate::map::HeaderMap;
 use crate::name::HeaderName;
 use crate::schema::{from_inbound_or, opt_from_inbound, optional, put, put_opt, required, HeaderSchema};
 use crate::vars::TemplateVars;
+use alloc::string::ToString;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopilotOverlay {
@@ -53,7 +54,7 @@ impl HeaderSchema for CopilotOverlay {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 5] = [
+    const NAMES: [&HeaderName; 5] = [
       &keys::EDITOR_VERSION,
       &keys::EDITOR_PLUGIN_VERSION,
       &keys::COPILOT_INTEGRATION_ID,

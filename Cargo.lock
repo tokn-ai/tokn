@@ -2836,7 +2836,6 @@ dependencies = [
  "tokio",
  "tokn-auth",
  "tokn-core",
- "tokn-engine",
  "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
@@ -2923,7 +2922,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "snafu",
+ "thiserror",
  "tokio",
  "tokn-core",
  "tokn-endpoint-chat-completions",
@@ -2951,10 +2950,10 @@ dependencies = [
  "snafu",
  "time",
  "tokio",
- "tokn-headers",
- "tokn-policy",
  "toml",
+ "toml_datetime",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -3003,16 +3002,6 @@ dependencies = [
  "serde_json",
  "tokn-endpoint-core",
  "tokn-endpoint-macros",
-]
-
-[[package]]
-name = "tokn-engine"
-version = "0.2.4"
-dependencies = [
- "bytes",
- "serde",
- "serde_json",
- "smol_str",
 ]
 
 [[package]]
@@ -3079,12 +3068,10 @@ dependencies = [
 name = "tokn-headers"
 version = "0.2.4"
 dependencies = [
- "http",
- "reqwest",
  "serde",
  "serde_json",
- "smol_str",
  "thiserror",
+ "tokn-core",
 ]
 
 [[package]]
@@ -3134,7 +3121,7 @@ dependencies = [
 name = "tokn-policy"
 version = "0.2.4"
 dependencies = [
- "smol_str",
+ "tokn-core",
 ]
 
 [[package]]
@@ -3274,6 +3261,7 @@ dependencies = [
 name = "tokn-requests"
 version = "0.2.4"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "async-trait",
  "bytes",
@@ -3293,6 +3281,7 @@ dependencies = [
  "tokn-core",
  "tokn-headers",
  "tokn-mock-server",
+ "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
  "tokn-provider-openai",
@@ -3420,9 +3409,10 @@ dependencies = [
  "tokn-endpoint-responses",
  "tokn-headers",
  "tokn-mock-server",
+ "tokn-policy",
  "tokn-requests",
- "tokn-router",
  "tokn-router-config",
+ "tokn-service",
 ]
 
 [[package]]
@@ -3435,6 +3425,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "tokio",
+ "tokn-core",
  "tower",
 ]
 

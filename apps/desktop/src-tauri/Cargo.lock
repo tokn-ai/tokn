@@ -4254,7 +4254,6 @@ dependencies = [
  "tokio",
  "tokn-auth",
  "tokn-core",
- "tokn-engine",
  "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
@@ -4317,10 +4316,10 @@ dependencies = [
  "snafu",
  "time",
  "tokio",
- "tokn-headers",
- "tokn-policy",
  "toml 1.1.6+spec-1.1.0",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4348,24 +4347,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokn-engine"
-version = "0.2.4"
-dependencies = [
- "bytes",
- "serde",
- "smol_str",
-]
-
-[[package]]
 name = "tokn-headers"
 version = "0.2.4"
 dependencies = [
- "http",
- "reqwest",
  "serde",
  "serde_json",
- "smol_str",
  "thiserror 2.0.20",
+ "tokn-core",
 ]
 
 [[package]]
@@ -4396,7 +4384,7 @@ dependencies = [
 name = "tokn-policy"
 version = "0.2.4"
 dependencies = [
- "smol_str",
+ "tokn-core",
 ]
 
 [[package]]

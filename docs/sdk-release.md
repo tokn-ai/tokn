@@ -7,7 +7,7 @@ tokn-requests on PyPI (import tokn_requests) and @tokn-ai/requests on npm.
 
 When changing the workspace version, refresh the isolated consumers' lockfiles
 under `crates/sdk/tests/no_std`, `crates/sdk/tests/std`, and
-`crates/engine/tests/no_std` as well. Their fixture
+`crates/accounts/tests/no_std` as well. Their fixture
 packages remain at `0.0.0`; the local SDK dependencies follow VERSION.
 
 From the source checkout, check metadata and run the relevant tests:

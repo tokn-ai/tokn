@@ -1,4 +1,5 @@
-use std::collections::BTreeSet;
+use alloc::collections::BTreeSet;
+use alloc::string::String;
 
 /// Compiled CORS permissions for one API listener. Empty permissions disable CORS.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

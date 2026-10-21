@@ -19,24 +19,24 @@ name = "tokn-gateway"
 path = "src/main.rs"
 
 [dependencies]
-tokn-accounts = { workspace = true }
-tokn-core = { workspace = true }
-tokn-policy = { workspace = true }
-tokn-config = { workspace = true }
+tokn-accounts = { workspace = true, features = ["std"] }
+tokn-core = { workspace = true, features = ["std"] }
+tokn-policy = { workspace = true, features = ["std"] }
+tokn-config = { workspace = true, features = ["std"] }
 tokn-router-legacy-config = { workspace = true }
 tokn-agent-migration = { workspace = true }
-tokn-catalogue = { workspace = true }
-tokn-convert = { workspace = true }
+tokn-catalogue = { workspace = true, features = ["std"] }
+tokn-convert = { workspace = true, features = ["std"] }
 tokn-router = { workspace = true }
-tokn-requests = { workspace = true }
+tokn-requests = { workspace = true, features = ["std"] }
 tokn-persistence = { workspace = true }
-tokn-provider-copilot = { workspace = true }
-tokn-provider-deepseek = { workspace = true }
-tokn-provider-openai = { workspace = true }
-tokn-provider-zai = { workspace = true }
-tokn-auth = { workspace = true }
+tokn-provider-copilot = { workspace = true, features = ["std"] }
+tokn-provider-deepseek = { workspace = true, features = ["std"] }
+tokn-provider-openai = { workspace = true, features = ["std"] }
+tokn-provider-zai = { workspace = true, features = ["std"] }
+tokn-auth = { workspace = true, features = ["std"] }
 tokn-access = { workspace = true }
-tokn-headers = { workspace = true }
+tokn-headers = { workspace = true, features = ["std"] }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }

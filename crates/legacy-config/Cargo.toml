@@ -9,8 +9,8 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-tokn-core = { workspace = true }
-tokn-config = { workspace = true }
+tokn-core = { workspace = true, features = ["std"] }
+tokn-config = { workspace = true, features = ["std"] }
 
 anyhow = { workspace = true }
 directories = { workspace = true }
@@ -23,5 +23,5 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokn-accounts = { workspace = true }
-tokn-policy = { workspace = true }
+tokn-accounts = { workspace = true, features = ["std"] }
+tokn-policy = { workspace = true, features = ["std"] }

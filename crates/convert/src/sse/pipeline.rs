@@ -1,8 +1,6 @@
 use super::codec::encode_event;
 use super::event::SseEvent;
-use crate::error::Result;
 use bytes::Bytes;
-use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -39,13 +37,7 @@ pub fn observer_channel() -> (ObserverSender, ObserverReceiver) {
   mpsc::unbounded_channel()
 }
 
-pub trait EventTransformer: Send {
-  fn transform(&mut self, event: SseEvent) -> Result<Vec<SseEvent>>;
-
-  fn finish(&mut self) -> Result<Vec<SseEvent>> {
-    Ok(Vec::new())
-  }
-}
+pub use super::transformer::EventTransformer;
 
 /// Per-kind opt-in mask for [`SsePipeline`] tap delivery.
 ///
@@ -88,7 +80,7 @@ pub struct SsePipeline {
   /// Shared tap sender used for raw-byte teeing and parsed/transformed/output observation.
   tap: Option<Arc<ObserverSender>>,
   tap_kinds: TapKinds,
-  transformers: Vec<Box<dyn EventTransformer>>,
+  transformers: Vec<Box<dyn EventTransformer + Send>>,
 }
 
 impl SsePipeline {
@@ -112,7 +104,7 @@ impl SsePipeline {
 
   pub fn with_transformer<T>(mut self, transformer: T) -> Self
   where
-    T: EventTransformer + 'static,
+    T: EventTransformer + Send + 'static,
   {
     self.transformers.push(Box::new(transformer));
     self
@@ -140,33 +132,20 @@ impl SsePipeline {
   }
 
   pub fn run(self) -> ByteStream {
-    let source: EventStream = if self.tap_kinds.from {
+    let source: ByteStream = if self.tap_kinds.from {
       let tap = self.tap.clone();
-      Box::pin(self.source.map(move |result| match result {
-        Ok(bytes) => {
-          if let Some(ref tap) = tap {
+      Box::pin(self.source.map(move |result| {
+        if let Ok(bytes) = &result {
+          if let Some(tap) = &tap {
             let _ = tap.send(ObserverMsg::From(bytes.clone()));
           }
-          Ok(bytes)
         }
-        Err(err) => Err(err),
+        result
       }))
-      .eventsource()
-      .map(|item| match item {
-        Ok(event) => Ok(SseEvent::from(event)),
-        Err(err) => Err(io::Error::other(err.to_string())),
-      })
-      .boxed()
     } else {
-      self
-        .source
-        .eventsource()
-        .map(|item| match item {
-          Ok(event) => Ok(SseEvent::from(event)),
-          Err(err) => Err(io::Error::other(err.to_string())),
-        })
-        .boxed()
+      self.source
     };
+    let source: EventStream = Box::pin(DecodedStream::new(source));
     Box::pin(StreamWithFinalizer::new(
       PipelineStream::new(source, self.transformers, self.tap, self.tap_kinds),
       finalize_tap,
@@ -174,9 +153,70 @@ impl SsePipeline {
   }
 }
 
+/// A std stream adapter around the same bounded framer used by embedded clients.
+struct DecodedStream {
+  source: ByteStream,
+  decoder: super::Decoder,
+  chunk: Bytes,
+  position: usize,
+  done: bool,
+}
+
+impl DecodedStream {
+  fn new(source: ByteStream) -> Self {
+    Self {
+      source,
+      decoder: super::Decoder::new(usize::MAX),
+      chunk: Bytes::new(),
+      position: 0,
+      done: false,
+    }
+  }
+}
+
+impl Stream for DecodedStream {
+  type Item = io::Result<SseEvent>;
+
+  fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    let this = self.get_mut();
+    loop {
+      if this.done {
+        return Poll::Ready(None);
+      }
+      while this.position < this.chunk.len() {
+        let byte = this.chunk[this.position];
+        this.position += 1;
+        match this.decoder.push(byte) {
+          Ok(Some(record)) => return Poll::Ready(Some(Ok(SseEvent::from(record)))),
+          Ok(None) => {}
+          Err(error) => {
+            this.done = true;
+            return Poll::Ready(Some(Err(io::Error::other(error))));
+          }
+        }
+      }
+      match this.source.as_mut().poll_next(cx) {
+        Poll::Ready(Some(Ok(chunk))) => {
+          this.chunk = chunk;
+          this.position = 0;
+        }
+        Poll::Ready(Some(Err(error))) => {
+          this.done = true;
+          return Poll::Ready(Some(Err(error)));
+        }
+        Poll::Ready(None) => {
+          this.done = true;
+          return Poll::Ready(None);
+        }
+        Poll::Pending => return Poll::Pending,
+      }
+    }
+  }
+}
+
 struct PipelineStream {
   source: EventStream,
-  transformers: Vec<Box<dyn EventTransformer>>,
+  transformers: Vec<Box<dyn EventTransformer + Send>>,
   tap: Option<Arc<ObserverSender>>,
   tap_kinds: TapKinds,
   pending: VecDeque<std::io::Result<Bytes>>,
@@ -186,7 +226,7 @@ struct PipelineStream {
 impl PipelineStream {
   fn new(
     source: EventStream,
-    transformers: Vec<Box<dyn EventTransformer>>,
+    transformers: Vec<Box<dyn EventTransformer + Send>>,
     tap: Option<Arc<ObserverSender>>,
     tap_kinds: TapKinds,
   ) -> Self {
@@ -385,6 +425,15 @@ mod tests {
       }
       Ok(vec![event])
     }
+  }
+
+  #[test]
+  fn decoded_stream_preserves_default_message_event_name() {
+    let source = stream::iter([Ok(Bytes::from_static(b"data: hello\n\n"))]);
+    let mut decoded = DecodedStream::new(Box::pin(source));
+    let event = futures::executor::block_on(decoded.next()).unwrap().unwrap();
+    assert_eq!(event.event.as_deref(), Some("message"));
+    assert_eq!(event.data, "hello");
   }
 
   #[test]

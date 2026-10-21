@@ -5,6 +5,13 @@
 //! runtime crates consume them without depending on TOML shape or compatibility
 //! aliases.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg_attr(test, macro_use)]
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
 mod authority;
 mod cors;
 mod id;
@@ -27,7 +34,9 @@ pub use route::{
 };
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
-  ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ForwardProxyListenerPlan, GatewayPlan, HostPattern, HttpAction,
-  HttpBindingPlan, HttpMatch, InvalidSubdomainSuffix, ListenerKind, ListenerPlan, LlmApiListenerPlan, ProviderOrigin,
-  ProviderPlan, SessionAffinityPlan, TlsPlan, DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+  ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ExecutionPlan, HostPattern, HttpAction, HttpBindingPlan,
+  HttpMatch, InvalidSubdomainSuffix, ProviderOrigin, ProviderPlan, SessionAffinityPlan,
+  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };
+#[cfg(feature = "std")]
+pub use topology::{ForwardProxyListenerPlan, GatewayPlan, ListenerKind, ListenerPlan, LlmApiListenerPlan, TlsPlan};

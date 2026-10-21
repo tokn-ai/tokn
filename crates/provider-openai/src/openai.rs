@@ -14,7 +14,7 @@ use crate::{
   ID_OPENAI,
 };
 
-pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub use crate::native::OPENAI_BASE_URL;
 
 pub struct OpenAiProvider {
   pub id: String,

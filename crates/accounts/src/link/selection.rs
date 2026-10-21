@@ -6,13 +6,13 @@
 //! exactly one shared runtime per linked pool for routes to reuse.
 
 use super::{LinkedAccountPool, LinkedAccountPools, LinkedPoolAccount, ProviderBinding, ProviderBindingKey};
+use crate::pool_state::{AffinityPolicy, PoolState, Selection};
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tokn_engine::pool::{AffinityPolicy, PoolState, Selection};
 use tokn_policy::{AccountPoolId, ProviderId};
 
 /// Selection result for one request.
