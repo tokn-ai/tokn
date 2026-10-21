@@ -3,12 +3,13 @@ use core::fmt;
 use serde::Serialize;
 use serde_json::Value;
 use tokn_endpoint_chat_completions::{ChatChunk, ChatEvent, ChatRequest};
+use tokn_endpoint_messages::{MessagesEvent, MessagesRequest};
 use tokn_endpoint_responses::{ResponsesEvent, ResponsesRequest};
 
 use super::{
   is_event_stream,
   sse::{Decoder, Record},
-  DirectClient, Header, Response, StreamBody, StreamError, StreamingResponse, StreamingTransport,
+  DirectClient, Endpoint, Header, Response, StreamBody, StreamError, StreamingResponse, StreamingTransport,
 };
 
 /// Buffer limits for one streaming request.
@@ -95,6 +96,7 @@ impl<B: StreamBody, E> EventStream<B, E> {
   ///
   /// A Chat Completions stream yields `ChatEvent::Done`; a Responses stream
   /// yields its terminal event (including failed/incomplete/error outcomes).
+  /// A Messages stream yields `MessagesEvent::MessageStop` or `MessagesEvent::Error`.
   /// EOF before that event is an error. Callers must inspect terminal events
   /// to distinguish provider success from provider failure.
   ///
@@ -156,7 +158,9 @@ impl<T: StreamingTransport> DirectClient<T> {
     request: &ResponsesRequest,
     options: StreamOptions,
   ) -> Result<EventStream<T::Body<'a>, ResponsesEvent>, StreamError<T::Error>> {
-    self.start_stream("responses", request, options, decode_responses).await
+    self
+      .start_stream(Endpoint::Responses, request, options, decode_responses)
+      .await
   }
 
   /// Stream native Chat Completions chunks followed by `ChatEvent::Done`.
@@ -168,13 +172,26 @@ impl<T: StreamingTransport> DirectClient<T> {
     options: StreamOptions,
   ) -> Result<EventStream<T::Body<'a>, ChatEvent>, StreamError<T::Error>> {
     self
-      .start_stream("chat/completions", request, options, decode_chat)
+      .start_stream(Endpoint::ChatCompletions, request, options, decode_chat)
+      .await
+  }
+
+  /// Stream native Messages events through the configured Messages endpoint.
+  /// This method always sets `stream: true`. Ping and content-block stop events
+  /// do not end the stream; `MessageStop` and provider `Error` events do.
+  pub async fn messages_stream<'a>(
+    &'a mut self,
+    request: &MessagesRequest,
+    options: StreamOptions,
+  ) -> Result<EventStream<T::Body<'a>, MessagesEvent>, StreamError<T::Error>> {
+    self
+      .start_stream(Endpoint::Messages, request, options, decode_messages)
       .await
   }
 
   async fn start_stream<'a, Q: Serialize, E>(
     &'a mut self,
-    operation: &str,
+    endpoint: Endpoint,
     request: &Q,
     options: StreamOptions,
     decode: DecodeEvent<E>,
@@ -182,7 +199,9 @@ impl<T: StreamingTransport> DirectClient<T> {
     let mut body = serde_json::to_value(request).map_err(StreamError::Serialize)?;
     body["stream"] = Value::Bool(true);
     let body = serde_json::to_vec(&body).map_err(StreamError::Serialize)?;
-    let request = self.http_request(operation, body, true);
+    let request = self
+      .http_request(endpoint, body, true)
+      .map_err(StreamError::UnsupportedEndpoint)?;
     let response = self
       .transport
       .send_stream(request)
@@ -264,18 +283,7 @@ fn decode_chat(record: Record) -> Result<(ChatEvent, bool), EventError> {
 
 fn decode_responses(record: Record) -> Result<(ResponsesEvent, bool), EventError> {
   let value: Value = serde_json::from_str(&record.data).map_err(EventError::Json)?;
-  let kind = value
-    .get("type")
-    .and_then(Value::as_str)
-    .filter(|kind| !kind.is_empty())
-    .ok_or(EventError::Invalid("Responses event must contain a nonempty type"))?;
-  if record
-    .event
-    .as_deref()
-    .is_some_and(|name| name != "message" && name != kind)
-  {
-    return Err(EventError::Invalid("SSE event name disagrees with the JSON type"));
-  }
+  let kind = event_kind(&record, &value, "Responses event must contain a nonempty type")?;
   let terminal = matches!(
     kind,
     "response.completed" | "response.failed" | "response.incomplete" | "response.cancelled" | "error"
@@ -285,4 +293,37 @@ fn decode_responses(record: Record) -> Result<(ResponsesEvent, bool), EventError
     return Err(EventError::Invalid("known Responses event has an invalid payload"));
   }
   Ok((event, terminal))
+}
+
+fn decode_messages(record: Record) -> Result<(MessagesEvent, bool), EventError> {
+  let value: Value = serde_json::from_str(&record.data).map_err(EventError::Json)?;
+  let kind = event_kind(&record, &value, "Messages event must contain a nonempty type")?;
+  if (kind == "error" && !value.get("error").is_some_and(Value::is_object))
+    || (kind == "message_delta" && !value.get("delta").is_some_and(Value::is_object))
+  {
+    return Err(EventError::Invalid("Messages event requires an object payload"));
+  }
+  let terminal = matches!(kind, "message_stop" | "error");
+  let event: MessagesEvent = serde_json::from_value(value).map_err(EventError::Json)?;
+  if matches!(&event, MessagesEvent::Other(_)) && MessagesEvent::is_known_kind(event.kind()) {
+    return Err(EventError::Invalid("known Messages event has an invalid payload"));
+  }
+  Ok((event, terminal))
+}
+
+fn event_kind<'a>(record: &Record, value: &'a Value, missing_type: &'static str) -> Result<&'a str, EventError> {
+  let kind = value
+    .get("type")
+    .and_then(Value::as_str)
+    .filter(|kind| !kind.is_empty())
+    .ok_or(EventError::Invalid(missing_type))?;
+  // SSE dispatches records without an explicit name as "message".
+  if record
+    .event
+    .as_deref()
+    .is_some_and(|name| name != "message" && name != kind)
+  {
+    return Err(EventError::Invalid("SSE event name disagrees with the JSON type"));
+  }
+  Ok(kind)
 }

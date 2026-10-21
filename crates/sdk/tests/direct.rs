@@ -8,7 +8,11 @@ use std::{collections::VecDeque, fmt, rc::Rc};
 use serde_json::{json, Value};
 use tokn_sdk::{
   chat_completions::ChatRequest,
-  direct::{ConfigError, Error, Header, OpenAi, Request, Response, Transport, OPENAI_BASE_URL},
+  direct::{
+    Anthropic, ConfigError, Endpoint, EndpointConfig, Error, Header, OpenAi, ProviderConfig, Request, Response,
+    Transport, OPENAI_BASE_URL,
+  },
+  messages::{ContentBlock, MessagesRequest},
   responses::ResponsesRequest,
   DirectClient,
 };
@@ -302,4 +306,302 @@ fn debug_output_redacts_credentials_and_request_and_error_bodies() {
     assert!(!debug.contains(private), "debug output leaked {private}");
   }
   assert!(debug.contains("401"));
+}
+
+fn messages_request() -> MessagesRequest {
+  serde_json::from_value(json!({
+    "model": "messages-model",
+    "messages": [{"role": "user", "content": "private message"}],
+    "max_tokens": 128,
+    "system": [{"type": "text", "text": "Be concise.", "cache_control": {"type": "ephemeral"}}],
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "thinking": {"type": "enabled", "budget_tokens": 64},
+    "extra_wire_field": {"preserve": true}
+  }))
+  .expect("Messages fixture")
+}
+
+#[test]
+fn messages_preserves_native_controls_content_usage_and_anthropic_headers() {
+  let mut client = DirectClient::new(
+    MockTransport::new([Ok(response(
+      200,
+      br#"{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"hello"},{"type":"tool_use","id":"tool_1","name":"lookup","input":{"query":"rust"}}],"stop_reason":"tool_use","usage":{"input_tokens":8,"output_tokens":12},"extra_output":123}"#,
+    ))]),
+    Anthropic::new("anthropic-private-key").unwrap(),
+  );
+  let response = run_ready(client.messages(&messages_request())).unwrap();
+  assert_eq!(response.status, 200);
+  assert_eq!(response.headers, [Header::new("x-request-id", "request-123")]);
+  assert_eq!(response.data.id.as_deref(), Some("msg_1"));
+  assert!(matches!(&response.data.content[0], ContentBlock::Text { text, .. } if text == "hello"));
+  assert!(
+    matches!(&response.data.content[1], ContentBlock::ToolUse { name, input, .. }
+    if name == "lookup" && input["query"] == "rust")
+  );
+  let decoded = serde_json::to_value(response.data).unwrap();
+  assert_eq!(decoded["stop_reason"], "tool_use");
+  assert_eq!(decoded["usage"], json!({"input_tokens": 8, "output_tokens": 12}));
+  assert_eq!(decoded["extra_output"], 123);
+
+  let sent = &client.transport().requests[0];
+  assert_eq!(sent.method, "POST");
+  assert_eq!(sent.url, "https://api.anthropic.com/v1/messages");
+  assert_eq!(
+    sent.headers,
+    [
+      Header::new("x-api-key", "anthropic-private-key"),
+      Header::new("anthropic-version", "2023-06-01"),
+      Header::new("content-type", "application/json"),
+      Header::new("accept", "application/json"),
+    ]
+  );
+  let wire: Value = serde_json::from_slice(&sent.body).unwrap();
+  assert_eq!(wire["model"], "messages-model");
+  assert_eq!(wire["messages"][0]["content"], "private message");
+  assert_eq!(wire["max_tokens"], 128);
+  assert_eq!(wire["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+  assert_eq!(wire["tools"][0]["input_schema"], json!({"type": "object"}));
+  assert_eq!(wire["thinking"], json!({"type": "enabled", "budget_tokens": 64}));
+  assert_eq!(wire["extra_wire_field"], json!({"preserve": true}));
+  assert_eq!(wire["stream"], false);
+}
+
+#[test]
+fn messages_rejects_stream_overrides_and_unconfigured_endpoints_without_io() {
+  let mut client = DirectClient::new(MockTransport::new([]), Anthropic::new("test-key").unwrap());
+  let mut request = messages_request();
+  request.stream = Some(true);
+  request.extras.insert("stream".into(), false.into());
+  assert!(matches!(
+    run_ready(client.messages(&request)),
+    Err(Error::StreamingUnsupported)
+  ));
+  request.stream = Some(false);
+  request.extras.insert("stream".into(), true.into());
+  assert!(matches!(
+    run_ready(client.messages(&request)),
+    Err(Error::StreamingUnsupported)
+  ));
+  assert!(matches!(
+    run_ready(client.responses(&responses_request())),
+    Err(Error::UnsupportedEndpoint(Endpoint::Responses))
+  ));
+  assert!(matches!(
+    run_ready(client.chat_completions(&chat_request())),
+    Err(Error::UnsupportedEndpoint(Endpoint::ChatCompletions))
+  ));
+  client.set_provider(OpenAi::new("test-key").unwrap());
+  assert!(matches!(
+    run_ready(client.messages(&messages_request())),
+    Err(Error::UnsupportedEndpoint(Endpoint::Messages))
+  ));
+  assert!(client.transport().requests.is_empty());
+}
+
+#[test]
+fn messages_retains_http_errors_and_distinguishes_transport_decode_and_sse_failures() {
+  let mut sse_response = response(200, b"data: {}\n\n");
+  sse_response
+    .headers
+    .push(Header::new("content-type", "text/event-stream"));
+  let mut client = DirectClient::new(
+    MockTransport::new([
+      Ok(response(429, b"private rate limit body")),
+      Err(TransportError("offline")),
+      Ok(response(200, b"invalid JSON")),
+      Ok(sse_response),
+    ]),
+    Anthropic::new("test-key").unwrap(),
+  );
+  let Error::HttpStatus { response } = run_ready(client.messages(&messages_request())).unwrap_err() else {
+    panic!("expected HTTP status error");
+  };
+  assert_eq!(response.status, 429);
+  assert_eq!(response.body, b"private rate limit body");
+  assert_eq!(response.headers[0], Header::new("x-request-id", "request-123"));
+  assert!(matches!(
+    run_ready(client.messages(&messages_request())),
+    Err(Error::Transport(TransportError("offline")))
+  ));
+  assert!(matches!(
+    run_ready(client.messages(&messages_request())),
+    Err(Error::Deserialize(_))
+  ));
+  assert!(matches!(
+    run_ready(client.messages(&messages_request())),
+    Err(Error::UnexpectedStream)
+  ));
+}
+
+#[test]
+fn custom_routes_keep_urls_and_credentials_scoped_to_the_selected_format() {
+  let provider = ProviderConfig::new()
+    .with_endpoint(
+      Endpoint::Responses,
+      EndpointConfig::new("https://responses.example/custom/generate")
+        .unwrap()
+        .with_bearer_auth("responses-token")
+        .unwrap(),
+    )
+    .with_endpoint(
+      Endpoint::Messages,
+      EndpointConfig::new("https://messages.example/anthropic/v1/messages/")
+        .unwrap()
+        .with_header("x-api-key", "messages-token")
+        .unwrap()
+        .with_header("anthropic-version", "2023-06-01")
+        .unwrap(),
+    )
+    .with_endpoint(
+      Endpoint::ChatCompletions,
+      EndpointConfig::new_insecure_http("http://127.0.0.1:8080/v1/chat/completions").unwrap(),
+    );
+  let mut client = DirectClient::new(
+    MockTransport::new([
+      Ok(response(200, br#"{"id":"resp_1"}"#)),
+      Ok(response(200, br#"{"id":"msg_1"}"#)),
+      Ok(response(200, br#"{"id":"chat_1","choices":[]}"#)),
+    ]),
+    provider,
+  );
+  run_ready(client.responses(&responses_request())).unwrap();
+  run_ready(client.messages(&messages_request())).unwrap();
+  run_ready(client.chat_completions(&chat_request())).unwrap();
+  let requests = &client.transport().requests;
+  assert_eq!(requests[0].url, "https://responses.example/custom/generate");
+  assert_eq!(requests[1].url, "https://messages.example/anthropic/v1/messages/");
+  assert_eq!(requests[2].url, "http://127.0.0.1:8080/v1/chat/completions");
+  assert_eq!(
+    requests[0].headers[0],
+    Header::new("authorization", "Bearer responses-token")
+  );
+  assert_eq!(requests[1].headers[0], Header::new("x-api-key", "messages-token"));
+  assert_eq!(requests[1].headers[1], Header::new("anthropic-version", "2023-06-01"));
+  assert!(!requests[0].headers.iter().any(|header| header.name == "x-api-key"));
+  assert!(!requests[1].headers.iter().any(|header| header.name == "authorization"));
+  assert_eq!(
+    requests[2].headers,
+    [
+      Header::new("content-type", "application/json"),
+      Header::new("accept", "application/json")
+    ]
+  );
+}
+
+#[test]
+fn endpoint_configuration_rejects_header_injection_reserved_headers_and_insecure_defaults() {
+  let endpoint = || EndpointConfig::new("https://example.com/messages").unwrap();
+  for name in [
+    "",
+    "bad name",
+    "x-header:",
+    "x-header\r\ninjected",
+    "héader",
+    ":authority",
+  ] {
+    assert_eq!(
+      endpoint().with_header(name, "value").unwrap_err(),
+      ConfigError::InvalidHeaderName
+    );
+  }
+  for value in [
+    "line\rbreak",
+    "line\nbreak",
+    "tab\tvalue",
+    "nul\0value",
+    "nonascii-é",
+    "del\x7f",
+  ] {
+    assert_eq!(
+      endpoint().with_header("x-header", value).unwrap_err(),
+      ConfigError::InvalidHeaderValue
+    );
+  }
+  for name in [
+    "Accept",
+    "CONTENT-TYPE",
+    "Host",
+    "Content-Length",
+    "Transfer-Encoding",
+    "Connection",
+    "Keep-Alive",
+    "Proxy-Authenticate",
+    "Proxy-Authorization",
+    "TE",
+    "Trailer",
+    "Upgrade",
+  ] {
+    assert_eq!(
+      endpoint().with_header(name, "value").unwrap_err(),
+      ConfigError::ReservedHeader
+    );
+  }
+  for url in [
+    "http://localhost/messages",
+    "https://user:secret@example.com/messages",
+    "https://example.com/messages?key=secret",
+    "https://example.com/messages#fragment",
+    "https://example.com/a/../messages",
+    "https://example.com/%2e/messages",
+  ] {
+    assert_eq!(EndpointConfig::new(url).unwrap_err(), ConfigError::InvalidEndpointUrl);
+  }
+  assert_eq!(
+    EndpointConfig::new_insecure_http("https://example.com/messages").unwrap_err(),
+    ConfigError::InvalidEndpointUrl
+  );
+  for key in ["", "has space", "key\ninjected"] {
+    assert_eq!(Anthropic::new(key).unwrap_err(), ConfigError::InvalidApiKey);
+    assert_eq!(
+      endpoint().with_bearer_auth(key).unwrap_err(),
+      ConfigError::InvalidApiKey
+    );
+  }
+  let endpoint = endpoint()
+    .with_header("X-Api-Key", "old-key")
+    .unwrap()
+    .with_header("x-api-key", "new-key")
+    .unwrap();
+  assert_eq!(endpoint.headers(), [Header::new("x-api-key", "new-key")]);
+  assert_eq!(endpoint.url(), "https://example.com/messages");
+}
+
+#[test]
+fn replacing_provider_rotates_credentials_without_replacing_the_transport() {
+  let mut client = DirectClient::new(
+    MockTransport::new([Ok(response(200, b"{}")), Ok(response(200, b"{}"))]),
+    Anthropic::new("old-private-key").unwrap(),
+  );
+  run_ready(client.messages(&messages_request())).unwrap();
+  let replacement = Anthropic::new("new-private-key")
+    .unwrap()
+    .with_base_url("https://example.com/custom/v1///")
+    .unwrap()
+    .with_version("2099-01-01")
+    .unwrap();
+  client.set_provider(replacement);
+  run_ready(client.messages(&messages_request())).unwrap();
+  assert_eq!(client.transport().requests.len(), 2);
+  assert_eq!(
+    client.transport().requests[0].headers[0],
+    Header::new("x-api-key", "old-private-key")
+  );
+  assert_eq!(
+    client.transport().requests[1].headers[0],
+    Header::new("x-api-key", "new-private-key")
+  );
+  assert_eq!(
+    client.transport().requests[1].headers[1],
+    Header::new("anthropic-version", "2099-01-01")
+  );
+  assert_eq!(
+    client.provider().endpoint(Endpoint::Messages).unwrap().url(),
+    "https://example.com/custom/v1/messages"
+  );
+  assert!(client.provider().endpoint(Endpoint::Responses).is_none());
+  let debug = format!("{client:?} {:?}", client.transport().requests);
+  for private in ["old-private-key", "new-private-key", "private message"] {
+    assert!(!debug.contains(private), "debug output leaked {private}");
+  }
 }

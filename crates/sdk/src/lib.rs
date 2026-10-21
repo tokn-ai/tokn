@@ -4,9 +4,9 @@
 //! `tokn-gateway` runtime, then executes requests in-process through the shared
 //! account pool, routing, conversion, retry, and provider implementations.
 //!
-//! [`DirectClient`] sends typed OpenAI requests through a caller-supplied
-//! [`direct::Transport`] or [`direct::StreamingTransport`]. Disable default
-//! features to use it with `no_std + alloc`.
+//! [`DirectClient`] sends native Responses, Chat Completions, and Messages requests
+//! through a caller-supplied [`direct::Transport`] or [`direct::StreamingTransport`].
+//! Disable default features to use it with `no_std + alloc`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

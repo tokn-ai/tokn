@@ -3,8 +3,8 @@
 With their default features, the SDKs execute requests in-process through the same configuration,
 credentials, account pool, routing, conversion, retry, and provider
 implementations as the gateway. They do not require a gateway process.
-Rust also supports direct OpenAI requests with caller-supplied networking in
-`no_std + alloc` environments.
+Rust also supports direct Responses, Chat Completions, and Messages requests
+with caller-supplied networking in `no_std + alloc` environments.
 
 ## Rust
 
@@ -145,7 +145,7 @@ pipeline stages. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
 when an exact endpoint wire shape is required.
 
-### Direct OpenAI client (`no_std + alloc`)
+### Direct provider APIs (`no_std + alloc`)
 
 Disable the default `std` feature to use `DirectClient` without the gateway,
 Tokio, Reqwest, filesystem configuration, or credential stores:
@@ -157,10 +157,10 @@ serde_json = { version = "1", default-features = false, features = ["alloc"] }
 ```
 
 `DirectClient` also works with default features enabled, alongside the existing
-`Client`. It accepts the same typed `ResponsesRequest` and `ChatRequest` wire
-schemas and returns `direct::BufferedResponse<T>` with `status`, `headers`, and
-typed `data`. Each call takes `&mut self`, allowing the transport to own a device
-driver or a single connection.
+`Client`. It accepts the same typed `ResponsesRequest`, `ChatRequest`, and
+`MessagesRequest` wire schemas and returns `direct::BufferedResponse<T>` with
+`status`, `headers`, and typed `data`. Each call takes `&mut self`, allowing the
+transport to own a device driver or a single connection.
 
 ```rust
 use tokn_sdk::{
@@ -188,9 +188,97 @@ async fn ask<T: Transport>(
 Create the provider with `OpenAi::new(api_key)?`. The default base URL is
 `https://api.openai.com/v1`. For an explicit OpenAI-compatible service, use
 `OpenAi::new(api_key)?.with_base_url("https://example.com/api/v1")?`.
-Base URLs must use HTTPS; the API path is preserved and trailing slashes are
-removed. The portable URL validator accepts ASCII hosts, optional ports, and
-unescaped paths, and rejects userinfo, queries, fragments, and dot segments.
+This convenience configuration enables Responses and Chat Completions.
+
+For Anthropic Messages, use `Anthropic`:
+
+```rust
+use tokn_sdk::{direct::Anthropic, messages::MessagesRequest, DirectClient};
+
+let provider = Anthropic::new(api_key)?;
+let mut client = DirectClient::new(transport, provider);
+let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+  "model": "claude-sonnet-4-6",
+  "max_tokens": 64,
+  "messages": [{ "role": "user", "content": "Say hello." }]
+}))?;
+let response = client.messages(&request).await?;
+```
+
+`Anthropic` enables only Messages at `https://api.anthropic.com/v1/messages`,
+using `x-api-key` and `anthropic-version: 2023-06-01`. Override the API base URL
+with `with_base_url()` and the version header with `with_version()`. See
+[Anthropic API versioning](https://platform.claude.com/docs/en/api/versioning).
+
+#### Explicit endpoint routes and credentials
+
+Use `ProviderConfig` and `EndpointConfig` for other providers or proxies. Each
+endpoint has its own complete URL and headers, so paths and authentication can
+differ between formats. For example, OpenCode Go uses Bearer authentication for
+Chat Completions and Responses, and an API-key header for Messages:
+
+```rust
+use tokn_sdk::direct::{ConfigError, Endpoint, EndpointConfig, ProviderConfig};
+
+fn opencode_routes(api_key: &str) -> Result<ProviderConfig, ConfigError> {
+  Ok(ProviderConfig::new()
+    .with_endpoint(
+      Endpoint::ChatCompletions,
+      EndpointConfig::new("https://opencode.ai/zen/go/v1/chat/completions")?
+        .with_bearer_auth(api_key)?,
+    )
+    .with_endpoint(
+      Endpoint::Responses,
+      EndpointConfig::new("https://opencode.ai/zen/go/v1/responses")?
+        .with_bearer_auth(api_key)?,
+    )
+    .with_endpoint(
+      Endpoint::Messages,
+      EndpointConfig::new("https://opencode.ai/zen/go/v1/messages")?
+        .with_header("x-api-key", api_key)?
+        .with_header("anthropic-version", "2023-06-01")?,
+    ))
+}
+```
+
+Pass the result to `DirectClient::new(transport, opencode_routes(api_key)?)`.
+Only configured endpoints are callable; other operations return
+`UnsupportedEndpoint` before transport I/O. An endpoint's headers are sent only
+to that endpoint. Configuring all three formats does not mean every provider
+model accepts all three; choose a model and native request supported by the
+selected endpoint.
+
+`EndpointConfig::new()` requires HTTPS and preserves the complete URL exactly,
+without appending a path. The `OpenAi` and `Anthropic` convenience configurations
+instead append operation paths to their base URL and remove trailing slashes.
+The portable URL validator accepts ASCII hosts, optional ports, and unescaped
+paths, and rejects userinfo, queries, fragments, percent escapes, and dot
+segments. A local llama.cpp server can explicitly opt into cleartext HTTP:
+
+```rust
+let provider = ProviderConfig::new().with_endpoint(
+  Endpoint::ChatCompletions,
+  EndpointConfig::new_insecure_http("http://127.0.0.1:8080/v1/chat/completions")?,
+);
+```
+
+Authentication is optional on explicit routes. Add `with_bearer_auth()` when
+the server requires a key or an already acquired access token. Header names
+and values are validated; repeated names replace the previous value without
+regard to case. SDK-owned Accept/Content-Type headers and HTTP framing or
+hop-by-hop headers cannot be overridden. Credentials and other configured
+header values are redacted from debug output.
+
+The caller owns credential acquisition and expiry handling. Use
+`client.set_provider(updated_routes)` to replace credentials or routes while
+retaining the transport. Native protocol support does not include the default
+client's provider authentication and body transformations: Copilot needs a
+caller-supplied exchanged API token and its required headers; Codex needs an
+access token, appropriate headers, and an already adapted native streaming
+Responses body. `DirectClient` does not perform their login, refresh, body
+rewrites, or model routing.
+
+#### Injected transport
 
 Implement `direct::Transport` on the application's HTTP/TLS adapter. Its contract is:
 
@@ -203,7 +291,8 @@ pub trait Transport {
 ```
 
 `Request` contains a method, complete URL, ordered header entries, and JSON body
-bytes. The SDK supplies Bearer authentication, content type, and accept headers.
+bytes. The SDK supplies the configured endpoint headers, content type, and
+accept headers.
 Return a `Response` containing status, headers, and buffered body bytes, including
 for non-2xx responses. The SDK checks HTTP status before decoding JSON, and
 `Error::HttpStatus` retains the original response for inspecting provider errors
@@ -216,9 +305,10 @@ credentials to another origin or downgrade HTTPS. No executor, boxed future,
 `Send` bound, or pointer atomics are required by this client. Firmware supplies
 an allocator and its own executor.
 
-The buffered methods support Responses and Chat Completions with static API
-keys and reject `stream: true`. Use native endpoint fields such as
-`max_output_tokens` for Responses or `max_completion_tokens` for Chat Completions.
+The buffered methods `responses()`, `chat_completions()`, and `messages()`
+reject `stream: true`. Use native endpoint fields such as `max_output_tokens`
+for Responses, `max_completion_tokens` for OpenAI Chat Completions, or
+`max_tokens` for Messages.
 The neutral `generate()` builder, routing profiles, automatic retries, OAuth
 refresh, and lifecycle subscriptions belong to the default `std` client.
 Endpoint schema crates also support `no_std + alloc` independently.
@@ -255,10 +345,11 @@ Reads must be cancellation safe, and dropping the body must abort or release
 the response without draining it. The adapter retains responsibility for TLS,
 timeouts, header limits, and any transport buffers.
 
-Use `responses_stream(&request, options)` or
-`chat_completions_stream(&request, options)`. Both set `stream: true` in the
-outgoing JSON, overriding any conflicting typed field or flattened extra, and
-request `text/event-stream`.
+Use `responses_stream(&request, options)`,
+`chat_completions_stream(&request, options)`, or
+`messages_stream(&request, options)`. All set `stream: true` in the outgoing
+JSON, overriding any conflicting typed field or flattened extra, and request
+`text/event-stream`.
 
 ```rust
 use tokn_sdk::{
@@ -286,18 +377,22 @@ async fn receive<T: StreamingTransport>(
 ```
 
 `EventStream` exposes HTTP `status` and `headers`. `next_event()` reads on
-demand, returning native `ResponsesEvent` or `ChatEvent` values. It handles
-fragmented UTF-8, LF/CR/CRLF, comments, and multiline SSE data. Unknown Responses
-event types remain available as `ResponsesEvent::Other`; malformed payloads for
-known event types are rejected.
+demand, returning native `ResponsesEvent`, `ChatEvent`, or `MessagesEvent`
+values. It handles fragmented UTF-8, LF/CR/CRLF, comments, and multiline SSE
+data. Unknown Responses and Messages event types remain available as their
+respective `Other` variants; malformed payloads for known event types are
+rejected.
 
 Chat streams yield `ChatEvent::Done` for `[DONE]`; a chunk's `finish_reason`
 does not terminate the stream because usage can follow it. Responses streams
 yield their terminal event, including failed, incomplete, or error outcomes.
+Messages streams yield `MessagesEvent::MessageStop` or `MessagesEvent::Error`
+as their terminal event; `Ping` keeps the stream open.
 These outcomes must be inspected by the application; reaching the end alone
 does not mean generation succeeded. See the official
 [Responses streaming event definitions](https://developers.openai.com/api/reference/resources/responses/streaming-events)
-and [Chat Completions stream options](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+and [Chat Completions stream options](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create),
+plus [Anthropic's streaming event lifecycle](https://platform.claude.com/docs/en/build-with-claude/streaming).
 
 EOF before an endpoint terminal event returns `StreamError::UnexpectedEof`.
 Malformed JSON, invalid SSE UTF-8, oversized records, and body-read failures
@@ -323,8 +418,9 @@ does not issue a provider cancellation API request.
 #### Consumer verification
 
 Bare-metal checks build both the SDK and an isolated consumer that instantiates
-both buffered and streaming endpoints with a transport that does not implement
-`Send`. Streaming bodies borrow that transport and exercise pending reads:
+Responses, Chat Completions, and Messages in both buffered and streaming modes
+with a transport that does not implement `Send`. Streaming bodies borrow that
+transport and exercise pending reads:
 
 ```sh
 rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf

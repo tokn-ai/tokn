@@ -17,7 +17,11 @@ use std::{
 use serde_json::{json, Value};
 use tokn_sdk::{
   chat_completions::{ChatEvent, ChatRequest},
-  direct::{Header, OpenAi, Request, StreamBody, StreamError, StreamOptions, StreamingResponse, StreamingTransport},
+  direct::{
+    Anthropic, Endpoint, EndpointConfig, Header, OpenAi, ProviderConfig, Request, StreamBody, StreamError,
+    StreamOptions, StreamingResponse, StreamingTransport,
+  },
+  messages::{ContentBlock, ContentBlockDelta, MessagesEvent, MessagesRequest},
   responses::{ResponsesEvent, ResponsesRequest},
   DirectClient,
 };
@@ -185,6 +189,30 @@ fn chat_request() -> ChatRequest {
     "messages": [{"role": "user", "content": "hello"}]
   }))
   .unwrap()
+}
+
+fn messages_request() -> MessagesRequest {
+  serde_json::from_value(json!({
+    "model": "test-messages-model",
+    "messages": [{"role": "user", "content": "hello"}],
+    "max_tokens": 128,
+    "system": "Be concise.",
+    "thinking": {"type": "enabled", "budget_tokens": 64},
+    "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
+    "future_request_field": {"enabled": true}
+  }))
+  .unwrap()
+}
+
+fn messages_client(transport: MockTransport) -> DirectClient<MockTransport> {
+  DirectClient::new(transport, Anthropic::new("test-messages-key").unwrap())
+}
+
+fn messages_wire(events: &[Value]) -> String {
+  events
+    .iter()
+    .map(|event| format!("event: {}\r\ndata: {event}\r\n\r\n", event["type"].as_str().unwrap()))
+    .collect()
 }
 
 #[test]
@@ -567,4 +595,325 @@ fn dropping_a_stream_cancels_without_waiting_for_more_events() {
   drop(stream);
   assert_eq!(stats.borrow().dropped, 1);
   assert_eq!(stats.borrow().reads, 0);
+}
+
+#[test]
+fn messages_stream_preserves_text_tools_thinking_usage_and_native_request_controls() {
+  let mut wire = messages_wire(&[
+    json!({"type": "message_start", "message": {
+      "id": "msg_stream", "type": "message", "role": "assistant", "model": "test-messages-model",
+      "content": [], "stop_reason": null, "usage": {"input_tokens": 10, "output_tokens": 1}
+    }}),
+    json!({"type": "ping"}),
+    json!({"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "réfléchir"}}),
+    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "signed-thought"}}),
+    json!({"type": "content_block_stop", "index": 0}),
+    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+    json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "héllo 🦀"}}),
+    json!({"type": "content_block_stop", "index": 1}),
+    json!({"type": "content_block_start", "index": 2, "content_block": {
+      "type": "tool_use", "id": "tool_1", "name": "lookup", "input": {}
+    }}),
+    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": "{\"city\":\"東京\"}"}}),
+    json!({"type": "content_block_stop", "index": 2}),
+    json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null},
+      "usage": {"output_tokens": 23, "cache_read_input_tokens": 4}, "future_event_field": 7}),
+    json!({"type": "message_stop"}),
+  ]);
+  wire.push_str("data: malformed trailing bytes must not be decoded\n\n");
+  for chunk_size in [1, 2, 7, wire.len()] {
+    let transport = MockTransport::new(&wire, chunk_size);
+    let stats = transport.stats.clone();
+    let mut client = messages_client(transport);
+    let mut request = messages_request();
+    request.stream = Some(false);
+    request.extras.insert("stream".into(), Value::Bool(false));
+    let mut stream = run(client.messages_stream(&request, StreamOptions::default())).unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = run(stream.next_event()).unwrap() {
+      events.push(event);
+    }
+    assert_eq!(events.len(), 14);
+    let MessagesEvent::MessageStart { message, .. } = &events[0] else {
+      panic!("expected message start");
+    };
+    assert_eq!(message.id.as_deref(), Some("msg_stream"));
+    assert_eq!(message.usage.as_ref().unwrap().input_tokens, Some(10));
+    assert!(matches!(&events[1], MessagesEvent::Ping { .. }));
+    assert!(matches!(
+      &events[2],
+      MessagesEvent::ContentBlockStart {
+        index: 0,
+        content_block: ContentBlock::Thinking { .. },
+        ..
+      }
+    ));
+    assert!(
+      matches!(&events[3], MessagesEvent::ContentBlockDelta { index: 0, delta: ContentBlockDelta::ThinkingDelta { thinking, .. }, .. } if thinking == "réfléchir")
+    );
+    assert!(
+      matches!(&events[4], MessagesEvent::ContentBlockDelta { index: 0, delta: ContentBlockDelta::SignatureDelta { signature, .. }, .. } if signature == "signed-thought")
+    );
+    assert!(
+      matches!(&events[7], MessagesEvent::ContentBlockDelta { index: 1, delta: ContentBlockDelta::TextDelta { text, .. }, .. } if text == "héllo 🦀")
+    );
+    assert!(
+      matches!(&events[9], MessagesEvent::ContentBlockStart { index: 2, content_block: ContentBlock::ToolUse { id, name, .. }, .. } if id == "tool_1" && name == "lookup")
+    );
+    assert!(
+      matches!(&events[10], MessagesEvent::ContentBlockDelta { index: 2, delta: ContentBlockDelta::InputJsonDelta { partial_json, .. }, .. } if partial_json == "{\"city\":\"東京\"}")
+    );
+    let MessagesEvent::MessageDelta { delta, usage, extras } = &events[12] else {
+      panic!("expected usage after content blocks stopped");
+    };
+    assert_eq!(delta["stop_reason"], "tool_use");
+    assert_eq!(usage.as_ref().unwrap().output_tokens, Some(23));
+    assert_eq!(usage.as_ref().unwrap().cache_read_input_tokens, Some(4));
+    assert_eq!(extras["future_event_field"], 7);
+    assert!(matches!(&events[13], MessagesEvent::MessageStop { .. }));
+    assert_eq!(stats.borrow().dropped, 1);
+    assert!(stats.borrow().pending > 0);
+    assert!(run(stream.next_event()).unwrap().is_none());
+    let stats = stats.borrow();
+    let sent = &stats.requests[0];
+    assert_eq!(sent.url, "https://api.anthropic.com/v1/messages");
+    assert_eq!(sent.method, "POST");
+    assert!(sent.headers.contains(&Header::new("x-api-key", "test-messages-key")));
+    assert!(sent.headers.contains(&Header::new("anthropic-version", "2023-06-01")));
+    assert!(sent.headers.contains(&Header::new("accept", "text/event-stream")));
+    assert!(!sent.headers.iter().any(|header| header.name == "authorization"));
+    let sent_body: Value = serde_json::from_slice(&sent.body).unwrap();
+    assert_eq!(sent_body["stream"], true);
+    assert_eq!(sent_body["max_tokens"], 128);
+    assert_eq!(sent_body["system"], "Be concise.");
+    assert_eq!(sent_body["thinking"]["budget_tokens"], 64);
+    assert_eq!(sent_body["tools"][0]["name"], "lookup");
+    assert_eq!(sent_body["future_request_field"]["enabled"], true);
+  }
+}
+
+#[test]
+fn messages_unknown_events_are_preserved_and_provider_errors_are_terminal_events() {
+  let unknown = json!({"type": "future_messages_event", "opaque": {"value": 42}});
+  let error = json!({"type": "error", "error": {"type": "overloaded_error", "message": "try later"}});
+  let wire = messages_wire(&[unknown.clone(), error, json!({"type": "message_stop"})]);
+  let transport = MockTransport::new(wire, 1);
+  let stats = transport.stats.clone();
+  let mut client = messages_client(transport);
+  let mut stream = run(client.messages_stream(&messages_request(), StreamOptions::default())).unwrap();
+  let Some(MessagesEvent::Other(actual)) = run(stream.next_event()).unwrap() else {
+    panic!("expected preserved future event");
+  };
+  assert_eq!(actual, unknown);
+  assert_eq!(stats.borrow().dropped, 0);
+  let Some(MessagesEvent::Error { error, .. }) = run(stream.next_event()).unwrap() else {
+    panic!("provider error must remain inspectable as a terminal event");
+  };
+  assert_eq!(error["type"], "overloaded_error");
+  assert_eq!(stats.borrow().dropped, 1);
+  assert!(run(stream.next_event()).unwrap().is_none());
+}
+
+#[test]
+fn malformed_known_messages_events_fail_without_changing_tolerant_schema_decoding() {
+  for payload in [
+    json!({"type": "message_start", "message": "invalid"}),
+    json!({"type": "content_block_start", "index": 0}),
+    json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": 42}}),
+    json!({"type": "content_block_stop", "index": -1}),
+    json!({"type": "message_delta", "delta": {}, "usage": "invalid"}),
+  ] {
+    assert!(matches!(
+      serde_json::from_value::<MessagesEvent>(payload.clone()).unwrap(),
+      MessagesEvent::Other(_)
+    ));
+    let transport = MockTransport::new(messages_wire(&[payload]), 3);
+    let stats = transport.stats.clone();
+    let mut client = messages_client(transport);
+    let mut stream = run(client.messages_stream(&messages_request(), StreamOptions::default())).unwrap();
+    assert!(matches!(run(stream.next_event()), Err(StreamError::InvalidEvent(_))));
+    assert_eq!(stats.borrow().dropped, 1);
+    assert!(run(stream.next_event()).unwrap().is_none());
+  }
+}
+
+#[test]
+fn messages_invalid_envelopes_and_payloads_release_the_body() {
+  for wire in [
+    "data: {not json}\n\n",
+    "data: []\n\n",
+    "data: {\"type\":\"\"}\n\n",
+    "data: {\"message\":\"missing type\"}\n\n",
+    "event: error\ndata: {\"type\":\"message_stop\"}\n\n",
+    "event: message_stop\ndata: {\"type\":\"ping\"}\n\n",
+    "data: [DONE]\n\n",
+    "data: {\"type\":\"error\"}\n\n",
+    "data: {\"type\":\"error\",\"error\":null}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":\"invalid\"}\n\n",
+  ] {
+    let transport = MockTransport::new(wire, 2);
+    let stats = transport.stats.clone();
+    let mut client = messages_client(transport);
+    let mut stream = run(client.messages_stream(&messages_request(), StreamOptions::default())).unwrap();
+    assert!(matches!(
+      run(stream.next_event()),
+      Err(StreamError::Deserialize(_) | StreamError::InvalidEvent(_))
+    ));
+    assert_eq!(stats.borrow().dropped, 1);
+    assert!(run(stream.next_event()).unwrap().is_none());
+  }
+}
+
+#[test]
+fn messages_eof_requires_a_complete_message_stop_or_error() {
+  for wire in [
+    "",
+    "data: {\"type\":\"ping\"}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n",
+  ] {
+    let transport = MockTransport::new(wire, 1);
+    let stats = transport.stats.clone();
+    let mut client = messages_client(transport);
+    let mut stream = run(client.messages_stream(&messages_request(), StreamOptions::default())).unwrap();
+    loop {
+      match run(stream.next_event()) {
+        Ok(Some(_)) => {}
+        Err(StreamError::UnexpectedEof) => break,
+        other => panic!("expected incomplete Messages stream to fail, got {other:?}"),
+      }
+    }
+    assert_eq!(stats.borrow().dropped, 1);
+    assert!(run(stream.next_event()).unwrap().is_none());
+  }
+}
+
+#[test]
+fn messages_stream_enforces_record_and_http_error_limits() {
+  let transport = MockTransport::new(
+    messages_wire(&[json!({"type": "content_block_delta", "index": 0,
+      "delta": {"type": "text_delta", "text": "x".repeat(256)}})]),
+    1,
+  );
+  let stats = transport.stats.clone();
+  let mut client = messages_client(transport);
+  let mut stream = run(client.messages_stream(
+    &messages_request(),
+    StreamOptions {
+      max_event_bytes: 64,
+      ..StreamOptions::default()
+    },
+  ))
+  .unwrap();
+  assert!(matches!(run(stream.next_event()), Err(StreamError::Sse(_))));
+  // CRLF normalization permits at most one additional wire byte here.
+  assert!(stats.borrow().bytes <= 66);
+  assert_eq!(stats.borrow().dropped, 1);
+  drop(stream);
+
+  let mut transport = MockTransport::new("provider error body", 1);
+  transport.status = 529;
+  let stats = transport.stats.clone();
+  let mut client = messages_client(transport);
+  let Err(StreamError::HttpStatus { response, truncated }) = run(client.messages_stream(
+    &messages_request(),
+    StreamOptions {
+      max_error_body_bytes: 8,
+      ..StreamOptions::default()
+    },
+  )) else {
+    panic!("expected HTTP error");
+  };
+  assert_eq!(response.status, 529);
+  assert_eq!(response.body, b"provider");
+  assert!(truncated);
+  assert_eq!(stats.borrow().bytes, 9);
+  assert_eq!(stats.borrow().dropped, 1);
+}
+
+#[test]
+fn streaming_uses_the_matching_endpoint_url_and_credentials() {
+  let config = ProviderConfig::new()
+    .with_endpoint(
+      Endpoint::ChatCompletions,
+      EndpointConfig::new("https://chat.example/api/chat")
+        .unwrap()
+        .with_header("authorization", "Bearer chat-token")
+        .unwrap(),
+    )
+    .with_endpoint(
+      Endpoint::Responses,
+      EndpointConfig::new("https://responses.example/api/responses")
+        .unwrap()
+        .with_header("authorization", "Bearer responses-token")
+        .unwrap(),
+    )
+    .with_endpoint(
+      Endpoint::Messages,
+      EndpointConfig::new("https://messages.example/anthropic/v1/messages")
+        .unwrap()
+        .with_header("x-api-key", "messages-key")
+        .unwrap(),
+    );
+  let transport = MockTransport::new("", 1);
+  let stats = transport.stats.clone();
+  let mut client = DirectClient::new(transport, config);
+  drop(run(client.chat_completions_stream(&chat_request(), StreamOptions::default())).unwrap());
+  drop(run(client.responses_stream(&responses_request(), StreamOptions::default())).unwrap());
+  drop(run(client.messages_stream(&messages_request(), StreamOptions::default())).unwrap());
+  let stats = stats.borrow();
+  for (request, (url, auth)) in stats.requests.iter().zip([
+    (
+      "https://chat.example/api/chat",
+      Header::new("authorization", "Bearer chat-token"),
+    ),
+    (
+      "https://responses.example/api/responses",
+      Header::new("authorization", "Bearer responses-token"),
+    ),
+    (
+      "https://messages.example/anthropic/v1/messages",
+      Header::new("x-api-key", "messages-key"),
+    ),
+  ]) {
+    assert_eq!(request.url, url);
+    assert_eq!(
+      request.headers,
+      [
+        auth,
+        Header::new("content-type", "application/json"),
+        Header::new("accept", "text/event-stream")
+      ]
+    );
+  }
+  assert_eq!(stats.reads, 0);
+  assert_eq!(stats.dropped, 3);
+}
+
+#[test]
+fn streaming_rejects_unconfigured_endpoints_before_transport_calls() {
+  let transport = MockTransport::new("", 1);
+  let stats = transport.stats.clone();
+  let mut client = client(transport);
+  assert!(matches!(
+    run(client.messages_stream(&messages_request(), StreamOptions::default())),
+    Err(StreamError::UnsupportedEndpoint(Endpoint::Messages))
+  ));
+  assert!(stats.borrow().requests.is_empty());
+
+  let transport = MockTransport::new("", 1);
+  let stats = transport.stats.clone();
+  let mut client = messages_client(transport);
+  assert!(matches!(
+    run(client.responses_stream(&responses_request(), StreamOptions::default())),
+    Err(StreamError::UnsupportedEndpoint(Endpoint::Responses))
+  ));
+  assert!(matches!(
+    run(client.chat_completions_stream(&chat_request(), StreamOptions::default())),
+    Err(StreamError::UnsupportedEndpoint(Endpoint::ChatCompletions))
+  ));
+  assert!(stats.borrow().requests.is_empty());
+  assert_eq!(stats.borrow().dropped, 0);
 }

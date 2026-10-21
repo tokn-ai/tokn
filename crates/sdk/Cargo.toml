@@ -30,6 +30,7 @@ std = [
   "serde_json/std",
   "thiserror/std",
   "tokn-endpoint-chat-completions/std",
+  "tokn-endpoint-core/std",
   "tokn-endpoint-messages/std",
   "tokn-endpoint-responses/std",
 ]
@@ -50,6 +51,7 @@ tokn-config = { workspace = true, optional = true }
 tokn-convert = { workspace = true, optional = true }
 tokn-core = { workspace = true, optional = true }
 tokn-endpoint-chat-completions.workspace = true
+tokn-endpoint-core.workspace = true
 tokn-endpoint-messages.workspace = true
 tokn-endpoint-responses.workspace = true
 tokn-headers = { workspace = true, optional = true }

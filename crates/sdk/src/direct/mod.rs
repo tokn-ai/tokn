@@ -1,9 +1,9 @@
-//! Buffered and streaming OpenAI requests with caller-supplied networking.
+//! Buffered and streaming native API requests with caller-supplied networking.
 //!
 //! This module only requires `core` and `alloc`. It does not load configuration,
 //! select accounts, convert between provider protocols, or start an executor.
-//! Requests use the exact OpenAI endpoint schemas, including their native
-//! generation controls.
+//! Requests use native Responses, Chat Completions, or Messages schemas,
+//! including their generation controls. Each endpoint has its own URL and headers.
 //!
 //! Implement [`Transport`] using the device's HTTP/TLS stack. The transport is
 //! responsible for certificate validation, DNS, timeouts, and limiting buffered
@@ -17,7 +17,10 @@ mod stream;
 mod stream_error;
 mod transport;
 
-pub use config::{ConfigError, OpenAi, OPENAI_BASE_URL};
+pub use config::{
+  Anthropic, ConfigError, EndpointConfig, OpenAi, ProviderConfig, ANTHROPIC_BASE_URL, ANTHROPIC_VERSION,
+  OPENAI_BASE_URL,
+};
 pub use error::Error;
 pub use sse::DecodeError as SseError;
 pub use stream::{EventStream, StreamOptions};
@@ -26,26 +29,34 @@ pub use transport::{
   BufferedResponse, Header, Request, Response, StreamBody, StreamingResponse, StreamingTransport, Transport,
 };
 
-use alloc::{format, vec};
+pub use tokn_endpoint_core::Endpoint;
+
+use alloc::vec::Vec;
 use core::fmt;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use tokn_endpoint_chat_completions::{ChatRequest, ChatResponse};
+use tokn_endpoint_messages::{MessagesRequest, MessagesResponse};
 use tokn_endpoint_responses::{ResponsesRequest, ResponsesResponse};
 
-/// A direct OpenAI client that borrows no executor or operating-system services.
+/// A native API client that borrows no executor or operating-system services.
 ///
 /// Methods take `&mut self` so a transport can own a single socket or an
 /// embedded network stack. Neither the transport nor its futures must be
 /// `Send`, and no reference counting or atomic operations are required.
 pub struct DirectClient<T> {
   transport: T,
-  provider: OpenAi,
+  provider: ProviderConfig,
 }
 
 impl<T> DirectClient<T> {
-  pub fn new(transport: T, provider: OpenAi) -> Self {
-    Self { transport, provider }
+  /// Accepts explicit endpoint routes or a convenience configuration such as
+  /// [`OpenAi`] or [`Anthropic`].
+  pub fn new(transport: T, provider: impl Into<ProviderConfig>) -> Self {
+    Self {
+      transport,
+      provider: provider.into(),
+    }
   }
 
   pub fn transport(&self) -> &T {
@@ -60,24 +71,34 @@ impl<T> DirectClient<T> {
     self.transport
   }
 
-  fn http_request(&self, operation: &str, body: alloc::vec::Vec<u8>, streaming: bool) -> Request {
-    Request {
+  pub fn provider(&self) -> &ProviderConfig {
+    &self.provider
+  }
+
+  /// Replace routes or credentials while retaining the transport. Credential
+  /// acquisition and expiry handling remain the caller's responsibility.
+  pub fn set_provider(&mut self, provider: impl Into<ProviderConfig>) {
+    self.provider = provider.into();
+  }
+
+  fn http_request(&self, endpoint: Endpoint, body: Vec<u8>, streaming: bool) -> Result<Request, Endpoint> {
+    let config = self.provider.endpoint(endpoint).ok_or(endpoint)?;
+    let mut headers = config.headers().to_vec();
+    headers.push(Header::new("content-type", "application/json"));
+    headers.push(Header::new(
+      "accept",
+      if streaming {
+        "text/event-stream"
+      } else {
+        "application/json"
+      },
+    ));
+    Ok(Request {
       method: "POST",
-      url: format!("{}/{operation}", self.provider.base_url()),
-      headers: vec![
-        Header::new("authorization", self.provider.authorization()),
-        Header::new("content-type", "application/json"),
-        Header::new(
-          "accept",
-          if streaming {
-            "text/event-stream"
-          } else {
-            "application/json"
-          },
-        ),
-      ],
+      url: config.url().into(),
+      headers,
       body,
-    }
+    })
   }
 }
 
@@ -90,7 +111,7 @@ impl<T> fmt::Debug for DirectClient<T> {
 }
 
 impl<T: Transport> DirectClient<T> {
-  /// Send a buffered request to `/responses`.
+  /// Send a buffered request to the configured Responses endpoint.
   ///
   /// Uses the model and OpenAI-native parameters exactly as supplied. A
   /// `stream: true` request is rejected before invoking the transport.
@@ -98,10 +119,10 @@ impl<T: Transport> DirectClient<T> {
     &mut self,
     request: &ResponsesRequest,
   ) -> Result<BufferedResponse<ResponsesResponse>, Error<T::Error>> {
-    self.execute("responses", request, request.stream).await
+    self.execute(Endpoint::Responses, request, request.stream).await
   }
 
-  /// Send a buffered request to `/chat/completions`.
+  /// Send a buffered request to the configured Chat Completions endpoint.
   ///
   /// Uses the model and OpenAI-native parameters exactly as supplied. A
   /// `stream: true` request is rejected before invoking the transport.
@@ -109,12 +130,23 @@ impl<T: Transport> DirectClient<T> {
     &mut self,
     request: &ChatRequest,
   ) -> Result<BufferedResponse<ChatResponse>, Error<T::Error>> {
-    self.execute("chat/completions", request, request.stream).await
+    self.execute(Endpoint::ChatCompletions, request, request.stream).await
+  }
+
+  /// Send a buffered request to the configured Messages endpoint.
+  ///
+  /// Uses native parameters such as `max_tokens`, `system`, `thinking`, and
+  /// `tools` as supplied. A `stream: true` request is rejected before transport.
+  pub async fn messages(
+    &mut self,
+    request: &MessagesRequest,
+  ) -> Result<BufferedResponse<MessagesResponse>, Error<T::Error>> {
+    self.execute(Endpoint::Messages, request, request.stream).await
   }
 
   async fn execute<Q: Serialize, R: DeserializeOwned>(
     &mut self,
-    operation: &str,
+    endpoint: Endpoint,
     request: &Q,
     stream: Option<bool>,
   ) -> Result<BufferedResponse<R>, Error<T::Error>> {
@@ -129,7 +161,9 @@ impl<T: Transport> DirectClient<T> {
     }
     body["stream"] = Value::Bool(false);
     let body = serde_json::to_vec(&body).map_err(Error::Serialize)?;
-    let request = self.http_request(operation, body, false);
+    let request = self
+      .http_request(endpoint, body, false)
+      .map_err(Error::UnsupportedEndpoint)?;
     let response = self.transport.send(request).await.map_err(Error::Transport)?;
     if !(200..300).contains(&response.status) {
       return Err(Error::HttpStatus { response });

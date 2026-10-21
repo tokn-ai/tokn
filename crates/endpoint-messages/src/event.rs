@@ -60,6 +60,24 @@ pub enum MessagesEvent {
 }
 
 impl MessagesEvent {
+  /// Whether this schema has a typed variant for a wire event name.
+  ///
+  /// Decoders can use this to distinguish future event types from malformed
+  /// known events that the tolerant serde representation preserves as `Other`.
+  pub fn is_known_kind(kind: &str) -> bool {
+    matches!(
+      kind,
+      "message_start"
+        | "content_block_start"
+        | "content_block_delta"
+        | "content_block_stop"
+        | "message_delta"
+        | "message_stop"
+        | "ping"
+        | "error"
+    )
+  }
+
   pub fn kind(&self) -> &str {
     match self {
       Self::MessageStart { .. } => "message_start",

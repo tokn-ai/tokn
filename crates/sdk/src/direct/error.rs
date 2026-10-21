@@ -1,6 +1,6 @@
 use core::fmt;
 
-use super::Response;
+use super::{Endpoint, Response};
 
 /// Failures from a buffered direct request.
 ///
@@ -14,6 +14,7 @@ pub enum Error<E> {
   HttpStatus { response: Response },
   StreamingUnsupported,
   UnexpectedStream,
+  UnsupportedEndpoint(Endpoint),
 }
 
 impl<E: fmt::Display> fmt::Display for Error<E> {
@@ -22,11 +23,12 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
       Self::Transport(error) => write!(f, "transport failed: {error}"),
       Self::Serialize(error) => write!(f, "failed to serialize request: {error}"),
       Self::Deserialize(error) => write!(f, "failed to deserialize response: {error}"),
-      Self::HttpStatus { response } => write!(f, "OpenAI request failed with HTTP status {}", response.status),
+      Self::HttpStatus { response } => write!(f, "provider request failed with HTTP status {}", response.status),
       Self::StreamingUnsupported => {
         f.write_str("buffered requests require stream=false; use a streaming method instead")
       }
       Self::UnexpectedStream => f.write_str("received an event stream for a buffered request"),
+      Self::UnsupportedEndpoint(endpoint) => write!(f, "{} endpoint is not configured", endpoint.as_str()),
     }
   }
 }

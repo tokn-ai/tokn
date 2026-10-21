@@ -2,13 +2,14 @@ use alloc::vec::Vec;
 use core::fmt;
 use serde_json::Value;
 
-use super::{Header, Response, SseError};
+use super::{Endpoint, Header, Response, SseError};
 
 /// Streaming failures. After an error the event stream is closed.
 ///
 /// HTTP errors retain status, headers, and at most the configured error-body
 /// limit. Provider error payloads can be inspected explicitly; Debug omits them.
 pub enum StreamError<E> {
+  UnsupportedEndpoint(Endpoint),
   Transport(E),
   Serialize(serde_json::Error),
   Deserialize(serde_json::Error),
@@ -24,6 +25,7 @@ pub enum StreamError<E> {
 impl<E: fmt::Debug> fmt::Debug for StreamError<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::UnsupportedEndpoint(endpoint) => f.debug_tuple("UnsupportedEndpoint").field(endpoint).finish(),
       Self::Transport(error) => f.debug_tuple("Transport").field(error).finish(),
       Self::Serialize(error) => f.debug_tuple("Serialize").field(error).finish(),
       Self::Deserialize(error) => f.debug_tuple("Deserialize").field(error).finish(),
@@ -49,10 +51,11 @@ impl<E: fmt::Debug> fmt::Debug for StreamError<E> {
 impl<E: fmt::Display> fmt::Display for StreamError<E> {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::UnsupportedEndpoint(endpoint) => write!(f, "provider has no {} endpoint configured", endpoint.as_str()),
       Self::Transport(error) => write!(f, "transport failed: {error}"),
       Self::Serialize(error) => write!(f, "failed to serialize request: {error}"),
       Self::Deserialize(error) => write!(f, "failed to deserialize stream event: {error}"),
-      Self::HttpStatus { response, .. } => write!(f, "OpenAI request failed with HTTP status {}", response.status),
+      Self::HttpStatus { response, .. } => write!(f, "provider request failed with HTTP status {}", response.status),
       Self::UnexpectedContentType { .. } => f.write_str("streaming response requires text/event-stream content type"),
       Self::Sse(error) => error.fmt(f),
       Self::InvalidEvent(reason) => write!(f, "invalid stream event: {reason}"),

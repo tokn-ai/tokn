@@ -20,7 +20,7 @@ mod tests {
   };
 
   use serde_json::{json, Value};
-  use tokn_sdk::{chat_completions::ChatRequest, Client, RequestOptions};
+  use tokn_sdk::{chat_completions::ChatRequest, Client, Endpoint, RequestOptions};
 
   const BUFFERED: &str = r#"{"id":"chatcmpl-std","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
   const STREAM_PARTS: [&str; 2] = [
@@ -73,7 +73,7 @@ mod tests {
         .expect("server still running")
         .join()
         .expect("server did not panic")
-        .expect("server completed both requests")
+        .expect("server completed all requests")
     }
   }
 
@@ -90,7 +90,7 @@ mod tests {
   fn serve(listener: TcpListener, stopped: &AtomicBool) -> io::Result<Vec<Value>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
-    while requests.len() < 2 {
+    while requests.len() < 3 {
       if stopped.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "fixture stopped"));
       }
@@ -219,15 +219,41 @@ mod tests {
         let finished: Value = serde_json::from_str(events[1]).unwrap();
         assert_eq!(finished["choices"][0]["finish_reason"], "stop");
         assert_eq!(events[2], "[DONE]");
+
+        // The root Endpoint is part of the configured client's public API.
+        // It must remain the type accepted by execute, with its existing helpers.
+        let endpoint = Endpoint::infer_from("/v1/chat/completions").expect("known endpoint");
+        assert_eq!(endpoint, Endpoint::ChatCompletions);
+        assert_eq!(endpoint.to_string(), "chat_completions");
+        let response = client
+          .execute(
+            endpoint,
+            json!({
+              "model": "llama-cpp/test-model",
+              "messages": [{"role": "user", "content": "raw request"}],
+              "stream": false
+            }),
+            RequestOptions::default(),
+          )
+          .await
+          .expect("raw SDK call with root Endpoint")
+          .into_json::<Value>()
+          .expect("buffered raw response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.data["id"], "chatcmpl-std");
+        assert_eq!(response.data["choices"][0]["message"]["content"], "hello");
       })
       .await
       .expect("SDK calls completed before timeout");
     });
     let requests = fixture.requests();
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[0]["model"], "test-model");
     assert_eq!(requests[0]["stream"], false);
     assert_eq!(requests[1]["model"], "test-model");
     assert_eq!(requests[1]["stream"], true);
+    assert_eq!(requests[2]["model"], "test-model");
+    assert_eq!(requests[2]["stream"], false);
+    assert_eq!(requests[2]["messages"][0]["content"], "raw request");
   }
 }

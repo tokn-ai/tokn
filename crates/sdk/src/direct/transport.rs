@@ -85,9 +85,10 @@ pub struct BufferedResponse<T> {
 ///
 /// Implementations own DNS, TCP, TLS with certificate verification, timeouts,
 /// and response-size limits. Return non-2xx HTTP responses normally: the client
-/// preserves them in [`super::Error::HttpStatus`]. Automatic redirects must not
-/// forward the authorization header to a different origin or downgrade HTTPS.
-/// Prefer returning redirects to the client as HTTP responses.
+/// preserves them in [`super::Error::HttpStatus`]. Prefer returning redirects
+/// as HTTP responses. Automatic redirects must not forward configured headers
+/// (including `authorization`, `x-api-key`, or custom credentials) to a different
+/// origin or downgrade HTTPS.
 ///
 /// Futures intentionally have no `Send` bound, allowing a single-threaded
 /// embedded executor and a transport that borrows a device driver. Neither a
