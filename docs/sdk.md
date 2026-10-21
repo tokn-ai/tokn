@@ -145,6 +145,48 @@ pipeline stages. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
 when an exact endpoint wire shape is required.
 
+### Shared engine extraction
+
+`tokn-engine` contains execution logic shared by the configured standard runtime
+and local `no_std + alloc` callers. The first extracted component is v2 account
+pool selection: ranking, round-robin ties, active/fallback precedence, cooldowns,
+and session affinity. The standard account runtime delegates to the same
+`PoolState` implementation that the isolated embedded consumer exercises.
+
+The kernel owns plain mutable state and accepts an explicit monotonic time.
+The standard adapter evaluates provider eligibility and ranking outside locks,
+then locks only for selection or success/failure commits. It keeps the existing
+shared provider handles, concurrent request APIs, and `Instant` deadlines.
+Embedded callers own the state directly and can supply `core::time::Duration`
+as elapsed monotonic time. No lock, executor, filesystem, or pointer atomics are
+required by the local backend.
+
+The kernel's concrete `SmolStr` and `Bytes` types select their backend by feature.
+Under `std` they are the existing crate types. With default features disabled,
+strings store short values inline and share long values through `Rc<str>`;
+buffers use static data or shared `Rc<Vec<u8>>` backing with slice offsets.
+Cloning and slicing shared values avoids copying their payload. The last owner
+releases heap storage through normal `Drop`. These local types are neither
+`Send` nor `Sync`. They implement the common storage API used by the engine,
+without a promise of identical layout or the complete upstream crate APIs.
+
+The conformance scenarios run from identical source under both storage backends.
+The isolated consumer prevents workspace feature unification from masking a
+dependency on `std`, and builds on both bare-metal targets in debug and release:
+
+```sh
+cargo test --locked -p tokn-engine --all-features
+cargo test --locked -p tokn-engine --no-default-features
+cargo test --locked --manifest-path crates/engine/tests/no_std/Cargo.toml
+cargo build --locked --manifest-path crates/engine/tests/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo build --locked --manifest-path crates/engine/tests/no_std/Cargo.toml --target thumbv7em-none-eabihf --release
+```
+
+This is the first shared-engine component. Provider preparation, conversion, and
+the complete request runner still need extraction before embedded callers can
+execute the configured Tokn pipeline. The direct client below remains the
+existing native-provider transport API during that migration.
+
 ### Direct OpenAI client (`no_std + alloc`)
 
 Disable the default `std` feature to use `DirectClient` without the gateway,

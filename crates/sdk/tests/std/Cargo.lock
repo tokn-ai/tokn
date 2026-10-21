@@ -2180,6 +2180,7 @@ dependencies = [
  "tokio",
  "tokn-auth",
  "tokn-core",
+ "tokn-engine",
  "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
@@ -2314,6 +2315,15 @@ dependencies = [
  "serde_json",
  "tokn-endpoint-core",
  "tokn-endpoint-macros",
+]
+
+[[package]]
+name = "tokn-engine"
+version = "0.2.4"
+dependencies = [
+ "bytes",
+ "serde",
+ "smol_str",
 ]
 
 [[package]]

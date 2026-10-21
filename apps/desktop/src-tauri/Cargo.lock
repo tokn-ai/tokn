@@ -4254,6 +4254,7 @@ dependencies = [
  "tokio",
  "tokn-auth",
  "tokn-core",
+ "tokn-engine",
  "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",
@@ -4344,6 +4345,15 @@ dependencies = [
  "tokn-router-config",
  "toml_edit 0.25.13+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "tokn-engine"
+version = "0.2.4"
+dependencies = [
+ "bytes",
+ "serde",
+ "smol_str",
 ]
 
 [[package]]

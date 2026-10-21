@@ -125,6 +125,41 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+  engine-no-std:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi,thumbv7em-none-eabihf
+          components: rustfmt,clippy
+
+      - name: Cache shared engine artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            crates/engine/tests/no_std
+
+      - name: Test shared engine and isolated local backend
+        run: |
+          cargo test --locked -p tokn-engine --no-default-features
+          cargo clippy --locked -p tokn-engine --no-default-features --all-targets -- -D warnings
+          cargo fmt --manifest-path crates/engine/tests/no_std/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path crates/engine/tests/no_std/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path crates/engine/tests/no_std/Cargo.toml
+
+      - name: Build shared engine consumer for bare metal
+        run: |
+          for target in thumbv6m-none-eabi thumbv7em-none-eabihf; do
+            cargo build --locked --manifest-path crates/engine/tests/no_std/Cargo.toml --target "$target"
+            cargo build --locked --manifest-path crates/engine/tests/no_std/Cargo.toml --target "$target" --release
+          done
+
   sdk-no-std:
     runs-on: ubuntu-latest
     timeout-minutes: 15
