@@ -1,0 +1,14 @@
+[package]
+name = "tokn-sdk-std-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Resolve the SDK as an external default-feature consumer, independently of
+# workspace members and their dev-dependencies.
+[workspace]
+
+[dependencies]
+tokn-sdk = { path = "../.." }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }

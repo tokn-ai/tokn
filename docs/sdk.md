@@ -216,15 +216,115 @@ credentials to another origin or downgrade HTTPS. No executor, boxed future,
 `Send` bound, or pointer atomics are required by this client. Firmware supplies
 an allocator and its own executor.
 
-This first direct API supports buffered Responses and Chat Completions with
-static API keys. It rejects `stream: true`. Use native endpoint fields such as
+The buffered methods support Responses and Chat Completions with static API
+keys and reject `stream: true`. Use native endpoint fields such as
 `max_output_tokens` for Responses or `max_completion_tokens` for Chat Completions.
 The neutral `generate()` builder, routing profiles, automatic retries, OAuth
 refresh, and lifecycle subscriptions belong to the default `std` client.
 Endpoint schema crates also support `no_std + alloc` independently.
 
+#### Injected streaming
+
+Implement `direct::StreamingTransport` to receive typed SSE events without
+buffering a complete response. This trait is independent of `Transport`, so a
+device can implement only the request modes it uses:
+
+```rust
+pub trait StreamBody {
+  type Error;
+  async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error>;
+}
+
+pub trait StreamingTransport {
+  type Error;
+  type Body<'a>: StreamBody<Error = Self::Error>
+  where
+    Self: 'a;
+
+  async fn send_stream(
+    &mut self,
+    request: Request,
+  ) -> Result<StreamingResponse<Self::Body<'_>>, Self::Error>;
+}
+```
+
+`StreamingResponse` contains `status`, `headers`, and an incremental `body`.
+The body may borrow the transport's socket or driver and need not implement
+`Send`. Return decoded HTTP body bytes from `read`; zero means permanent EOF.
+Reads must be cancellation safe, and dropping the body must abort or release
+the response without draining it. The adapter retains responsibility for TLS,
+timeouts, header limits, and any transport buffers.
+
+Use `responses_stream(&request, options)` or
+`chat_completions_stream(&request, options)`. Both set `stream: true` in the
+outgoing JSON, overriding any conflicting typed field or flattened extra, and
+request `text/event-stream`.
+
+```rust
+use tokn_sdk::{
+  direct::{StreamError, StreamOptions, StreamingTransport},
+  responses::{ResponsesEvent, ResponsesRequest},
+  DirectClient,
+};
+
+async fn receive<T: StreamingTransport>(
+  client: &mut DirectClient<T>,
+  request: &ResponsesRequest,
+  mut on_event: impl FnMut(ResponsesEvent),
+) -> Result<(), StreamError<T::Error>> {
+  let options = StreamOptions {
+    max_event_bytes: 32 * 1024,
+    max_error_body_bytes: 4 * 1024,
+  };
+  let mut stream = client.responses_stream(request, options).await?;
+  while let Some(event) = stream.next_event().await? {
+    // Inspect failure/incomplete events as well as text deltas and completion.
+    on_event(event);
+  }
+  Ok(())
+}
+```
+
+`EventStream` exposes HTTP `status` and `headers`. `next_event()` reads on
+demand, returning native `ResponsesEvent` or `ChatEvent` values. It handles
+fragmented UTF-8, LF/CR/CRLF, comments, and multiline SSE data. Unknown Responses
+event types remain available as `ResponsesEvent::Other`; malformed payloads for
+known event types are rejected.
+
+Chat streams yield `ChatEvent::Done` for `[DONE]`; a chunk's `finish_reason`
+does not terminate the stream because usage can follow it. Responses streams
+yield their terminal event, including failed, incomplete, or error outcomes.
+These outcomes must be inspected by the application; reaching the end alone
+does not mean generation succeeded. See the official
+[Responses streaming event definitions](https://developers.openai.com/api/reference/resources/responses/streaming-events)
+and [Chat Completions stream options](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+
+EOF before an endpoint terminal event returns `StreamError::UnexpectedEof`.
+Malformed JSON, invalid SSE UTF-8, oversized records, and body-read failures
+also end the stream. A successful HTTP response must have a
+`text/event-stream` content type. Non-2xx responses return
+`StreamError::HttpStatus` with status, headers, a bounded body prefix, and a
+`truncated` flag.
+
+Defaults allow 64 KiB per SSE record and retain 8 KiB of an HTTP error body.
+The event limit includes fields, comments, and delimiters, counting CRLF as one
+newline; it is enforced before growing the record buffer. The reader uses a
+fixed 1 KiB buffer and never accumulates the entire generated response. These
+are wire-data limits, not a total heap budget: JSON decoding, transport buffers,
+and events retained by the application consume additional memory.
+
+Dropping the stream or calling `cancel()` immediately drops its body. Terminal
+events and errors also drop it, and later `next_event()` calls return `None`.
+Dropping a pending `next_event()` future preserves parser state so reading can
+resume, provided the transport follows the cancellation-safe read contract.
+Drop the stream itself to release its borrow of the client. Local cancellation
+does not issue a provider cancellation API request.
+
+#### Consumer verification
+
 Bare-metal checks build both the SDK and an isolated consumer that instantiates
-both endpoints with a transport that does not implement `Send`:
+both buffered and streaming endpoints with a transport that does not implement
+`Send`. Streaming bodies borrow that transport and exercise pending reads:
 
 ```sh
 rustup target add thumbv6m-none-eabi thumbv7em-none-eabihf
@@ -232,6 +332,7 @@ cargo build --locked -p tokn-sdk --lib --no-default-features --target thumbv6m-n
 cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv6m-none-eabi
 cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv7em-none-eabihf --release
 cargo test --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml
+cargo test --locked --manifest-path crates/sdk/tests/std/Cargo.toml
 ```
 
 CI covers both targets in debug and release, including a target without pointer
@@ -239,6 +340,11 @@ atomics. The isolated consumer avoids the SDK's native test dependencies enablin
 `std` through Cargo feature unification. These checks verify compilation and a
 host round trip through an in-memory transport; they do not exercise a device's
 network stack or make paid provider calls.
+
+The separate `std` consumer resolves the SDK's default features outside the
+workspace. It loads configuration and verifies the existing `Client` buffered
+and streaming behavior against a local HTTP server, without workspace test
+dependencies enabling missing features.
 
 ## Python
 

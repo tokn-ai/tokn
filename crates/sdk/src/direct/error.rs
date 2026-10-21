@@ -23,7 +23,9 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
       Self::Serialize(error) => write!(f, "failed to serialize request: {error}"),
       Self::Deserialize(error) => write!(f, "failed to deserialize response: {error}"),
       Self::HttpStatus { response } => write!(f, "OpenAI request failed with HTTP status {}", response.status),
-      Self::StreamingUnsupported => f.write_str("direct client only supports buffered requests; stream must be false"),
+      Self::StreamingUnsupported => {
+        f.write_str("buffered requests require stream=false; use a streaming method instead")
+      }
       Self::UnexpectedStream => f.write_str("received an event stream for a buffered request"),
     }
   }
