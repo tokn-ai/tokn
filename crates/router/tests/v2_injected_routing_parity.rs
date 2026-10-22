@@ -736,16 +736,84 @@ async fn account_relay_post_replay_policy_matches_and_failures_still_cool_accoun
 async fn client_credential_relay_forwards_http_errors_without_retrying() {
   let mut config = config();
   add_relay(&mut config, "client", "buffered");
-  let fixture = Fixture::new(config, vec![], &[503]).await;
-  fixture
-    .assert_outcome(
-      "relay",
-      "gpt-4o",
-      Endpoint::ChatCompletions,
-      None,
-      Expected::response(503, &[chat_observation("client")]).with_sleeps(&[]),
-    )
-    .await;
+  let statuses = [400, 429, 503, 200];
+  let fixture = Fixture::new(config, vec![], &statuses).await;
+  for status in statuses {
+    fixture
+      .assert_outcome(
+        "relay",
+        "gpt-4o",
+        Endpoint::ChatCompletions,
+        None,
+        Expected::response(status, &[chat_observation("client")]).with_sleeps(&[]),
+      )
+      .await;
+  }
+}
+
+#[tokio::test]
+async fn api_status_feedback_matches_without_retries_for_managed_and_account_relay() {
+  for relay in [false, true] {
+    for status in [200, 401, 429, 503] {
+      let mut config = config();
+      let profile = if relay {
+        add_relay(&mut config, "account_pool", "never");
+        "relay"
+      } else {
+        add_route(&mut config, "managed", json!({"kind": "capability"}), "preserve");
+        config["routes"]["managed"]["retry"] = retry_setting("never");
+        "managed"
+      };
+      let fixture = Fixture::new(
+        config,
+        vec![
+          account("first", "alpha", "active"),
+          account("second", "alpha", "active"),
+        ],
+        &[status, 200, 200],
+      )
+      .await;
+      let first = [chat_observation("first")];
+      let expected = if status == 200 {
+        Expected::response(200, &first)
+      } else {
+        Expected::failure("send", status == 503, &first)
+      };
+      fixture
+        .assert_outcome(
+          profile,
+          "gpt-4o",
+          Endpoint::ChatCompletions,
+          Some("original"),
+          expected.with_sleeps(&[]),
+        )
+        .await;
+      // A permanent failure neither cools the account nor commits affinity.
+      // The next successful send commits affinity; a fresh session then proves
+      // whether the first account remains eligible independently of retries.
+      for (session, account) in [
+        ("original", if status == 200 { "first" } else { "second" }),
+        (
+          "fresh",
+          if status == 401 || status == 429 {
+            "first"
+          } else {
+            "second"
+          },
+        ),
+      ] {
+        fixture
+          .assert_outcome(
+            profile,
+            "gpt-4o",
+            Endpoint::ChatCompletions,
+            Some(session),
+            Expected::response(200, &[chat_observation(account)]).with_sleeps(&[]),
+          )
+          .await;
+      }
+    }
+  }
 }
 
 fn retry_setting(kind: &str) -> Value {

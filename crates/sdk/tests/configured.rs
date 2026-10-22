@@ -23,8 +23,12 @@ fn shared_retry_schedule_and_exhaustion() {
   scenarios::retry_schedule_and_exhaustion();
 }
 #[test]
-fn response_decode_failure_does_not_retry() {
-  scenarios::response_decode_failure_does_not_retry();
+fn transport_failure_account_feedback() {
+  scenarios::transport_failure_account_feedback();
+}
+#[test]
+fn response_body_failure_does_not_retry() {
+  scenarios::response_body_failure_does_not_retry();
 }
 #[test]
 fn stream_errors_and_borrow_release() {

@@ -6,6 +6,7 @@
 
 use crate::interpretation::RequestInterpretation;
 use crate::retry::{RetryFailure, RetryPolicy};
+use crate::send_policy::{AccountFeedback, AccountFeedbackPolicy, ResponsePolicy, SendOutcome};
 use alloc::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   format,
@@ -444,6 +445,24 @@ impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
     });
   }
 
+  fn record_send_outcome(&self, target: &Target, session_id: Option<&str>, outcome: SendOutcome) -> Result<(), Error> {
+    let Target::Account { binding, pool } = target else {
+      return Ok(());
+    };
+    let feedback = AccountFeedbackPolicy::Api.feedback(outcome);
+    if feedback == AccountFeedback::None {
+      return Ok(());
+    }
+    let now = self.platform.runtime.borrow().now();
+    let mut state = self.platform.pools.get(pool).expect("linked pool").state.borrow_mut();
+    match feedback {
+      AccountFeedback::Success => state.record_success(now, session_id, binding),
+      AccountFeedback::Failure => state.record_failure(now, binding).map(|_| ()),
+      AccountFeedback::None => unreachable!("no feedback returned above"),
+    }
+    .map_err(|error| Error::new("send", error))
+  }
+
   fn template_vars(&self) -> tokn_core::headers::TemplateVars {
     let mut vars = tokn_headers::inbound::build_template_vars(&self.headers);
     vars.request_id.get_or_insert_with(|| SmolStr::new(&self.request_id));
@@ -758,57 +777,32 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       Err(source) => {
         let mut error = Error::new("send", &source);
         error.recoverable = transport.recoverable(&source);
-        if error.recoverable {
-          if let Target::Account { binding, ref pool } = resolved.target {
-            self
-              .platform
-              .pools
-              .get(pool)
-              .expect("linked pool")
-              .state
-              .borrow_mut()
-              .record_failure(self.platform.runtime.borrow().now(), &binding)
-              .map_err(|e| Error::new("send", e))?;
-          }
-        }
+        self.record_send_outcome(
+          &resolved.target,
+          extracted.session_id.as_deref(),
+          SendOutcome::Failure {
+            recoverable: error.recoverable,
+          },
+        )?;
         return Err(error);
       }
     };
-    let disposition = crate::driver::classify_status(head.status);
-    if disposition != crate::driver::StatusDisposition::Success && !matches!(resolved.target, Target::Client) {
+    // Account-credential API relays have the same failure policy as managed
+    // API calls. Only client-credential relays forward every received status.
+    let policy = match resolved.target {
+      Target::Account { .. } => ResponsePolicy::Api,
+      Target::Client => ResponsePolicy::ForwardAll,
+    };
+    let outcome = SendOutcome::Response { status: head.status };
+    let disposition = policy.classify_status(head.status);
+    if disposition != crate::driver::StatusDisposition::Success {
       let detail = read_error_body(&mut **transport, self.platform.limits.max_error_body_bytes).await;
-      if disposition == crate::driver::StatusDisposition::RecoverableFailure {
-        if let Target::Account { binding, ref pool } = resolved.target {
-          self
-            .platform
-            .pools
-            .get(pool)
-            .expect("linked pool")
-            .state
-            .borrow_mut()
-            .record_failure(self.platform.runtime.borrow().now(), &binding)
-            .map_err(|e| Error::new("send", e))?;
-        }
-      }
+      self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
       let mut error = Error::new("send", format!("upstream {}: {detail}", head.status));
       error.recoverable = disposition == crate::driver::StatusDisposition::RecoverableFailure;
       return Err(error);
     }
-    if let Target::Account { binding, ref pool } = resolved.target {
-      self
-        .platform
-        .pools
-        .get(pool)
-        .expect("linked pool")
-        .state
-        .borrow_mut()
-        .record_success(
-          self.platform.runtime.borrow().now(),
-          extracted.session_id.as_deref(),
-          &binding,
-        )
-        .map_err(|e| Error::new("send", e))?;
-    }
+    self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
     self.emit("send", None);
     Ok((head, resolved.clone(), extracted.stream, converted.upstream_stream))
   }

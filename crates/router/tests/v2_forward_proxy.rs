@@ -708,6 +708,141 @@ api_key = "router-secret"
 }
 
 #[tokio::test]
+async fn account_relay_forwards_statuses_and_applies_cooldown_or_affinity() {
+  use std::time::Duration;
+
+  const BODY: &[u8] = b"opaque \0 payload \xff";
+  for (status, cools_account) in [
+    (400, false),
+    (401, true),
+    (403, true),
+    (408, true),
+    (425, true),
+    (429, true),
+    (500, true),
+    (599, true),
+    (600, false),
+  ] {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream.local_addr().unwrap();
+    let received = tokio::spawn(async move {
+      let mut credentials = Vec::new();
+      for status in [status, 200, 200] {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_response_head(&mut stream).await;
+        let authorization = request
+          .lines()
+          .filter_map(|line| line.split_once(':'))
+          .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+          .map(|(_, value)| value.trim().to_owned())
+          .expect("account relay supplies credentials");
+        credentials.push(authorization);
+        let mut body = [0; 5];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"hello");
+        stream
+          .write_all(
+            format!(
+              "HTTP/1.1 {status} Test\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+              BODY.len()
+            )
+            .as_bytes(),
+          )
+          .await
+          .unwrap();
+        stream.write_all(BODY).await.unwrap();
+      }
+      credentials
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    let config = format!(
+      r#"
+schema_version = 2
+[listeners.proxy]
+kind = "forward_proxy"
+bind = "{proxy_addr}"
+client_auth = "none"
+default_http_action = {{ kind = "route", profile = "relay" }}
+default_connect = "reject"
+[profiles.relay]
+route = "relay"
+account_pool = {{ failure_cooldown_secs = 3600, session_ttl_secs = 3600 }}
+[routes.relay]
+kind = "relay"
+destination = {{ kind = "fixed_provider", provider = "local" }}
+credentials = {{ kind = "account_pool" }}
+retry = {{ kind = "buffered", policy = "retry" }}
+[retry_policies.retry]
+max_retries = 1
+initial_backoff_ms = 1
+[providers.local]
+driver = "llama-cpp"
+base_url = "http://{upstream_addr}/v1"
+"#
+    );
+    let plan = tokn_config::v2::parse(&config, Path::new("proxy-status-feedback.toml")).unwrap();
+    let accounts = ["first", "second"]
+      .map(|id| toml::from_str(&format!("id = '{id}'\nprovider = 'local'\napi_key = 'key-{id}'")).unwrap());
+    let state = tokn_router::v2::build_runtime_states(
+      plan,
+      &accounts,
+      Arc::new(AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap()
+    .forward_proxy
+    .pop()
+    .unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
+      stopped.await.unwrap();
+    }));
+    let client = reqwest::Client::builder()
+      .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+      .redirect(reqwest::redirect::Policy::none())
+      .timeout(Duration::from_secs(5))
+      .build()
+      .unwrap();
+    for (session, expected_status) in [("original", status), ("original", 200), ("fresh", 200)] {
+      let response = client
+        .post(format!("http://{upstream_addr}/custom"))
+        .header("x-session-id", session)
+        .header("authorization", "Bearer caller-key")
+        .body("hello")
+        .send()
+        .await
+        .unwrap();
+      assert_eq!(response.status().as_u16(), expected_status, "initial status {status}");
+      assert_eq!(response.headers()["content-type"], "application/octet-stream");
+      assert_eq!(response.bytes().await.unwrap().as_ref(), BODY);
+    }
+    let credentials = tokio::time::timeout(Duration::from_secs(5), received)
+      .await
+      .unwrap()
+      .unwrap();
+    // Success commits affinity, including forwarded ordinary client errors.
+    // Failure cools the selected account even though its response is forwarded.
+    // No feedback would instead yield first/second/first and fail both cases.
+    assert_eq!(
+      credentials,
+      [
+        "Bearer key-first",
+        if cools_account {
+          "Bearer key-second"
+        } else {
+          "Bearer key-first"
+        },
+        "Bearer key-second",
+      ],
+      "initial status {status}"
+    );
+    stop.send(()).unwrap();
+    proxy.await.unwrap().unwrap();
+  }
+}
+
+#[tokio::test]
 async fn v2_forward_proxy_shutdown_cancels_an_active_tunnel() {
   let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let upstream_addr = upstream.local_addr().unwrap();

@@ -73,10 +73,22 @@ struct MemoryTransport<'a> {
   yield_next: bool,
   local: Rc<()>,
   encoding: &'static str,
+  recoverable_errors: bool,
+  read_failure_after: Option<usize>,
 }
 impl<'a> MemoryTransport<'a> {
   fn with_encoding(mut self, encoding: &'static str) -> Self {
     self.encoding = encoding;
+    self
+  }
+
+  fn with_recoverable_errors(mut self, recoverable: bool) -> Self {
+    self.recoverable_errors = recoverable;
+    self
+  }
+
+  fn with_read_failure_after(mut self, bytes: usize) -> Self {
+    self.read_failure_after = Some(bytes);
     self
   }
 
@@ -89,6 +101,8 @@ impl<'a> MemoryTransport<'a> {
       yield_next: true,
       local: Rc::new(()),
       encoding: "identity",
+      recoverable_errors: true,
+      read_failure_after: None,
     }
   }
 }
@@ -129,6 +143,10 @@ impl Transport for MemoryTransport<'_> {
   }
   async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
     poll_fn(|context| {
+      if self.read_failure_after.is_some_and(|limit| self.position >= limit) {
+        self.read_failure_after = None;
+        return Poll::Ready(Err(MemoryError));
+      }
       if self.yield_next {
         self.yield_next = false;
         context.waker().wake_by_ref();
@@ -147,7 +165,7 @@ impl Transport for MemoryTransport<'_> {
     self.encoding
   }
   fn recoverable(&self, _: &Self::Error) -> bool {
-    true
+    self.recoverable_errors
   }
 }
 
@@ -509,36 +527,122 @@ pub fn retry_schedule_and_exhaustion() {
       })
       .collect();
     assert_eq!(failed_attempts, [0, 1, 2]);
+    drop(trace);
+    drop(sent);
+
+    // The final failure still cools its account after consuming the retry
+    // budget, leaving no eligible account for the next independent request.
+    let error = run(client.chat_completions().create(&chat())).unwrap_err();
+    assert_eq!(error.stage, "resolve");
   }
 }
 
-/// A successful send ends replay eligibility even when response decoding fails.
-pub fn response_decode_failure_does_not_retry() {
-  let sent = RefCell::new(Vec::new());
-  let runtime = TestRuntime::default();
-  let trace = runtime.clone();
-  let client = Client::from_platform(
-    Injected::new(
-      retry_plan(2, 2),
-      vec![account_config("primary", "primary-key", "active")],
-      MemoryTransport::new(&sent, [Reply::json(b"invalid JSON"), Reply::json(CHAT_JSON)]),
-      runtime,
-    )
-    .unwrap(),
-  );
-  let error = run(client.chat_completions().create(&chat())).unwrap_err();
-  assert_eq!(error.stage, "convert_response");
-  assert!(!error.recoverable);
-  assert_eq!(sent.borrow().len(), 1);
-  assert!(trace.0.borrow().sleeps.is_empty());
+/// Transport classification controls cooldown independently of whether replay
+/// is enabled or has any remaining budget.
+pub fn transport_failure_account_feedback() {
+  for (recoverable, retry_budget) in [(false, Some(2)), (true, None)] {
+    let sent = RefCell::new(Vec::new());
+    let runtime = TestRuntime::default();
+    let trace = runtime.clone();
+    let plan = retry_budget.map_or_else(|| plan("openai"), |max_retries| retry_plan(max_retries, 2));
+    let client = Client::from_platform(
+      Injected::new(
+        plan,
+        vec![
+          account_config("primary", "primary-key", "active"),
+          account_config("backup", "backup-key", "fallback"),
+        ],
+        MemoryTransport::new(
+          &sent,
+          [
+            Reply {
+              status: 0,
+              content_type: "",
+              bytes: &[],
+            },
+            Reply::json(CHAT_JSON),
+          ],
+        )
+        .with_recoverable_errors(recoverable),
+        runtime,
+      )
+      .unwrap(),
+    );
+    let error = run(client.chat_completions().create(&chat())).unwrap_err();
+    assert_eq!(error.stage, "send");
+    assert_eq!(error.recoverable, recoverable);
+    assert_eq!(sent.borrow().len(), 1);
+    assert!(trace.0.borrow().sleeps.is_empty());
 
-  // The failed response releases the transport and does not cool the account.
-  run(client.chat_completions().create(&chat())).unwrap();
-  assert_eq!(sent.borrow().len(), 2);
-  assert_eq!(
-    sent.borrow()[1].headers.get("authorization").unwrap().as_str(),
-    "Bearer primary-key"
-  );
+    run(client.chat_completions().create(&chat())).unwrap();
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+      sent[0].headers.get("authorization").unwrap().as_str(),
+      "Bearer primary-key"
+    );
+    assert_eq!(
+      sent[1].headers.get("authorization").unwrap().as_str(),
+      if recoverable {
+        "Bearer backup-key"
+      } else {
+        "Bearer primary-key"
+      }
+    );
+  }
+}
+
+/// Successful response headers commit affinity and end replay eligibility,
+/// even when subsequently reading or decoding the response body fails.
+pub fn response_body_failure_does_not_retry() {
+  for read_failure in [false, true] {
+    let sent = RefCell::new(Vec::new());
+    let runtime = TestRuntime::default();
+    let trace = runtime.clone();
+    let mut transport = MemoryTransport::new(
+      &sent,
+      [
+        Reply::json(if read_failure { CHAT_JSON } else { b"invalid JSON" }),
+        Reply::json(CHAT_JSON),
+        Reply::json(CHAT_JSON),
+      ],
+    );
+    if read_failure {
+      transport = transport.with_read_failure_after(1);
+    }
+    let client = Client::from_platform(
+      Injected::new(
+        retry_plan(2, 2),
+        vec![
+          account_config("primary", "primary-key", "active"),
+          account_config("secondary", "secondary-key", "active"),
+        ],
+        transport,
+        runtime,
+      )
+      .unwrap(),
+    );
+    let options = RequestOptions::default().with_session_id("body-failure-session");
+    let error = run(client.chat_completions().create_with(&chat(), options.clone())).unwrap_err();
+    assert_eq!(error.stage, "convert_response");
+    assert!(!error.recoverable);
+    assert_eq!(sent.borrow().len(), 1);
+    assert!(trace.0.borrow().sleeps.is_empty());
+
+    // Body failure releases the transport and retains the successful account's
+    // affinity. A request without that session advances to the other account.
+    run(client.chat_completions().create_with(&chat(), options)).unwrap();
+    run(client.chat_completions().create(&chat())).unwrap();
+    let sent = sent.borrow();
+    let credentials: Vec<_> = sent
+      .iter()
+      .map(|request| request.headers.get("authorization").unwrap().as_str())
+      .collect();
+    assert_eq!(
+      credentials,
+      ["Bearer primary-key", "Bearer primary-key", "Bearer secondary-key"]
+    );
+  }
 }
 
 /// EOF and event limits are errors, and dropping a stream releases the borrowed session.
