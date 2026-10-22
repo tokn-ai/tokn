@@ -12,18 +12,14 @@ use std::path::PathBuf;
 type PathBuf = String;
 
 pub const SCHEMA_VERSION: u32 = 2;
-pub const DEFAULT_MAX_WIRE_BYTES: u64 = 10 * 1024 * 1024;
-pub const DEFAULT_MAX_DECODED_BYTES: u64 = 10 * 1024 * 1024;
+/// Omitted admission limits do not impose a request size cap.
+pub const DEFAULT_MAX_WIRE_BYTES: Option<u64> = None;
+pub const DEFAULT_MAX_DECODED_BYTES: Option<u64> = None;
 pub const DEFAULT_BODY_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_WRITE_QUEUE_CAPACITY: u64 = 4_096;
 pub const DEFAULT_ARCHIVE_AFTER_DAYS: u64 = 7;
 pub const DEFAULT_PRUNE_AFTER_DAYS: u64 = 10;
-pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize =
-  tokn_policy::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES;
-
-fn default_forward_proxy_request_body_max_bytes() -> usize {
-  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES
-}
+pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: Option<usize> = None;
 
 /// The complete on-disk version 2 configuration.
 ///
@@ -93,23 +89,16 @@ pub struct RawOutbound {
   pub use_system_proxy: bool,
 }
 
-/// Independent bounds for bytes received on the wire and produced by decoding.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Optional admission bounds, independent of the persistence body capture limit.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawRequestLimits {
-  #[serde(default = "default_max_wire_bytes")]
-  pub max_wire_bytes: u64,
-  #[serde(default = "default_max_decoded_bytes")]
-  pub max_decoded_bytes: u64,
-}
-
-impl Default for RawRequestLimits {
-  fn default() -> Self {
-    Self {
-      max_wire_bytes: default_max_wire_bytes(),
-      max_decoded_bytes: default_max_decoded_bytes(),
-    }
-  }
+  /// Maximum bytes received before decoding. Omission leaves admission unbounded.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub max_wire_bytes: Option<u64>,
+  /// Maximum bytes after decompression. Omission leaves admission unbounded.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub max_decoded_bytes: Option<u64>,
 }
 
 /// Persistence behavior without changing database schemas or path resolution.
@@ -128,6 +117,7 @@ pub struct RawPersistence {
   pub record_sessions: bool,
   #[serde(default = "default_true")]
   pub record_request_bodies: bool,
+  /// Maximum stored body size in bytes (default: 10 MiB). Larger bodies are omitted entirely.
   #[serde(default = "default_body_max_bytes")]
   pub body_max_bytes: u64,
   #[serde(default = "default_write_queue_capacity")]
@@ -156,14 +146,6 @@ impl Default for RawPersistence {
       prune_after_days: default_prune_after_days(),
     }
   }
-}
-
-const fn default_max_wire_bytes() -> u64 {
-  DEFAULT_MAX_WIRE_BYTES
-}
-
-const fn default_max_decoded_bytes() -> u64 {
-  DEFAULT_MAX_DECODED_BYTES
 }
 
 const fn default_body_max_bytes() -> u64 {
@@ -205,9 +187,9 @@ pub enum RawListener {
     /// non-loopback bind. Remote listeners must still use `local_keys`.
     #[serde(default)]
     allow_insecure_public: bool,
-    /// Maximum HTTP message-body bytes buffered before dispatch.
-    #[serde(default = "default_forward_proxy_request_body_max_bytes")]
-    request_body_max_bytes: usize,
+    /// Optional maximum HTTP message-body bytes admitted before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_body_max_bytes: Option<usize>,
     default_http_action: RawBindingAction,
     default_connect: RawConnectAction,
     #[serde(default)]

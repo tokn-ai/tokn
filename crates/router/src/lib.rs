@@ -4,6 +4,7 @@ pub mod api;
 mod cors;
 pub mod dispatch;
 pub mod frontend;
+mod ingress_record;
 #[cfg(unix)]
 pub mod ipc;
 pub mod pipeline;

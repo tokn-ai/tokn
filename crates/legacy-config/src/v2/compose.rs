@@ -5,8 +5,7 @@ use tokn_config::v2::{
   CompiledConfig, RawAccountPool, RawBinding, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction,
   RawConnectRule, RawListener, RawModelSelector, RawOperationPolicy, RawOutbound, RawPersistence, RawProfile,
   RawProfileBinding, RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination,
-  RawRequestLimits, RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
-  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES, SCHEMA_VERSION,
+  RawRequestLimits, RawRetryPolicy, RawRoute, RawRouteRetry, RawService, RawWireIdentity, SCHEMA_VERSION,
 };
 use tokn_config::{Config, ProxyProviderMode, RouteMode};
 use tokn_core::account::AccountConfig;
@@ -374,7 +373,7 @@ fn project_forward_proxy(
       RawClientAuth::None
     },
     allow_insecure_public,
-    request_body_max_bytes: DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
+    request_body_max_bytes: None,
     default_http_action: RawBindingAction::Route {
       profile: default_profile_id,
     },
@@ -1066,6 +1065,44 @@ mod tests {
     assert_eq!(compiled.service().logging(), &legacy.logging);
     assert_eq!(accounts.len(), 1);
     assert!(!warnings.is_empty());
+  }
+
+  #[test]
+  fn legacy_capture_limits_do_not_become_admission_limits() {
+    for capture_limit in [1234, 10 * 1024 * 1024] {
+      let mut legacy = Config::default();
+      legacy.db.body_max_bytes = capture_limit;
+      let projection = project_v2_config(
+        &legacy,
+        &[account("primary", "openai", None)],
+        forward_proxy_options(RouteMode::Passthrough),
+      )
+      .unwrap();
+      let raw = projection.raw_config();
+      assert_eq!(
+        raw.service.persistence.body_max_bytes,
+        u64::try_from(capture_limit).unwrap()
+      );
+      assert_eq!(raw.service.request_limits.max_wire_bytes, None);
+      assert_eq!(raw.service.request_limits.max_decoded_bytes, None);
+      let RawListener::ForwardProxy {
+        request_body_max_bytes, ..
+      } = &raw.listeners[FORWARD_PROXY_LISTENER_ID]
+      else {
+        panic!("forward proxy listener");
+      };
+      assert_eq!(*request_body_max_bytes, None);
+
+      let compiled = projection.compiled_config();
+      assert_eq!(compiled.service().persistence().body_max_bytes(), capture_limit);
+      assert_eq!(compiled.service().request_limits().max_wire_bytes(), usize::MAX);
+      assert_eq!(compiled.service().request_limits().max_decoded_bytes(), usize::MAX);
+      let tokn_policy::ListenerPlan::ForwardProxy(proxy) = &compiled.gateway().listeners()[FORWARD_PROXY_LISTENER_ID]
+      else {
+        panic!("compiled forward proxy listener");
+      };
+      assert_eq!(proxy.request_body_max_bytes(), usize::MAX);
+    }
   }
 
   #[test]

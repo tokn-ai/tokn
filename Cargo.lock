@@ -3332,6 +3332,7 @@ dependencies = [
  "tokn-convert",
  "tokn-core",
  "tokn-headers",
+ "tokn-persistence",
  "tokn-policy",
  "tokn-provider-copilot",
  "tokn-provider-deepseek",

@@ -112,7 +112,7 @@ impl OutboundPlan {
   }
 }
 
-/// Independent bounds for bytes received on the wire and produced by decoding.
+/// Independent admission bounds; `usize::MAX` represents an omitted limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestLimitsPlan {
   max_wire_bytes: usize,
@@ -121,10 +121,7 @@ pub struct RequestLimitsPlan {
 
 impl Default for RequestLimitsPlan {
   fn default() -> Self {
-    Self::new(
-      super::DEFAULT_MAX_WIRE_BYTES as usize,
-      super::DEFAULT_MAX_DECODED_BYTES as usize,
-    )
+    Self::new(usize::MAX, usize::MAX)
   }
 }
 

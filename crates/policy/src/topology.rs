@@ -20,7 +20,8 @@ use core::time::Duration;
 use std::path::{Path, PathBuf};
 use tokn_core::types::SmolStr;
 
-pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
+/// No admission cap is imposed unless the forward-proxy policy supplies one.
+pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize = usize::MAX;
 
 /// Validated execution resources independent of gateway hosting.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -830,7 +831,7 @@ mod tests {
     assert_eq!(proxy.connect_rules()[1].id().as_str(), "intercept-public");
     assert_eq!(proxy.connect_rules()[1].action(), ConnectAction::Intercept);
     assert_eq!(proxy.default_connect_action(), ConnectAction::Reject);
-    assert_eq!(proxy.request_body_max_bytes(), 10 * 1024 * 1024);
+    assert_eq!(proxy.request_body_max_bytes(), usize::MAX);
     assert_eq!(proxy.tls().unwrap().ca_dir(), Path::new("/tmp/tokn-ca"));
   }
 

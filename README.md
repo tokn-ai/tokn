@@ -289,7 +289,36 @@ Set `record_sessions = false` to disable live semantic capture without disabling
 
 The request DBs are not a single `requests.db` file. They record request and
 response metadata, and can also persist request bodies when
-`record_request_bodies = true`. Use `body_max_bytes` to cap stored body size.
+`record_request_bodies = true`. Bodies larger than `body_max_bytes` (10 MiB by
+default) are omitted entirely; bodies at or below the limit are saved in full. Request
+metadata, headers, status, and errors are still recorded. This capture limit is
+independent of request admission: exceeding it skips body storage and continues
+forwarding the request. Request size limits are disabled by default.
+
+Configure the capture threshold in bytes using the matching config format.
+Omitting the setting defaults to 10 MiB (`10485760` bytes).
+
+```toml
+# Legacy configuration
+[db]
+body_max_bytes = 10485760
+```
+
+```toml
+# Native v2 configuration
+[service.persistence]
+body_max_bytes = 10485760
+```
+
+Native v2 configs can separately opt into request size limits with
+`service.request_limits.max_wire_bytes`,
+`service.request_limits.max_decoded_bytes`, or a forward-proxy listener's
+`request_body_max_bytes`. These limits apply only when explicitly configured;
+they do not inherit the body capture threshold.
+
+Requests rejected before the pipeline starts are also saved as failed records,
+including their request ID, status, error, timing, URL, and redacted headers.
+Rejected request bodies are omitted.
 
 ### Inspect request history
 

@@ -48,7 +48,9 @@ hosts = ["blocked.example"]
       .unwrap()
       .is_empty()
   );
-  let state = tokn_router::v2::build_runtime_states(plan, &[], access, Arc::new(EventBus::noop()))
+  let events = Arc::new(EventBus::new(64));
+  let mut event_rx = events.subscribe();
+  let state = tokn_router::v2::build_runtime_states(plan, &[], access, events)
     .unwrap()
     .forward_proxy
     .pop()
@@ -86,6 +88,41 @@ hosts = ["blocked.example"]
 
   let rejected = connect(proxy_addr, "blocked.example:443", Some(&key.token)).await;
   assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"));
+  let rejected_request_id = rejected
+    .lines()
+    .filter_map(|line| line.split_once(':'))
+    .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+    .map(|(_, value)| value.trim())
+    .expect("rejected CONNECT response missing request id");
+  let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+  let rejections = events
+    .iter()
+    .filter_map(|event| {
+      let Event::Requests(request) = &**event else {
+        return None;
+      };
+      assert!(!matches!(
+        request.payload,
+        RequestEventPayload::Stage(StageEvent::Started { .. })
+      ));
+      match &request.payload {
+        RequestEventPayload::Record(RecordEvent::IngressRejected(rejection)) => Some((request, rejection)),
+        _ => None,
+      }
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(rejections.len(), 6, "all early proxy rejections must be recorded");
+  assert_eq!(
+    rejections
+      .iter()
+      .map(|(_, rejection)| rejection.status)
+      .collect::<Vec<_>>(),
+    [407, 407, 407, 407, 407, 403]
+  );
+  let (request, rejection) = rejections.last().unwrap();
+  assert_eq!(request.request_id, rejected_request_id);
+  assert_eq!(rejection.method, "CONNECT");
+  assert_eq!(rejection.user.as_deref(), Some("proxy test"));
 
   let mut tunnel = TcpStream::connect(proxy_addr).await.unwrap();
   tunnel
@@ -104,6 +141,10 @@ hosts = ["blocked.example"]
     "unexpected CONNECT response: {response:?}"
   );
   assert!(!response.to_ascii_lowercase().contains("x-request-id:"));
+  assert!(
+    event_rx.try_recv().is_err(),
+    "successful CONNECT must not create a failed record"
+  );
   tunnel.write_all(b"ping").await.unwrap();
   let mut reply = [0_u8; 4];
   tunnel.read_exact(&mut reply).await.unwrap();
@@ -343,12 +384,13 @@ credentials = {{ kind = "client" }}
 "#
   );
   let plan = tokn_config::v2::parse(&config, Path::new("v2-forward-proxy.toml")).unwrap();
-  let state =
-    tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), Arc::new(EventBus::noop()))
-      .unwrap()
-      .forward_proxy
-      .pop()
-      .unwrap();
+  let events = Arc::new(EventBus::new(64));
+  let mut event_rx = events.subscribe();
+  let state = tokn_router::v2::build_runtime_states(plan, &[], Arc::new(AccessStore::disabled()), events)
+    .unwrap()
+    .forward_proxy
+    .pop()
+    .unwrap();
   let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
   let proxy_task = tokio::spawn(tokn_router::v2::serve_bound_forward_proxy(state, listener, async {
     let _ = shutdown_rx.await;
@@ -357,7 +399,7 @@ credentials = {{ kind = "client" }}
   let mut client = TcpStream::connect(proxy_addr).await.unwrap();
   client
     .write_all(
-      b"POST http://127.0.0.1:1/opaque HTTP/1.1\r\nHost: 127.0.0.1:1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+      b"POST http://127.0.0.1:1/opaque HTTP/1.1\r\nHost: 127.0.0.1:1\r\nTransfer-Encoding: chunked\r\nConnection: close, x-request-id\r\nX-Request-Id: req-proxy-rejected-body\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
     )
     .await
     .unwrap();
@@ -368,6 +410,36 @@ credentials = {{ kind = "client" }}
     "unexpected response: {}",
     String::from_utf8_lossy(&response)
   );
+  let response = String::from_utf8(response).unwrap();
+  let response_request_id = response
+    .lines()
+    .filter_map(|line| line.split_once(':'))
+    .find(|(name, _)| name.eq_ignore_ascii_case("x-request-id"))
+    .map(|(_, value)| value.trim())
+    .expect("413 response missing request id");
+  assert_eq!(response_request_id, "req-proxy-rejected-body");
+  let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+  let rejections = events
+    .iter()
+    .filter_map(|event| {
+      let Event::Requests(request) = &**event else {
+        return None;
+      };
+      assert!(!matches!(
+        request.payload,
+        RequestEventPayload::Stage(StageEvent::Started { .. })
+      ));
+      match &request.payload {
+        RequestEventPayload::Record(RecordEvent::IngressRejected(rejection)) => Some((request, rejection)),
+        _ => None,
+      }
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(rejections.len(), 1);
+  let (request, rejection) = rejections[0];
+  assert_eq!(request.request_id, response_request_id);
+  assert_eq!(rejection.status, 413);
+  assert!(rejection.error.contains("byte limit"));
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();
@@ -505,7 +577,16 @@ base_url = "http://{upstream_addr}/v1"
   assert!(response_lower.contains("connection: upgrade\r\n"));
   assert!(response_lower.contains("upgrade: websocket\r\n"));
   assert!(upstream_rx.try_recv().is_err(), "websocket request reached upstream");
-  assert!(event_rx.try_recv().is_err(), "websocket request entered the pipeline");
+  let event = event_rx.try_recv().expect("WebSocket rejection record");
+  let Event::Requests(event) = &*event else {
+    panic!("expected a request rejection");
+  };
+  let RequestEventPayload::Record(RecordEvent::IngressRejected(rejection)) = &event.payload else {
+    panic!("WebSocket rejection must not enter the pipeline");
+  };
+  assert_eq!(rejection.status, 426);
+  assert!(response_lower.contains(&format!("x-request-id: {}\r\n", event.request_id)));
+  assert!(event_rx.try_recv().is_err(), "only the ingress rejection is recorded");
 
   shutdown_tx.send(()).unwrap();
   proxy_task.await.unwrap().unwrap();

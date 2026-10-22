@@ -28,7 +28,7 @@
 pub mod record;
 pub mod stage;
 
-pub use record::RecordEvent;
+pub use record::{IngressRejection, RecordEvent};
 pub use stage::{
   BuiltHeadersSummary, ConvertedRequestSummary, ConvertedResponseSummary, ExtractedSummary, RequestEndpoint,
   ResolvedSummary, SentSummary, Stage, StageEvent,

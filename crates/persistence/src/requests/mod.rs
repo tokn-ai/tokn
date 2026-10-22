@@ -155,6 +155,17 @@ impl RequestsDb {
     self.conn_for_day(&key).ok()
   }
 
+  /// A self-contained rejection may follow an inbound-connection record.
+  /// Reuse its pinned day rather than creating a second row across midnight.
+  pub(crate) fn conn_for_request_or_ts(&mut self, request_id: &str, ts: i64) -> Result<&mut Connection> {
+    let day = self
+      .request_meta
+      .get(request_id)
+      .map(|meta| meta.day.clone())
+      .unwrap_or_else(|| day_key(ts));
+    self.conn_for_day(&day)
+  }
+
   pub(crate) fn contains_request(&self, request_id: &str) -> bool {
     self.request_meta.contains_key(request_id)
   }

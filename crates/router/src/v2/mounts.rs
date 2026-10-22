@@ -96,17 +96,29 @@ pub(crate) async fn dispatch(
   connection: InboundConnectionInfo,
   request: Request,
 ) -> Response {
+  let rejection = request
+    .extensions()
+    .get::<crate::ingress_record::IngressRecorder>()
+    .cloned()
+    .unwrap_or_else(|| {
+      crate::ingress_record::IngressRecorder::new(state.events.clone(), &request, connection, "requests")
+        .with_access(&access)
+    });
   let Some(entry) = state.mounts.get(request.uri().path()) else {
-    return ApiError::not_found("API path is not exposed").into_response();
+    return rejection.reject(ApiError::not_found("API path is not exposed"));
   };
   if !entry.enabled {
-    return ApiError::not_found("generation endpoint is disabled for this profile").into_response();
+    return rejection.reject(ApiError::not_found("generation endpoint is disabled for this profile"));
   }
   let expected = match entry.operation {
     ApiOperation::Generate(_) => Method::POST,
     _ => Method::GET,
   };
   if request.method() != expected && !(expected == Method::GET && request.method() == Method::HEAD) {
+    rejection.record(
+      StatusCode::METHOD_NOT_ALLOWED,
+      "method is not allowed for this API path",
+    );
     return (
       StatusCode::METHOD_NOT_ALLOWED,
       [(
@@ -128,13 +140,17 @@ pub(crate) async fn dispatch(
             .source()
             .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
         {
-          return ApiError::payload_too_large("request body exceeds the configured limit").into_response()
+          return rejection.reject(ApiError::payload_too_large("request body exceeds the configured limit"))
         }
-        Err(_) => return ApiError::bad_request("could not read request body").into_response(),
+        Err(_) => return rejection.reject(ApiError::bad_request("could not read request body")),
       };
       handle(
         state,
-        ApiRequestContext { access, connection },
+        ApiRequestContext {
+          access,
+          connection,
+          rejection: rejection.clone(),
+        },
         parts.method,
         parts.uri,
         parts.headers,
@@ -155,5 +171,5 @@ pub(crate) async fn dispatch(
   };
   // Axum sets Content-Length from the representation before stripping HEAD
   // bodies, including for fallback dispatch and error responses.
-  result.unwrap_or_else(IntoResponse::into_response)
+  result.unwrap_or_else(|error| rejection.reject(error))
 }

@@ -85,7 +85,10 @@ fn compile_request_limits(raw: &RawRequestLimits) -> Result<RequestLimitsPlan, C
   Ok(RequestLimitsPlan::new(max_wire_bytes, max_decoded_bytes))
 }
 
-fn compile_limit(location: &'static str, value: u64) -> Result<usize, CompileError> {
+fn compile_limit(location: &'static str, value: Option<u64>) -> Result<usize, CompileError> {
+  let Some(value) = value else {
+    return Ok(usize::MAX);
+  };
   if value == 0 {
     return Err(invalid_value(location, "must be greater than zero"));
   }
@@ -141,10 +144,49 @@ fn invalid_value(location: impl Into<String>, message: impl Into<String>) -> Com
   }
 }
 
-#[cfg(all(test, target_pointer_width = "32"))]
+#[cfg(test)]
 mod tests {
   use super::*;
 
+  #[test]
+  fn omitted_request_limits_are_unbounded_and_remain_absent_in_toml() {
+    let raw = RawRequestLimits::default();
+    assert_eq!(raw.max_wire_bytes, None);
+    assert_eq!(raw.max_decoded_bytes, None);
+    let limits = compile_request_limits(&raw).unwrap();
+    assert_eq!(limits.max_wire_bytes(), usize::MAX);
+    assert_eq!(limits.max_decoded_bytes(), usize::MAX);
+    assert_eq!(limits, RequestLimitsPlan::default());
+    let serialized = toml::to_string(&raw).unwrap();
+    assert!(!serialized.contains("max_wire_bytes"));
+    assert!(!serialized.contains("max_decoded_bytes"));
+    assert_eq!(toml::from_str::<RawRequestLimits>(&serialized).unwrap(), raw);
+    assert_eq!(RawPersistence::default().body_max_bytes, 10 * 1024 * 1024);
+  }
+
+  #[test]
+  fn explicit_request_limits_are_independent_and_must_be_positive() {
+    for field in ["max_wire_bytes", "max_decoded_bytes"] {
+      let raw: RawRequestLimits = toml::from_str(&format!("{field} = 4096")).unwrap();
+      let limits = compile_request_limits(&raw).unwrap();
+      let expected_wire = if field == "max_wire_bytes" { 4096 } else { usize::MAX };
+      let expected_decoded = if field == "max_decoded_bytes" { 4096 } else { usize::MAX };
+      assert_eq!(limits.max_wire_bytes(), expected_wire);
+      assert_eq!(limits.max_decoded_bytes(), expected_decoded);
+      let serialized = toml::to_string(&raw).unwrap();
+      assert!(serialized.contains(&format!("{field} = 4096")));
+      assert_eq!(toml::from_str::<RawRequestLimits>(&serialized).unwrap(), raw);
+
+      let raw: RawRequestLimits = toml::from_str(&format!("{field} = 0")).unwrap();
+      assert!(matches!(
+        compile_request_limits(&raw),
+        Err(CompileError::InvalidValue { location, .. })
+          if location == format!("service.request_limits.{field}")
+      ));
+    }
+  }
+
+  #[cfg(target_pointer_width = "32")]
   #[test]
   fn service_sizes_reject_platform_usize_overflow() {
     assert!(matches!(
@@ -152,5 +194,15 @@ mod tests {
       Err(CompileError::InvalidValue { location, .. })
         if location == "service.persistence.body_max_bytes"
     ));
+    for field in [
+      "service.request_limits.max_wire_bytes",
+      "service.request_limits.max_decoded_bytes",
+    ] {
+      assert_eq!(compile_limit(field, None).unwrap(), usize::MAX);
+      assert!(matches!(
+        compile_limit(field, Some(u64::MAX)),
+        Err(CompileError::InvalidValue { location, .. }) if location == field
+      ));
+    }
   }
 }

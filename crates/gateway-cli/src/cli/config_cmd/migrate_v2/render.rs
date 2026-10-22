@@ -8,7 +8,6 @@ use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use tokn_config::v2::{
   RawAccountPool, RawConfig, RawCors, RawListener, RawProvider, RawRoute, RawRouteRetry, RawService, RawWireIdentity,
-  DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };
 use toml_edit::visit_mut::{self, VisitMut};
 use toml_edit::{Array, DocumentMut, Item, Table, Value};
@@ -63,7 +62,7 @@ fn compact(document: &mut DocumentMut, raw: &RawConfig) -> Result<()> {
         if !allow_insecure_public {
           table.remove("allow_insecure_public");
         }
-        if *request_body_max_bytes == DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES {
+        if request_body_max_bytes.is_none() {
           table.remove("request_body_max_bytes");
         }
       }

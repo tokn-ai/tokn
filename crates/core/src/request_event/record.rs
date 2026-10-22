@@ -28,17 +28,43 @@ use bytes::Bytes;
 use serde::Serialize;
 use smol_str::SmolStr;
 
-/// Wire-truth capture from the actual outbound HTTP call (via
-/// [`OutboundCapture`](crate::provider::OutboundCapture)).
+/// A local rejection returned before the request pipeline takes ownership.
 ///
-/// The four variants split a single capture so subscribers can write
-/// each piece as soon as it's known: request side before the response
-/// arrives, response status+headers as soon as they come back, body
-/// once it's been drained/accumulated, and converted body once the client-facing
-/// payload is fully materialized.
+/// The enclosing [`super::RequestEvent::ts`] is the completion time. Rejected
+/// bodies are deliberately absent: a failed body read may be partial, exceed
+/// the configured limit, or contain data that was never admitted for execution.
+/// Emit this record only on local ingress failures, never for requests already
+/// dispatched to a pipeline, whose lifecycle supplies its own records.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressRejection {
+  pub started_ts: i64,
+  pub request_endpoint: super::RequestEndpoint,
+  pub status: u16,
+  pub error: SmolStr,
+  pub mode: SmolStr,
+  pub pipeline_id: SmolStr,
+  pub method: SmolStr,
+  pub url: Option<SmolStr>,
+  /// Original inbound headers. Persistence must apply its normal redaction.
+  pub headers: HeaderMap,
+  pub user: Option<SmolStr>,
+  pub api_key_id: Option<SmolStr>,
+  pub local_addr: Option<SmolStr>,
+  pub peer_addr: Option<SmolStr>,
+}
+
+/// Transport facts recorded alongside request execution.
+///
+/// Ingress failures are self-contained. Pipeline records split captures so
+/// subscribers can write each piece as soon as it is known: inbound connection
+/// facts, outbound request bytes, response status and headers, accumulated
+/// bodies, and parsed usage. Providers emit outbound captures through
+/// [`OutboundCapture`](crate::provider::OutboundCapture).
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RecordEvent {
+  /// Complete record for a request rejected before pipeline dispatch.
+  IngressRejected(IngressRejection),
   /// Inbound client->router connection facts captured by the transport
   /// before the pipeline starts. Emitted outside the runner so callers can
   /// supply whatever connection context they have without widening
