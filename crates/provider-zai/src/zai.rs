@@ -24,7 +24,8 @@ use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
 use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::CleartextHttpPolicy;
-use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
+use tokn_core::Endpoint;
+use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use tokn_headers::{HeaderMap, HeaderValue};
 use tracing::{debug, instrument, warn};
 
@@ -36,10 +37,10 @@ use crate::{
 /// Canonical upstreams for the four Z.ai provider identities. Legacy account
 /// URLs may override these until destination ownership moves fully to v2
 /// upstream resources.
-pub const ZAI_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
-pub const ZAI_CODING_PLAN_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
-pub const ZHIPUAI_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
-pub const ZHIPUAI_CODING_PLAN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+pub use crate::native::ZAI_BASE_URL;
+pub use crate::native::ZAI_CODING_PLAN_BASE_URL;
+pub use crate::native::ZHIPUAI_BASE_URL;
+pub use crate::native::ZHIPUAI_CODING_PLAN_BASE_URL;
 
 pub struct ZaiProvider {
   pub id: String,
@@ -177,28 +178,17 @@ impl Provider for ZaiProvider {
     Some(self)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
-    headers.insert(
-      &AUTHORIZATION,
-      HeaderValue::from_string(format!("Bearer {}", self.api_key.expose())),
+  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+    crate::native::inject_credentials(
+      headers,
+      ctx.endpoint().unwrap_or(Endpoint::ChatCompletions),
+      self.api_key.expose(),
     );
     Ok(())
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
-    headers.insert(
-      &ACCEPT,
-      HeaderValue::from_static(if ctx.stream {
-        "text/event-stream"
-      } else {
-        "application/json"
-      }),
-    );
-    headers.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(encoding) = ctx.content_encoding {
-      headers.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
-    }
-    Ok(None)
+    Ok(crate::native::normalize_headers(headers, ctx))
   }
 
   #[instrument(

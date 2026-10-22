@@ -1,7 +1,12 @@
-use std::fmt;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+use alloc::string::String;
+use core::fmt;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
 use tokn_policy::InvalidIdentifier;
 
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub enum Error {
   Read { path: PathBuf, source: std::io::Error },
@@ -12,6 +17,7 @@ pub enum Error {
   Compile { path: PathBuf, source: Box<CompileError> },
 }
 
+#[cfg(feature = "std")]
 impl fmt::Display for Error {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
@@ -41,8 +47,9 @@ impl fmt::Display for Error {
   }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for Error {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+  fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
     match self {
       Self::Read { source, .. } => Some(source),
       Self::Parse { source, .. } => Some(source),
@@ -129,8 +136,8 @@ impl fmt::Display for CompileError {
   }
 }
 
-impl std::error::Error for CompileError {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for CompileError {
+  fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
     match self {
       Self::InvalidIdentifier { source, .. } => Some(source),
       _ => None,
@@ -138,4 +145,5 @@ impl std::error::Error for CompileError {
   }
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
+#[cfg(feature = "std")]
+pub type Result<T, E = Error> = core::result::Result<T, E>;

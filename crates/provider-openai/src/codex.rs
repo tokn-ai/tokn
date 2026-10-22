@@ -15,7 +15,7 @@ use crate::{
   TemplateVars, ID_CODEX,
 };
 
-pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+pub use crate::native::CODEX_BASE_URL;
 pub const CODEX_CLIENT_VERSION: &str = common::CODEX_CLI_VERSION;
 
 pub struct CodexProvider {
@@ -111,71 +111,9 @@ impl CodexProvider {
 }
 
 impl InputTransformer for CodexProvider {
-  fn transform_input(&self, endpoint: Endpoint, mut body: Value) -> Result<Value> {
-    if endpoint == Endpoint::Responses {
-      if let Some(obj) = body.as_object_mut() {
-        obj.remove("max_output_tokens");
-        obj.insert("store".into(), Value::Bool(false));
-        obj.insert("stream".into(), Value::Bool(true));
-        normalize_verbosity(obj);
-        if let Some(input) = obj.get_mut("input") {
-          normalize_codex_input(input);
-        }
-        if !obj.get("instructions").map(Value::is_string).unwrap_or(false) {
-          obj.insert("instructions".into(), Value::String(String::new()));
-        }
-        normalize_reasoning_effort(obj);
-      }
-    }
-    Ok(body)
+  fn transform_input(&self, endpoint: Endpoint, body: Value) -> Result<Value> {
+    Ok(crate::native::transform_codex_input(endpoint, body))
   }
-}
-
-fn normalize_reasoning_effort(obj: &mut serde_json::Map<String, Value>) {
-  let Some(effort) = obj
-    .remove("reasoning_effort")
-    .and_then(|v| v.as_str().map(str::to_string))
-  else {
-    return;
-  };
-
-  match obj.get_mut("reasoning") {
-    Some(Value::Object(reasoning)) => {
-      reasoning.entry("effort").or_insert_with(|| Value::String(effort));
-    }
-    Some(_) => {}
-    None => {
-      obj.insert("reasoning".into(), serde_json::json!({ "effort": effort }));
-    }
-  }
-}
-
-fn normalize_verbosity(obj: &mut serde_json::Map<String, Value>) {
-  let Some(verbosity) = obj.remove("verbosity") else {
-    return;
-  };
-
-  match obj.get_mut("text") {
-    Some(Value::Object(text)) => {
-      text.entry("verbosity").or_insert(verbosity);
-    }
-    Some(_) => {}
-    None => {
-      obj.insert("text".into(), serde_json::json!({ "verbosity": verbosity }));
-    }
-  }
-}
-
-fn normalize_codex_input(input: &mut Value) {
-  let replacement = match input.clone() {
-    Value::Array(_) => return,
-    Value::String(text) => {
-      serde_json::json!([{"role": "user", "content": [{"type": "input_text", "text": text.clone()}]}])
-    }
-    Value::Null => Value::Array(Vec::new()),
-    other => Value::Array(vec![other]),
-  };
-  *input = replacement;
 }
 
 pub fn validate(account: &AccountConfig) -> Result<()> {

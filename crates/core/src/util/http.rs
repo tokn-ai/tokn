@@ -1,3 +1,4 @@
+use crate::headers::HeaderMap;
 use anyhow::Result;
 use bytes::Bytes;
 use http::HeaderMap as NativeHeaderMap;
@@ -5,7 +6,6 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use snafu::ResultExt;
 use std::time::Duration;
-use tokn_headers::HeaderMap;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -169,8 +169,8 @@ pub async fn send(
   // Persona builders may inject these from inbound captures or from defaults
   // derived from real-world traffic; that's fine for diagnostics but must
   // not reach the wire.
-  let stripped_host = headers.remove(&tokn_headers::keys::HOST);
-  let stripped_clen = headers.remove(&tokn_headers::keys::CONTENT_LENGTH);
+  let stripped_host = headers.remove(&crate::headers::keys::HOST);
+  let stripped_clen = headers.remove(&crate::headers::keys::CONTENT_LENGTH);
   if stripped_host > 0 || stripped_clen > 0 {
     tracing::trace!(
       what,

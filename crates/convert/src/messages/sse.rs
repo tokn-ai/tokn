@@ -1,5 +1,6 @@
 use crate::error::Result;
 use crate::ir::IrDelta;
+use alloc::vec::Vec;
 use tokn_endpoint_messages::MessagesEvent;
 
 pub fn delta_from_endpoint_event(event: &MessagesEvent) -> Result<Vec<IrDelta>> {

@@ -3,12 +3,18 @@ use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokn_accounts::link::{AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, ProviderBinding};
+use tokn_accounts::selection::{
+  managed_binding_matches, model_candidates, model_provider_score, operation_candidates, provider_allowed,
+};
+#[cfg(test)]
+use tokn_accounts::selection::{qualification_name, DiscoveryEvidence, ProviderConstraint};
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_policy::{
-  AccountPoolId, DriverId, GatewayPlan, ManagedRoute, ModelSelector, OperationPolicy, ProfileId, ProviderId,
-  ProviderSelector, QualificationNamespace, RelayDestination, RelayRoute, RouteId, RoutePlan,
+  AccountPoolId, GatewayPlan, ManagedRoute, ProfileId, ProviderId, RelayDestination, RelayRoute, RouteId, RoutePlan,
 };
+#[cfg(test)]
+use tokn_policy::{OperationPolicy, QualificationNamespace};
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
 use tokn_requests::pipeline::error::{PipelineError, RequestsError};
@@ -20,7 +26,6 @@ use tokn_requests::stages::{
   ACCESS_ALLOWED_PROVIDERS_KEY,
 };
 
-const BUILTIN_OPERATION_ORDER: [Endpoint; 3] = [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages];
 pub(super) const V2_PROXY_ORIGIN_KEY: &str = "v2.proxy.origin";
 
 pub(super) struct SelectionState {
@@ -98,7 +103,8 @@ impl V2AccountSelector {
   ) -> Result<SelectorOutcome, PipelineError> {
     let endpoint = resolved_endpoint(ctx)?;
     let allowed = allowed_provider_ids(ctx)?;
-    let candidates = model_candidates(route, extracted.model.as_str())?;
+    let candidates =
+      model_candidates(route, extracted.model.as_str()).map_err(|error| invalid_route_request(error.to_string()))?;
     let operations = operation_candidates(route.operation(), endpoint);
     let mut matching_binding_exists = false;
     let mut allowed_matching_binding_exists = false;
@@ -456,141 +462,6 @@ fn selected(binding: Arc<ProviderBinding>, operation: Endpoint, model: SmolStr) 
   }
 }
 
-#[derive(Clone)]
-struct ModelCandidate {
-  model: SmolStr,
-  constraint: ProviderConstraint,
-  evidence: DiscoveryEvidence,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum DiscoveryEvidence {
-  /// Family expansion requires evidence so its configured fallback order remains meaningful.
-  Required,
-  /// Automatic concrete routing prefers evidence, then lets a compatible upstream decide.
-  Preferred,
-  /// Explicit destinations already identify where the request should go.
-  Ignored,
-}
-
-impl DiscoveryEvidence {
-  fn order(self) -> &'static [DiscoveryEvidence] {
-    match self {
-      Self::Required => &[Self::Required],
-      Self::Preferred => &[Self::Required, Self::Ignored],
-      Self::Ignored => &[Self::Ignored],
-    }
-  }
-}
-
-#[derive(Clone)]
-enum ProviderConstraint {
-  Any,
-  Driver(DriverId),
-  Provider(ProviderId),
-}
-
-impl ProviderConstraint {
-  fn matches(&self, binding: &ProviderBinding) -> bool {
-    match self {
-      Self::Any => true,
-      Self::Driver(driver) => binding.driver_id() == driver,
-      Self::Provider(provider) => binding.provider_id() == provider,
-    }
-  }
-}
-
-fn model_candidates(route: &ManagedRoute, requested_model: &str) -> Result<Vec<ModelCandidate>, PipelineError> {
-  let fixed_provider = matches!(route.target().provider(), ProviderSelector::Fixed(_));
-  match route.target().model() {
-    ModelSelector::Capability => Ok(vec![ModelCandidate {
-      model: SmolStr::new(requested_model),
-      constraint: ProviderConstraint::Any,
-      evidence: if fixed_provider {
-        DiscoveryEvidence::Ignored
-      } else {
-        DiscoveryEvidence::Preferred
-      },
-    }]),
-    ModelSelector::Qualified { namespace } => {
-      let (qualifier, model) = requested_model.split_once('/').ok_or_else(|| {
-        invalid_route_request(format!(
-          "{}-qualified model must use '<qualifier>/<model>'",
-          qualification_name(*namespace)
-        ))
-      })?;
-      if model.is_empty() || model.trim() != model {
-        return Err(invalid_route_request("qualified model name is empty or non-canonical"));
-      }
-      let constraint = match namespace {
-        QualificationNamespace::Driver => ProviderConstraint::Driver(
-          DriverId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
-        ),
-        QualificationNamespace::Provider => ProviderConstraint::Provider(
-          ProviderId::new(qualifier).map_err(|error| invalid_route_request(error.to_string()))?,
-        ),
-      };
-      Ok(vec![ModelCandidate {
-        model: SmolStr::new(model),
-        constraint,
-        evidence: DiscoveryEvidence::Ignored,
-      }])
-    }
-    ModelSelector::Family(families) => {
-      let Some(family) = families.iter().find(|family| family.name() == requested_model) else {
-        return Ok(vec![ModelCandidate {
-          model: SmolStr::new(requested_model),
-          constraint: ProviderConstraint::Any,
-          evidence: if fixed_provider {
-            DiscoveryEvidence::Ignored
-          } else {
-            DiscoveryEvidence::Preferred
-          },
-        }]);
-      };
-      Ok(
-        family
-          .members()
-          .iter()
-          .cloned()
-          .map(|model| ModelCandidate {
-            model,
-            constraint: ProviderConstraint::Any,
-            evidence: DiscoveryEvidence::Required,
-          })
-          .collect(),
-      )
-    }
-  }
-}
-
-fn managed_binding_matches(
-  route: &ManagedRoute,
-  candidate: &ModelCandidate,
-  evidence: DiscoveryEvidence,
-  operation: Endpoint,
-  binding: &ProviderBinding,
-) -> bool {
-  let route_provider_matches = match route.target().provider() {
-    ProviderSelector::Any => true,
-    ProviderSelector::Fixed(provider) => binding.provider_id() == provider,
-  };
-  route_provider_matches
-    && candidate.constraint.matches(binding)
-    && match evidence {
-      DiscoveryEvidence::Required => binding.driver().supports(candidate.model.as_str(), operation),
-      DiscoveryEvidence::Preferred => unreachable!("preferred discovery expands into concrete matching passes"),
-      DiscoveryEvidence::Ignored => binding.driver().has_endpoint(candidate.model.as_str(), operation),
-    }
-}
-
-fn model_provider_score(route: &ManagedRoute, candidate: &ModelCandidate, binding: &ProviderBinding) -> i32 {
-  if matches!(route.target().model(), ModelSelector::Qualified { .. }) {
-    return 0;
-  }
-  route.provider_score(candidate.model.as_str(), binding.provider_id())
-}
-
 fn managed_unavailable_outcome(
   matching_binding_exists: bool,
   allowed_matching_binding_exists: bool,
@@ -600,23 +471,6 @@ fn managed_unavailable_outcome(
   } else {
     SelectorOutcome::NoAccount
   }
-}
-
-fn operation_candidates(policy: OperationPolicy, requested: Endpoint) -> Vec<Endpoint> {
-  if policy == OperationPolicy::Preserve {
-    return vec![requested];
-  }
-  std::iter::once(requested)
-    .chain(
-      BUILTIN_OPERATION_ORDER
-        .into_iter()
-        .filter(|operation| *operation != requested),
-    )
-    .collect()
-}
-
-fn provider_allowed(provider_id: &str, allowed: Option<&BTreeSet<String>>) -> bool {
-  allowed.is_none_or(|providers| providers.contains(provider_id))
 }
 
 fn allowed_provider_ids(ctx: &PipelineCtx) -> Result<Option<BTreeSet<String>>, PipelineError> {
@@ -646,13 +500,6 @@ fn resolved_endpoint(ctx: &PipelineCtx) -> Result<Endpoint, PipelineError> {
       },
     )
   })
-}
-
-fn qualification_name(namespace: QualificationNamespace) -> &'static str {
-  match namespace {
-    QualificationNamespace::Driver => "driver",
-    QualificationNamespace::Provider => "provider",
-  }
 }
 
 fn invalid_route_request(message: impl Into<String>) -> PipelineError {

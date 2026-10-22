@@ -1,7 +1,12 @@
 use crate::{AccountPoolId, HeaderPatchSetId, OperationId, ProviderId, RetryPolicyId, RouteId, WireIdentityId};
-use smol_str::SmolStr;
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
+#[cfg(test)]
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::time::Duration;
+use tokn_core::types::SmolStr;
 
 /// The request-handling families supported by the gateway.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -509,7 +514,7 @@ mod tests {
   fn id<T>(value: &str) -> T
   where
     T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
+    T::Error: core::fmt::Debug,
   {
     T::try_from(value.to_string()).unwrap()
   }

@@ -2,7 +2,7 @@
 name = "tokn-sdk"
 version.workspace = true
 edition.workspace = true
-description = "Rust SDK for configured LLM routing and no_std direct provider requests"
+description = "Rust SDK for configured LLM routing with standard and embedded platform services"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -10,7 +10,7 @@ license.workspace = true
 
 [features]
 default = ["std"]
-# The configured, in-process gateway client. The direct client only needs alloc.
+# Standard filesystem, runtime, and HTTP adapters.
 std = [
   "dep:anyhow",
   "dep:arc-swap",
@@ -19,13 +19,14 @@ std = [
   "dep:futures-util",
   "dep:smol_str",
   "dep:tokio",
-  "dep:tokn-auth",
-  "dep:tokn-config",
-  "dep:tokn-convert",
-  "dep:tokn-core",
-  "dep:tokn-headers",
-  "dep:tokn-requests",
-  "dep:tokn-router",
+  "tokn-auth/std",
+  "tokn-config/std",
+  "tokn-convert/std",
+  "tokn-core/std",
+  "tokn-headers/std",
+  "tokn-requests/std",
+  "tokn-service/std",
+  "tokn-policy/std",
   "serde/std",
   "serde_json/std",
   "thiserror/std",
@@ -46,15 +47,16 @@ smol_str = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tokn-auth = { workspace = true, optional = true }
-tokn-config = { workspace = true, optional = true }
+tokn-config.workspace = true
 tokn-convert = { workspace = true, optional = true }
-tokn-core = { workspace = true, optional = true }
+tokn-core.workspace = true
 tokn-endpoint-chat-completions.workspace = true
 tokn-endpoint-messages.workspace = true
 tokn-endpoint-responses.workspace = true
-tokn-headers = { workspace = true, optional = true }
-tokn-requests = { workspace = true, optional = true }
-tokn-router = { workspace = true, optional = true }
+tokn-headers.workspace = true
+tokn-requests.workspace = true
+tokn-service.workspace = true
+tokn-policy.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

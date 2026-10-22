@@ -1,0 +1,14 @@
+[package]
+name = "tokn-accounts-no-std-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Isolate portable account behavior from workspace feature unification.
+[workspace]
+
+[dependencies]
+tokn-accounts = { path = "../..", default-features = false }
+tokn-core = { path = "../../../core", default-features = false }
+tokn-config = { package = "tokn-router-config", path = "../../../config", default-features = false }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }

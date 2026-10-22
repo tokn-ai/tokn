@@ -6,8 +6,8 @@ use std::sync::Arc;
 use tokn_core::account::AccountConfig;
 use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::CleartextHttpPolicy;
-use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
-use tokn_headers::{HeaderMap, HeaderValue};
+use tokn_core::Endpoint;
+use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
   ID_LLAMA_CPP,
 };
 
-pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+pub use crate::native::DEFAULT_BASE_URL;
 
 pub struct LlamaCppProvider {
   pub id: String,
@@ -111,28 +111,13 @@ impl Provider for LlamaCppProvider {
 
   fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
     if let Some(key) = &self.api_key {
-      headers.insert(
-        &AUTHORIZATION,
-        HeaderValue::from_string(format!("Bearer {}", key.expose())),
-      );
+      crate::native::inject_credentials(headers, Endpoint::ChatCompletions, key.expose());
     }
     Ok(())
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
-    headers.insert(
-      &ACCEPT,
-      HeaderValue::from_static(if ctx.stream {
-        "text/event-stream"
-      } else {
-        "application/json"
-      }),
-    );
-    headers.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(encoding) = ctx.content_encoding {
-      headers.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
-    }
-    Ok(None)
+    Ok(crate::native::normalize_headers(headers, ctx))
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {

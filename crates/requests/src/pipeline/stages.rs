@@ -231,50 +231,22 @@ impl Drop for AccumInner {
 /// unknown to the router.
 fn stream_terminal_error(endpoint: &RequestEndpoint, body: &[u8]) -> Option<SmolStr> {
   let endpoint = endpoint.resolved()?;
-  let text = String::from_utf8_lossy(body);
-  let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-
-  for frame in normalized.split("\n\n") {
-    let mut event = None;
-    let mut data = String::new();
-    for line in frame.lines() {
-      if let Some(value) = line.strip_prefix("event:") {
-        event = Some(value.trim());
-      } else if let Some(value) = line.strip_prefix("data:") {
-        if !data.is_empty() {
-          data.push('\n');
-        }
-        data.push_str(value.trim_start());
-      }
-    }
-
-    let data_type = serde_json::from_str::<Value>(&data)
-      .ok()
-      .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned));
-    let event_type = data_type.as_deref().or(event);
-    match endpoint {
-      Endpoint::ChatCompletions if data.trim() == "[DONE]" => return None,
-      Endpoint::Responses if event_type == Some("response.completed") => return None,
-      Endpoint::Responses if matches!(event_type, Some("response.failed" | "response.incomplete" | "error")) => {
-        return Some(SmolStr::new(format!(
-          "upstream responses stream terminated with {}",
-          event_type.unwrap_or("error")
-        )));
-      }
-      Endpoint::Messages if event_type == Some("message_stop") => return None,
-      Endpoint::Messages if event_type == Some("error") => {
-        return Some(SmolStr::new("upstream messages stream terminated with error"));
-      }
-      _ => {}
+  let mut decoder = tokn_convert::sse::Decoder::new(usize::MAX);
+  let mut terminal = tokn_convert::sse::TerminalState::new(endpoint);
+  for &byte in body {
+    let record = match decoder.push(byte) {
+      Ok(Some(record)) => record,
+      Ok(None) => continue,
+      Err(error) => return Some(SmolStr::new(error.to_string())),
+    };
+    let event = tokn_convert::sse::SseEvent::from(record);
+    match terminal.observe(&event) {
+      Ok(true) => return None,
+      Ok(false) => {}
+      Err(error) => return Some(SmolStr::new(error.to_string())),
     }
   }
-
-  let message = match endpoint {
-    Endpoint::ChatCompletions => "upstream chat completions stream ended without [DONE]",
-    Endpoint::Responses => "upstream responses stream ended without a terminal response event",
-    Endpoint::Messages => "upstream messages stream ended without message_stop",
-  };
-  Some(SmolStr::new(message))
+  terminal.finish().err().map(|error| SmolStr::new(error.to_string()))
 }
 
 /// Raw inbound HTTP payload passed to the Extract stage. The runner is

@@ -8,10 +8,12 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["tokn-core/std", "serde/std", "serde_json/std", "thiserror/std"]
+
 [dependencies]
-http = { workspace = true }
-reqwest = { workspace = true }
+tokn-core = { workspace = true, default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
-smol_str = { workspace = true }
 thiserror = { workspace = true }

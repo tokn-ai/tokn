@@ -12,7 +12,7 @@ use crate::name::HeaderName;
 use crate::schema::{from_inbound_or, opt_from_inbound, optional, put, put_opt, required, HeaderSchema};
 use crate::vars::TemplateVars;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClineHeaders {
@@ -36,7 +36,7 @@ impl HeaderSchema for ClineHeaders {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 2] = [&keys::USER_AGENT, &keys::X_SESSION_ID];
+    const NAMES: [&HeaderName; 2] = [&keys::USER_AGENT, &keys::X_SESSION_ID];
     &NAMES
   }
 }

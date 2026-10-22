@@ -6,17 +6,14 @@
 //! exactly one shared runtime per linked pool for routes to reuse.
 
 use super::{LinkedAccountPool, LinkedAccountPools, LinkedPoolAccount, ProviderBinding, ProviderBindingKey};
-use crate::affinity::{Affinity, Lookup};
+use crate::pool_state::{AffinityPolicy, PoolState, Selection};
 use parking_lot::Mutex;
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokn_policy::{AccountPoolId, ProviderId};
-
-const MAX_COOLDOWN_EXPONENT: u32 = 5;
 
 /// Selection result for one request.
 #[derive(Clone, Debug)]
@@ -84,10 +81,7 @@ pub fn build_account_pool_runtimes(pools: &LinkedAccountPools) -> AccountPoolRun
 pub struct AccountPoolRuntime {
   pool: Arc<LinkedAccountPool>,
   bindings: BTreeMap<ProviderBindingKey, Arc<ProviderBinding>>,
-  active_cursor: AtomicUsize,
-  fallback_cursor: AtomicUsize,
-  cooldowns: Mutex<BTreeMap<ProviderBindingKey, BindingCooldown>>,
-  affinity: Option<Affinity<ProviderBindingKey>>,
+  state: Mutex<PoolState<ProviderBindingKey, Instant>>,
 }
 
 impl AccountPoolRuntime {
@@ -102,20 +96,26 @@ impl AccountPoolRuntime {
       let previous = bindings.insert(binding.key().clone(), binding.clone());
       debug_assert!(previous.is_none(), "linked pool contains a duplicate provider binding");
     }
-    let cooldowns = bindings
-      .keys()
-      .cloned()
-      .map(|key| (key, BindingCooldown::default()))
+    let active = pool
+      .active()
+      .iter()
+      .map(|account| account.binding().key().clone())
       .collect();
-    let affinity = pool.session_affinity().map(Affinity::from_session_plan);
+    let fallback = pool
+      .fallback()
+      .iter()
+      .map(|account| account.binding().key().clone())
+      .collect();
+    let affinity = pool
+      .session_affinity()
+      .map(|policy| AffinityPolicy::new(policy.ttl(), policy.expired_retention()));
+    let state = PoolState::new(active, fallback, pool.failure_cooldown(), affinity)
+      .expect("linked pool contains unique provider bindings");
 
     Self {
       pool,
       bindings,
-      active_cursor: AtomicUsize::new(0),
-      fallback_cursor: AtomicUsize::new(0),
-      cooldowns: Mutex::new(cooldowns),
-      affinity,
+      state: Mutex::new(state),
     }
   }
 
@@ -137,49 +137,51 @@ impl AccountPoolRuntime {
   /// Select the highest-ranked healthy binding within each account tier.
   /// Equal ranks retain the pool's round-robin behavior, and established
   /// healthy session affinity remains sticky regardless of later score changes.
+  /// Eligibility and ranks are snapshotted for all eligible bindings in both
+  /// tiers before selection. Callbacks must provide decisions independently of
+  /// invocation count; they can also be called for cooled bindings or affinity hits.
   pub fn acquire_ranked<F, R>(&self, session_id: Option<&str>, eligible: F, rank: R) -> PoolAcquire
   where
     F: Fn(&ProviderBinding) -> bool,
     R: Fn(&ProviderBinding) -> i32,
   {
-    let now = Instant::now();
-    let cooling_bindings = self.cooling_bindings(now);
+    self.acquire_ranked_with_clock(session_id, eligible, rank, Instant::now)
+  }
 
-    if let (Some(session_id), Some(affinity)) = (session_id, self.affinity.as_ref()) {
-      if let Lookup::Hit(key) = affinity.lookup(session_id) {
-        if let Some(binding) = self.bindings.get(&key) {
-          if eligible(binding) && !cooling_bindings.contains_key(&key) {
-            return PoolAcquire::Selected(binding.clone());
-          }
-        }
-      }
-    }
-
-    let mut earliest_retry = None;
-    if let Some(binding) = self.select_tier(
-      self.pool.active(),
-      &self.active_cursor,
-      &eligible,
-      &rank,
-      &cooling_bindings,
-      &mut earliest_retry,
-    ) {
-      return PoolAcquire::Selected(binding);
-    }
-    if let Some(binding) = self.select_tier(
-      self.pool.fallback(),
-      &self.fallback_cursor,
-      &eligible,
-      &rank,
-      &cooling_bindings,
-      &mut earliest_retry,
-    ) {
-      return PoolAcquire::Selected(binding);
-    }
-
-    match earliest_retry {
-      Some(retry_at) => PoolAcquire::CoolingDown { retry_at },
-      None => PoolAcquire::NoEligible,
+  fn acquire_ranked_with_clock<F, R>(
+    &self,
+    session_id: Option<&str>,
+    eligible: F,
+    rank: R,
+    now: impl FnOnce() -> Instant,
+  ) -> PoolAcquire
+  where
+    F: Fn(&ProviderBinding) -> bool,
+    R: Fn(&ProviderBinding) -> i32,
+  {
+    // User callbacks may inspect account state or re-enter this runtime. Gather
+    // their results before locking; only the shared selection algorithm runs
+    // inside the short state transaction.
+    let eligible_ranks = self
+      .pool
+      .active()
+      .iter()
+      .chain(self.pool.fallback())
+      .map(LinkedPoolAccount::binding)
+      .filter(|binding| eligible(binding))
+      .map(|binding| (binding.key().clone(), rank(binding)))
+      .collect();
+    let selected = self.state.lock().select(now(), session_id, &eligible_ranks);
+    match selected {
+      Selection::Selected(key) => PoolAcquire::Selected(
+        self
+          .bindings
+          .get(&key)
+          .expect("shared selection returns a linked binding")
+          .clone(),
+      ),
+      Selection::CoolingDown { retry_at } => PoolAcquire::CoolingDown { retry_at },
+      Selection::NoEligible => PoolAcquire::NoEligible,
     }
   }
 
@@ -189,90 +191,38 @@ impl AccountPoolRuntime {
   /// configured, creates or refreshes affinity only after the caller confirms
   /// the provider operation succeeded.
   pub fn record_success(&self, session_id: Option<&str>, key: &ProviderBindingKey) -> PoolRuntimeResult<()> {
-    {
-      let mut cooldowns = self.cooldowns.lock();
-      let cooldown = cooldowns.get_mut(key).ok_or_else(|| self.unknown_binding(key))?;
-      *cooldown = BindingCooldown::default();
-    }
+    self.record_success_with_clock(session_id, key, Instant::now)
+  }
 
-    if let (Some(session_id), Some(affinity)) = (session_id, self.affinity.as_ref()) {
-      affinity.record(session_id, key.clone());
-    }
-    Ok(())
+  fn record_success_with_clock(
+    &self,
+    session_id: Option<&str>,
+    key: &ProviderBindingKey,
+    now: impl FnOnce() -> Instant,
+  ) -> PoolRuntimeResult<()> {
+    self
+      .state
+      .lock()
+      .record_success(now(), session_id, key)
+      .map_err(|_| self.unknown_binding(key))
   }
 
   /// Record one failure and cool only this pool's exact account/provider
   /// tuple. Returns the new retry deadline for logging or scheduling.
   pub fn record_failure(&self, key: &ProviderBindingKey) -> PoolRuntimeResult<Instant> {
-    let mut cooldowns = self.cooldowns.lock();
-    let cooldown = cooldowns.get_mut(key).ok_or_else(|| self.unknown_binding(key))?;
-    cooldown.consecutive_failures = cooldown.consecutive_failures.saturating_add(1);
-    let duration = cooldown_duration(self.pool.failure_cooldown(), cooldown.consecutive_failures);
-    let retry_at = saturating_instant_add(Instant::now(), duration);
-    cooldown.retry_at = Some(retry_at);
-    Ok(retry_at)
+    self.record_failure_with_clock(key, Instant::now)
   }
 
-  fn select_tier<F, R>(
+  fn record_failure_with_clock(
     &self,
-    accounts: &[LinkedPoolAccount],
-    cursor: &AtomicUsize,
-    eligible: &F,
-    rank: &R,
-    cooling_bindings: &BTreeMap<ProviderBindingKey, Instant>,
-    earliest_retry: &mut Option<Instant>,
-  ) -> Option<Arc<ProviderBinding>>
-  where
-    F: Fn(&ProviderBinding) -> bool,
-    R: Fn(&ProviderBinding) -> i32,
-  {
-    if accounts.is_empty() {
-      return None;
-    }
-
-    let mut candidates = Vec::new();
-    let mut best_rank = None;
-    for account in accounts {
-      let binding = account.binding();
-      if !eligible(binding) {
-        continue;
-      }
-      match cooling_bindings.get(binding.key()).copied() {
-        Some(retry_at) => retain_earliest(earliest_retry, retry_at),
-        None => {
-          let candidate_rank = rank(binding);
-          match best_rank {
-            Some(current) if candidate_rank < current => {}
-            Some(current) if candidate_rank == current => candidates.push(binding.clone()),
-            _ => {
-              best_rank = Some(candidate_rank);
-              candidates.clear();
-              candidates.push(binding.clone());
-            }
-          }
-        }
-      }
-    }
-
-    if candidates.is_empty() {
-      return None;
-    }
-    let index = cursor.fetch_add(1, Ordering::Relaxed) % candidates.len();
-    Some(candidates.swap_remove(index))
-  }
-
-  fn cooling_bindings(&self, now: Instant) -> BTreeMap<ProviderBindingKey, Instant> {
+    key: &ProviderBindingKey,
+    now: impl FnOnce() -> Instant,
+  ) -> PoolRuntimeResult<Instant> {
     self
-      .cooldowns
+      .state
       .lock()
-      .iter()
-      .filter_map(|(key, cooldown)| {
-        cooldown
-          .retry_at
-          .filter(|retry_at| *retry_at > now)
-          .map(|retry_at| (key.clone(), retry_at))
-      })
-      .collect()
+      .record_failure(now(), key)
+      .map_err(|_| self.unknown_binding(key))
   }
 
   fn unknown_binding(&self, key: &ProviderBindingKey) -> PoolRuntimeError {
@@ -294,46 +244,6 @@ impl std::fmt::Debug for AccountPoolRuntime {
   }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct BindingCooldown {
-  consecutive_failures: u32,
-  retry_at: Option<Instant>,
-}
-
-fn cooldown_duration(base: Duration, consecutive_failures: u32) -> Duration {
-  let exponent = consecutive_failures.saturating_sub(1).min(MAX_COOLDOWN_EXPONENT);
-  base.saturating_mul(1_u32 << exponent)
-}
-
-fn saturating_instant_add(now: Instant, duration: Duration) -> Instant {
-  if let Some(deadline) = now.checked_add(duration) {
-    return deadline;
-  }
-
-  let mut lower_nanos = 0_u128;
-  let mut upper_nanos = duration.as_nanos();
-  while lower_nanos < upper_nanos {
-    let midpoint = lower_nanos + (upper_nanos - lower_nanos).div_ceil(2);
-    if now.checked_add(duration_from_nanos(midpoint)).is_some() {
-      lower_nanos = midpoint;
-    } else {
-      upper_nanos = midpoint - 1;
-    }
-  }
-  now.checked_add(duration_from_nanos(lower_nanos)).unwrap_or(now)
-}
-
-fn duration_from_nanos(nanos: u128) -> Duration {
-  const NANOS_PER_SECOND: u128 = 1_000_000_000;
-  Duration::new((nanos / NANOS_PER_SECOND) as u64, (nanos % NANOS_PER_SECOND) as u32)
-}
-
-fn retain_earliest(earliest: &mut Option<Instant>, candidate: Instant) {
-  if earliest.is_none_or(|current| candidate < current) {
-    *earliest = Some(candidate);
-  }
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -341,6 +251,7 @@ mod tests {
   use crate::registry::Registry;
   use smol_str::SmolStr;
   use std::collections::BTreeMap;
+  use std::time::Duration;
   use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::ID_LLAMA_CPP;
   use tokn_policy::{
@@ -726,18 +637,162 @@ mod tests {
       runtime.acquire(None, |_| true),
       PoolAcquire::CoolingDown { retry_at } if retry_at == known_retry
     ));
-    assert_eq!(runtime.cooldowns.lock().len(), 1);
+    assert_eq!(runtime.state.lock().binding_count(), 1);
   }
 
   #[test]
-  fn cooldown_backoff_caps_at_thirty_two_times_the_base() {
-    let base = Duration::from_secs(3);
-    assert_eq!(cooldown_duration(base, 1), Duration::from_secs(3));
-    assert_eq!(cooldown_duration(base, 2), Duration::from_secs(6));
-    assert_eq!(cooldown_duration(base, 5), Duration::from_secs(48));
-    assert_eq!(cooldown_duration(base, 6), Duration::from_secs(96));
-    assert_eq!(cooldown_duration(base, 7), Duration::from_secs(96));
-    assert_eq!(cooldown_duration(base, u32::MAX), Duration::from_secs(96));
+  fn concurrent_requests_share_round_robin_progress() {
+    let runtimes = runtimes(
+      BTreeMap::from([(pool_id("default"), pool(None, None))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
+      &[
+        account("first", AccountTier::Active),
+        account("second", AccountTier::Active),
+      ],
+    );
+    let runtime = runtimes.runtime(&pool_id("default")).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(4));
+    let totals = std::thread::scope(|scope| {
+      let workers = (0..4)
+        .map(|_| {
+          let runtime = runtime.clone();
+          let barrier = barrier.clone();
+          scope.spawn(move || {
+            barrier.wait();
+            let mut counts = [0; 2];
+            for _ in 0..100 {
+              match selected(runtime.acquire(None, |_| true)).account_id() {
+                "first" => counts[0] += 1,
+                "second" => counts[1] += 1,
+                other => panic!("unexpected account {other}"),
+              }
+            }
+            counts
+          })
+        })
+        .collect::<Vec<_>>();
+      workers.into_iter().fold([0; 2], |mut total, worker| {
+        let counts = worker.join().expect("selection worker completed");
+        total[0] += counts[0];
+        total[1] += counts[1];
+        total
+      })
+    });
+
+    assert_eq!(totals, [200, 200]);
+  }
+
+  #[test]
+  fn eligibility_and_ranking_callbacks_can_reenter_state_operations() {
+    let runtimes = runtimes(
+      BTreeMap::from([(pool_id("default"), pool(None, None))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
+      &[account("only", AccountTier::Active)],
+    );
+    let runtime = runtimes.runtime(&pool_id("default")).unwrap();
+    let chosen = selected(runtime.acquire_ranked(
+      None,
+      |binding| {
+        assert!(
+          runtime.state.try_lock().is_some(),
+          "eligibility runs outside state lock"
+        );
+        runtime.record_success(None, binding.key()).unwrap();
+        true
+      },
+      |binding| {
+        assert!(runtime.state.try_lock().is_some(), "ranking runs outside state lock");
+        runtime.record_success(None, binding.key()).unwrap();
+        10
+      },
+    ));
+
+    assert_eq!(chosen.account_id(), "only");
+  }
+
+  #[test]
+  fn standard_adapter_matches_shared_engine_decision_transcript() {
+    fn compare(
+      runtime: &AccountPoolRuntime,
+      shared: &mut PoolState<ProviderBindingKey, Instant>,
+      now: Instant,
+      session: Option<&str>,
+      ranks: &BTreeMap<ProviderBindingKey, i32>,
+    ) {
+      let expected = shared.select(now, session, ranks);
+      let actual = runtime.acquire_ranked_with_clock(
+        session,
+        |binding| ranks.contains_key(binding.key()),
+        |binding| ranks[binding.key()],
+        || now,
+      );
+      let actual = match actual {
+        PoolAcquire::Selected(binding) => Selection::Selected(binding.key().clone()),
+        PoolAcquire::CoolingDown { retry_at } => Selection::CoolingDown { retry_at },
+        PoolAcquire::NoEligible => Selection::NoEligible,
+      };
+      assert_eq!(actual, expected);
+    }
+
+    let affinity = SessionAffinityPlan::new(Duration::from_secs(5), Duration::from_secs(7));
+    let runtimes = runtimes(
+      BTreeMap::from([(pool_id("default"), pool(None, Some(affinity)))]),
+      BTreeMap::from([(provider_id("local"), provider())]),
+      &[
+        account("first", AccountTier::Active),
+        account("second", AccountTier::Active),
+        account("fallback", AccountTier::Fallback),
+      ],
+    );
+    let runtime = runtimes.runtime(&pool_id("default")).unwrap();
+    let key = |id| ProviderBindingKey::new(provider_id("local"), id);
+    let first = key("first");
+    let second = key("second");
+    let fallback = key("fallback");
+    let mut shared = PoolState::new(
+      vec![first.clone(), second.clone()],
+      vec![fallback.clone()],
+      Duration::from_secs(60),
+      Some(AffinityPolicy::new(affinity.ttl(), affinity.expired_retention())),
+    )
+    .unwrap();
+    let started = Instant::now();
+    let at = |seconds| started + Duration::from_secs(seconds);
+    let mut ranks = BTreeMap::from([(first.clone(), 10), (second.clone(), 10), (fallback.clone(), 100)]);
+
+    compare(runtime, &mut shared, at(0), Some("session"), &ranks);
+    compare(runtime, &mut shared, at(0), Some("session"), &ranks);
+    runtime
+      .record_success_with_clock(Some("session"), &second, || at(0))
+      .unwrap();
+    shared.record_success(at(0), Some("session"), &second).unwrap();
+    ranks.insert(first.clone(), 100);
+    ranks.insert(second.clone(), 0);
+    compare(runtime, &mut shared, at(1), Some("session"), &ranks);
+
+    for (key, seconds) in [(&second, 2), (&first, 3), (&fallback, 5), (&second, 7)] {
+      let expected_retry = shared.record_failure(at(seconds), key).unwrap();
+      assert_eq!(
+        runtime.record_failure_with_clock(key, || at(seconds)).unwrap(),
+        expected_retry
+      );
+      compare(runtime, &mut shared, at(seconds), Some("session"), &ranks);
+      if seconds == 3 {
+        runtime
+          .record_success_with_clock(Some("session"), &fallback, || at(4))
+          .unwrap();
+        shared.record_success(at(4), Some("session"), &fallback).unwrap();
+        compare(runtime, &mut shared, at(4), Some("session"), &ranks);
+      }
+    }
+
+    compare(runtime, &mut shared, at(8), Some("session"), &ranks);
+    runtime.record_success_with_clock(None, &first, || at(9)).unwrap();
+    shared.record_success(at(9), None, &first).unwrap();
+    compare(runtime, &mut shared, at(9), Some("session"), &ranks);
+    compare(runtime, &mut shared, at(63), None, &ranks);
+    ranks.clear();
+    compare(runtime, &mut shared, at(64), None, &ranks);
   }
 
   #[test]

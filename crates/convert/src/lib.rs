@@ -1,4 +1,12 @@
-pub use tokn_core::provider;
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc;
+
+/// Endpoint identity shared with provider and request crates.
+pub mod provider {
+  pub use tokn_core::Endpoint;
+}
 
 pub mod chat;
 pub mod error;

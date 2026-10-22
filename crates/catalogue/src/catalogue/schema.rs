@@ -10,8 +10,8 @@
 //! sometimes a richer object), so a narrow schema is also more robust.
 //! `#[serde(deny_unknown_fields)]` is *not* used: unknown fields are tolerated.
 
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use serde::Deserialize;
-use std::collections::BTreeMap;
 use tokn_core::generation::ReasoningEffort;
 use tokn_core::provider::Endpoint;
 

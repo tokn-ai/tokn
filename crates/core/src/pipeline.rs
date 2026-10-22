@@ -1,9 +1,9 @@
+use crate::headers::HeaderMap;
 use crate::provider::Endpoint;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
-use tokn_headers::HeaderMap;
 
 pub type SendFuture<'a, T, E> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
 

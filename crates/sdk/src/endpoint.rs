@@ -1,5 +1,4 @@
-use crate::response::{BufferedResponse, StreamResponse};
-use crate::{Client, RequestOptions, Result};
+use crate::{BufferedResponse, Client, Platform, PlatformResponse, RequestOptions};
 use tokn_core::provider::Endpoint;
 use tokn_endpoint_chat_completions::{ChatRequest, ChatResponse};
 use tokn_endpoint_messages::{MessagesRequest, MessagesResponse};
@@ -12,16 +11,21 @@ macro_rules! endpoint_client {
     $response:ty,
     $endpoint:expr
   ) => {
-    pub struct $name<'client> {
-      client: &'client Client,
+    #[cfg(feature = "std")]
+    pub struct $name<'client, P: Platform = crate::StdPlatform> {
+      client: &'client Client<P>,
+    }
+    #[cfg(not(feature = "std"))]
+    pub struct $name<'client, P: Platform> {
+      client: &'client Client<P>,
     }
 
-    impl<'client> $name<'client> {
-      pub(crate) fn new(client: &'client Client) -> Self {
+    impl<'client, P: Platform> $name<'client, P> {
+      pub(crate) fn new(client: &'client Client<P>) -> Self {
         Self { client }
       }
 
-      pub async fn create(&self, request: &$request) -> Result<BufferedResponse<$response>> {
+      pub async fn create(&self, request: &$request) -> Result<BufferedResponse<$response>, P::Error> {
         self.create_with(request, RequestOptions::default()).await
       }
 
@@ -29,7 +33,7 @@ macro_rules! endpoint_client {
         &self,
         request: &$request,
         options: RequestOptions,
-      ) -> Result<BufferedResponse<$response>> {
+      ) -> Result<BufferedResponse<$response>, P::Error> {
         self
           .client
           .execute_typed($endpoint, request, false, options)
@@ -37,11 +41,11 @@ macro_rules! endpoint_client {
           .into_json()
       }
 
-      pub async fn stream(&self, request: &$request) -> Result<StreamResponse> {
+      pub async fn stream(&self, request: &$request) -> Result<P::Stream<'_>, P::Error> {
         self.stream_with(request, RequestOptions::default()).await
       }
 
-      pub async fn stream_with(&self, request: &$request, options: RequestOptions) -> Result<StreamResponse> {
+      pub async fn stream_with(&self, request: &$request, options: RequestOptions) -> Result<P::Stream<'_>, P::Error> {
         self
           .client
           .execute_typed($endpoint, request, true, options)

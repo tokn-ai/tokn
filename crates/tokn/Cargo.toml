@@ -9,24 +9,24 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-tokn-auth = { workspace = true }
-tokn-catalogue = { workspace = true }
-tokn-config = { workspace = true }
-tokn-convert = { workspace = true }
-tokn-core = { workspace = true }
+tokn-auth = { workspace = true, features = ["std"] }
+tokn-catalogue = { workspace = true, features = ["std"] }
+tokn-config = { workspace = true, features = ["std"] }
+tokn-convert = { workspace = true, features = ["std"] }
+tokn-core = { workspace = true, features = ["std"] }
 tokn-endpoint-chat-completions = { workspace = true }
 tokn-endpoint-core = { workspace = true }
 tokn-endpoint-macros = { workspace = true }
 tokn-endpoint-messages = { workspace = true }
 tokn-endpoint-responses = { workspace = true }
-tokn-headers = { workspace = true }
-tokn-policy = { workspace = true }
-tokn-provider-copilot = { workspace = true }
-tokn-provider-deepseek = { workspace = true }
-tokn-provider-llama-cpp = { workspace = true }
-tokn-provider-openai = { workspace = true }
-tokn-provider-opencode = { workspace = true }
-tokn-provider-zai = { workspace = true }
+tokn-headers = { workspace = true, features = ["std"] }
+tokn-policy = { workspace = true, features = ["std"] }
+tokn-provider-copilot = { workspace = true, features = ["std"] }
+tokn-provider-deepseek = { workspace = true, features = ["std"] }
+tokn-provider-llama-cpp = { workspace = true, features = ["std"] }
+tokn-provider-openai = { workspace = true, features = ["std"] }
+tokn-provider-opencode = { workspace = true, features = ["std"] }
+tokn-provider-zai = { workspace = true, features = ["std"] }
 tokn-router = { workspace = true }
 tokn-sdk = { workspace = true }
-tokn-service = { workspace = true }
+tokn-service = { workspace = true, features = ["std"] }

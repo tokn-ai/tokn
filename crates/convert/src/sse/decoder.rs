@@ -22,7 +22,7 @@ impl fmt::Display for DecodeError {
 impl core::error::Error for DecodeError {}
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Record {
+pub struct Record {
   pub event: Option<String>,
   pub data: String,
 }
@@ -34,7 +34,7 @@ pub(super) struct Record {
 /// ending, like CR or LF. The limit is checked before storing another byte.
 /// Records without a `data` field are discarded. An unterminated record is
 /// never dispatched: the caller must handle EOF according to its protocol.
-pub(super) struct Decoder {
+pub struct Decoder {
   max_event_bytes: usize,
   record_bytes: usize,
   line: Vec<u8>,

@@ -16,7 +16,7 @@
 //!   `Usage.input_tokens` to the total (input + cache_creation + cache_read).
 
 use serde_json::Value;
-use tokn_core::db::{Usage, UsageDetails, UsageType};
+use tokn_core::usage::{Usage, UsageDetails, UsageType};
 
 /// Extract `Usage` from an upstream response body. Returns an empty `Usage`
 /// (all `None`) when no recognizable shape is found.

@@ -8,13 +8,18 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["tokn-core/std", "dep:bytes", "dep:futures-util", "dep:http", "dep:http-body", "dep:http-body-util", "dep:tower"]
+
 [dependencies]
-bytes = { workspace = true }
-futures-util = { workspace = true }
-http = { workspace = true }
-http-body = { workspace = true }
-http-body-util = { workspace = true }
-tower = { workspace = true, features = ["util"] }
+tokn-core.workspace = true
+bytes = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

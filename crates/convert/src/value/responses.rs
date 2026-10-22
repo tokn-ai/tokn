@@ -1,8 +1,9 @@
 use super::chat::args_to_string;
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use alloc::collections::BTreeMap;
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
 
 const REQUEST_KEYS: &[&str] = &[
   "model",
@@ -816,7 +817,7 @@ mod tests {
 
   #[test]
   fn request_to_value_promotes_reasoning_effort_extra() {
-    let mut extras = std::collections::BTreeMap::new();
+    let mut extras = alloc::collections::BTreeMap::new();
     extras.insert("reasoning_effort".into(), json!("high"));
     let req = IrRequest {
       model: "gpt-5.4".into(),
@@ -844,7 +845,7 @@ mod tests {
 
   #[test]
   fn request_to_value_preserves_existing_reasoning_effort() {
-    let mut extras = std::collections::BTreeMap::new();
+    let mut extras = alloc::collections::BTreeMap::new();
     extras.insert("reasoning_effort".into(), json!("high"));
     let req = IrRequest {
       model: "gpt-5.4".into(),
@@ -875,7 +876,7 @@ mod tests {
 
   #[test]
   fn request_to_value_promotes_verbosity_extra_into_text() {
-    let mut extras = std::collections::BTreeMap::new();
+    let mut extras = alloc::collections::BTreeMap::new();
     extras.insert("verbosity".into(), json!("low"));
     let req = IrRequest {
       model: "gpt-5.4".into(),
@@ -903,7 +904,7 @@ mod tests {
 
   #[test]
   fn request_to_value_preserves_existing_text_verbosity() {
-    let mut extras = std::collections::BTreeMap::new();
+    let mut extras = alloc::collections::BTreeMap::new();
     extras.insert("verbosity".into(), json!("low"));
     let req = IrRequest {
       model: "gpt-5.4".into(),
@@ -940,7 +941,7 @@ mod tests {
 
   #[test]
   fn request_to_value_preserves_explicit_text_extra_before_normalizing_verbosity() {
-    let mut extras = std::collections::BTreeMap::new();
+    let mut extras = alloc::collections::BTreeMap::new();
     extras.insert("verbosity".into(), json!("low"));
     extras.insert("text".into(), json!({ "format": { "type": "text" } }));
     let req = IrRequest {

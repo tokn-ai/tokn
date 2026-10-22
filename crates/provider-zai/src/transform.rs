@@ -15,6 +15,7 @@
 //! object, we never overwrite it — that's a deliberate opt-out path for
 //! debugging.
 
+use alloc::string::ToString;
 use serde_json::{json, Value};
 
 /// Returns a (possibly cloned) request body with the `thinking` block applied

@@ -14,6 +14,7 @@
 //! The returned [`SentResponse`] carries the live [`reqwest::Response`];
 //! draining or wrapping it as an SSE stream is the next stage's job.
 
+use crate::driver::{classify_status, StatusDisposition};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, ProviderError, RequestsError};
@@ -134,7 +135,8 @@ impl SendStage for DefaultSend {
     // Status-based classification: 5xx is recoverable (transient
     // upstream issue), 4xx is permanent (won't change on retry). 2xx/3xx
     // flow through normally.
-    if status >= 500 {
+    let disposition = classify_status(status);
+    if disposition == StatusDisposition::RecoverableFailure {
       let body_text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
@@ -156,7 +158,7 @@ impl SendStage for DefaultSend {
         },
       ));
     }
-    if status >= 400 {
+    if disposition == StatusDisposition::PermanentFailure {
       let body_text = resp.text().await.unwrap_or_default();
       ctx.emit_record(RecordEvent::UpstreamBody {
         body: Bytes::copy_from_slice(body_text.as_bytes()),

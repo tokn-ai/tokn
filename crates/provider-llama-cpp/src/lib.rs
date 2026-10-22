@@ -1,65 +1,11 @@
-pub mod auth;
-pub mod llama_cpp;
+//! Provider preparation shared by standard and embedded execution.
 
-pub use tokn_catalogue as catalogue;
-pub use tokn_core::provider::{
-  error, AuthKind, Endpoint, HeaderPatchCtx, Provider, ProviderInfo, ProviderRequestKind, RequestCtx, Result,
-  TemplateVars, ID_LLAMA_CPP,
-};
-pub use tokn_core::{account as config, provider, util};
+#![cfg_attr(not(feature = "std"), no_std)]
 
-pub use llama_cpp::*;
+#[macro_use]
+extern crate alloc;
 
-use std::sync::Arc;
-use tokn_auth::descriptor::{EndpointSpec, ProviderDescriptor};
-use tokn_auth::provider::CredentialFlavor;
-use tokn_core::provider::ProviderTarget;
+pub mod native;
 
-pub static DEFAULT_ENDPOINTS: &[Endpoint] = &[Endpoint::ChatCompletions];
-
-pub(crate) fn operation_url(target: &ProviderTarget, endpoint: Endpoint) -> Result<reqwest::Url> {
-  match endpoint {
-    Endpoint::ChatCompletions => Ok(target.base_url().operation_url(["chat", "completions"])?),
-    Endpoint::Responses | Endpoint::Messages => Err(error::Error::UnsupportedEndpoint {
-      provider: ID_LLAMA_CPP.to_string(),
-      endpoint: endpoint.as_str(),
-    }),
-  }
-}
-
-pub static DESCRIPTOR: ProviderDescriptor = ProviderDescriptor {
-  id: ID_LLAMA_CPP,
-  display_name: "llama.cpp",
-  hosts: &["localhost", "127.0.0.1", "::1"],
-  base_url: llama_cpp::DEFAULT_BASE_URL,
-  credentials: &[CredentialFlavor::ApiKey],
-  endpoints: &[EndpointSpec {
-    endpoint: Endpoint::ChatCompletions,
-    method: "POST",
-    path: "/v1/chat/completions",
-    aliases: &["/chat/completions"],
-  }],
-  model_endpoint_rules: Some(&[]),
-  operation_url,
-  rewrites: &[],
-  auth_urls: &[],
-  matches_url,
-  validate,
-  build,
-  build_auth: Some(crate::auth::provider_auth),
-};
-
-pub fn matches_url(host: &str, path: &str, _id: &'static str) -> bool {
-  DESCRIPTOR.hosts.contains(&host) && (path.is_empty() || path == "/" || path.starts_with("/v1/"))
-}
-
-pub fn validate(account: &tokn_core::account::AccountConfig) -> tokn_core::provider::Result<()> {
-  llama_cpp::LlamaCppProvider::validate_account(account)
-}
-
-pub fn build(
-  account: Arc<tokn_core::account::AccountConfig>,
-  target: ProviderTarget,
-) -> tokn_core::provider::Result<Arc<dyn tokn_core::provider::Provider>> {
-  Ok(Arc::new(llama_cpp::LlamaCppProvider::from_account_at(account, target)?))
-}
+#[cfg(feature = "std")]
+include!("runtime.rs");

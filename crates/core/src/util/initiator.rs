@@ -1,5 +1,20 @@
 use serde_json::Value;
 
+/// Classify any supported request shape, including the legacy tools-only hint.
+pub fn classify_initiator_any(body: &Value) -> Option<&'static str> {
+  if body.get("input").is_some() {
+    classify_initiator_responses(body)
+  } else {
+    classify_initiator(body).or_else(|| {
+      body
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        .then_some("agent")
+    })
+  }
+}
+
 /// Best-effort initiator classifier for chat-style payloads.
 ///
 /// Contract:

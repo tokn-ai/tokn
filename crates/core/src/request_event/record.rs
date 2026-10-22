@@ -23,10 +23,10 @@
 //! [`RequestEventPayload::Record`]: super::RequestEventPayload::Record
 
 use crate::db::Usage;
+use crate::headers::HeaderMap;
 use bytes::Bytes;
 use serde::Serialize;
 use smol_str::SmolStr;
-use tokn_headers::HeaderMap;
 
 /// A local rejection returned before the request pipeline takes ownership.
 ///

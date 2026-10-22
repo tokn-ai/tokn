@@ -1,15 +1,18 @@
-//! Conversions between [`crate::HeaderMap`] and [`reqwest::header::HeaderMap`]
+//! Conversions between [`crate::headers::HeaderMap`] and [`reqwest::header::HeaderMap`]
 //! used at the wire boundary.
 //!
 //! `reqwest::header::HeaderName` lowercases its input internally, so the
 //! original casing of names is **not** preserved when crossing the boundary
-//! in either direction. Order is preserved going `crate::HeaderMap ->
+//! in either direction. Order is preserved going `crate::headers::HeaderMap ->
 //! reqwest::header::HeaderMap` (we use `append`); the reverse direction
 //! preserves whatever order `reqwest`'s iterator yields (insertion order in
 //! practice).
 
-use crate::map::HeaderMap;
-use crate::value::HeaderValue;
+use crate::headers::map::HeaderMap;
+use crate::headers::value::HeaderValue;
+use alloc::string::ToString;
+#[cfg(test)]
+use alloc::vec::Vec;
 use reqwest::header::{HeaderMap as ReqMap, HeaderName as ReqName, HeaderValue as ReqValue};
 
 impl From<HeaderMap> for ReqMap {

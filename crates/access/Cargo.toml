@@ -9,7 +9,7 @@ repository.workspace = true
 license.workspace = true
 
 [dependencies]
-tokn-core = { workspace = true }
+tokn-core = { workspace = true, features = ["std"] }
 tokn-persistence = { workspace = true }
 anyhow = { workspace = true }
 parking_lot = { workspace = true }

@@ -15,7 +15,7 @@ use crate::name::HeaderName;
 use crate::schema::{from_inbound_or, opt_from_inbound, optional, put, put_opt, required, HeaderSchema};
 use crate::vars::TemplateVars;
 use serde::{Deserialize, Serialize};
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 /// Inbound headers consistently emitted by the OpenCode CLI persona.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,7 +82,7 @@ impl HeaderSchema for OpencodeHeaders {
     m
   }
   fn known_names() -> &'static [&'static HeaderName] {
-    static NAMES: [&HeaderName; 10] = [
+    const NAMES: [&HeaderName; 10] = [
       &keys::USER_AGENT,
       &keys::AUTHORIZATION,
       &keys::HOST,

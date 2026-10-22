@@ -16,6 +16,7 @@
 //! (`Extracted`, `Resolved`, `BuiltHeaders`, `ConvertedRequest`,
 //! `SentResponse`, `ConvertedResponse`); requests provides `From` impls.
 
+use crate::headers::{HeaderMap, TemplateVars};
 use crate::provider::Endpoint;
 use crate::request_classification::RequestClassification;
 use crate::AgentId;
@@ -24,7 +25,6 @@ use serde::Serialize;
 use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
-use tokn_headers::{HeaderMap, TemplateVars};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(untagged)]

@@ -9,7 +9,8 @@ use crate::error::Error;
 use crate::map::HeaderMap;
 use crate::name::HeaderName;
 use crate::value::HeaderValue;
-use smol_str::SmolStr;
+use alloc::string::ToString;
+use tokn_core::types::SmolStr;
 
 /// A typed view over a subset of HTTP headers belonging to a particular
 /// persona or provider overlay.

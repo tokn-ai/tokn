@@ -1,3 +1,5 @@
+use alloc::{string::String, string::ToString};
+#[cfg(feature = "std")]
 use eventsource_stream::Event;
 use serde_json::Value;
 
@@ -41,6 +43,19 @@ impl SseEvent {
   }
 }
 
+impl From<super::decoder::Record> for SseEvent {
+  fn from(record: super::decoder::Record) -> Self {
+    // SSE's default event type is "message". Preserve the standard parser's
+    // established observable event name for both platform adapters.
+    let event = record
+      .event
+      .filter(|name| !name.is_empty())
+      .unwrap_or_else(|| "message".into());
+    Self::raw(Some(event), record.data)
+  }
+}
+
+#[cfg(feature = "std")]
 impl From<Event> for SseEvent {
   fn from(value: Event) -> Self {
     let event = (!value.event.is_empty()).then_some(value.event);

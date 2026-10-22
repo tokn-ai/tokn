@@ -4,11 +4,14 @@
 //! resolution, listener-specific action rules, URL normalization, and other
 //! semantic checks belong to the v2 compiler.
 
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+#[cfg(feature = "std")]
 use std::path::PathBuf;
+#[cfg(not(feature = "std"))]
+type PathBuf = String;
 
-pub const SCHEMA_VERSION: u32 = crate::schema::V2_SCHEMA_VERSION as u32;
+pub const SCHEMA_VERSION: u32 = 2;
 /// Omitted admission limits do not impose a request size cap.
 pub const DEFAULT_MAX_WIRE_BYTES: Option<u64> = None;
 pub const DEFAULT_MAX_DECODED_BYTES: Option<u64> = None;
@@ -470,7 +473,7 @@ const fn default_true() -> bool {
   true
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

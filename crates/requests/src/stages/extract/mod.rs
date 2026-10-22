@@ -22,7 +22,7 @@ use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
 use tokn_core::request_classification::classify_request;
-use tokn_core::util::initiator::{classify_initiator as classify_chat_initiator, classify_initiator_responses};
+use tokn_core::util::initiator::classify_initiator_any as classify_initiator;
 use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS};
 use tokn_headers::HeaderMap;
 
@@ -109,21 +109,6 @@ fn infer_stream(headers: &HeaderMap, body: &Value) -> bool {
         .any(|part| part.split(';').next().map(str::trim) == Some("text/event-stream"))
     })
     .unwrap_or(false)
-}
-
-fn classify_initiator(body: &Value) -> Option<&'static str> {
-  if body.get("input").is_some() {
-    classify_initiator_responses(body)
-  } else {
-    classify_chat_initiator(body).or_else(|| {
-      let has_tools = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-      has_tools.then_some("agent")
-    })
-  }
 }
 
 #[cfg(test)]
