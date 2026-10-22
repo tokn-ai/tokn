@@ -10,6 +10,7 @@
 #[macro_use]
 extern crate alloc;
 
+pub mod link;
 pub mod native;
 pub mod pool_state;
 pub mod selection;
@@ -18,8 +19,6 @@ pub mod selection;
 pub mod affinity;
 #[cfg(feature = "std")]
 pub mod inventory;
-#[cfg(feature = "std")]
-pub mod link;
 #[cfg(feature = "std")]
 pub mod registry;
 #[cfg(feature = "std")]

@@ -3,13 +3,13 @@
 //! Each account already owns exactly one configured-provider binding. Pools
 //! only filter and tier those logical accounts.
 
+use super::portable::{link_pool_metadata, MetadataPoolError};
 use super::{ProviderBinding, ProviderGraph};
 use smol_str::SmolStr;
 use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokn_core::account::AccountTier;
 use tokn_policy::{AccountPoolId, AccountSelectionStrategy, GatewayPlan, SessionAffinityPlan};
 
 /// Every account pool linked from one compiled gateway plan.
@@ -146,73 +146,39 @@ pub type PoolLinkResult<T> = std::result::Result<T, PoolLinkError>;
 /// accounts without a viable provider binding are intentionally omitted, but
 /// an explicitly named disabled account is still a valid reference.
 pub fn link_account_pools(plan: &GatewayPlan, providers: &ProviderGraph) -> PoolLinkResult<LinkedAccountPools> {
+  let metadata = link_pool_metadata(plan.execution(), &providers.metadata).map_err(|error| match error {
+    MetadataPoolError::UnknownAccount { pool, account_id } => PoolLinkError::UnknownAccount { pool, account_id },
+  })?;
   let mut pools = BTreeMap::new();
-
-  for (pool_id, pool_plan) in plan.account_pools() {
-    validate_selector(pool_id, pool_plan.selector(), providers)?;
-
-    let mut active = Vec::new();
-    let mut fallback = Vec::new();
-    for account in providers.accounts() {
-      let config = account.config();
-      let selector = pool_plan.selector();
-      let Some(binding) = account.binding() else {
-        continue;
-      };
-      if !config.enabled
-        || !selector
-          .providers()
-          .is_none_or(|provider_ids| provider_ids.contains(binding.provider_id()))
-        || !selector
-          .accounts()
-          .is_none_or(|account_ids| account_ids.contains(config.id.as_str()))
-      {
-        continue;
-      }
-
-      let linked = LinkedPoolAccount {
-        account_id: SmolStr::new(&config.id),
-        account_order: account.input_order(),
-        binding: binding.clone(),
-      };
-
-      match config.tier {
-        AccountTier::Active => active.push(linked),
-        AccountTier::Fallback => fallback.push(linked),
-      }
-    }
-
-    let pool = Arc::new(LinkedAccountPool {
+  for (pool_id, pool) in metadata {
+    let materialize = |indices: &[usize]| {
+      indices
+        .iter()
+        .map(|index| {
+          let binding = &providers.metadata.bindings()[*index];
+          let runtime_binding = providers
+            .binding(binding.provider_id(), binding.key().account_id())
+            .expect("shared pool membership references an enabled binding");
+          LinkedPoolAccount {
+            account_id: SmolStr::new(binding.key().account_id()),
+            account_order: binding.account_order(),
+            binding: runtime_binding.clone(),
+          }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+    };
+    let runtime_pool = Arc::new(LinkedAccountPool {
       id: pool_id.clone(),
-      strategy: pool_plan.strategy(),
-      failure_cooldown: pool_plan.failure_cooldown(),
-      session_affinity: pool_plan.session_affinity(),
-      active: active.into_boxed_slice(),
-      fallback: fallback.into_boxed_slice(),
+      strategy: pool.strategy(),
+      failure_cooldown: pool.failure_cooldown(),
+      session_affinity: pool.session_affinity(),
+      active: materialize(pool.active()),
+      fallback: materialize(pool.fallback()),
     });
-    pools.insert(pool_id.clone(), pool);
+    pools.insert(pool_id, runtime_pool);
   }
-
   Ok(LinkedAccountPools { pools })
-}
-
-fn validate_selector(
-  pool_id: &AccountPoolId,
-  selector: &tokn_policy::AccountSelector,
-  providers: &ProviderGraph,
-) -> PoolLinkResult<()> {
-  if let Some(account_ids) = selector.accounts() {
-    for account_id in account_ids {
-      if providers.account(account_id.as_str()).is_none() {
-        return Err(PoolLinkError::UnknownAccount {
-          pool: pool_id.clone(),
-          account_id: account_id.clone(),
-        });
-      }
-    }
-  }
-
-  Ok(())
 }
 
 #[cfg(test)]
@@ -221,7 +187,7 @@ mod tests {
   use crate::link::link_provider_graph;
   use crate::registry::Registry;
   use std::collections::BTreeMap;
-  use tokn_core::account::AccountConfig;
+  use tokn_core::account::{AccountConfig, AccountTier};
   use tokn_core::provider::{ID_LLAMA_CPP, ID_OPENAI};
   use tokn_policy::{AccountPoolPlan, AccountSelector, ProviderPlan};
 

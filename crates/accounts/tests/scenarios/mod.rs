@@ -132,3 +132,184 @@ pub fn storage_round_trip() {
   drop(view);
   assert_eq!(&clone[..], [22, 33, 44]);
 }
+
+/// Compile and link actual v2 configuration, then run the same route decisions
+/// with the host and alloc-only binding/storage backends.
+pub fn configured_routing_transcript() {
+  use tokn_accounts::link::portable::{
+    link_pool_metadata, link_provider_metadata, BindingMetadata, DestinationMetadata,
+  };
+  use tokn_accounts::selection::{select_route, CandidateBinding, RouteSelection, SelectionRequest};
+  use tokn_core::{account::AccountConfig, Endpoint};
+  use tokn_policy::{DriverId, ProfileId, ProviderId};
+
+  struct Candidate<'a> {
+    binding: &'a BindingMetadata,
+    destination: &'a DestinationMetadata,
+  }
+  impl CandidateBinding for Candidate<'_> {
+    fn provider_id(&self) -> &ProviderId {
+      self.binding.provider_id()
+    }
+    fn driver_id(&self) -> &DriverId {
+      self.binding.driver_id()
+    }
+    fn supports(&self, model: &str, endpoint: Endpoint) -> bool {
+      model == "discovered-model" && self.has_endpoint(model, endpoint)
+    }
+    fn has_endpoint(&self, model: &str, endpoint: Endpoint) -> bool {
+      tokn_accounts::native::supports_model_endpoint(
+        self.driver_id().as_str(),
+        model,
+        endpoint,
+        self.destination.base_url().as_str(),
+      )
+    }
+  }
+
+  let raw = serde_json::from_str(
+    r#"{
+      "schema_version": 2,
+      "profiles": {
+        "default": {
+          "route": "qualified",
+          "account_pool": {
+            "accounts": ["active", "fallback", "disabled"],
+            "failure_cooldown_secs": 2
+          }
+        },
+        "independent": {
+          "route": "qualified",
+          "account_pool": { "accounts": ["active", "fallback"], "failure_cooldown_secs": 2 }
+        },
+        "outside": {
+          "route": "qualified",
+          "account_pool": { "accounts": ["outside"] }
+        }
+      },
+      "routes": {
+        "qualified": {
+          "kind": "managed",
+          "providers": ["*"],
+          "provider": { "kind": "any" },
+          "model": { "kind": "qualified", "namespace": "provider" },
+          "operation": "translate_compatible"
+        }
+      },
+      "providers": {
+        "primary": { "driver": "llama-cpp", "base_url": "https://primary.example/v1" },
+        "outside": { "driver": "llama-cpp", "base_url": "https://outside.example/v1" }
+      }
+    }"#,
+  )
+  .unwrap();
+  let plan = tokn_config::v2::compile_execution(&raw).unwrap();
+  let accounts: Vec<AccountConfig> = serde_json::from_str(
+    r#"[
+      { "id": "disabled", "provider": "primary", "enabled": false },
+      { "id": "fallback", "provider": "primary", "tier": "fallback" },
+      { "id": "outside", "provider": "outside" },
+      { "id": "active", "provider": "primary" }
+    ]"#,
+  )
+  .unwrap();
+  let graph = link_provider_metadata(&plan, &accounts, tokn_accounts::native::provider_default_base_url).unwrap();
+  let pools = link_pool_metadata(&plan, &graph).unwrap();
+  let candidates = graph
+    .bindings()
+    .iter()
+    .map(|binding| Candidate {
+      binding,
+      destination: graph.destination(binding.provider_id()).unwrap(),
+    })
+    .collect::<Vec<_>>();
+  let profile = |name| plan.profile(&ProfileId::new(name).unwrap()).unwrap();
+  let main_pool = &pools[profile("default").account_pool().unwrap()];
+  let independent_pool = &pools[profile("independent").account_pool().unwrap()];
+  let outside_pool = &pools[profile("outside").account_pool().unwrap()];
+  let route = plan.route(profile("default").route()).unwrap();
+  let make_state = |metadata: &tokn_accounts::link::portable::PoolMetadata| {
+    PoolState::new(
+      metadata.active().to_vec(),
+      metadata.fallback().to_vec(),
+      metadata.failure_cooldown(),
+      metadata
+        .session_affinity()
+        .map(|policy| AffinityPolicy::new(policy.ttl(), policy.expired_retention())),
+    )
+    .unwrap()
+  };
+  let mut state = make_state(main_pool);
+  let mut independent = make_state(independent_pool);
+  let mut outside = make_state(outside_pool);
+  assert_eq!(main_pool.active().len(), 1);
+  assert_eq!(main_pool.fallback().len(), 1);
+  assert_eq!(graph.accounts().len(), 4);
+  assert_eq!(graph.bindings().len(), 3);
+  assert!(graph.account("disabled").unwrap().binding_index().is_none());
+
+  let decide =
+    |metadata: &tokn_accounts::link::portable::PoolMetadata, state: &mut PoolState<usize>, now, model: &str| {
+      select_route(
+        route,
+        SelectionRequest {
+          model,
+          endpoint: Endpoint::Responses,
+          allowed_providers: None,
+        },
+        metadata
+          .active()
+          .iter()
+          .chain(metadata.fallback())
+          .map(|&index| (index, &candidates[index])),
+        |ranks| match state.select(now, None, ranks) {
+          Selection::Selected(index) => Some(index),
+          Selection::CoolingDown { .. } | Selection::NoEligible => None,
+        },
+      )
+      .unwrap()
+    };
+  let record = |selection: RouteSelection<usize>| {
+    let RouteSelection::Selected {
+      binding,
+      model,
+      endpoint,
+    } = selection
+    else {
+      panic!("expected a configured route selection");
+    };
+    (
+      SmolStr::new(graph.bindings()[binding].key().account_id()),
+      model,
+      endpoint,
+    )
+  };
+  let mut transcript = vec![record(decide(main_pool, &mut state, at(0), "primary/unlisted"))];
+  state.record_failure(at(0), &main_pool.active()[0]).unwrap();
+  transcript.push(record(decide(main_pool, &mut state, at(0), "primary/unlisted")));
+  state.record_failure(at(0), &main_pool.fallback()[0]).unwrap();
+  assert_eq!(
+    decide(main_pool, &mut state, at(0), "primary/unlisted"),
+    RouteSelection::NoAccount
+  );
+  transcript.push(record(decide(
+    independent_pool,
+    &mut independent,
+    at(0),
+    "primary/unlisted",
+  )));
+  assert_eq!(
+    decide(main_pool, &mut state, at(0), "outside/unlisted"),
+    RouteSelection::NoAccount
+  );
+  transcript.push(record(decide(outside_pool, &mut outside, at(0), "outside/unlisted")));
+  transcript.push(record(decide(main_pool, &mut state, at(2), "primary/unlisted")));
+  assert_eq!(
+    transcript,
+    ["active", "fallback", "active", "outside", "active"].map(|account| (
+      SmolStr::new(account),
+      SmolStr::new("unlisted"),
+      Endpoint::ChatCompletions,
+    ))
+  );
+}
