@@ -1,14 +1,13 @@
 use crate::util::secret::Secret;
 use async_trait::async_trait;
 use reqwest::Method;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
 use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::CleartextHttpPolicy;
-use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
-use tokn_headers::{HeaderMap, HeaderValue};
+use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
 use crate::{
@@ -16,7 +15,7 @@ use crate::{
   TemplateVars, ID_DEEPSEEK,
 };
 
-pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+pub use crate::native::DEFAULT_BASE_URL;
 
 pub struct DeepSeekProvider {
   pub id: String,
@@ -142,28 +141,17 @@ impl Provider for DeepSeekProvider {
     Some(self)
   }
 
-  fn inject_credentials(&self, headers: &mut HeaderMap, _ctx: &HeaderPatchCtx<'_>) -> Result<()> {
-    headers.insert(
-      &AUTHORIZATION,
-      HeaderValue::from_string(format!("Bearer {}", self.api_key.expose())),
+  fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
+    crate::native::inject_credentials(
+      headers,
+      ctx.endpoint().unwrap_or(Endpoint::ChatCompletions),
+      self.api_key.expose(),
     );
     Ok(())
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
-    headers.insert(
-      &ACCEPT,
-      HeaderValue::from_static(if ctx.stream {
-        "text/event-stream"
-      } else {
-        "application/json"
-      }),
-    );
-    headers.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    if let Some(encoding) = ctx.content_encoding {
-      headers.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
-    }
-    Ok(None)
+    Ok(crate::native::normalize_headers(headers, ctx))
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {
@@ -205,81 +193,12 @@ impl Provider for DeepSeekProvider {
   }
 }
 
-fn shape_request(endpoint: crate::Endpoint, body: Value) -> Value {
-  let mut out = body;
-  let Some(obj) = out.as_object_mut() else {
-    return out;
-  };
-
-  // Keep normalized controls authoritative, but also accept native endpoint
-  // fields. Otherwise raw requests (and already-shaped requests) lose effort.
-  let effort = extract_effort(obj.get("thinking"))
-    .or_else(|| extract_effort(obj.get("reasoning")))
-    .or_else(|| obj.get("reasoning_effort").and_then(Value::as_str).map(str::to_string))
-    .or_else(|| extract_effort(obj.get("output_config")));
-  let thinking_mode = extract_thinking_mode(obj.get("thinking"), obj.get("reasoning"), effort.is_some());
-  obj.insert("thinking".into(), json!({ "type": thinking_mode }));
-  obj.remove("reasoning");
-
-  match endpoint {
-    crate::Endpoint::ChatCompletions => {
-      obj.remove("output_config");
-      if let Some(effort) = effort {
-        obj.insert("reasoning_effort".into(), Value::String(effort));
-      } else {
-        obj.remove("reasoning_effort");
-      }
-    }
-    crate::Endpoint::Messages => {
-      obj.remove("reasoning_effort");
-      if let Some(effort) = effort {
-        obj.insert("output_config".into(), json!({ "effort": effort }));
-      } else {
-        obj.remove("output_config");
-      }
-    }
-    crate::Endpoint::Responses => {}
-  }
-
-  out
-}
-
-fn extract_thinking_mode(thinking: Option<&Value>, reasoning: Option<&Value>, has_effort: bool) -> &'static str {
-  match thinking
-    .and_then(explicit_thinking_mode)
-    .or_else(|| reasoning.and_then(explicit_thinking_mode))
-  {
-    Some(mode) => mode,
-    None if thinking.is_some() || reasoning.is_some() || has_effort => "enabled",
-    None => "disabled",
-  }
-}
-
-fn explicit_thinking_mode(value: &Value) -> Option<&'static str> {
-  match value {
-    Value::Bool(true) => Some("enabled"),
-    Value::Bool(false) => Some("disabled"),
-    Value::String(s) if s.eq_ignore_ascii_case("enabled") => Some("enabled"),
-    Value::String(s) if s.eq_ignore_ascii_case("disabled") => Some("disabled"),
-    Value::Object(map) => match map.get("type").and_then(Value::as_str) {
-      Some("enabled") => Some("enabled"),
-      Some("disabled") => Some("disabled"),
-      _ => None,
-    },
-    _ => None,
-  }
-}
-
-fn extract_effort(value: Option<&Value>) -> Option<String> {
-  match value {
-    Some(Value::Object(map)) => map.get("effort").and_then(Value::as_str).map(str::to_string),
-    _ => None,
-  }
-}
+use crate::native::transform_input as shape_request;
 
 #[cfg(test)]
 mod tests {
   use super::*;
+  use serde_json::json;
   use tokn_core::account::AccountTier;
   use tokn_core::provider::Endpoint;
 

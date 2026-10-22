@@ -47,33 +47,33 @@ license = "MIT"
 [workspace.dependencies]
 tokn = { version = "0.2.4", path = "crates/tokn" }
 tokn-mock-server = { version = "0.2.4", path = "crates/mock-server" }
-tokn-core = { version = "0.2.4", path = "crates/core" }
-tokn-policy = { version = "0.2.4", path = "crates/policy" }
-tokn-config = { package = "tokn-router-config", version = "0.2.4", path = "crates/config" }
+tokn-core = { version = "0.2.4", path = "crates/core", default-features = false }
+tokn-policy = { version = "0.2.4", path = "crates/policy", default-features = false }
+tokn-config = { package = "tokn-router-config", version = "0.2.4", path = "crates/config", default-features = false }
 tokn-router-legacy-config = { version = "0.2.4", path = "crates/legacy-config" }
 tokn-agent-migration = { version = "0.2.4", path = "crates/agent-migration" }
-tokn-auth = { version = "0.2.4", path = "crates/auth" }
+tokn-auth = { version = "0.2.4", path = "crates/auth", default-features = false }
 tokn-access = { version = "0.2.4", path = "crates/access" }
-tokn-catalogue = { version = "0.2.4", path = "crates/catalogue" }
-tokn-convert = { version = "0.2.4", path = "crates/convert" }
+tokn-catalogue = { version = "0.2.4", path = "crates/catalogue", default-features = false }
+tokn-convert = { version = "0.2.4", path = "crates/convert", default-features = false }
 tokn-endpoint-core = { version = "0.2.4", path = "crates/endpoint-core", default-features = false }
 tokn-endpoint-macros = { version = "0.2.4", path = "crates/endpoint-macros" }
 tokn-endpoint-chat-completions = { version = "0.2.4", path = "crates/endpoint-chat-completions", default-features = false }
 tokn-endpoint-responses = { version = "0.2.4", path = "crates/endpoint-responses", default-features = false }
 tokn-endpoint-messages = { version = "0.2.4", path = "crates/endpoint-messages", default-features = false }
-tokn-headers = { version = "0.2.4", path = "crates/headers" }
+tokn-headers = { version = "0.2.4", path = "crates/headers", default-features = false }
 tokn-router = { version = "0.2.4", path = "crates/router" }
-tokn-service = { version = "0.2.4", path = "crates/service" }
+tokn-service = { version = "0.2.4", path = "crates/service", default-features = false }
 tokn-sdk = { version = "0.2.4", path = "crates/sdk" }
-tokn-requests = { version = "0.2.4", path = "crates/requests" }
+tokn-requests = { version = "0.2.4", path = "crates/requests", default-features = false }
 tokn-persistence = { version = "0.2.4", path = "crates/persistence" }
-tokn-accounts = { version = "0.2.4", path = "crates/accounts" }
-tokn-provider-copilot = { version = "0.2.4", path = "crates/provider-copilot" }
-tokn-provider-deepseek = { version = "0.2.4", path = "crates/provider-deepseek" }
-tokn-provider-llama-cpp = { version = "0.2.4", path = "crates/provider-llama-cpp" }
-tokn-provider-openai = { version = "0.2.4", path = "crates/provider-openai" }
-tokn-provider-opencode = { version = "0.2.4", path = "crates/provider-opencode" }
-tokn-provider-zai = { version = "0.2.4", path = "crates/provider-zai" }
+tokn-accounts = { version = "0.2.4", path = "crates/accounts", default-features = false }
+tokn-provider-copilot = { version = "0.2.4", path = "crates/provider-copilot", default-features = false }
+tokn-provider-deepseek = { version = "0.2.4", path = "crates/provider-deepseek", default-features = false }
+tokn-provider-llama-cpp = { version = "0.2.4", path = "crates/provider-llama-cpp", default-features = false }
+tokn-provider-openai = { version = "0.2.4", path = "crates/provider-openai", default-features = false }
+tokn-provider-opencode = { version = "0.2.4", path = "crates/provider-opencode", default-features = false }
+tokn-provider-zai = { version = "0.2.4", path = "crates/provider-zai", default-features = false }
 
 anyhow = "1"
 arc-swap = "1"
@@ -111,14 +111,14 @@ same-file = "1.0.6"
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 serde_yaml = "0.9"
-sha2 = "0.11"
+sha2 = { version = "0.11", default-features = false }
 subtle = "2"
 smol_str = { version = "0.3", features = ["serde"] }
 snafu = "0.9"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
-toml = "1"
+toml = { version = "1", default-features = false, features = ["serde"] }
 toml_edit = "0.25"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors", "request-id", "util"] }

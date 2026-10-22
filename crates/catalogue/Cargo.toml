@@ -8,15 +8,28 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = [
+  "tokn-core/std",
+  "serde/std",
+  "serde_json/std",
+  "dep:directories",
+  "dep:reqwest",
+  "dep:snafu",
+  "dep:tempfile",
+  "dep:tracing",
+]
+
 [dependencies]
-tokn-core = { workspace = true }
-directories = { workspace = true }
-reqwest = { workspace = true }
+tokn-core = { workspace = true, default-features = false }
+directories = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-snafu = { workspace = true }
-tempfile = "3"
-tracing = { workspace = true }
+snafu = { workspace = true, optional = true }
+tempfile = { version = "3", optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

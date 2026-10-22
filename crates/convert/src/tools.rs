@@ -20,6 +20,7 @@
 //! `{"type":"web_search"}` and friends) are passed through unchanged so we do
 //! not silently drop provider-specific surfaces we don't understand.
 
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
 
 /// Normalise a tool definition into the canonical chat-shape used inside the

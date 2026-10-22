@@ -1,6 +1,7 @@
+use alloc::collections::BTreeMap;
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IrRequest {

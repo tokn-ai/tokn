@@ -112,11 +112,7 @@ impl RetryPolicy {
   }
 
   fn backoff_for(&self, attempt: u32) -> Duration {
-    if self.initial_backoff.is_zero() {
-      return Duration::ZERO;
-    }
-    let multiplier = 1u32.checked_shl(attempt.min(31)).unwrap_or(u32::MAX);
-    self.initial_backoff.saturating_mul(multiplier)
+    crate::driver::backoff(self.initial_backoff, attempt)
   }
 }
 
@@ -153,189 +149,182 @@ impl PipelineRunner {
   /// transport-level hints down to custom Resolve / Send stages.
   pub async fn run_with(&self, raw: RawInbound, config: RunConfig) -> Result<ConvertedResponse, PipelineError> {
     let request_id = raw.request_id.clone().unwrap_or_else(|| SmolStr::new(uuid_like()));
-    let config = Arc::new(config);
-    let mut attempt = 0;
+    crate::driver::run(StandardSession {
+      runner: self,
+      raw,
+      config: Arc::new(config),
+      request_id,
+      ctx: None,
+      terminal: None,
+    })
+    .await
+  }
+}
 
-    loop {
-      match self
-        .run_attempt(raw.clone(), config.clone(), request_id.clone(), attempt)
-        .await
-      {
-        Ok(response) => return Ok(response),
-        Err(err) if self.retry_policy.should_retry(attempt, &err, config.as_ref()) => {
-          let backoff = self.retry_policy.backoff_for(attempt);
-          if !backoff.is_zero() {
-            tokio::time::sleep(backoff).await;
-          }
-          attempt += 1;
-        }
-        Err(err) => return Err(err),
-      }
-    }
+/// Adapts the existing dynamic std stages to the common pipeline driver.
+struct StandardSession<'a> {
+  runner: &'a PipelineRunner,
+  raw: RawInbound,
+  config: Arc<RunConfig>,
+  request_id: SmolStr,
+  ctx: Option<PipelineCtx>,
+  terminal: Option<AttemptTerminalGuard>,
+}
+
+impl StandardSession<'_> {
+  fn stage(&mut self, stage: Stage) {
+    self.terminal.as_mut().expect("attempt started").set_stage(stage);
   }
 
-  async fn run_attempt(
-    &self,
-    raw: RawInbound,
-    config: Arc<RunConfig>,
-    request_id: SmolStr,
-    attempt: u32,
-  ) -> Result<ConvertedResponse, PipelineError> {
-    let started_endpoint = raw.request_endpoint.clone();
+  fn ctx(&self) -> &PipelineCtx {
+    self.ctx.as_ref().expect("attempt started")
+  }
+}
+
+impl crate::driver::Session for StandardSession<'_> {
+  type Extracted = Extracted;
+  type Resolved = Resolved;
+  type Headers = BuiltHeaders;
+  type Converted = ConvertedRequest;
+  type Sent = SentResponse;
+  type Output = ConvertedResponse;
+  type Error = PipelineError;
+
+  fn start(&mut self, attempt: u32) {
     let ctx = PipelineCtx::new_with_attempt_and_config(
-      request_id,
+      self.request_id.clone(),
       attempt,
-      raw.request_endpoint.clone(),
-      self.events.clone(),
-      config,
+      self.raw.request_endpoint.clone(),
+      self.runner.events.clone(),
+      self.config.clone(),
     );
     ctx.emit_stage(StageEvent::Started {
-      request_endpoint: started_endpoint,
+      request_endpoint: self.raw.request_endpoint.clone(),
     });
-    let mut terminal = AttemptTerminalGuard::new(&ctx);
-
-    // ---- Extract ----
-    terminal.set_stage(Stage::Extract);
-    let extracted = match self.profile.extract.extract(&ctx, raw).await {
-      Ok(e) => {
-        ctx.emit_stage(StageEvent::Extract((&e).into()));
-        e
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    // ---- Resolve ----
-    terminal.set_stage(Stage::Resolve);
-    let resolved = match self.profile.resolve.resolve(&ctx, &extracted).await {
-      Ok(r) => {
-        ctx.emit_stage(StageEvent::Resolve((&r).into()));
-        r
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    // ---- BuildHeaders ----
-    terminal.set_stage(Stage::BuildHeaders);
-    let headers = match self
-      .profile
-      .build_headers
-      .build_headers(&ctx, &extracted, &resolved)
-      .await
-    {
-      Ok(h) => {
-        ctx.emit_stage(StageEvent::BuildHeaders((&h).into()));
-        h
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    // ---- ConvertRequest ----
-    terminal.set_stage(Stage::ConvertRequest);
-    let converted = match self
-      .profile
-      .convert_request
-      .convert_request(&ctx, &extracted, &resolved)
-      .await
-    {
-      Ok(c) => {
-        ctx.emit_stage(StageEvent::ConvertRequest((&c).into()));
-        c
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    // ---- Send ----
-    terminal.set_stage(Stage::Send);
-    let sent = match self
-      .profile
-      .send
-      .send(&ctx, &extracted, &resolved, &headers, &converted)
-      .await
-    {
-      Ok(s) => {
-        // SentResponse owns a single-shot reqwest::Response; emit its
-        // cloneable subset for observers and pass the full struct on to
-        // ConvertResponse.
-        ctx.emit_stage(StageEvent::Send((&s).into()));
-        s
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    // ---- ConvertResponse ----
-    terminal.set_stage(Stage::ConvertResponse);
-    let converted_response = match self.profile.convert_response.convert_response(&ctx, sent).await {
-      Ok(c) => {
-        // Build the summary before moving `c` to the caller — body (when
-        // buffered) is shared via the same Arc<Value>.
-        ctx.emit_stage(StageEvent::ConvertResponse((&c).into()));
-        c
-      }
-      Err(err) => {
-        let err = self.fail(&ctx, err);
-        terminal.mark_terminal();
-        return Err(err);
-      }
-    };
-
-    match &converted_response.body {
-      stages::ConvertedBody::Buffered { body_bytes, .. } => {
-        ctx.emit_record(tokn_core::request_event::RecordEvent::ConvertedBody {
-          body: body_bytes.clone(),
-          error: None,
-        });
-        ctx.emit_stage(StageEvent::Completed {
-          success: true,
-          attempts: ctx.attempt + 1,
-        });
-        terminal.mark_terminal();
-      }
-      stages::ConvertedBody::Stream { .. } => {
-        // Stream completion is emitted by AccumHelper when the returned body
-        // is drained or dropped; the attempt has been handed off successfully.
-        terminal.mark_terminal();
-      }
-    }
-    Ok(converted_response)
+    self.terminal = Some(AttemptTerminalGuard::new(&ctx));
+    self.ctx = Some(ctx);
   }
 
-  /// Emit [`StageEvent::Error`] + [`StageEvent::Completed`] for the given
-  /// error and return it. `Completed.success` is always `false` here —
-  /// even a deliberate stop did not produce a `ConvertedResponse`.
-  /// Subscribers that need to distinguish a stop from a real failure read
-  /// the preceding `Error` event's `stop` flag.
-  fn fail(&self, ctx: &PipelineCtx, err: PipelineError) -> PipelineError {
-    ctx.emit_stage(StageEvent::Error {
-      stage: err.stage,
-      message: SmolStr::new(err.message().as_ref()),
-      recoverable: err.recoverable,
-      stop: err.stop,
+  async fn extract(&mut self) -> Result<Extracted, PipelineError> {
+    self.stage(Stage::Extract);
+    let output = self
+      .runner
+      .profile
+      .extract
+      .extract(self.ctx(), self.raw.clone())
+      .await?;
+    self.ctx().emit_stage(StageEvent::Extract((&output).into()));
+    Ok(output)
+  }
+
+  async fn resolve(&mut self, extracted: &Extracted) -> Result<Resolved, PipelineError> {
+    self.stage(Stage::Resolve);
+    let output = self.runner.profile.resolve.resolve(self.ctx(), extracted).await?;
+    self.ctx().emit_stage(StageEvent::Resolve((&output).into()));
+    Ok(output)
+  }
+
+  async fn build_headers(&mut self, extracted: &Extracted, resolved: &Resolved) -> Result<BuiltHeaders, PipelineError> {
+    self.stage(Stage::BuildHeaders);
+    let output = self
+      .runner
+      .profile
+      .build_headers
+      .build_headers(self.ctx(), extracted, resolved)
+      .await?;
+    self.ctx().emit_stage(StageEvent::BuildHeaders((&output).into()));
+    Ok(output)
+  }
+
+  async fn convert_request(
+    &mut self,
+    extracted: &Extracted,
+    resolved: &Resolved,
+    _headers: &BuiltHeaders,
+  ) -> Result<ConvertedRequest, PipelineError> {
+    self.stage(Stage::ConvertRequest);
+    let output = self
+      .runner
+      .profile
+      .convert_request
+      .convert_request(self.ctx(), extracted, resolved)
+      .await?;
+    self.ctx().emit_stage(StageEvent::ConvertRequest((&output).into()));
+    Ok(output)
+  }
+
+  async fn send(
+    &mut self,
+    extracted: &Extracted,
+    resolved: &Resolved,
+    headers: &BuiltHeaders,
+    converted: &ConvertedRequest,
+  ) -> Result<SentResponse, PipelineError> {
+    self.stage(Stage::Send);
+    let output = self
+      .runner
+      .profile
+      .send
+      .send(self.ctx(), extracted, resolved, headers, converted)
+      .await?;
+    self.ctx().emit_stage(StageEvent::Send((&output).into()));
+    Ok(output)
+  }
+
+  async fn convert_response(mut self, sent: SentResponse) -> Result<ConvertedResponse, PipelineError> {
+    self.stage(Stage::ConvertResponse);
+    let result = self
+      .runner
+      .profile
+      .convert_response
+      .convert_response(self.ctx(), sent)
+      .await;
+    match result {
+      Ok(output) => {
+        self.ctx().emit_stage(StageEvent::ConvertResponse((&output).into()));
+        if let stages::ConvertedBody::Buffered { body_bytes, .. } = &output.body {
+          self
+            .ctx()
+            .emit_record(tokn_core::request_event::RecordEvent::ConvertedBody {
+              body: body_bytes.clone(),
+              error: None,
+            });
+          self.ctx().emit_stage(StageEvent::Completed {
+            success: true,
+            attempts: self.ctx().attempt + 1,
+          });
+        }
+        self.terminal.as_mut().expect("attempt started").mark_terminal();
+        Ok(output)
+      }
+      Err(error) => {
+        self.failed(self.ctx().attempt, &error);
+        Err(error)
+      }
+    }
+  }
+
+  fn failed(&mut self, attempt: u32, error: &PipelineError) -> Option<Duration> {
+    self.ctx().emit_stage(StageEvent::Error {
+      stage: error.stage,
+      message: SmolStr::new(error.message().as_ref()),
+      recoverable: error.recoverable,
+      stop: error.stop,
     });
-    ctx.emit_stage(StageEvent::Completed {
+    self.ctx().emit_stage(StageEvent::Completed {
       success: false,
-      attempts: ctx.attempt + 1,
+      attempts: attempt + 1,
     });
-    err
+    self.terminal.as_mut().expect("attempt started").mark_terminal();
+    self
+      .runner
+      .retry_policy
+      .should_retry(attempt, error, self.config.as_ref())
+      .then(|| self.runner.retry_policy.backoff_for(attempt))
+  }
+
+  async fn sleep(&mut self, delay: Duration) {
+    tokio::time::sleep(delay).await;
   }
 }
 

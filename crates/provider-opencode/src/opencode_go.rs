@@ -4,12 +4,11 @@ use reqwest::Method;
 use serde_json::Value;
 use std::sync::Arc;
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{match_endpoint_rule, ProviderTarget};
+use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy};
-use tokn_headers::keys::{
-  ACCEPT, ANTHROPIC_VERSION, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, USER_AGENT, X_API_KEY, X_OPENCODE_SESSION,
-};
-use tokn_headers::{HeaderMap, HeaderValue};
+#[cfg(test)]
+use tokn_headers::{keys::X_OPENCODE_SESSION, HeaderValue};
+use tokn_headers::HeaderMap;
 use tracing::{debug, instrument, warn};
 
 use crate::{
@@ -133,72 +132,25 @@ impl Provider for OpenCodeGoProvider {
   }
 
   fn has_endpoint(&self, model: &str, endpoint: Endpoint) -> bool {
-    if let Some(allowed) = match_endpoint_rule(crate::MODEL_ENDPOINT_RULES, model, endpoint) {
-      return allowed;
-    }
-    if let Some(expected) = crate::catalogue::endpoint_for_model(ID_OPENCODE_GO, model) {
-      return endpoint == expected;
-    }
-    endpoint == Endpoint::ChatCompletions
+    crate::native::supports_model_endpoint_with_catalogue(
+      model,
+      endpoint,
+      self.target.base_url().as_str(),
+      crate::catalogue::endpoint_for_model(ID_OPENCODE_GO, model),
+    )
   }
 
   fn inject_credentials(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<()> {
-    if ctx.endpoint() == Some(Endpoint::Messages) {
-      headers.insert(&X_API_KEY, HeaderValue::from_string(self.api_key.expose().to_string()));
-    } else {
-      headers.insert(
-        &AUTHORIZATION,
-        HeaderValue::from_string(format!("Bearer {}", self.api_key.expose())),
-      );
-    }
+    crate::native::inject_credentials(
+      headers,
+      ctx.endpoint().unwrap_or(Endpoint::ChatCompletions),
+      self.api_key.expose(),
+    );
     Ok(())
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
-    let authorization = headers.get(&AUTHORIZATION).cloned();
-    let api_key = headers.get(&X_API_KEY).cloned();
-    let session = ctx
-      .vars
-      .session_id
-      .as_deref()
-      .or(ctx.vars.interaction_id.as_deref())
-      .or(ctx.vars.request_id.as_deref())
-      .map(str::to_string);
-    let mut normalized = HeaderMap::new();
-    if ctx.endpoint() == Some(Endpoint::Messages) {
-      if let Some(api_key) = api_key {
-        normalized.insert(&X_API_KEY, api_key);
-      }
-    } else if let Some(authorization) = authorization {
-      normalized.insert(&AUTHORIZATION, authorization);
-    }
-    normalized.insert(
-      &ACCEPT,
-      HeaderValue::from_static(if ctx.stream {
-        "text/event-stream"
-      } else {
-        "application/json"
-      }),
-    );
-    normalized.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    normalized.insert(
-      &USER_AGENT,
-      HeaderValue::from_string(tokn_core::util::version::tokn_router_user_agent()),
-    );
-    if ctx.endpoint() == Some(Endpoint::Messages) {
-      let version = headers
-        .get(&ANTHROPIC_VERSION)
-        .cloned()
-        .unwrap_or_else(|| HeaderValue::from_static("2023-06-01"));
-      normalized.insert(&ANTHROPIC_VERSION, version);
-    }
-    if let Some(session) = session {
-      normalized.insert(&X_OPENCODE_SESSION, HeaderValue::from_string(session));
-    }
-    if let Some(encoding) = ctx.content_encoding {
-      normalized.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
-    }
-    Ok(Some(normalized))
+    Ok(crate::native::normalize_headers(headers, ctx))
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {

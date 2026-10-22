@@ -5,6 +5,10 @@
 //! Mirrors `parseJwtClaims` / `extractAccountIdFromClaims` from
 //! `opencode/src/plugin/codex.ts`.
 
+use alloc::{
+  string::{String, ToString},
+  vec::Vec,
+};
 use base64::Engine;
 use serde::Deserialize;
 use tokn_core::account::AccountConfig;

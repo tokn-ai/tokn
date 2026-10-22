@@ -1,8 +1,16 @@
+use crate::authority::{CanonicalAuthority, CanonicalHost, InvalidAuthority};
+use crate::types::SmolStr;
+use alloc::string::{String, ToString};
+use core::fmt;
+#[cfg(feature = "std")]
 use http::uri::PathAndQuery;
-use reqwest::Url;
-use smol_str::SmolStr;
-use std::fmt;
-use tokn_policy::{CanonicalAuthority, CanonicalHost, InvalidAuthority};
+#[cfg(feature = "std")]
+pub use url::Url;
+#[cfg(any(not(feature = "std"), test))]
+#[path = "upstream_url/local.rs"]
+mod local;
+#[cfg(not(feature = "std"))]
+pub use local::Url;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleartextHttpPolicy {
@@ -64,9 +72,7 @@ impl CanonicalUpstreamUrl {
     }
 
     let mut url = self.url.clone();
-    let mut path = url
-      .path_segments_mut()
-      .map_err(|()| InvalidOperationPath::InvalidBase)?;
+    let mut path = url.path_segments_mut().map_err(|_| InvalidOperationPath::InvalidBase)?;
     path.pop_if_empty();
     for (index, segment) in segments {
       let segment = segment.as_ref();
@@ -83,6 +89,7 @@ impl CanonicalUpstreamUrl {
   }
 
   /// Append an opaque relay request target beneath this configured prefix.
+  #[cfg(feature = "std")]
   pub fn relay_url(&self, target: &PathAndQuery) -> Result<Url, InvalidRequestUrl> {
     let path = validated_request_path(target)?;
     let relative_path = path.strip_prefix('/').expect("validated HTTP paths start with '/'");
@@ -134,6 +141,7 @@ impl CanonicalHttpOrigin {
   }
 
   /// Build a request URL at this exact admitted origin.
+  #[cfg(feature = "std")]
   pub fn request_url(&self, target: &PathAndQuery) -> Result<Url, InvalidRequestUrl> {
     let path = validated_request_path(target)?;
     let raw = compose_request_url(self.as_str(), &path, target.query());
@@ -196,8 +204,8 @@ impl fmt::Display for InvalidUpstreamUrl {
   }
 }
 
-impl std::error::Error for InvalidUpstreamUrl {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for InvalidUpstreamUrl {
+  fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
     match self {
       Self::InvalidAuthority(source) => Some(source),
       _ => None,
@@ -224,7 +232,7 @@ impl fmt::Display for InvalidOperationPath {
   }
 }
 
-impl std::error::Error for InvalidOperationPath {}
+impl core::error::Error for InvalidOperationPath {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvalidRequestUrl {
@@ -281,8 +289,8 @@ impl fmt::Display for InvalidRequestUrl {
   }
 }
 
-impl std::error::Error for InvalidRequestUrl {
-  fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl core::error::Error for InvalidRequestUrl {
+  fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
     match self {
       Self::InvalidUrl(source) => Some(source),
       _ => None,
@@ -290,6 +298,7 @@ impl std::error::Error for InvalidRequestUrl {
   }
 }
 
+#[cfg(feature = "std")]
 fn validated_request_path(target: &PathAndQuery) -> Result<String, InvalidRequestUrl> {
   let raw = target.path();
   if raw.is_empty() || !raw.starts_with('/') || !raw.is_ascii() {
@@ -306,6 +315,7 @@ fn validated_request_path(target: &PathAndQuery) -> Result<String, InvalidReques
   Ok(raw.to_string())
 }
 
+#[cfg(feature = "std")]
 fn canonical_dot_segment(segment: &str) -> Option<String> {
   let bytes = segment.as_bytes();
   let mut dots = String::new();
@@ -327,6 +337,7 @@ fn canonical_dot_segment(segment: &str) -> Option<String> {
   Some(dots)
 }
 
+#[cfg(feature = "std")]
 fn compose_request_url(base: &str, path: &str, query: Option<&str>) -> String {
   let mut raw = String::with_capacity(base.len() + path.len() + query.map_or(0, |query| query.len() + 1));
   raw.push_str(base);
@@ -338,12 +349,14 @@ fn compose_request_url(base: &str, path: &str, query: Option<&str>) -> String {
   raw
 }
 
+#[cfg(feature = "std")]
 fn parse_composed_request_url(raw: &str) -> Result<Url, InvalidRequestUrl> {
   parse_http_url(raw)
     .map(|(url, _)| url)
     .map_err(InvalidRequestUrl::InvalidUrl)
 }
 
+#[cfg(feature = "std")]
 fn ensure_origin(url: &Url, expected: &str) -> Result<(), InvalidRequestUrl> {
   let found = url.origin().ascii_serialization();
   if found == expected {
@@ -356,6 +369,7 @@ fn ensure_origin(url: &Url, expected: &str) -> Result<(), InvalidRequestUrl> {
   }
 }
 
+#[cfg(feature = "std")]
 fn ensure_path_and_query(
   url: &Url,
   expected_path: &str,
@@ -376,7 +390,7 @@ fn ensure_path_and_query(
   Ok(())
 }
 
-fn parse_http_url(raw: &str) -> Result<(Url, CanonicalAuthority), InvalidUpstreamUrl> {
+fn admit_http_url(raw: &str) -> Result<CanonicalAuthority, InvalidUpstreamUrl> {
   if !raw.is_ascii() {
     return Err(InvalidUpstreamUrl::NonAscii);
   }
@@ -405,6 +419,11 @@ fn parse_http_url(raw: &str) -> Result<(Url, CanonicalAuthority), InvalidUpstrea
     return Err(InvalidUpstreamUrl::DotSegment);
   }
 
+  Ok(authority)
+}
+
+fn parse_http_url(raw: &str) -> Result<(Url, CanonicalAuthority), InvalidUpstreamUrl> {
+  let authority = admit_http_url(raw)?;
   let url = Url::parse(raw).map_err(|error| InvalidUpstreamUrl::Parse(error.to_string()))?;
   if !matches!(url.scheme(), "http" | "https") {
     return Err(InvalidUpstreamUrl::UnsupportedScheme);
@@ -590,6 +609,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "std")]
   #[test]
   fn relay_urls_preserve_prefix_path_and_query() {
     let base = CanonicalUpstreamUrl::parse(
@@ -610,6 +630,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "std")]
   #[test]
   fn origin_request_urls_preserve_exact_origin() {
     let origin = CanonicalHttpOrigin::parse("https://api.example.com:8443", CleartextHttpPolicy::LoopbackOnly).unwrap();
@@ -620,6 +641,7 @@ mod tests {
     );
   }
 
+  #[cfg(feature = "std")]
   #[test]
   fn request_urls_reject_dot_segments() {
     let base = CanonicalUpstreamUrl::parse("https://api.example.com/v1", CleartextHttpPolicy::LoopbackOnly).unwrap();

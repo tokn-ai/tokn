@@ -20,6 +20,7 @@
 //! retry behavior. V2 account-pool callers opt into forwarding every received
 //! response verbatim and classify its status separately.
 
+use crate::driver::{classify_status, StatusDisposition};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, ProviderError, RequestsError};
@@ -224,7 +225,8 @@ impl SendStage for ProxySend {
       headers: resp_headers.clone(),
     });
 
-    if status >= 500 && !self.forward_server_errors {
+    let disposition = classify_status(status);
+    if disposition == StatusDisposition::RecoverableFailure && !self.forward_server_errors {
       let body_text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
@@ -246,7 +248,7 @@ impl SendStage for ProxySend {
         },
       ));
     }
-    if status >= 400 {
+    if disposition != StatusDisposition::Success {
       warn!(%status, "proxy upstream error response — forwarding verbatim");
     }
 

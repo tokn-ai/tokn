@@ -22,6 +22,12 @@ mod tests {
   use serde_json::{json, Value};
   use tokn_sdk::{chat_completions::ChatRequest, Client, RequestOptions};
 
+  fn assert_send_sync<T: Send + Sync>() {}
+
+  fn assert_send<T: Send>(value: T) -> T {
+    value
+  }
+
   const BUFFERED: &str = r#"{"id":"chatcmpl-std","object":"chat.completion","model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
   const STREAM_PARTS: [&str; 2] = [
     "data: {\"id\":\"chatcmpl-std\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n",
@@ -172,6 +178,7 @@ mod tests {
 
   #[test]
   fn default_client_sends_buffered_and_streaming_requests() {
+    assert_send_sync::<Client>();
     let mut fixture = Fixture::start();
     let runtime = tokio::runtime::Builder::new_current_thread()
       .enable_all()
@@ -188,14 +195,13 @@ mod tests {
           "messages": [{"role": "user", "content": "hello"}]
         }))
         .unwrap();
-        let response = client
-          .chat_completions()
-          .create_with(
-            &request,
-            RequestOptions::default().with_request_id("isolated-std-buffered"),
-          )
-          .await
-          .expect("buffered SDK call");
+        let endpoint = client.chat_completions();
+        let response = assert_send(endpoint.create_with(
+          &request,
+          RequestOptions::default().with_request_id("isolated-std-buffered"),
+        ))
+        .await
+        .expect("buffered SDK call");
         assert_eq!(response.status, 200);
         assert_eq!(response.data.id.as_deref(), Some("chatcmpl-std"));
         assert_eq!(
@@ -203,9 +209,7 @@ mod tests {
           "hello"
         );
 
-        let response = client
-          .chat_completions()
-          .stream(&request)
+        let response = assert_send(endpoint.stream(&request))
           .await
           .expect("streaming SDK call");
         assert_eq!(response.status, 200);

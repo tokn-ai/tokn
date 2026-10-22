@@ -8,29 +8,41 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = [
+  "dep:anyhow",
+  "tokn-core/std", "tokn-accounts/std", "tokn-convert/std", "tokn-headers/std", "tokn-service/std", "tokn-policy/std",
+  "dep:tokn-config", "tokn-config/std", "dep:arc-swap", "dep:async-trait", "dep:bytes", "dep:flate2",
+  "dep:futures-util", "dep:http", "dep:http-body-util", "dep:reqwest", "dep:smol_str", "dep:snafu",
+  "dep:tokio", "dep:tracing", "dep:tower", "dep:zstd", "serde/std", "serde_json/std",
+]
+
 [dependencies]
+anyhow = { workspace = true, optional = true }
+tokn-policy.workspace = true
 tokn-accounts = { workspace = true }
 tokn-core = { workspace = true }
 tokn-headers = { workspace = true }
 tokn-service = { workspace = true }
-tokn-config = { workspace = true }
+tokn-config = { workspace = true, optional = true }
 tokn-convert = { workspace = true }
-arc-swap = { workspace = true }
-async-trait = { workspace = true }
-bytes = { workspace = true }
-flate2 = { workspace = true }
-futures-util = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
-reqwest = { workspace = true }
+arc-swap = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-smol_str = { workspace = true }
-snafu = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tower = { workspace = true, features = ["util"] }
-zstd = { workspace = true }
+smol_str = { workspace = true, optional = true }
+snafu = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
+zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
 http = { workspace = true }
@@ -40,3 +52,15 @@ tokn-mock-server = { workspace = true }
 tokn-provider-copilot = { workspace = true }
 tokn-provider-deepseek = { workspace = true }
 tokn-provider-openai = { workspace = true }
+
+[[test]]
+name = "headers_integration"
+required-features = ["std"]
+
+[[test]]
+name = "pipeline_events"
+required-features = ["std"]
+
+[[test]]
+name = "pipeline_retry"
+required-features = ["std"]

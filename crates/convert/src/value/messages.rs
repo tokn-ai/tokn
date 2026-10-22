@@ -1,8 +1,9 @@
 use super::chat::args_to_string;
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use alloc::collections::BTreeMap;
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
 
 pub use tokn_endpoint_messages::DEFAULT_MESSAGES_MAX_TOKENS;
 

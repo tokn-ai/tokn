@@ -103,7 +103,7 @@ fn compile_binding(name: &str, raw: Option<&RawProfileBinding>) -> Result<ApiBin
   };
   let path = raw.and_then(|binding| binding.path.as_deref()).unwrap_or(&default);
   let location = format!("profiles.{name}.binding.path");
-  let path = super::super::listeners::canonical_path_prefix(path, &location)?;
+  let path = super::super::path::canonical_path_prefix(path, &location)?;
   let path = path.trim_end_matches('/');
   if path.is_empty() || path.contains("//") || path.split('/').any(|segment| segment.contains(['{', '}', '*'])) {
     return Err(invalid_value(

@@ -23,10 +23,10 @@
 //! [`RequestEventPayload::Record`]: super::RequestEventPayload::Record
 
 use crate::db::Usage;
+use crate::headers::HeaderMap;
 use bytes::Bytes;
 use serde::Serialize;
 use smol_str::SmolStr;
-use tokn_headers::HeaderMap;
 
 /// Wire-truth capture from the actual outbound HTTP call (via
 /// [`OutboundCapture`](crate::provider::OutboundCapture)).

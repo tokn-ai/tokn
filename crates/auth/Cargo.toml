@@ -8,21 +8,38 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
-[dependencies]
-tokn-core = { workspace = true }
-tokn-config = { workspace = true }
+[features]
+default = ["std"]
+std = [
+  "tokn-core/std",
+  "serde/std",
+  "serde_json/std",
+  "dep:tokn-config",
+  "tokn-config?/std",
+  "dep:anyhow",
+  "dep:async-trait",
+  "dep:reqwest",
+  "dep:serde_yaml",
+  "dep:time",
+  "dep:tokio",
+  "dep:toml",
+  "dep:tracing",
+]
 
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-reqwest = { workspace = true }
+[dependencies]
+tokn-core = { workspace = true, default-features = false }
+tokn-config = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+serde_yaml = { workspace = true, optional = true }
 thiserror = { workspace = true }
-time = { workspace = true }
-tokio = { workspace = true }
-toml = { workspace = true }
-tracing = { workspace = true }
+time = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

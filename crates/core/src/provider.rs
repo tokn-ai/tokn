@@ -1,5 +1,7 @@
 use crate::account::AccountConfig;
 use crate::generation::ReasoningEffort;
+pub use crate::headers::TemplateVars;
+use crate::headers::{AgentId, HeaderMap};
 use crate::upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -7,81 +9,16 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock, RwLock};
-pub use tokn_headers::TemplateVars;
-use tokn_headers::{AgentId, HeaderMap};
 
 pub mod error;
+pub mod prepare;
+pub use prepare::{prepare_request, prepare_request_with_policy, validate_credential, PrepareError};
 mod reasoning;
 pub use reasoning::upstream_reasoning_efforts;
 
 pub use error::{Error, Result};
 
-pub const ID_GITHUB_COPILOT: &str = "github-copilot";
-pub const ID_DEEPSEEK: &str = "deepseek";
-pub const ID_LLAMA_CPP: &str = "llama-cpp";
-pub const ID_OPENAI: &str = "openai";
-pub const ID_OPENCODE_GO: &str = "opencode-go";
-pub const ID_CODEX: &str = "codex";
-pub const ID_ZAI_CODING_PLAN: &str = "zai-coding-plan";
-pub const ID_ZAI: &str = "zai";
-pub const ID_ZHIPUAI_CODING_PLAN: &str = "zhipuai-coding-plan";
-pub const ID_ZHIPUAI: &str = "zhipuai";
-pub const ZAI_PROVIDERS: &[&str] = &[ID_ZAI_CODING_PLAN, ID_ZAI, ID_ZHIPUAI_CODING_PLAN, ID_ZHIPUAI];
-
-/// One built-in provider destination made available by v2 without an
-/// explicit `[providers.*]` table.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OfficialProviderPreset {
-  pub id: &'static str,
-  pub driver: &'static str,
-}
-
-pub const OFFICIAL_PROVIDER_PRESETS: &[OfficialProviderPreset] = &[
-  OfficialProviderPreset {
-    id: ID_CODEX,
-    driver: ID_CODEX,
-  },
-  OfficialProviderPreset {
-    id: ID_DEEPSEEK,
-    driver: ID_DEEPSEEK,
-  },
-  OfficialProviderPreset {
-    id: ID_GITHUB_COPILOT,
-    driver: ID_GITHUB_COPILOT,
-  },
-  OfficialProviderPreset {
-    id: ID_LLAMA_CPP,
-    driver: ID_LLAMA_CPP,
-  },
-  OfficialProviderPreset {
-    id: ID_OPENAI,
-    driver: ID_OPENAI,
-  },
-  OfficialProviderPreset {
-    id: ID_OPENCODE_GO,
-    driver: ID_OPENCODE_GO,
-  },
-  OfficialProviderPreset {
-    id: ID_ZAI,
-    driver: ID_ZAI,
-  },
-  OfficialProviderPreset {
-    id: ID_ZAI_CODING_PLAN,
-    driver: ID_ZAI,
-  },
-  OfficialProviderPreset {
-    id: ID_ZHIPUAI,
-    driver: ID_ZAI,
-  },
-  OfficialProviderPreset {
-    id: ID_ZHIPUAI_CODING_PLAN,
-    driver: ID_ZAI,
-  },
-];
-
-pub fn official_provider_preset(id: &str) -> Option<&'static OfficialProviderPreset> {
-  OFFICIAL_PROVIDER_PRESETS.iter().find(|preset| preset.id == id)
-}
+pub use crate::provider_values::*;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -323,109 +260,7 @@ impl ProviderTarget {
   }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Endpoint {
-  ChatCompletions,
-  Responses,
-  Messages,
-}
-
-impl Endpoint {
-  pub fn as_str(self) -> &'static str {
-    match self {
-      Endpoint::ChatCompletions => "chat_completions",
-      Endpoint::Responses => "responses",
-      Endpoint::Messages => "messages",
-    }
-  }
-
-  /// Best-effort guess at which [`Endpoint`] variant a given path
-  /// represents. Used only to populate [`tokn_requests::RawInbound::endpoint`];
-  /// the proxy passthrough pipeline never branches on it.
-  pub fn infer_from(path: impl AsRef<str>) -> Option<Self> {
-    let path = path.as_ref();
-    if path.ends_with("/chat/completions") {
-      Some(Endpoint::ChatCompletions)
-    } else if path.ends_with("/responses") {
-      Some(Endpoint::Responses)
-    } else if path.ends_with("/messages") {
-      Some(Endpoint::Messages)
-    } else {
-      None
-    }
-  }
-}
-
-impl std::fmt::Display for Endpoint {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(self.as_str())
-  }
-}
-
-/// Per-provider declarative rule mapping a model id glob pattern to the
-/// set of endpoints that model is allowed to be served on.
-///
-/// Patterns use a tiny `*`-only glob (no character classes, no `?`).
-/// Examples: `"claude-*"`, `"gpt-5*"`, `"o4-mini"`.
-///
-/// Lives in `tokn-core` so both [`ProviderInfo`] and the descriptor type
-/// in `tokn-auth` can reference it without a dependency cycle.
-#[derive(Copy, Clone, Debug)]
-pub struct EndpointRule {
-  pub pattern: &'static str,
-  pub endpoints: &'static [Endpoint],
-}
-
-/// Walk `rules` in order; the first pattern that matches `model` wins.
-/// Returns `Some(true)` if that rule allows `endpoint`, `Some(false)` if
-/// it explicitly does not, and `None` if no rule matched.
-pub fn match_endpoint_rule(rules: &[EndpointRule], model: &str, endpoint: Endpoint) -> Option<bool> {
-  for rule in rules {
-    if glob_match(rule.pattern, model) {
-      return Some(rule.endpoints.contains(&endpoint));
-    }
-  }
-  None
-}
-
-/// Tiny `*`-only glob matcher. `*` matches any (possibly empty) run of
-/// characters; everything else matches literally. ASCII case-sensitive.
-pub fn glob_match(pattern: &str, input: &str) -> bool {
-  let p = pattern.as_bytes();
-  let s = input.as_bytes();
-  fn rec(p: &[u8], s: &[u8]) -> bool {
-    let mut pi = 0;
-    let mut si = 0;
-    while pi < p.len() {
-      if p[pi] == b'*' {
-        // Collapse consecutive '*'.
-        while pi < p.len() && p[pi] == b'*' {
-          pi += 1;
-        }
-        if pi == p.len() {
-          return true;
-        }
-        let rest = &p[pi..];
-        while si <= s.len() {
-          if rec(rest, &s[si..]) {
-            return true;
-          }
-          si += 1;
-        }
-        return false;
-      } else {
-        if si >= s.len() || p[pi] != s[si] {
-          return false;
-        }
-        pi += 1;
-        si += 1;
-      }
-    }
-    si == s.len()
-  }
-  rec(p, s)
-}
+pub use crate::endpoint::{glob_match, match_endpoint_rule, Endpoint, EndpointRule};
 
 pub struct RequestCtx<'a> {
   pub endpoint: Endpoint,
@@ -469,55 +304,6 @@ pub type OutboundCapture = Arc<OnceLock<crate::db::OutboundSnapshot>>;
 
 pub fn new_outbound_capture() -> OutboundCapture {
   Arc::new(OnceLock::new())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderRequestKind {
-  Operation(Endpoint),
-  Models,
-  Opaque,
-}
-
-impl ProviderRequestKind {
-  pub fn endpoint(self) -> Option<Endpoint> {
-    match self {
-      Self::Operation(endpoint) => Some(endpoint),
-      Self::Models | Self::Opaque => None,
-    }
-  }
-
-  pub fn from_provider_path(path: &str) -> Self {
-    let path_only = path.split('?').next().unwrap_or(path).trim_end_matches('/');
-    if path_only.ends_with("/models") {
-      Self::Models
-    } else {
-      Self::Opaque
-    }
-  }
-}
-
-pub struct HeaderPatchCtx<'a> {
-  pub request_kind: ProviderRequestKind,
-  pub body: &'a Value,
-  pub bearer_token: Option<&'a str>,
-  pub content_encoding: Option<&'a str>,
-  pub stream: bool,
-  pub initiator: &'a str,
-  pub inbound_headers: &'a HeaderMap,
-  pub vars: &'a TemplateVars,
-  pub agent_id: &'a AgentId,
-}
-
-impl HeaderPatchCtx<'_> {
-  pub fn endpoint(&self) -> Option<Endpoint> {
-    self.request_kind.endpoint()
-  }
-
-  pub fn operation_endpoint(&self) -> Endpoint {
-    self
-      .endpoint()
-      .expect("generation endpoint required for operation header patching")
-  }
 }
 
 #[async_trait]
@@ -632,13 +418,13 @@ pub trait Provider: Send + Sync {
     // Correlation is chosen before provider-specific normalization. Some
     // normalizers rebuild an allowlisted map, but they must not replace or
     // discard the pipeline's authoritative request id.
-    let request_id = headers.get(&tokn_headers::keys::X_REQUEST_ID).cloned();
+    let request_id = headers.get(&crate::headers::keys::X_REQUEST_ID).cloned();
     self.inject_credentials(headers, ctx)?;
     if let Some(new_headers) = self.normalize_headers(headers, ctx)? {
       *headers = new_headers;
     }
     if let Some(request_id) = request_id {
-      headers.insert(&tokn_headers::keys::X_REQUEST_ID, request_id);
+      headers.insert(&crate::headers::keys::X_REQUEST_ID, request_id);
     }
     Ok(())
   }
@@ -925,7 +711,7 @@ mod tests {
     let mut provider = stub(None, &[]);
     provider.rebuild_headers = true;
     let mut headers = HeaderMap::new();
-    headers.insert(&tokn_headers::keys::X_REQUEST_ID, "req-provider");
+    headers.insert(&crate::headers::keys::X_REQUEST_ID, "req-provider");
     headers.insert("x-discarded", "discarded");
 
     provider
@@ -947,7 +733,7 @@ mod tests {
 
     assert_eq!(
       headers
-        .get(&tokn_headers::keys::X_REQUEST_ID)
+        .get(&crate::headers::keys::X_REQUEST_ID)
         .map(|value| value.as_str()),
       Some("req-provider")
     );

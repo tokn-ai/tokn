@@ -2,13 +2,16 @@
 //!
 //! At build time we embed `https://models.dev/api.json`; at runtime we
 //! prefer a disk cache and publish validated refreshes without restarting. See
-//! [`loader::global`] for resolution order. See [`mapping::to_model_info`]
-//! for the conversion to our internal [`crate::provider::ModelInfo`].
+//! the standard loader for resolution order. See the standard mapping module
+//! for conversion to internal provider metadata.
 
+#[cfg(feature = "std")]
 pub mod loader;
+#[cfg(feature = "std")]
 pub mod mapping;
 pub mod schema;
 
+#[cfg(feature = "std")]
 use tokn_core::provider::{Endpoint, ModelInfo};
 
 /// Build our internal model list for a given models.dev provider id.
@@ -16,6 +19,7 @@ use tokn_core::provider::{Endpoint, ModelInfo};
 /// Returns an empty Vec when the provider isn't in the catalogue (e.g. the
 /// id changed in models.dev or the embedded snapshot is older than the
 /// caller). Providers should treat this as best-effort metadata.
+#[cfg(feature = "std")]
 pub fn default_models_for(provider_id: &str) -> Vec<ModelInfo> {
   let cat = loader::global();
   let Some(p) = cat.get(provider_id) else {
@@ -28,6 +32,7 @@ pub fn default_models_for(provider_id: &str) -> Vec<ModelInfo> {
 /// key is absent. Useful for enriching upstream model listings with catalogue
 /// metadata. Neither source guarantees that a particular account can use a model.
 #[allow(dead_code)]
+#[cfg(feature = "std")]
 pub fn model_info_for(provider_id: &str, model_id: &str) -> Option<ModelInfo> {
   loader::global()
     .get(provider_id)?
@@ -39,11 +44,12 @@ pub fn model_info_for(provider_id: &str, model_id: &str) -> Option<ModelInfo> {
 /// Return the endpoint implied by models.dev's provider adapter metadata.
 /// This reads the current in-process snapshot, so a periodic catalogue refresh
 /// can change routing without restarting the gateway.
+#[cfg(feature = "std")]
 pub fn endpoint_for_model(provider_id: &str, model_id: &str) -> Option<Endpoint> {
   loader::global().get(provider_id)?.endpoint_for_model(model_id)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

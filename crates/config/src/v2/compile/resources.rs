@@ -3,8 +3,13 @@ use crate::v2::{
   RawProviderSelector, RawQualificationNamespace, RawRelayCredentials, RawRelayDestination, RawRetryPolicy, RawRoute,
   RawRouteRetry, RawWireIdentity,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use alloc::{
+  boxed::Box,
+  collections::{BTreeMap, BTreeSet},
+  string::{String, ToString},
+  vec::Vec,
+};
+use core::time::Duration;
 use tokn_core::provider::{official_provider_preset, OFFICIAL_PROVIDER_PRESETS};
 use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, CleartextHttpPolicy};
 use tokn_policy::{
@@ -652,5 +657,5 @@ fn duplicate_value(location: String, value: &str) -> CompileError {
   invalid_value(location, format!("contains duplicate value `{value}`"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;

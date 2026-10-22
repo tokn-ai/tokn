@@ -1,28 +1,30 @@
+#[cfg(feature = "std")]
+use crate::ListenerId;
 use crate::{
-  AccountPoolId, BindingId, CanonicalHost, DriverId, ListenerId, OperationId, ProfileId, ProfilePlan, ProviderId,
-  RetryPolicyId, RetryPolicyPlan, RouteId, RoutePlan,
+  AccountPoolId, BindingId, CanonicalHost, DriverId, OperationId, ProfileId, ProfilePlan, ProviderId, RetryPolicyId,
+  RetryPolicyPlan, RouteId, RoutePlan,
 };
-use smol_str::SmolStr;
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::net::SocketAddr;
-use std::num::NonZeroUsize;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use alloc::string::String;
+#[cfg(test)]
+use alloc::string::ToString;
+use core::fmt;
+#[cfg(feature = "std")]
+use core::net::SocketAddr;
+#[cfg(feature = "std")]
+use core::num::NonZeroUsize;
+use core::time::Duration;
+#[cfg(feature = "std")]
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use tokn_core::types::SmolStr;
 
 pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize = 10 * 1024 * 1024;
 
-/// A configuration-compiled gateway plan.
-///
-/// References within the configuration and all raw syntax are validated
-/// before this value is constructed. A runtime linker must still resolve
-/// driver catalogue defaults and runtime-owned names (such as operations
-/// and wire identities), then reject an unusable plan before listeners bind.
-/// Runtime crates consume this graph without knowing how it was represented
-/// on disk.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GatewayPlan {
-  listeners: BTreeMap<ListenerId, ListenerPlan>,
+/// Validated execution resources independent of gateway hosting.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExecutionPlan {
   profiles: BTreeMap<ProfileId, ProfilePlan>,
   routes: BTreeMap<RouteId, RoutePlan>,
   retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
@@ -30,6 +32,63 @@ pub struct GatewayPlan {
   providers: BTreeMap<ProviderId, ProviderPlan>,
 }
 
+impl ExecutionPlan {
+  pub fn new(
+    profiles: BTreeMap<ProfileId, ProfilePlan>,
+    routes: BTreeMap<RouteId, RoutePlan>,
+    retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
+    account_pools: BTreeMap<AccountPoolId, AccountPoolPlan>,
+    providers: BTreeMap<ProviderId, ProviderPlan>,
+  ) -> Self {
+    Self {
+      profiles,
+      routes,
+      retry_policies,
+      account_pools,
+      providers,
+    }
+  }
+  pub fn profiles(&self) -> &BTreeMap<ProfileId, ProfilePlan> {
+    &self.profiles
+  }
+  pub fn profile(&self, id: &ProfileId) -> Option<&ProfilePlan> {
+    self.profiles.get(id)
+  }
+  pub fn routes(&self) -> &BTreeMap<RouteId, RoutePlan> {
+    &self.routes
+  }
+  pub fn route(&self, id: &RouteId) -> Option<&RoutePlan> {
+    self.routes.get(id)
+  }
+  pub fn retry_policies(&self) -> &BTreeMap<RetryPolicyId, RetryPolicyPlan> {
+    &self.retry_policies
+  }
+  pub fn retry_policy(&self, id: &RetryPolicyId) -> Option<&RetryPolicyPlan> {
+    self.retry_policies.get(id)
+  }
+  pub fn account_pools(&self) -> &BTreeMap<AccountPoolId, AccountPoolPlan> {
+    &self.account_pools
+  }
+  pub fn account_pool(&self, id: &AccountPoolId) -> Option<&AccountPoolPlan> {
+    self.account_pools.get(id)
+  }
+  pub fn providers(&self) -> &BTreeMap<ProviderId, ProviderPlan> {
+    &self.providers
+  }
+  pub fn provider(&self, id: &ProviderId) -> Option<&ProviderPlan> {
+    self.providers.get(id)
+  }
+}
+
+/// A configuration-compiled gateway plan; execution resources are shared with SDKs.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GatewayPlan {
+  listeners: BTreeMap<ListenerId, ListenerPlan>,
+  execution: ExecutionPlan,
+}
+
+#[cfg(feature = "std")]
 impl GatewayPlan {
   pub fn new(
     listeners: BTreeMap<ListenerId, ListenerPlan>,
@@ -41,75 +100,68 @@ impl GatewayPlan {
   ) -> Self {
     Self {
       listeners,
-      profiles,
-      routes,
-      retry_policies,
-      account_pools,
-      providers,
+      execution: ExecutionPlan::new(profiles, routes, retry_policies, account_pools, providers),
     }
   }
-
   pub fn listeners(&self) -> &BTreeMap<ListenerId, ListenerPlan> {
     &self.listeners
   }
-
   pub fn listener(&self, id: &ListenerId) -> Option<&ListenerPlan> {
     self.listeners.get(id)
   }
-
+  pub fn execution(&self) -> &ExecutionPlan {
+    &self.execution
+  }
+  pub fn into_execution(self) -> ExecutionPlan {
+    self.execution
+  }
   pub fn profiles(&self) -> &BTreeMap<ProfileId, ProfilePlan> {
-    &self.profiles
+    self.execution.profiles()
   }
-
   pub fn profile(&self, id: &ProfileId) -> Option<&ProfilePlan> {
-    self.profiles.get(id)
+    self.execution.profile(id)
   }
-
   pub fn routes(&self) -> &BTreeMap<RouteId, RoutePlan> {
-    &self.routes
+    self.execution.routes()
   }
-
   pub fn route(&self, id: &RouteId) -> Option<&RoutePlan> {
-    self.routes.get(id)
+    self.execution.route(id)
   }
-
   pub fn retry_policies(&self) -> &BTreeMap<RetryPolicyId, RetryPolicyPlan> {
-    &self.retry_policies
+    self.execution.retry_policies()
   }
-
   pub fn retry_policy(&self, id: &RetryPolicyId) -> Option<&RetryPolicyPlan> {
-    self.retry_policies.get(id)
+    self.execution.retry_policy(id)
   }
-
   pub fn account_pools(&self) -> &BTreeMap<AccountPoolId, AccountPoolPlan> {
-    &self.account_pools
+    self.execution.account_pools()
   }
-
   pub fn account_pool(&self, id: &AccountPoolId) -> Option<&AccountPoolPlan> {
-    self.account_pools.get(id)
+    self.execution.account_pool(id)
   }
-
   pub fn providers(&self) -> &BTreeMap<ProviderId, ProviderPlan> {
-    &self.providers
+    self.execution.providers()
   }
-
   pub fn provider(&self, id: &ProviderId) -> Option<&ProviderPlan> {
-    self.providers.get(id)
+    self.execution.provider(id)
   }
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListenerKind {
   LlmApi,
   ForwardProxy,
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ListenerPlan {
   LlmApi(LlmApiListenerPlan),
   ForwardProxy(ForwardProxyListenerPlan),
 }
 
+#[cfg(feature = "std")]
 impl ListenerPlan {
   pub fn kind(&self) -> ListenerKind {
     match self {
@@ -133,6 +185,7 @@ impl ListenerPlan {
   }
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LlmApiListenerPlan {
   bind: SocketAddr,
@@ -140,6 +193,7 @@ pub struct LlmApiListenerPlan {
   cors: crate::CorsPlan,
 }
 
+#[cfg(feature = "std")]
 impl LlmApiListenerPlan {
   pub fn new(bind: SocketAddr, client_auth: ClientAuthPlan) -> Self {
     Self {
@@ -169,6 +223,7 @@ impl LlmApiListenerPlan {
   }
 }
 
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForwardProxyListenerPlan {
   bind: SocketAddr,
@@ -181,6 +236,7 @@ pub struct ForwardProxyListenerPlan {
   tls: Option<TlsPlan>,
 }
 
+#[cfg(feature = "std")]
 impl ForwardProxyListenerPlan {
   pub fn new(
     bind: SocketAddr,
@@ -256,11 +312,13 @@ pub enum ClientAuthPlan {
 
 /// Material needed to terminate forward-proxy TLS connections selected for
 /// [`ConnectAction::Intercept`].
+#[cfg(feature = "std")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsPlan {
   ca_dir: PathBuf,
 }
 
+#[cfg(feature = "std")]
 impl TlsPlan {
   pub fn new(ca_dir: PathBuf) -> Self {
     Self { ca_dir }
@@ -370,7 +428,7 @@ impl fmt::Display for InvalidSubdomainSuffix {
   }
 }
 
-impl std::error::Error for InvalidSubdomainSuffix {}
+impl core::error::Error for InvalidSubdomainSuffix {}
 
 /// Error returned when a binding tries to act as an implicit catch-all.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,7 +442,7 @@ impl fmt::Display for EmptyHttpMatch {
   }
 }
 
-impl std::error::Error for EmptyHttpMatch {}
+impl core::error::Error for EmptyHttpMatch {}
 
 /// Match dimensions are combined with AND. Values within one dimension are
 /// combined with OR. An empty dimension is unconstrained.
@@ -482,7 +540,7 @@ impl fmt::Display for EmptyConnectMatch {
   }
 }
 
-impl std::error::Error for EmptyConnectMatch {}
+impl core::error::Error for EmptyConnectMatch {}
 
 /// CONNECT match dimensions are combined with AND. Values within one
 /// dimension are combined with OR. An empty dimension is unconstrained.
@@ -676,6 +734,7 @@ impl ProviderPlan {
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(feature = "std")]
   use crate::{
     ManagedRetry, ManagedRoute, ManagedTarget, ModelSelector, OperationPolicy, ProviderSelector, WireIdentity,
   };
@@ -700,6 +759,7 @@ mod tests {
     HostPattern::subdomains_of(host(value)).unwrap()
   }
 
+  #[cfg(feature = "std")]
   fn http_matcher(host: &str) -> HttpMatch {
     HttpMatch::new(
       vec![exact_host(host)].into_boxed_slice(),
@@ -710,6 +770,7 @@ mod tests {
     .unwrap()
   }
 
+  #[cfg(feature = "std")]
   #[test]
   fn forward_proxy_keeps_connect_and_http_decisions_separate() {
     let first_http = HttpBindingPlan::new(
@@ -871,6 +932,7 @@ mod tests {
     assert_eq!(provider.origins()[1].as_str(), "https://chatgpt.com");
   }
 
+  #[cfg(feature = "std")]
   #[test]
   fn gateway_plan_owns_the_compiled_graph() {
     let listener_id: ListenerId = id("api");

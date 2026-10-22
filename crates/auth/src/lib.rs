@@ -15,15 +15,25 @@
 //! lives in the consumer that already pulls in every provider — currently
 //! `gateway-cli::auth_registry`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
+#[cfg(feature = "std")]
 pub mod descriptor;
+#[cfg(feature = "std")]
 pub mod provider;
+#[cfg(feature = "std")]
 pub mod store;
 
+#[cfg(feature = "std")]
 pub use descriptor::{EndpointSpec, PathRewrite, ProviderDescriptor};
+#[cfg(feature = "std")]
 pub use provider::{
   default_import_from, AuthError, CredentialFlavor, CredentialResult, CredentialSource, CredentialSourceKind,
   DeviceCodeHandle, DeviceFlowOutcome, MeteredBucket, ProviderAuth, QuotaSnapshot, RefreshOutcome, Result, UsageBucket,
   VerifyOutcome,
 };
+#[cfg(feature = "std")]
 pub use store::{default_auth_path, AuthSource, AuthStore, AuthStoreLock};
 pub use tokn_core::account::{AccountConfig, AccountState, AccountTier};

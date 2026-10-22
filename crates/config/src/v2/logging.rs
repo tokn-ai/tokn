@@ -1,6 +1,29 @@
+#[cfg(feature = "std")]
 use crate::{LogFormat, LogTarget, LoggingConfig};
+use alloc::string::String;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "std")]
 use std::path::PathBuf;
+#[cfg(not(feature = "std"))]
+type PathBuf = String;
+#[cfg(not(feature = "std"))]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+  Pretty,
+  #[default]
+  Compact,
+  Json,
+}
+#[cfg(not(feature = "std"))]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogTarget {
+  Stderr,
+  File,
+  #[default]
+  Both,
+}
 
 /// Strict v2 logging syntax with the same defaults as legacy logging.
 ///
@@ -19,10 +42,25 @@ pub struct RawLogging {
 
 impl Default for RawLogging {
   fn default() -> Self {
-    LoggingConfig::default().into()
+    #[cfg(feature = "std")]
+    {
+      LoggingConfig::default().into()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+      Self {
+        level: "info,tokn_router=info".into(),
+        format: LogFormat::default(),
+        target: LogTarget::default(),
+        dir: None,
+        ansi: true,
+        include_spans: false,
+      }
+    }
   }
 }
 
+#[cfg(feature = "std")]
 impl From<LoggingConfig> for RawLogging {
   fn from(config: LoggingConfig) -> Self {
     Self {
@@ -36,6 +74,7 @@ impl From<LoggingConfig> for RawLogging {
   }
 }
 
+#[cfg(feature = "std")]
 impl From<&RawLogging> for LoggingConfig {
   fn from(raw: &RawLogging) -> Self {
     Self {
@@ -49,7 +88,7 @@ impl From<&RawLogging> for LoggingConfig {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
   use crate::v2;

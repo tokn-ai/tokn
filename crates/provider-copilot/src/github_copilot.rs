@@ -14,8 +14,7 @@ use tokn_core::account::AccountConfig;
 use tokn_core::pipeline::InputTransformer;
 use tokn_core::provider::ProviderTarget;
 use tokn_core::upstream_url::CleartextHttpPolicy;
-use tokn_headers::keys::{ACCEPT, AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE};
-use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
+use tokn_headers::HeaderMap;
 use tracing::{debug, instrument};
 
 use crate::{
@@ -204,28 +203,12 @@ impl Provider for CopilotProvider {
     let token = ctx.bearer_token.ok_or_else(|| error::Error::Profiles {
       message: "missing copilot bearer token for header patch".to_string(),
     })?;
-    headers.insert(&AUTHORIZATION, HeaderValue::from_string(format!("Bearer {token}")));
+    crate::native::inject_credentials(headers, ctx.endpoint().unwrap_or(Endpoint::ChatCompletions), token);
     Ok(())
   }
 
   fn normalize_headers(&self, headers: &mut HeaderMap, ctx: &HeaderPatchCtx<'_>) -> Result<Option<HeaderMap>> {
-    headers.insert(
-      &ACCEPT,
-      HeaderValue::from_static(if ctx.stream {
-        "text/event-stream"
-      } else {
-        "application/json"
-      }),
-    );
-    headers.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(
-      HeaderName::new("x-initiator"),
-      HeaderValue::from_string(ctx.initiator.to_string()),
-    );
-    if let Some(encoding) = ctx.content_encoding {
-      headers.insert(&CONTENT_ENCODING, HeaderValue::from_string(encoding.to_string()));
-    }
-    Ok(None)
+    Ok(crate::native::normalize_headers(headers, ctx))
   }
 
   async fn list_models(&self, http: &reqwest::Client) -> Result<Value> {

@@ -1,7 +1,8 @@
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use alloc::collections::BTreeMap;
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
 
 const REQUEST_KEYS: &[&str] = &[
   "model",

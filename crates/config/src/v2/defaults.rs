@@ -1,6 +1,6 @@
 //! Opt-in authoring shorthand, expanded before the existing graph compiler.
 
-use std::borrow::Cow;
+use alloc::{borrow::Cow, string::String, vec::Vec};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,7 +116,7 @@ pub(super) fn source_error(raw: &RawConfig, mut error: CompileError) -> CompileE
   error
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
   use super::*;
 

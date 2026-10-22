@@ -2,11 +2,13 @@ use super::super::error::{ConvertError, Result};
 use super::super::ir::{IrDelta, IrResponse};
 use super::event::SseEvent;
 use crate::provider::Endpoint;
+use alloc::collections::BTreeMap;
+use alloc::{string::String, string::ToString, vec::Vec};
+#[cfg(feature = "std")]
 use bytes::Bytes;
-use eventsource_stream::Eventsource;
+#[cfg(feature = "std")]
 use futures_util::StreamExt;
 use serde_json::Value;
-use std::collections::BTreeMap;
 
 #[derive(Default)]
 struct ResponsesState {
@@ -343,45 +345,79 @@ impl ResponsesState {
   }
 }
 
+/// Accumulate a complete, bounded SSE body using the shared protocol framer.
+pub fn accumulate_slice(endpoint: Endpoint, body: &[u8], max_event_bytes: usize) -> Result<IrResponse> {
+  let mut accumulator = ResponseAccumulator::new(endpoint, max_event_bytes);
+  accumulator.push(body)?;
+  accumulator.finish()
+}
+
+struct ResponseAccumulator {
+  decoder: super::Decoder,
+  terminal: super::TerminalState,
+  accumulator: SseAccumulator,
+  done: bool,
+}
+
+impl ResponseAccumulator {
+  fn new(endpoint: Endpoint, max_event_bytes: usize) -> Self {
+    Self {
+      decoder: super::Decoder::new(max_event_bytes),
+      terminal: super::TerminalState::new(endpoint),
+      accumulator: SseAccumulator::new(endpoint),
+      done: false,
+    }
+  }
+
+  fn push(&mut self, body: &[u8]) -> Result<()> {
+    for &byte in body {
+      if self.done {
+        break;
+      }
+      let Some(record) = self
+        .decoder
+        .push(byte)
+        .map_err(|error| ConvertError::sse(error.to_string()))?
+      else {
+        continue;
+      };
+      let event = SseEvent::from(record);
+      let done = self.terminal.observe(&event)?;
+      if !event.is_done() {
+        let value = event
+          .json
+          .as_ref()
+          .ok_or_else(|| ConvertError::sse("expected JSON SSE payload"))?;
+        self.accumulator.push_value(value);
+      }
+      self.done = done;
+    }
+    Ok(())
+  }
+
+  fn finish(self) -> Result<IrResponse> {
+    self.terminal.finish()?;
+    Ok(self.accumulator.finish())
+  }
+}
+
+#[cfg(feature = "std")]
 pub async fn accumulate(endpoint: Endpoint, resp: reqwest::Response) -> Result<IrResponse> {
-  let mut acc = SseAccumulator::new(endpoint);
-  let mut stream = resp.bytes_stream().eventsource();
-  while let Some(item) = stream.next().await {
-    let ev = item.map_err(|e| ConvertError::sse(e.to_string()))?;
-    let event = SseEvent::from(ev);
-    if event.is_done() {
+  let mut accumulator = ResponseAccumulator::new(endpoint, usize::MAX);
+  let mut stream = resp.bytes_stream();
+  while let Some(chunk) = stream.next().await {
+    accumulator.push(&chunk.map_err(|error| ConvertError::sse(error.to_string()))?)?;
+    if accumulator.done {
       break;
     }
-    let value = event
-      .json
-      .as_ref()
-      .ok_or_else(|| ConvertError::sse("expected JSON SSE payload"))?;
-    acc.push_value(value);
   }
-  Ok(acc.finish())
+  accumulator.finish()
 }
 
 /// Accumulate a complete SSE body into the endpoint-neutral response IR.
-///
-/// This is useful when an upstream requires streaming but the downstream
-/// caller requested a buffered response.
+#[cfg(feature = "std")]
 pub async fn accumulate_bytes(endpoint: Endpoint, body: Bytes) -> Result<IrResponse> {
-  let mut acc = SseAccumulator::new(endpoint);
-  let source = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(body) });
-  let mut stream = Box::pin(source.eventsource());
-  while let Some(item) = stream.next().await {
-    let ev = item.map_err(|e| ConvertError::sse(e.to_string()))?;
-    let event = SseEvent::from(ev);
-    if event.is_done() {
-      break;
-    }
-    let value = event
-      .json
-      .as_ref()
-      .ok_or_else(|| ConvertError::sse("expected JSON SSE payload"))?;
-    acc.push_value(value);
-  }
-  Ok(acc.finish())
+  accumulate_slice(endpoint, &body, usize::MAX)
 }
 
 #[cfg(test)]

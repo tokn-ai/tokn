@@ -1,7 +1,11 @@
+#[cfg(feature = "std")]
 use crate::CorsConfig;
+use alloc::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "std")]
 use tokn_policy::CorsPlan;
 
+#[cfg(feature = "std")]
 use super::CompileError;
 
 /// Strict v2 CORS syntax; permissions and validation match legacy CORS.
@@ -13,6 +17,7 @@ pub struct RawCors {
   pub allowed_origins: Vec<String>,
 }
 
+#[cfg(feature = "std")]
 impl From<&CorsConfig> for RawCors {
   fn from(config: &CorsConfig) -> Self {
     Self {
@@ -23,6 +28,7 @@ impl From<&CorsConfig> for RawCors {
   }
 }
 
+#[cfg(feature = "std")]
 impl RawCors {
   /// Validate even disabled policy so enabling it later cannot expose bad origins.
   pub(super) fn compile(&self, listener_id: &str) -> Result<CorsPlan, CompileError> {

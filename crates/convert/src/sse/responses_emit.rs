@@ -6,7 +6,9 @@
 
 use super::event::SseEvent;
 use crate::ir::{IrDelta, Usage};
+use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Value};
+#[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug)]
@@ -69,10 +71,18 @@ pub struct ResponsesEmitter {
 
 impl ResponsesEmitter {
   pub fn new(id: String, model: String) -> Self {
+    #[cfg(feature = "std")]
     let created_at = SystemTime::now()
       .duration_since(UNIX_EPOCH)
       .map(|d| d.as_secs())
       .unwrap_or(0);
+    #[cfg(not(feature = "std"))]
+    let created_at = 0;
+    Self::with_created_at(id, model, created_at)
+  }
+
+  /// Construct an emitter using an application-supplied Unix timestamp.
+  pub fn with_created_at(id: String, model: String, created_at: u64) -> Self {
     Self {
       id,
       model,

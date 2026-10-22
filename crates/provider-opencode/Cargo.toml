@@ -8,18 +8,36 @@ homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+std = [
+  "tokn-core/std",
+  "tokn-headers/std",
+  "tokn-auth?/std",
+  "tokn-catalogue?/std",
+  "serde/std",
+  "serde_json/std",
+  "dep:tokn-auth",
+  "dep:tokn-catalogue",
+  "dep:async-trait",
+  "dep:reqwest",
+  "dep:time",
+  "dep:toml",
+  "dep:tracing",
+]
+
 [dependencies]
-tokn-core = { workspace = true }
-tokn-auth = { workspace = true }
-tokn-catalogue = { workspace = true }
-tokn-headers = { workspace = true }
-async-trait = { workspace = true }
-reqwest = { workspace = true }
+tokn-core = { workspace = true, default-features = false }
+tokn-auth = { workspace = true, optional = true }
+tokn-catalogue = { workspace = true, optional = true }
+tokn-headers = { workspace = true, default-features = false }
+async-trait = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-time = { workspace = true }
-toml = { workspace = true }
-tracing = { workspace = true }
+time = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokn-mock-server = { workspace = true }

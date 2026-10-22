@@ -1,7 +1,9 @@
 use crate::keys::X_CODEX_TURN_METADATA;
 use crate::{HeaderMap, TemplateVars};
+#[cfg(test)]
+use alloc::string::ToString;
 use serde::Deserialize;
-use smol_str::SmolStr;
+use tokn_core::types::SmolStr;
 
 pub const SESSION_ID_HEADERS: &[&str] = &[
   "x-session-id",
