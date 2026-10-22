@@ -294,6 +294,21 @@ default) are omitted entirely; bodies at or below the limit are saved in full. R
 metadata, headers, status, and errors are still recorded. This capture limit is
 independent of request admission limits.
 
+Configure the capture threshold in bytes using the matching config format.
+Omitting the setting defaults to 10 MiB (`10485760` bytes).
+
+```toml
+# Legacy configuration
+[db]
+body_max_bytes = 10485760
+```
+
+```toml
+# Native v2 configuration
+[service.persistence]
+body_max_bytes = 10485760
+```
+
 Requests rejected before the pipeline starts are also saved as failed records,
 including their request ID, status, error, timing, URL, and redacted headers.
 Rejected request bodies are omitted.

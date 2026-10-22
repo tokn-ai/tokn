@@ -668,6 +668,7 @@ pub struct DbConfig {
   pub record_sessions: bool,
   #[serde(default = "default_true")]
   pub record_request_bodies: bool,
+  /// Maximum stored body size in bytes (default: 10 MiB). Larger bodies are omitted entirely.
   #[serde(default = "default_body_max_bytes")]
   pub body_max_bytes: usize,
   #[serde(default = "default_write_queue_capacity")]
