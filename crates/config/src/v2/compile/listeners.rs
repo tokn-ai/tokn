@@ -157,7 +157,7 @@ pub(super) fn compile_listeners(
         client_auth,
         tokn_policy::CorsPlan::default(),
         *allow_insecure_public,
-        NonZeroUsize::new(*request_body_max_bytes),
+        NonZeroUsize::new(request_body_max_bytes.unwrap_or(usize::MAX)),
         Some(default_http_action),
         Some(compile_connect_action(*default_connect)),
         resolve_ca_dir(ca_dir.as_deref(), source, raw_id)?,

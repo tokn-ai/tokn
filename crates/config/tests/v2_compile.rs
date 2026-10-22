@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokn_config::v2::{
   compile, decode, load, parse, parse_config, CompileError, Error, DEFAULT_ARCHIVE_AFTER_DAYS, DEFAULT_BODY_MAX_BYTES,
-  DEFAULT_MAX_DECODED_BYTES, DEFAULT_MAX_WIRE_BYTES, DEFAULT_PRUNE_AFTER_DAYS, DEFAULT_WRITE_QUEUE_CAPACITY,
+  DEFAULT_PRUNE_AFTER_DAYS, DEFAULT_WRITE_QUEUE_CAPACITY,
 };
 use tokn_policy::{ConnectAction, ListenerPlan, ManagedRetry, ProviderId, RetryPolicyId, RouteKind, RoutePlan};
 
@@ -178,19 +178,14 @@ fn service_defaults_match_v2_operational_defaults() {
   assert_eq!(service.outbound().proxy_url(), None);
   assert!(service.outbound().no_proxy().is_empty());
   assert!(!service.outbound().use_system_proxy());
-  assert_eq!(
-    service.request_limits().max_wire_bytes(),
-    DEFAULT_MAX_WIRE_BYTES as usize
-  );
-  assert_eq!(
-    service.request_limits().max_decoded_bytes(),
-    DEFAULT_MAX_DECODED_BYTES as usize
-  );
+  assert_eq!(service.request_limits().max_wire_bytes(), usize::MAX);
+  assert_eq!(service.request_limits().max_decoded_bytes(), usize::MAX);
   let persistence = service.persistence();
   assert!(persistence.enabled());
   assert!(persistence.record_sessions());
   assert!(persistence.record_request_bodies());
   assert_eq!(persistence.body_max_bytes(), DEFAULT_BODY_MAX_BYTES as usize);
+  assert_eq!(persistence.body_max_bytes(), 10 * 1024 * 1024);
   assert_eq!(
     persistence.write_queue_capacity(),
     DEFAULT_WRITE_QUEUE_CAPACITY as usize

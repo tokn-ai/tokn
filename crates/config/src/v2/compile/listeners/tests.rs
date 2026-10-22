@@ -707,7 +707,7 @@ default_connect = "intercept"
 }
 
 #[test]
-fn forward_proxy_request_body_limit_has_a_default_and_must_be_positive() {
+fn forward_proxy_request_body_limit_is_optional_and_explicit_limits_must_be_positive() {
   let defaulted = parse_config(
     r#"
 schema_version = 2
@@ -724,10 +724,15 @@ default_connect = "reject"
   let ListenerPlan::ForwardProxy(listener) = &listeners["proxy"] else {
     panic!("expected forward proxy listener");
   };
-  assert_eq!(
-    listener.request_body_max_bytes(),
-    crate::v2::raw::DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES
-  );
+  assert_eq!(listener.request_body_max_bytes(), usize::MAX);
+  assert!(matches!(
+    defaulted.listeners["proxy"],
+    RawListener::ForwardProxy {
+      request_body_max_bytes: None,
+      ..
+    }
+  ));
+  assert!(!toml::to_string(&defaulted).unwrap().contains("request_body_max_bytes"));
 
   let configured = parse_config(
     r#"
@@ -747,6 +752,9 @@ default_connect = "reject"
     panic!("expected forward proxy listener");
   };
   assert_eq!(listener.request_body_max_bytes(), 4096);
+  assert!(toml::to_string(&configured)
+    .unwrap()
+    .contains("request_body_max_bytes = 4096"));
 
   let zero = parse_config(
     r#"

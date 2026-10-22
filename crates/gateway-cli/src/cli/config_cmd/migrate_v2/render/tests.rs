@@ -57,6 +57,9 @@ fn default_migration_is_compact_and_owns_its_pool_without_api_bindings() {
   assert!(compact.contains("model = { kind = \"capability\" }"));
   assert!(compact.contains("retry = { kind = \"recoverable\", policy = \"legacy-recoverable\" }"));
   assert!(!compact.contains("not-a-real-secret"));
+  assert!(!expanded.contains("max_wire_bytes"));
+  assert!(!expanded.contains("max_decoded_bytes"));
+  assert!(expanded.contains("body_max_bytes = 10485760"));
 }
 
 #[test]
@@ -168,7 +171,7 @@ fn service_customizations_and_disabled_features_remain_explicit() {
   )
   .unwrap();
   raw.service.outbound = toml::from_str("proxy_url = 'http://127.0.0.1:7890'\nno_proxy = ['localhost']").unwrap();
-  raw.service.request_limits.max_wire_bytes = 12345;
+  raw.service.request_limits.max_wire_bytes = Some(12345);
   raw.service.models.enabled = false;
   raw.service.models.upstream_refresh_seconds = 600;
   raw.service.persistence = toml::from_str(
@@ -380,6 +383,34 @@ default_connect = "reject"
     assert!(output.contains("ports = [\n  443,\n  8443,\n]"));
   }
   assert!(compact.contains("default_connect = \"reject\""));
+}
+
+#[test]
+fn explicit_ten_mebibyte_admission_limits_are_not_omitted_as_capture_defaults() {
+  let mut raw = native_config();
+  raw.service.request_limits.max_wire_bytes = Some(10 * 1024 * 1024);
+  raw.service.request_limits.max_decoded_bytes = Some(10 * 1024 * 1024);
+  raw.listeners.insert(
+    "proxy".into(),
+    toml::from_str(
+      r#"
+kind = "forward_proxy"
+bind = "127.0.0.1:4142"
+client_auth = "none"
+request_body_max_bytes = 10485760
+default_http_action = { kind = "reject" }
+default_connect = "reject"
+"#,
+    )
+    .unwrap(),
+  );
+
+  let (compact, expanded) = assert_equivalent(&raw);
+  for output in [&compact, &expanded] {
+    assert!(output.contains("max_wire_bytes = 10485760"));
+    assert!(output.contains("max_decoded_bytes = 10485760"));
+    assert!(output.contains("request_body_max_bytes = 10485760"));
+  }
 }
 
 #[test]
