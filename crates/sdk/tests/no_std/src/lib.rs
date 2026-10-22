@@ -7,7 +7,8 @@ extern crate alloc;
 mod scenarios;
 pub use scenarios::{
   buffered_round_trip, configured_client_relay, configured_provider_policies, configured_relay_policies,
-  configured_status_policy, configured_transport_encoding, cross_format_round_trip, retry_fallback_affinity,
+  configured_status_policy, configured_transport_encoding, cross_format_round_trip,
+  response_decode_failure_does_not_retry, retry_fallback_affinity, retry_schedule_and_exhaustion,
   stream_errors_and_cancellation, streaming_round_trip,
 };
 
@@ -49,6 +50,14 @@ mod tests {
   #[test]
   fn shared_retry_fallback_and_affinity() {
     super::retry_fallback_affinity();
+  }
+  #[test]
+  fn shared_retry_schedule_and_exhaustion() {
+    super::retry_schedule_and_exhaustion();
+  }
+  #[test]
+  fn response_decode_failure_does_not_retry() {
+    super::response_decode_failure_does_not_retry();
   }
   #[test]
   fn stream_errors_and_borrow_release() {

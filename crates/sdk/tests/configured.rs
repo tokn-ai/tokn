@@ -19,6 +19,14 @@ fn shared_retry_fallback_and_affinity() {
   scenarios::retry_fallback_affinity();
 }
 #[test]
+fn shared_retry_schedule_and_exhaustion() {
+  scenarios::retry_schedule_and_exhaustion();
+}
+#[test]
+fn response_decode_failure_does_not_retry() {
+  scenarios::response_decode_failure_does_not_retry();
+}
+#[test]
 fn stream_errors_and_borrow_release() {
   scenarios::stream_errors_and_cancellation();
 }

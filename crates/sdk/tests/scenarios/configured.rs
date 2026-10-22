@@ -198,6 +198,15 @@ fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
   .unwrap();
   tokn_sdk::config::v2::compile_execution(&raw).unwrap()
 }
+fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionPlan {
+  let raw = serde_json::from_value(json!({
+    "schema_version":2,
+    "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},
+    "retry_policies":{"retry":{"max_retries":max_retries,"initial_backoff_ms":initial_backoff_ms}},
+    "providers":{"upstream":{"driver":"openai","base_url":"https://example.com/v1"}}
+  })).unwrap();
+  tokn_sdk::config::v2::compile_execution(&raw).unwrap()
+}
 fn account_config(id: &str, key: &str, tier: &str) -> AccountConfig {
   serde_json::from_value(json!({"id":id,"provider":"upstream","api_key":key,"tier":tier})).unwrap()
 }
@@ -378,13 +387,6 @@ pub fn cross_format_round_trip() {
 
 /// Retry timing, fallback tiers and committed affinity all use the configured pool.
 pub fn retry_fallback_affinity() {
-  let raw=serde_json::from_value(json!({
-    "schema_version":2,
-    "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},
-    "retry_policies":{"retry":{"max_retries":1,"initial_backoff_ms":2}},
-    "providers":{"upstream":{"driver":"openai","base_url":"https://example.com/v1"}}
-  })).unwrap();
-  let plan = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
   let sent = RefCell::new(Vec::new());
   let runtime = TestRuntime::default();
   let trace = runtime.clone();
@@ -399,7 +401,7 @@ pub fn retry_fallback_affinity() {
   ];
   let client = Client::from_platform(
     Injected::new(
-      plan,
+      retry_plan(1, 2),
       vec![
         account_config("primary", "primary-key", "active"),
         account_config("backup", "backup-key", "fallback"),
@@ -436,6 +438,107 @@ pub fn retry_fallback_affinity() {
     && event.attempt == 1
     && event.stage == "completed"
     && event.success == Some(true)));
+}
+
+/// Recoverable status and transport failures use the same retry budget and
+/// exponential schedule, including immediate retries without timer calls.
+pub fn retry_schedule_and_exhaustion() {
+  for initial_backoff_ms in [2, 0] {
+    let sent = RefCell::new(Vec::new());
+    let runtime = TestRuntime::default();
+    let trace = runtime.clone();
+    let replies = [503, 0, 502].map(|status| Reply {
+      status,
+      content_type: "application/json",
+      bytes: br#"{"error":{"message":"retry exhausted"}}"#,
+    });
+    let client = Client::from_platform(
+      Injected::new(
+        retry_plan(2, initial_backoff_ms),
+        vec![
+          account_config("primary", "primary-key", "active"),
+          account_config("secondary", "secondary-key", "active"),
+          account_config("backup", "backup-key", "fallback"),
+        ],
+        MemoryTransport::new(&sent, replies),
+        runtime,
+      )
+      .unwrap(),
+    );
+    let error = run(
+      client
+        .chat_completions()
+        .create_with(&chat(), RequestOptions::default().with_request_id("exhausted-request")),
+    )
+    .unwrap_err();
+    assert_eq!(error.stage, "send");
+    assert!(error.recoverable);
+    assert!(error.message.contains("upstream 502"));
+    let sent = sent.borrow();
+    let credentials: Vec<_> = sent
+      .iter()
+      .map(|request| request.headers.get("authorization").unwrap().as_str())
+      .collect();
+    assert_eq!(
+      credentials,
+      ["Bearer primary-key", "Bearer secondary-key", "Bearer backup-key"]
+    );
+    for request in sent.iter() {
+      assert_eq!(request.url, "https://example.com/v1/chat/completions");
+      assert_eq!(
+        request.headers.get("x-request-id").unwrap().as_str(),
+        "exhausted-request"
+      );
+      assert_eq!(request.body, sent[0].body);
+    }
+    let trace = trace.0.borrow();
+    let expected_sleeps = if initial_backoff_ms == 0 {
+      vec![]
+    } else {
+      vec![Duration::from_millis(2), Duration::from_millis(4)]
+    };
+    assert_eq!(trace.sleeps, expected_sleeps);
+    let failed_attempts: Vec<_> = trace
+      .events
+      .iter()
+      .filter(|event| event.stage == "completed")
+      .map(|event| {
+        assert_eq!(event.request_id, "exhausted-request");
+        assert_eq!(event.success, Some(false));
+        event.attempt
+      })
+      .collect();
+    assert_eq!(failed_attempts, [0, 1, 2]);
+  }
+}
+
+/// A successful send ends replay eligibility even when response decoding fails.
+pub fn response_decode_failure_does_not_retry() {
+  let sent = RefCell::new(Vec::new());
+  let runtime = TestRuntime::default();
+  let trace = runtime.clone();
+  let client = Client::from_platform(
+    Injected::new(
+      retry_plan(2, 2),
+      vec![account_config("primary", "primary-key", "active")],
+      MemoryTransport::new(&sent, [Reply::json(b"invalid JSON"), Reply::json(CHAT_JSON)]),
+      runtime,
+    )
+    .unwrap(),
+  );
+  let error = run(client.chat_completions().create(&chat())).unwrap_err();
+  assert_eq!(error.stage, "convert_response");
+  assert!(!error.recoverable);
+  assert_eq!(sent.borrow().len(), 1);
+  assert!(trace.0.borrow().sleeps.is_empty());
+
+  // The failed response releases the transport and does not cool the account.
+  run(client.chat_completions().create(&chat())).unwrap();
+  assert_eq!(sent.borrow().len(), 2);
+  assert_eq!(
+    sent.borrow()[1].headers.get("authorization").unwrap().as_str(),
+    "Bearer primary-key"
+  );
 }
 
 /// EOF and event limits are errors, and dropping a stream releases the borrowed session.
@@ -704,12 +807,6 @@ pub fn configured_client_relay() {
 /// permanent, all 5xx statuses are recoverable, and redirects reach decoding.
 pub fn configured_status_policy() {
   for (status, expected_sends) in [(429, 1), (501, 2), (302, 1)] {
-    let raw=serde_json::from_value(json!({
-      "schema_version":2,
-      "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},
-      "retry_policies":{"retry":{"max_retries":1,"initial_backoff_ms":1}},
-      "providers":{"upstream":{"driver":"openai","base_url":"https://example.com/v1"}}
-    })).unwrap();
     let sent = RefCell::new(Vec::new());
     let replies = [
       Reply {
@@ -726,7 +823,7 @@ pub fn configured_status_policy() {
     ];
     let client = Client::from_platform(
       Injected::new(
-        tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
+        retry_plan(1, 1),
         vec![
           account_config("primary", "primary-key", "active"),
           account_config("backup", "backup-key", "fallback"),

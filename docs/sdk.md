@@ -200,12 +200,31 @@ selection in `tokn-accounts`:
 Standard provider objects, refreshable model caches, and injected native driver
 capabilities remain platform adapters. Routing parity depends on equivalent
 plans, accounts, capability inventories, and pool state. The injected executor
-accepts v2 configuration only. The default standard SDK still loads legacy configuration and retains its
-older routing behavior; legacy routing is not available in `no_std`.
+accepts v2 configuration only. The default standard SDK still loads legacy
+configuration and retains its older routing behavior; legacy routing is not available in `no_std`.
+
+Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
+The v2 gateway and injected executor resolve named policies through `from_route`;
+standard pipelines keep the existing `RetryPolicy::new` and `safe_methods` APIs.
+Both sessions supply error facts and the transport method to `next_delay`:
+
+- Only recoverable send failures can replay; deliberate stops and later response
+  or stream failures do not replay a request.
+- The retry limit counts additional attempts. Backoff doubles from the configured
+  initial delay; a zero delay skips the timer.
+- Safe-method policies allow only GET, HEAD, OPTIONS, and TRACE. Injected LLM API
+  calls use POST, so account relays require an explicit buffered policy to replay.
+- The shared driver resolves an account again for every retry. Account cooldown
+  still applies to recoverable send failures even when retries are disabled.
+
+Timers and concrete transport-error classification remain platform services.
+HTTP status handling is unchanged: managed and account-credential API requests
+classify failures, while client-credential API relays and v2 forward-proxy relays
+forward received statuses. Forwarding an HTTP error does not itself trigger replay.
 
 The standard and injected sessions still implement their stages separately.
-They reuse provider preparation helpers, JSON conversion, and SSE primitives,
-but complete retry, response, and event behavior is not yet unified.
+They reuse provider preparation helpers, JSON conversion, and SSE primitives;
+send-result feedback, response handling, and event delivery remain separate.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
 Further unification belongs in these existing crates, with platform services for
 transport, time, credentials, state access, and event delivery. There is no

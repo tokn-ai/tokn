@@ -13,6 +13,7 @@ extern crate alloc;
 pub mod configured;
 pub mod driver;
 pub mod interpretation;
+pub mod retry;
 #[cfg(feature = "std")]
 pub mod runtime;
 
@@ -38,10 +39,11 @@ pub use event::{CustomEvent, Event, EventBus, EventPayload, Stage, StageEvent};
 pub use executor::{ExecutionRequest, PipelineRequestContext, PipelineResponseKind, RequestError, RequestService};
 #[cfg(feature = "std")]
 pub use pipeline::{
-  ctx::PipelineCtx, error::PipelineError, stages as stage_traits, Pipeline, PipelineRunner, RawInbound, RetryPolicy,
-  RunConfig, RunConfigBuilder,
+  ctx::PipelineCtx, error::PipelineError, stages as stage_traits, Pipeline, PipelineRunner, RawInbound, RunConfig,
+  RunConfigBuilder,
 };
 #[cfg(feature = "std")]
 pub use profile::Profile;
+pub use retry::{MissingRetryPolicy, RetryFailure, RetryPolicy};
 
 mod header_policy;
