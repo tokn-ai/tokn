@@ -17,6 +17,7 @@
 //! mirrors `DefaultExtract` since BuildHeaders and Send both depend on
 //! those values.
 
+use crate::interpretation::RequestInterpretation;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::PipelineError;
 use crate::pipeline::stages::{ExtractStage, Extracted, RawInbound};
@@ -27,8 +28,6 @@ use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
 use tokn_core::request_classification::classify_request;
-use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS};
-use tokn_headers::HeaderMap;
 
 /// Preserve the original all-or-nothing metadata peek: an invalid type in
 /// either field makes both peeked fields unavailable.
@@ -60,30 +59,17 @@ impl ExtractStage for PassthroughExtract {
     let peek = serde_json::from_slice::<ModelPeek>(&decoded_body).unwrap_or_default();
     let inspected_body = serde_json::from_slice::<Value>(&decoded_body).unwrap_or(Value::Null);
 
-    let model = peek
-      .model
-      .filter(|s| !s.is_empty())
-      .unwrap_or_else(|| SmolStr::new("unknown"));
-
-    let stream = peek.stream.unwrap_or_else(|| accept_is_sse(&headers));
+    let RequestInterpretation {
+      model,
+      stream,
+      session_id,
+      project_id,
+      initiator,
+      header_initiator,
+      route_mode_hint,
+      ..
+    } = RequestInterpretation::from_headers(&headers).with_body_metadata(peek.model.as_deref(), peek.stream);
     let request_classification = classify_request(&ctx.request_endpoint, &inspected_body);
-
-    let header_initiator = header_str(&headers, "x-initiator")
-      .map(|s| s.trim().to_ascii_lowercase())
-      .filter(|s| s == "user" || s == "agent")
-      .map(SmolStr::new);
-
-    // Passthrough has no body-shape classifier, so missing header
-    // initiator stays unknown for persistence purposes.
-    let initiator = header_initiator.clone();
-
-    let session_id = inbound_correlation(&headers).session_id;
-    let project_id = first_present_smol(&headers, PROJECT_ID_HEADERS);
-
-    let route_mode_hint = header_str(&headers, "x-route-mode")
-      .map(str::trim)
-      .filter(|s| !s.is_empty())
-      .map(SmolStr::new);
 
     let content_encoding = request_content_encoding(&headers).ok().flatten();
 
@@ -109,19 +95,6 @@ impl ExtractStage for PassthroughExtract {
   }
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-  headers.get(name).map(|v| v.as_str())
-}
-
-fn accept_is_sse(headers: &HeaderMap) -> bool {
-  header_str(headers, "accept")
-    .map(|v| {
-      v.split(',')
-        .any(|part| part.split(';').next().map(str::trim) == Some("text/event-stream"))
-    })
-    .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -131,6 +104,7 @@ mod tests {
   use tokn_core::provider::Endpoint;
   use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
   use tokn_core::request_event::RequestEndpoint;
+  use tokn_headers::HeaderMap;
 
   fn ctx() -> PipelineCtx {
     PipelineCtx::new(

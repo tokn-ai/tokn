@@ -1,30 +1,18 @@
 //! Default Extract stage — turns a [`RawInbound`] into normalized
 //! [`Extracted`] state.
 //!
-//! Behavior is a clean reimplementation of the legacy
-//! `crates/router/src/pipeline/parse.rs::{request_header_extract,
-//! request_body_extract, RequestParser::parse}`, with all small strings stored
-//! as [`SmolStr`].
-//!
-//! Header name lists are duplicated here intentionally to keep requests free
-//! of any dependency on the legacy `crates/router` crate. PR2 will move the
-//! canonical constants to a shared location.
+//! Managed metadata interpretation is shared with injected execution.
 
 pub mod passthrough;
 pub use passthrough::PassthroughExtract;
 
+use crate::interpretation::RequestInterpretation;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::PipelineError;
 use crate::pipeline::stages::{ExtractStage, Extracted, RawInbound};
 use crate::utils::codec::request_content_encoding;
 use async_trait::async_trait;
-use serde_json::Value;
-use smol_str::SmolStr;
 use std::sync::Arc;
-use tokn_core::request_classification::classify_request;
-use tokn_core::util::initiator::classify_initiator_any as classify_initiator;
-use tokn_headers::inbound::{first_present_smol, inbound_correlation, PROJECT_ID_HEADERS};
-use tokn_headers::HeaderMap;
 
 pub struct DefaultExtract;
 
@@ -40,32 +28,16 @@ impl ExtractStage for DefaultExtract {
       request_id: _,
     } = raw;
 
-    let model = body_json
-      .get("model")
-      .and_then(Value::as_str)
-      .filter(|s| !s.is_empty())
-      .map(SmolStr::new)
-      .unwrap_or_else(|| SmolStr::new("unknown"));
-
-    let stream = infer_stream(&headers, &body_json);
-
-    let header_initiator = header_str(&headers, "x-initiator")
-      .map(|s| s.trim().to_ascii_lowercase())
-      .filter(|s| s == "user" || s == "agent")
-      .map(SmolStr::new);
-
-    let initiator = header_initiator
-      .clone()
-      .or_else(|| classify_initiator(&body_json).map(SmolStr::new));
-    let request_classification = classify_request(&ctx.request_endpoint, &body_json);
-
-    let session_id = inbound_correlation(&headers).session_id;
-    let project_id = first_present_smol(&headers, PROJECT_ID_HEADERS);
-
-    let route_mode_hint = header_str(&headers, "x-route-mode")
-      .map(str::trim)
-      .filter(|s| !s.is_empty())
-      .map(SmolStr::new);
+    let RequestInterpretation {
+      model,
+      stream,
+      session_id,
+      project_id,
+      initiator,
+      header_initiator,
+      request_classification,
+      route_mode_hint,
+    } = RequestInterpretation::from_json(&ctx.request_endpoint, &headers, &body_json);
 
     // Parsing failures here are recoverable for the codec layer
     // (which would have failed loudly at the transport boundary
@@ -95,33 +67,19 @@ impl ExtractStage for DefaultExtract {
   }
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-  headers.get(name).map(|v| v.as_str())
-}
-
-fn infer_stream(headers: &HeaderMap, body: &Value) -> bool {
-  if let Some(stream) = body.get("stream").and_then(Value::as_bool) {
-    return stream;
-  }
-  header_str(headers, "accept")
-    .map(|v| {
-      v.split(',')
-        .any(|part| part.split(';').next().map(str::trim) == Some("text/event-stream"))
-    })
-    .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use crate::event::EventBus;
   use bytes::Bytes;
+  use serde_json::Value;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
   use tokn_core::request_classification::{RequestClassification, RequestClassificationSource, RequestPurpose};
   use tokn_core::request_event::ExtractedSummary;
   use tokn_core::AgentId;
   use tokn_headers::inbound::{first_present, SESSION_ID_HEADERS};
+  use tokn_headers::HeaderMap;
 
   fn ctx() -> PipelineCtx {
     PipelineCtx::new(

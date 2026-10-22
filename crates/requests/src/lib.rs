@@ -12,6 +12,7 @@ extern crate alloc;
 
 pub mod configured;
 pub mod driver;
+pub mod interpretation;
 #[cfg(feature = "std")]
 pub mod runtime;
 

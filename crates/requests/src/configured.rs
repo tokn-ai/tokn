@@ -4,6 +4,7 @@
 //! mutable pool selection, provider preparation, and protocol conversion come
 //! from their existing domain crates.
 
+use crate::interpretation::RequestInterpretation;
 use alloc::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   format,
@@ -39,6 +40,9 @@ use tokn_policy::{
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
+#[cfg(all(test, feature = "std"))]
+mod interpretation_tests;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RequestOptions {
@@ -57,6 +61,28 @@ pub struct RequestOptions {
 }
 
 impl RequestOptions {
+  /// Build SDK inbound headers using standard precedence: defaults, option
+  /// fields, then explicit headers. Header aliases are interpreted afterwards.
+  pub fn inbound_headers(&self) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(&tokn_headers::keys::CONTENT_TYPE, "application/json");
+    headers.insert(&tokn_headers::keys::ACCEPT, "application/json");
+    for (name, value) in [
+      ("x-request-id", self.request_id.as_deref()),
+      ("x-session-id", self.session_id.as_deref()),
+      ("x-project-cwd", self.project_id.as_deref()),
+      ("x-initiator", self.initiator.as_deref()),
+    ] {
+      if let Some(value) = value {
+        headers.insert(name, HeaderValue::from_string(value.to_string()));
+      }
+    }
+    for (name, value) in &self.headers {
+      headers.insert(HeaderName::new(name.as_str()), HeaderValue::from_string(value.clone()));
+    }
+    headers
+  }
+
   pub fn is_empty(&self) -> bool {
     self == &Self::default()
   }
@@ -411,6 +437,7 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
       transport: Some(Exchange(transport)),
       endpoint,
       body,
+      headers: options.inbound_headers(),
       options,
       request_id,
       attempt: 0,
@@ -460,10 +487,6 @@ impl<T: Transport> Drop for Exchange<'_, T> {
   }
 }
 
-struct Extracted {
-  model: String,
-  stream: bool,
-}
 #[derive(Clone)]
 enum Target {
   Account { binding: usize, pool: AccountPoolId },
@@ -487,6 +510,7 @@ struct LocalSession<'a, T: Transport, R: Runtime> {
   transport: Option<Exchange<'a, T>>,
   endpoint: Endpoint,
   body: Value,
+  headers: HeaderMap,
   options: RequestOptions,
   request_id: String,
   attempt: u32,
@@ -503,23 +527,9 @@ impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
     });
   }
 
-  fn inbound_headers(&self) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    for (name, value) in &self.options.headers {
-      headers.insert(HeaderName::new(name.as_str()), HeaderValue::from_string(value.clone()));
-    }
-    headers
-  }
-
-  fn template_vars(&self, inbound: &HeaderMap) -> tokn_core::headers::TemplateVars {
-    let mut vars = tokn_headers::inbound::build_template_vars(inbound);
-    vars.request_id = Some(SmolStr::new(&self.request_id));
-    if let Some(session) = self.options.session_id.as_deref() {
-      vars.session_id = Some(SmolStr::new(session));
-    }
-    if let Some(project) = self.options.project_id.as_deref() {
-      vars.project_cwd = Some(SmolStr::new(project));
-    }
+  fn template_vars(&self) -> tokn_core::headers::TemplateVars {
+    let mut vars = tokn_headers::inbound::build_template_vars(&self.headers);
+    vars.request_id.get_or_insert_with(|| SmolStr::new(&self.request_id));
     vars
   }
 
@@ -536,7 +546,7 @@ impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
 }
 
 impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T, R> {
-  type Extracted = Extracted;
+  type Extracted = RequestInterpretation;
   type Resolved = Resolved;
   type Headers = HeaderMap;
   type Converted = Converted;
@@ -549,19 +559,12 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     self.terminal = false;
     self.emit("started", None);
   }
-  async fn extract(&mut self) -> Result<Extracted, Error> {
-    let model = self
-      .body
-      .get("model")
-      .and_then(Value::as_str)
-      .filter(|v| !v.is_empty())
-      .ok_or_else(|| Error::new("extract", "request needs a model"))?
-      .to_string();
-    let stream = self.body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+  async fn extract(&mut self) -> Result<RequestInterpretation, Error> {
+    let extracted = RequestInterpretation::from_json(&self.endpoint.into(), &self.headers, &self.body);
     self.emit("extract", None);
-    Ok(Extracted { model, stream })
+    Ok(extracted)
   }
-  async fn resolve(&mut self, extracted: &Extracted) -> Result<Resolved, Error> {
+  async fn resolve(&mut self, extracted: &RequestInterpretation) -> Result<Resolved, Error> {
     let profile = match self.options.profile.as_deref() {
       Some(id) => self.platform.plan.profiles().get(id),
       None => self
@@ -627,7 +630,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         .borrow_mut()
         .get_mut(pool)
         .ok_or_else(|| Error::new("resolve", "missing account pool"))?
-        .select(now, self.options.session_id.as_deref(), &ranks);
+        .select(now, extracted.session_id.as_deref(), &ranks);
       return match selected {
         Selection::Selected(binding) => {
           self.emit("resolve", None);
@@ -680,7 +683,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
             .borrow_mut()
             .get_mut(pool)
             .ok_or_else(|| Error::new("resolve", "missing account pool"))?
-            .select(now, self.options.session_id.as_deref(), &ranks);
+            .select(now, extracted.session_id.as_deref(), &ranks);
           if let Selection::Selected(binding) = selected {
             self.emit("resolve", None);
             return Ok(Resolved {
@@ -700,9 +703,9 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     }
     Err(Error::new("resolve", "no eligible account for this request"))
   }
-  async fn build_headers(&mut self, _: &Extracted, resolved: &Resolved) -> Result<HeaderMap, Error> {
+  async fn build_headers(&mut self, _: &RequestInterpretation, resolved: &Resolved) -> Result<HeaderMap, Error> {
     if matches!(resolved.target, Target::Client) {
-      let mut headers = crate::header_policy::passthrough_headers(&self.inbound_headers(), false, true);
+      let mut headers = crate::header_policy::passthrough_headers(&self.headers, false, true);
       headers.remove("content-length");
       if !headers.contains_key("content-type") {
         headers.insert("content-type", "application/json");
@@ -718,16 +721,16 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       unreachable!("client relay returned above")
     };
     let binding = &self.platform.bindings[binding];
-    let inbound = self.inbound_headers();
-    let vars = self.template_vars(&inbound);
+    let inbound = &self.headers;
+    let vars = self.template_vars();
     let identity = self.wire_identity(resolved);
     let mut headers = if resolved.opaque {
-      let mut headers = crate::header_policy::passthrough_headers(&inbound, false, false);
+      let mut headers = crate::header_policy::passthrough_headers(inbound, false, false);
       headers.remove("content-length");
       headers
     } else {
       identity.map_or_else(HeaderMap::new, |identity| {
-        tokn_headers::registry::build_wire_identity_headers(binding.driver.as_str(), identity.as_str(), &vars, &inbound)
+        tokn_headers::registry::build_wire_identity_headers(binding.driver.as_str(), identity.as_str(), &vars, inbound)
       })
     };
     for (name, value) in &binding.account.headers {
@@ -739,7 +742,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
   }
   async fn convert_request(
     &mut self,
-    _: &Extracted,
+    extracted: &RequestInterpretation,
     resolved: &Resolved,
     headers: &HeaderMap,
   ) -> Result<Converted, Error> {
@@ -779,7 +782,9 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         .map_err(|e| Error::new("convert_request", e))?
     };
     if !resolved.opaque {
-      body["model"] = Value::String(resolved.model.to_string());
+      if let Some(object) = body.as_object_mut() {
+        object.insert("model".into(), Value::String(resolved.model.to_string()));
+      }
     }
     // Apply the selected driver to the headers already built by the profile.
     let credential = if matches!(binding.driver.as_str(), "codex" | "github-copilot") {
@@ -824,33 +829,16 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       .unwrap_or(false);
     let shaped_body: Value =
       serde_json::from_slice(&prepared.body).map_err(|error| Error::new("convert_request", error))?;
-    let inbound = self.inbound_headers();
-    let vars = self.template_vars(&inbound);
+    let vars = self.template_vars();
     let agent_id = self.wire_identity(resolved).unwrap_or_default();
     let context = tokn_core::provider::HeaderPatchCtx {
       request_kind: tokn_core::provider::ProviderRequestKind::Operation(resolved.endpoint),
       body: &shaped_body,
       bearer_token: Some(credential),
       content_encoding: None,
-      stream: self.body.get("stream").and_then(Value::as_bool).unwrap_or(false),
-      initiator: self
-        .options
-        .initiator
-        .as_deref()
-        .or_else(|| inbound.get("x-initiator").map(HeaderValue::as_str))
-        .and_then(|value| {
-          let value = value.trim();
-          if value.eq_ignore_ascii_case("user") {
-            Some("user")
-          } else if value.eq_ignore_ascii_case("agent") {
-            Some("agent")
-          } else {
-            None
-          }
-        })
-        .or_else(|| tokn_core::util::initiator::classify_initiator_any(&self.body))
-        .unwrap_or("user"),
-      inbound_headers: &inbound,
+      stream: extracted.stream,
+      initiator: extracted.initiator.as_deref().unwrap_or("user"),
+      inbound_headers: &self.headers,
       vars: &vars,
       agent_id: &agent_id,
     };
@@ -869,7 +857,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
   }
   async fn send(
     &mut self,
-    extracted: &Extracted,
+    extracted: &RequestInterpretation,
     resolved: &Resolved,
     _headers: &HeaderMap,
     converted: &Converted,
@@ -934,7 +922,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         .expect("linked pool")
         .record_success(
           self.platform.runtime.borrow().now(),
-          self.options.session_id.as_deref(),
+          extracted.session_id.as_deref(),
           &binding,
         )
         .map_err(|e| Error::new("send", e))?;

@@ -1,8 +1,8 @@
 # Embedded SDKs
 
-With their default features, the SDKs execute requests in-process through the same configuration,
-credentials, account pool, routing, conversion, retry, and provider
-implementations as the gateway. They do not require a gateway process.
+With their default features, the SDKs execute requests in-process using the
+standard configuration, credentials, account pool, routing, conversion, retry,
+and provider runtime. They do not require a gateway process.
 Rust also supports configured requests with caller-supplied networking in
 `no_std + alloc` environments.
 
@@ -147,7 +147,8 @@ when an exact endpoint wire shape is required.
 
 ### Shared standard and embedded execution
 
-`Client<P>` uses one request pipeline in `tokn-requests`. The default
+`Client<P>` delegates execution to its platform. Both platforms use the shared
+stage driver and managed request interpretation in `tokn-requests`. The default
 `StdPlatform` loads configuration and credentials from disk and preserves
 reloads, lifecycle subscriptions, and concurrent requests. The SDK does not
 depend on the HTTP gateway crate.
@@ -167,10 +168,31 @@ let client = Client::from_platform(platform);
 let response = client.chat_completions().create(&request).await?;
 ```
 
-Both platforms run the same stage driver, pool selection, model/provider routing
-rules, provider preparation, JSON conversion, and SSE parsing/conversion.
-`tokn-accounts` owns selection, cooldown, and session affinity; `tokn-policy`
-owns the execution plan; `tokn-convert` owns protocol conversion. There is no
+Managed request interpretation has one implementation in
+`tokn_requests::interpretation::RequestInterpretation`:
+
+- SDK option fields become canonical inbound headers; explicit headers override
+  matching fields, then the shared header alias rules apply.
+- A JSON `stream` boolean takes precedence over `Accept: text/event-stream`.
+- Missing, empty, or non-string models become `unknown` for route resolution.
+- Session/project identity, explicit and inferred initiator, request purpose,
+  and route hints are normalized before routing and provider conversion.
+
+The injected executor uses the normalized session for account affinity and the
+normalized stream/initiator for provider context. Request-purpose classification
+is portable metadata; this does not yet port standard Codex compaction priority
+or routing-header policy. Standard passthrough keeps its distinct typed metadata
+peek, header-only initiator, and original body bytes.
+
+The standard and injected sessions still implement their stages separately.
+They reuse provider preparation helpers, JSON conversion, and SSE primitives,
+but complete routing, retry, response, and event behavior is not yet unified.
+The default standard SDK still loads legacy configuration and uses its older
+account pool; gateway v2 and injected execution share `tokn-accounts::PoolState`
+and selection helpers, with separate linking and route traversal.
+`tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
+Further unification belongs in these existing crates, with platform services for
+transport, time, credentials, state access, and event delivery. There is no
 separate direct client or engine crate.
 
 Implement `transport::Transport` on the application's HTTP/TLS session:
@@ -204,7 +226,13 @@ time. Standard builds re-export the original upstream types; embedded builds
 use local static/inline/`Rc` storage. The local backend supports single-threaded,
 non-atomic targets and is intentionally neither `Send` nor `Sync`.
 
-Verification includes an isolated default-feature SDK consumer and an isolated
+`crates/sdk/tests/interpretation_parity.rs` compares real standard and injected
+clients using controlled upstream responses: stream mode, initiator headers,
+session aliases, option precedence, and account affinity. Extraction-stage
+comparisons also cover request purpose across all three APIs and missing-model
+behavior. These checks establish interpretation parity, not full stage parity.
+
+Verification also includes an isolated default-feature SDK consumer and an isolated
 alloc-only consumer that exercises configured requests, injected transports,
 and suspended stream reads. The latter is compiled for both targets below:
 

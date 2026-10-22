@@ -1,8 +1,7 @@
 //! Request purposes for inspection and provider request policies.
 //! Missing evidence leaves the purpose unknown.
 
-use crate::provider::Endpoint;
-use crate::request_event::RequestEndpoint;
+use crate::endpoint::{Endpoint, RequestEndpoint};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -214,6 +213,7 @@ fn is_opencode_compaction(body: &Value, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use alloc::string::String;
   use serde_json::json;
 
   fn compaction(source: RequestClassificationSource) -> Option<RequestClassification> {
