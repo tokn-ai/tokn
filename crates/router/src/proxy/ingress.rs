@@ -36,6 +36,13 @@ pub(crate) enum IngressState {
 }
 
 impl IngressState {
+  pub(crate) fn events(&self) -> Arc<tokn_core::event::EventBus> {
+    match self {
+      Self::Local(state) => state.events.clone(),
+      Self::Remote(state) => state.events.clone(),
+    }
+  }
+
   pub(crate) fn connect_action_for(&self, ingress: &IngressAuthority) -> ConnectAction {
     match self {
       Self::Local(state) => state.connect_action_for(ingress),

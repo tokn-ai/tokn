@@ -21,7 +21,9 @@ pub(crate) fn new_request_id() -> String {
 
 pub(crate) fn ensure_request_id(headers: &mut HeaderMap) -> HeaderValue {
   if let Some(request_id) = headers.get(REQUEST_ID_HEADER) {
-    return request_id.clone();
+    if request_id.to_str().is_ok_and(|value| !value.is_empty()) {
+      return request_id.clone();
+    }
   }
 
   let request_id = new_request_id_header();
@@ -29,12 +31,10 @@ pub(crate) fn ensure_request_id(headers: &mut HeaderMap) -> HeaderValue {
   request_id
 }
 
-pub(crate) async fn propagate_request_id(request: AxumRequest, next: Next) -> AxumResponse {
-  let request_id = request.headers().get(REQUEST_ID_HEADER).cloned();
+pub(crate) async fn propagate_request_id(mut request: AxumRequest, next: Next) -> AxumResponse {
+  let request_id = ensure_request_id(request.headers_mut());
   let mut response = next.run(request).await;
-  if let Some(request_id) = request_id {
-    set_response_request_id(&mut response, request_id);
-  }
+  set_response_request_id(&mut response, request_id);
   response
 }
 
@@ -64,5 +64,16 @@ mod tests {
 
     assert_eq!(ensure_request_id(&mut headers), "client-request");
     assert_eq!(headers[REQUEST_ID_HEADER], "client-request");
+  }
+
+  #[test]
+  fn ensure_request_id_replaces_values_that_cannot_identify_a_record() {
+    for value in [HeaderValue::from_bytes(&[0xff]).unwrap(), HeaderValue::from_static("")] {
+      let mut headers = HeaderMap::new();
+      headers.insert(REQUEST_ID_HEADER, value);
+      let request_id = ensure_request_id(&mut headers);
+      assert!(request_id.to_str().unwrap().starts_with("req-"));
+      assert_eq!(headers[REQUEST_ID_HEADER], request_id);
+    }
   }
 }

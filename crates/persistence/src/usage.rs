@@ -458,6 +458,13 @@ impl EventHandler for UsageEventHandler {
         StageEvent::Completed { .. } => self.on_completed(request_id, attempt, request.ts),
       },
       RequestEventPayload::Record(record) => match record {
+        // Ingress rejections have no admitted model or token usage. Their
+        // authoritative failure record lives in the daily request database.
+        // A connection record may already have allocated preparatory state.
+        RecordEvent::IngressRejected(_) => {
+          self.pending.remove(&composite_request_id(request_id, attempt));
+          Ok(())
+        }
         RecordEvent::InboundConnection {
           user,
           api_key_id,
@@ -587,7 +594,7 @@ mod tests {
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
   use tokn_core::request_event::stage::{ConvertedResponseSummary, ExtractedSummary, ResolvedSummary, SentSummary};
-  use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+  use tokn_core::request_event::{IngressRejection, RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
   use tokn_headers::HeaderMap;
 
   #[test]
@@ -816,6 +823,69 @@ mod tests {
       )
       .unwrap();
     assert_eq!(user.as_deref(), Some("client-a"));
+  }
+
+  #[test]
+  fn ingress_rejections_do_not_create_usage_or_pending_models() {
+    let dir = std::env::temp_dir().join(format!("tokn-ingress-rejection-usage-{}", uuid::Uuid::new_v4()));
+    let path = dir.join("usage.db");
+    let mut handler = UsageEventHandler::new(path.clone()).unwrap();
+
+    for status in [401, 413] {
+      let request_id = format!("req-rejected-{status}");
+      handler.handle(&request_record(
+        &request_id,
+        0,
+        1_000,
+        RecordEvent::InboundConnection {
+          user: None,
+          api_key_id: None,
+          local_addr: None,
+          peer_addr: None,
+          mode: SmolStr::new("router"),
+          method: SmolStr::new("requests"),
+          inbound_method: SmolStr::new("POST"),
+          url: Some(SmolStr::new("/v1/responses")),
+        },
+      ));
+      assert!(handler.pending.contains_key(&request_id));
+      handler.handle(&request_record(
+        &request_id,
+        0,
+        1_025,
+        RecordEvent::IngressRejected(IngressRejection {
+          started_ts: 1_000,
+          request_endpoint: Endpoint::Responses.into(),
+          status,
+          error: SmolStr::new("rejected before execution"),
+          mode: SmolStr::new("router"),
+          pipeline_id: SmolStr::new("ingress"),
+          method: SmolStr::new("POST"),
+          url: Some(SmolStr::new("/v1/responses")),
+          headers: HeaderMap::new(),
+          user: None,
+          api_key_id: None,
+          local_addr: None,
+          peer_addr: None,
+        }),
+      ));
+    }
+
+    assert!(
+      handler.pending.is_empty(),
+      "rejections must not retain model-less usage state"
+    );
+    let count: i64 = handler
+      .db
+      .conn
+      .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+      .unwrap();
+    assert_eq!(
+      count, 0,
+      "a local rejection must not inflate model usage request counts"
+    );
+    drop(handler);
+    std::fs::remove_dir_all(dir).unwrap();
   }
 
   #[test]

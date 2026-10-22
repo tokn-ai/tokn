@@ -348,7 +348,9 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   } else {
     None
   };
-  let mut frontend = tokn_router::frontend::Frontend::new(plan, service, access, pool.clone())?;
+  let (events, receiver, handlers, archive) = crate::server_runtime::build_v2_ingress_event_bus(service.persistence())?;
+  let mut frontend =
+    tokn_router::frontend::Frontend::new_with_events(plan, service, access, pool.clone(), events.clone())?;
   if let Some(bind) = bind_override {
     frontend = frontend.with_bind_override(bind)?;
   }
@@ -367,6 +369,7 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     inode: metadata.ino(),
   };
   std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
   let (stop_tx, mut stop_rx) = watch::channel(false);
   let control = serve_control(
     listener,
@@ -389,9 +392,13 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let result = tokio::select! {
     result = &mut public => { let _ = stop_tx.send(true); result.and(control.await) }
     result = &mut control => { let _ = stop_tx.send(true); result.and(public.await) }
-    result = shutdown.wait() => { let _ = stop_tx.send(true); result?; public.await.and(control.await) }
+    result = shutdown.wait() => {
+      let _ = stop_tx.send(true);
+      result.map_err(anyhow::Error::from).and(public.await).and(control.await)
+    }
   };
-  result
+  let cleanup = crate::server_runtime::finish_events(&events, archive).await;
+  result.and(cleanup)
 }
 
 pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {

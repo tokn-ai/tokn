@@ -18,7 +18,9 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::request_classification::RequestClassification;
-use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEventPayload, Stage, StageEvent};
+use tokn_core::request_event::{
+  IngressRejection, RecordEvent, RequestEndpoint, RequestEventPayload, Stage, StageEvent,
+};
 
 /// `EventHandler` that persists requests stage events into the requests DB.
 /// Construct once and register with `spawn_event_loop`; its dedicated worker
@@ -33,6 +35,8 @@ pub struct RequestEventHandler {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestPersistenceOptions {
   pub record_request_bodies: bool,
+  /// Save a body in full only when its byte length does not exceed this limit.
+  /// Oversized bodies are omitted while the request metadata remains recorded.
   pub body_max_bytes: usize,
 }
 
@@ -118,12 +122,16 @@ impl EventHandler for RequestEventHandler {
       // Record events capture transport-adjacent facts that live alongside
       // the stage lifecycle. Some of them overlap with stage summaries, but
       // they may still be the only persistence signal on error paths.
+      RequestEventPayload::Record(RecordEvent::IngressRejected(rejection)) => {
+        self.on_ingress_rejected(request_id, attempt, r2.ts, rejection)
+      }
       RequestEventPayload::Record(record) => {
         if let Err(e) = self.ensure_started_for_record(request_id, attempt, r2.ts) {
           tracing::warn!(error = %e, request_id, attempt, "requests record bootstrap failed");
           return;
         }
         match record {
+          RecordEvent::IngressRejected(_) => unreachable!("ingress rejections have their own bootstrap timestamp"),
           RecordEvent::InboundConnection {
             user,
             api_key_id,
@@ -179,6 +187,89 @@ impl RequestEventHandler {
       return Ok(());
     }
     self.on_started(request_id, attempt, ts, None)
+  }
+
+  /// Admission failures have no pipeline stages or body capture. Persist their
+  /// complete diagnostic record independently of a subsequent `Started` event.
+  pub fn on_ingress_rejected(
+    &mut self,
+    request_id: &str,
+    attempt: u32,
+    ts: i64,
+    rejection: &IngressRejection,
+  ) -> Result<()> {
+    let _maintenance = self.acquire_write_lock()?;
+    let id = composite_request_id(request_id, attempt);
+    let conn = self.db.conn_for_request_or_ts(&id, rejection.started_ts)?;
+    let transaction = conn.transaction()?;
+    let error = format!("ingress: {}", rejection.error);
+    transaction.execute(
+      "INSERT INTO request_connection (request_id, ts, ver, endpoint, status, request_error, user)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+       ON CONFLICT(request_id) DO UPDATE SET
+         ts = excluded.ts,
+         endpoint = excluded.endpoint,
+         status = excluded.status,
+         request_error = excluded.request_error,
+         user = COALESCE(excluded.user, request_connection.user)",
+      params![
+        id,
+        rejection.started_ts,
+        tokn_core::util::version::full(),
+        rejection.request_endpoint.as_str(),
+        i64::from(rejection.status),
+        error,
+        rejection.user.as_deref(),
+      ],
+    )?;
+    let mut ctx = Map::new();
+    ctx.insert("mode".into(), Value::String(rejection.mode.to_string()));
+    ctx.insert("pipeline_id".into(), Value::String(rejection.pipeline_id.to_string()));
+    ctx.insert("failure_stage".into(), Value::String("ingress".into()));
+    ctx.insert("request_body_omitted".into(), Value::Bool(true));
+    ctx.insert(
+      "latency_ms".into(),
+      Value::from(ts.saturating_sub(rejection.started_ts).max(0)),
+    );
+    for (key, value) in [
+      ("api_key_id", rejection.api_key_id.as_deref()),
+      ("local_addr", rejection.local_addr.as_deref()),
+      ("peer_addr", rejection.peer_addr.as_deref()),
+    ] {
+      if let Some(value) = value {
+        ctx.insert(key.into(), Value::String(value.into()));
+      }
+    }
+    patch_ctx_json(&transaction, &id, ctx)?;
+    transaction.execute(
+      "INSERT INTO request_metadata (request_id) VALUES (?1)
+       ON CONFLICT(request_id) DO NOTHING",
+      params![id],
+    )?;
+    let headers = headers_json(&rejection.headers);
+    transaction.execute(
+      "INSERT INTO request_downstream (
+         request_id, inbound_req_method, inbound_req_url, inbound_req_headers,
+         inbound_req_body, inbound_resp_status, inbound_resp_body
+       ) VALUES (?1, ?2, ?3, ?4, NULL, ?5, NULL)
+       ON CONFLICT(request_id) DO UPDATE SET
+         inbound_req_method = excluded.inbound_req_method,
+         inbound_req_url = excluded.inbound_req_url,
+         inbound_req_headers = excluded.inbound_req_headers,
+         inbound_req_body = NULL,
+         inbound_resp_status = excluded.inbound_resp_status,
+         inbound_resp_body = NULL",
+      params![
+        id,
+        rejection.method.as_str(),
+        rejection.url.as_deref(),
+        headers.as_ref(),
+        i64::from(rejection.status),
+      ],
+    )?;
+    transaction.commit()?;
+    self.db.clear_request(&id);
+    Ok(())
   }
 
   pub fn on_inbound_connection(
@@ -523,11 +614,9 @@ impl RequestEventHandler {
     Ok(())
   }
 
-  /// Wire-truth upstream-response body. Written by ConvertResponse for
-  /// buffered flows; streaming responses are not captured here (the live
-  /// SSE byte stream is single-shot and can't be cheaply tee'd, matching
-  /// legacy behavior). The `Send` stage already wrote status + response
-  /// headers, so this update touches only the body column.
+  /// Wire-truth upstream-response body, emitted immediately for buffered flows
+  /// or after accumulation for streams. The `Send` stage already wrote status
+  /// and response headers, so this update touches only the body column.
   pub fn on_upstream_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
     let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
@@ -588,9 +677,7 @@ impl RequestEventHandler {
 }
 
 fn persisted_body(options: RequestPersistenceOptions, body: &bytes::Bytes) -> Option<&[u8]> {
-  options
-    .record_request_bodies
-    .then(|| &body[..body.len().min(options.body_max_bytes)])
+  (options.record_request_bodies && body.len() <= options.body_max_bytes).then_some(body.as_ref())
 }
 
 fn params_patch(
@@ -677,4 +764,19 @@ fn usage_json(usage: &tokn_core::db::Usage) -> Option<String> {
     out.insert("reasoning".to_string(), Value::from(v));
   }
   (!out.is_empty()).then(|| Value::Object(out).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn zero_body_limit_preserves_only_empty_bodies() {
+    let options = RequestPersistenceOptions {
+      record_request_bodies: true,
+      body_max_bytes: 0,
+    };
+    assert_eq!(persisted_body(options, &bytes::Bytes::new()), Some(&[][..]));
+    assert!(persisted_body(options, &bytes::Bytes::from_static(b"x")).is_none());
+  }
 }

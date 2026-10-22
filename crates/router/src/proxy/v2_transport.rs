@@ -6,7 +6,6 @@ use crate::v2::{InboundConnectionInfo, ProxyAuthenticationError};
 use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderName, Method, Request, Response, StatusCode};
-use axum::response::IntoResponse;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -82,14 +81,13 @@ async fn handle_request(
   connection: InboundConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
-  if request.method() != Method::CONNECT {
-    let request_id = crate::request_id::ensure_request_id(request.headers_mut());
-    let mut response = handle_request_inner(state, outbound_proxy, upgrades, connection, request).await;
+  let is_connect = request.method() == Method::CONNECT;
+  let request_id = crate::request_id::ensure_request_id(request.headers_mut());
+  let mut response = handle_request_inner(state, outbound_proxy, upgrades, connection, request).await;
+  if !is_connect || !response.status().is_success() {
     crate::request_id::set_response_request_id(&mut response, request_id);
-    return response;
   }
-
-  handle_request_inner(state, outbound_proxy, upgrades, connection, request).await
+  response
 }
 
 async fn handle_request_inner(
@@ -99,11 +97,17 @@ async fn handle_request_inner(
   connection: InboundConnectionInfo,
   mut request: Request<hyper::body::Incoming>,
 ) -> Response<Body> {
+  let request_id = crate::request_id::ensure_request_id(request.headers_mut());
+  let state = live.current();
+  let recorder = crate::ingress_record::IngressRecorder::new(state.events(), &request, connection, "proxy");
   if is_websocket_upgrade(request.headers()) {
+    recorder.record(StatusCode::UPGRADE_REQUIRED, "WebSocket upgrades are not supported");
     return websocket_upgrade_response();
   }
   if request.method() == Method::CONNECT && request_body_present(&request) {
-    return ApiError::bad_request("CONNECT requests must not contain a body representation").into_response();
+    return recorder.reject(ApiError::bad_request(
+      "CONNECT requests must not contain a body representation",
+    ));
   }
   let admission = if request.method() == Method::CONNECT {
     admit_connect(&request).map(Admission::Connect)
@@ -112,37 +116,50 @@ async fn handle_request_inner(
   };
   let admission = match admission {
     Ok(admission) => admission,
-    Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
+    Err(error) => return recorder.reject(ApiError::bad_request(error.to_string())),
   };
-  let state = live.current();
   let access = match state.authenticate_proxy(request.headers_mut()).await {
     Ok(access) => access,
-    Err(ProxyAuthenticationError::Rejected) => return proxy_auth_required(),
+    Err(ProxyAuthenticationError::Rejected) => {
+      recorder.record(
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+        "missing or invalid proxy credentials",
+      );
+      return proxy_auth_required();
+    }
     Err(ProxyAuthenticationError::Unavailable) => {
+      recorder.record(StatusCode::INTERNAL_SERVER_ERROR, "proxy authentication unavailable");
       return response(StatusCode::INTERNAL_SERVER_ERROR, "proxy authentication unavailable");
     }
   };
+  let recorder = recorder.with_access(&access);
 
   match admission {
     Admission::Http(ingress) => {
       if let Err(error) = strip_hop_by_hop_headers(request.headers_mut()) {
-        return ApiError::bad_request(error.to_string()).into_response();
+        return recorder.reject(ApiError::bad_request(error.to_string()));
       }
+      request
+        .headers_mut()
+        .insert(crate::request_id::REQUEST_ID_HEADER, request_id);
       state
         .dispatch_http(&ingress, "http", access, connection, request.map(Body::new))
         .await
     }
     Admission::Connect(ingress) => {
       let transport = match state.connect_action_for(&ingress) {
-        ConnectAction::Reject => return response(StatusCode::FORBIDDEN, "CONNECT rejected by listener policy"),
+        ConnectAction::Reject => {
+          recorder.record(StatusCode::FORBIDDEN, "CONNECT rejected by listener policy");
+          return response(StatusCode::FORBIDDEN, "CONNECT rejected by listener policy");
+        }
         ConnectAction::Tunnel => match connect_upstream(ingress.host().as_str(), ingress.port(), &outbound_proxy).await
         {
           Ok(upstream) => PreparedConnect::Tunnel(upstream),
-          Err(error) => return ApiError::bad_gateway(error.to_string()).into_response(),
+          Err(error) => return recorder.reject(ApiError::bad_gateway(error.to_string())),
         },
         ConnectAction::Intercept => match state.pinned_tls_config(&ingress) {
           Ok(config) => PreparedConnect::Intercept(config),
-          Err(error) => return ApiError::bad_gateway(error.to_string()).into_response(),
+          Err(error) => return recorder.reject(ApiError::bad_gateway(error.to_string())),
         },
       };
       let on_upgrade = hyper::upgrade::on(&mut request);
@@ -154,6 +171,7 @@ async fn handle_request_inner(
         transport,
       };
       if upgrades.send(upgrade).await.is_err() {
+        recorder.record(StatusCode::INTERNAL_SERVER_ERROR, "CONNECT upgrade unavailable");
         return response(StatusCode::INTERNAL_SERVER_ERROR, "CONNECT upgrade unavailable");
       }
       response(StatusCode::OK, "")
@@ -237,7 +255,10 @@ async fn run_connect(upgrade: ConnectUpgrade, state: IngressSource, mut shutdown
         let access = access.clone();
         async move {
           let request_id = crate::request_id::ensure_request_id(request.headers_mut());
+          let recorder = crate::ingress_record::IngressRecorder::new(state.events(), &request, connection, "proxy")
+            .with_access(&access);
           let mut response = if is_websocket_upgrade(request.headers()) {
+            recorder.record(StatusCode::UPGRADE_REQUIRED, "WebSocket upgrades are not supported");
             websocket_upgrade_response()
           } else {
             match admit_intercepted(&request, &ingress) {
@@ -245,14 +266,17 @@ async fn run_connect(upgrade: ConnectUpgrade, state: IngressSource, mut shutdown
                 request.headers_mut().remove(header::PROXY_AUTHORIZATION);
                 match strip_hop_by_hop_headers(request.headers_mut()) {
                   Ok(()) => {
+                    request
+                      .headers_mut()
+                      .insert(crate::request_id::REQUEST_ID_HEADER, request_id.clone());
                     state
                       .dispatch_http(&ingress, "https", access, connection, request.map(Body::new))
                       .await
                   }
-                  Err(error) => ApiError::bad_request(error.to_string()).into_response(),
+                  Err(error) => recorder.reject(ApiError::bad_request(error.to_string())),
                 }
               }
-              Err(error) => ApiError::bad_request(error.to_string()).into_response(),
+              Err(error) => recorder.reject(ApiError::bad_request(error.to_string())),
             }
           };
           crate::request_id::set_response_request_id(&mut response, request_id);

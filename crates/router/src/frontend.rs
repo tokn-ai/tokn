@@ -2,6 +2,7 @@
 
 use crate::api::error::ApiError;
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
+use crate::ingress_record::IngressRecorder;
 use crate::proxy::ingress::IngressSource;
 use crate::routing::{RoutingControl, UpdateWeights};
 use crate::v2::mounts::{ApiMounts, ApiOperation};
@@ -16,6 +17,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokn_access::{AccessContext, AccessStore};
+use tokn_core::event::EventBus;
 use tokn_policy::{
   ConnectAction, CredentialPolicy, ForwardProxyListenerPlan, GatewayPlan, IngressAuthority, ListenerId, ListenerPlan,
   LlmApiListenerPlan,
@@ -33,6 +35,17 @@ impl Frontend {
     service: tokn_config::v2::ServicePlan,
     access: Arc<AccessStore>,
     dispatcher: Arc<dyn RequestDispatcher>,
+  ) -> anyhow::Result<Self> {
+    Self::new_with_events(plan, service, access, dispatcher, Arc::new(EventBus::noop()))
+  }
+
+  /// Persist only requests rejected here; dispatched requests belong to their worker.
+  pub fn new_with_events(
+    plan: GatewayPlan,
+    service: tokn_config::v2::ServicePlan,
+    access: Arc<AccessStore>,
+    dispatcher: Arc<dyn RequestDispatcher>,
+    events: Arc<EventBus>,
   ) -> anyhow::Result<Self> {
     let mounts = Arc::new(ApiMounts::new(&plan)?);
     let client_credentials = Arc::new(
@@ -59,6 +72,7 @@ impl Frontend {
             client_credentials: client_credentials.clone(),
             access: access.clone(),
             dispatcher: dispatcher.clone(),
+            events: events.clone(),
             max_wire_bytes: service.request_limits().max_wire_bytes(),
           });
           let cors_state = state.clone();
@@ -96,6 +110,7 @@ impl Frontend {
               ca,
               access: access.clone(),
               dispatcher: dispatcher.clone(),
+              events: events.clone(),
               outbound: service.outbound().to_http_client_options(),
               max_wire_bytes: listener
                 .request_body_max_bytes()
@@ -224,6 +239,7 @@ struct ApiIngress {
   client_credentials: Arc<BTreeSet<tokn_policy::ProfileId>>,
   access: Arc<AccessStore>,
   dispatcher: Arc<dyn RequestDispatcher>,
+  events: Arc<EventBus>,
   max_wire_bytes: usize,
 }
 
@@ -232,8 +248,9 @@ async fn dispatch_api(
   connection: InboundConnectionInfo,
   mut request: Request,
 ) -> Response {
+  let recorder = IngressRecorder::new(state.events.clone(), &request, connection, "requests");
   let Some(entry) = state.mounts.get(request.uri().path()).filter(|entry| entry.enabled) else {
-    return ApiError::not_found("API path is not exposed").into_response();
+    return recorder.reject(ApiError::not_found("API path is not exposed"));
   };
   let client_owned =
     matches!(entry.operation, ApiOperation::Generate(_)) && state.client_credentials.contains(&entry.profile);
@@ -244,11 +261,12 @@ async fn dispatch_api(
   };
   let access = match access {
     Ok(access) => access,
-    Err(_) => return ApiError::unauthorized("missing or invalid API key").into_response(),
+    Err(_) => return recorder.reject(ApiError::unauthorized("missing or invalid API key")),
   };
+  let recorder = recorder.with_access(&access);
   // Worker mounts validate methods and execute against their own policy generation.
   if request.method() == Method::CONNECT {
-    return ApiError::bad_request("CONNECT requires a forward-proxy listener").into_response();
+    return recorder.reject(ApiError::bad_request("CONNECT requires a forward-proxy listener"));
   }
   let context = DispatchContext {
     listener_id: state.listener_id.to_string(),
@@ -257,7 +275,7 @@ async fn dispatch_api(
     local_addr: connection.local_addr,
     peer_addr: connection.peer_addr,
   };
-  dispatch(&*state.dispatcher, context, request, state.max_wire_bytes).await
+  dispatch(&*state.dispatcher, context, request, state.max_wire_bytes, recorder).await
 }
 
 pub(crate) struct ProxyIngress {
@@ -266,6 +284,7 @@ pub(crate) struct ProxyIngress {
   pub(crate) access: Arc<AccessStore>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
   dispatcher: Arc<dyn RequestDispatcher>,
+  pub(crate) events: Arc<EventBus>,
   outbound: tokn_core::util::http::HttpClientOptions,
   max_wire_bytes: usize,
 }
@@ -291,6 +310,10 @@ impl ProxyIngress {
     connection: InboundConnectionInfo,
     request: Request,
   ) -> Response {
+    let path = request.uri().path_and_query().map_or("/", |path| path.as_str());
+    let recorder = IngressRecorder::new(self.events.clone(), &request, connection, "proxy")
+      .with_access(&access)
+      .with_url(format!("{scheme}://{}{path}", ingress.authority()));
     let context = DispatchContext {
       listener_id: self.listener_id.to_string(),
       origin: RequestOrigin::proxy(ingress, scheme),
@@ -298,7 +321,7 @@ impl ProxyIngress {
       local_addr: connection.local_addr,
       peer_addr: connection.peer_addr,
     };
-    dispatch(&*self.dispatcher, context, request, self.max_wire_bytes).await
+    dispatch(&*self.dispatcher, context, request, self.max_wire_bytes, recorder).await
   }
 }
 
@@ -307,6 +330,7 @@ async fn dispatch(
   context: DispatchContext,
   request: Request,
   max_wire_bytes: usize,
+  recorder: IngressRecorder,
 ) -> Response {
   // Existing ingress handlers buffer request bodies with a limit. Retain that
   // limit before IPC; response bodies remain streaming end-to-end.
@@ -319,16 +343,16 @@ async fn dispatch(
         .source()
         .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
     {
-      return ApiError::payload_too_large("request body exceeds the configured limit").into_response();
+      return recorder.reject(ApiError::payload_too_large("request body exceeds the configured limit"));
     }
-    Err(_) => return ApiError::bad_request("could not read request body").into_response(),
+    Err(_) => return recorder.reject(ApiError::bad_request("could not read request body")),
   };
   let request = Request::from_parts(parts, axum::body::Body::from(bytes));
   match dispatcher.dispatch(context, request).await {
     Ok(response) => response,
     Err(error) => {
       tracing::warn!(%error, "worker dispatch failed");
-      ApiError::bad_gateway("gateway worker unavailable").into_response()
+      recorder.reject(ApiError::bad_gateway("gateway worker unavailable"))
     }
   }
 }
@@ -363,3 +387,6 @@ async fn update_weights(
     }
   }
 }
+
+#[cfg(test)]
+mod tests;

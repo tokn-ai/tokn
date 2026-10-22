@@ -193,7 +193,8 @@ impl SessionEventHandler {
         StageEvent::BuildHeaders(_) | StageEvent::ConvertRequest(_) | StageEvent::Error { .. },
       )
       | RequestEventPayload::Record(
-        RecordEvent::InboundConnection { .. }
+        RecordEvent::IngressRejected(_)
+        | RecordEvent::InboundConnection { .. }
         | RecordEvent::UpstreamReq { .. }
         | RecordEvent::UpstreamBody { .. }
         | RecordEvent::ConvertedBody { .. }

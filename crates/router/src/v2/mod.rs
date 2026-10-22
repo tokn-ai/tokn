@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod cors_tests;
 mod discovery;
+#[cfg(test)]
+mod ingress_record_tests;
 mod model_refresh;
 pub(crate) mod mounts;
 mod selector;
@@ -187,7 +189,7 @@ pub struct ForwardProxyState {
   profiles: Arc<BTreeMap<ProfileId, ProfileRuntime>>,
   discovery: Arc<discovery::DiscoveryRuntime>,
   access: Arc<tokn_access::AccessStore>,
-  events: Arc<EventBus>,
+  pub(crate) events: Arc<EventBus>,
   identity: Arc<ProxyIdentitySources>,
   ca: Option<Arc<crate::proxy::ProxyCa>>,
   outbound: tokn_core::util::http::HttpClientOptions,
@@ -259,12 +261,19 @@ impl ForwardProxyState {
     connection: InboundConnectionInfo,
     request: Request,
   ) -> Response {
+    let mut rejection = crate::ingress_record::IngressRecorder::new(self.events.clone(), &request, connection, "proxy")
+      .with_access(&access)
+      .with_url(format!(
+        "{}{}",
+        canonical_origin(scheme, ingress),
+        request.uri().path_and_query().map_or("/", |value| value.as_str())
+      ));
     match self
-      .dispatch_http_inner(ingress, scheme, access, connection, request)
+      .dispatch_http_inner(ingress, scheme, access, connection, request, &mut rejection)
       .await
     {
       Ok(response) => response,
-      Err(error) => error.into_response(),
+      Err(error) => rejection.reject(error),
     }
   }
 
@@ -275,9 +284,11 @@ impl ForwardProxyState {
     access: AccessContext,
     connection: InboundConnectionInfo,
     request: Request,
+    rejection: &mut crate::ingress_record::IngressRecorder,
   ) -> Result<Response, ApiError> {
     let (parts, body) = request.into_parts();
     let runtime = self.select_profile(ingress, &parts.method, &parts.uri)?;
+    *rejection = rejection.clone().with_mode(runtime.record_mode);
     let service = runtime
       .proxy_service
       .as_ref()
@@ -404,6 +415,7 @@ impl ForwardProxyState {
     .with_config(config.build())
     .into_http(parts.method, parts.uri)
     .map_err(|error| ApiError::internal(format!("building v2 proxy service message: {error}")))?;
+    rejection.pipeline_started();
     service
       .execute(request)
       .await
@@ -421,6 +433,7 @@ pub(crate) struct InboundConnectionInfo {
 struct ApiRequestContext {
   access: AccessContext,
   connection: InboundConnectionInfo,
+  rejection: crate::ingress_record::IngressRecorder,
 }
 
 impl InboundConnectionInfo {
@@ -1493,16 +1506,25 @@ async fn health() -> &'static str {
 
 async fn authenticate(State(live): State<LiveAppState>, mut request: Request, next: Next) -> Response {
   let state = live.current();
+  let connection = InboundConnectionInfo {
+    local_addr: request.extensions().get::<SocketAddr>().copied(),
+    peer_addr: request
+      .extensions()
+      .get::<ConnectInfo<SocketAddr>>()
+      .map(|ConnectInfo(addr)| *addr),
+  };
+  let rejection = crate::ingress_record::IngressRecorder::new(state.events.clone(), &request, connection, "requests");
+  request.extensions_mut().insert(rejection.clone());
   request.extensions_mut().insert(state.clone());
   let endpoint = match state.mounts.get(request.uri().path()) {
     Some(entry) if !entry.enabled => {
-      return ApiError::not_found("generation endpoint is disabled for this profile").into_response()
+      return rejection.reject(ApiError::not_found("generation endpoint is disabled for this profile"))
     }
     Some(entry) => match entry.operation {
       mounts::ApiOperation::Generate(endpoint) => Some(endpoint),
       _ => None,
     },
-    None => return ApiError::not_found("API path is not exposed").into_response(),
+    None => return rejection.reject(ApiError::not_found("API path is not exposed")),
   };
   if let Some(endpoint) = endpoint {
     match state.select_profile(request.uri(), endpoint) {
@@ -1517,6 +1539,7 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
   let context = crate::dispatch::authenticate_api(state.listener.client_auth(), &state.access, request.headers_mut());
   match context {
     Ok(context) => {
+      request.extensions_mut().insert(rejection.with_access(&context));
       request.extensions_mut().insert(context);
       next.run(request).await
     }
@@ -1525,7 +1548,7 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
         tokn_access::AuthenticationError::Missing => "missing API key",
         tokn_access::AuthenticationError::Invalid | tokn_access::AuthenticationError::Revoked => "invalid API key",
       };
-      ApiError::unauthorized(message).into_response()
+      rejection.reject(ApiError::unauthorized(message))
     }
   }
 }
@@ -1652,10 +1675,12 @@ async fn handle(
     .with_config(config.build())
     .into_http(method, uri)
     .map_err(|error| ApiError::internal(format!("building v2 request service message: {error}")))?;
-  runtime
+  let service = runtime
     .api_service
     .as_ref()
-    .ok_or_else(|| ApiError::internal("selected profile cannot run on an LLM API listener"))?
+    .ok_or_else(|| ApiError::internal("selected profile cannot run on an LLM API listener"))?;
+  context.rejection.pipeline_started();
+  service
     .execute(request)
     .await
     .map(crate::api::response::converted_to_axum)
