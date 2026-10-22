@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 tokn-accounts = { path = "../..", default-features = false }
+tokn-policy = { path = "../../../policy", default-features = false }
 tokn-core = { path = "../../../core", default-features = false }
 tokn-config = { package = "tokn-router-config", path = "../../../config", default-features = false }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }

@@ -130,6 +130,17 @@ pub fn default_base_url(provider_or_driver: &str) -> Option<&'static str> {
   }
 }
 
+/// Destination defaults for the portable linker. Official providers retain
+/// their named destination while custom mappings inherit their driver's URL.
+pub fn provider_default_base_url(
+  provider: &tokn_policy::ProviderId,
+  driver: &tokn_policy::DriverId,
+) -> Option<&'static str> {
+  let preset =
+    tokn_core::provider::official_provider_preset(provider.as_str()).filter(|preset| preset.driver == driver.as_str());
+  default_base_url(preset.map_or(driver.as_str(), |preset| preset.id))
+}
+
 /// Apply each driver's actual per-model API rules. Known models can force a
 /// native operation even when the provider supports several operations overall.
 pub fn supports_model_endpoint(driver: &str, model: &str, endpoint: Endpoint, base_url: &str) -> bool {

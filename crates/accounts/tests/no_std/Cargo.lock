@@ -203,6 +203,7 @@ dependencies = [
  "serde_json",
  "tokn-accounts",
  "tokn-core",
+ "tokn-policy",
  "tokn-router-config",
 ]
 

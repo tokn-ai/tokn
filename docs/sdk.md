@@ -184,12 +184,28 @@ is portable metadata; this does not yet port standard Codex compaction priority
 or routing-header policy. Standard passthrough keeps its distinct typed metadata
 peek, header-only initiator, and original body bytes.
 
+The v2 gateway and injected executor share provider/account linking and route
+selection in `tokn-accounts`:
+
+- `link::portable` validates provider destinations, account identities, and pool
+  membership from the same `ExecutionPlan`. Disabled accounts remain valid pool
+  references but cannot be selected; provider URLs are owned by v2 configuration.
+- `selection::select_route` handles provider/driver qualification, model families,
+  capability evidence, operation fallback, provider scores, and access filtering.
+  Both adapters pass only the selected pool's bindings to this algorithm.
+- `PoolState` owns round-robin, cooldown, fallback tiers, and session affinity.
+  Standard execution locks its pool for each state transaction; injected execution
+  borrows local state and uses the supplied monotonic clock.
+
+Standard provider objects, refreshable model caches, and injected native driver
+capabilities remain platform adapters. Routing parity depends on equivalent
+plans, accounts, capability inventories, and pool state. The injected executor
+accepts v2 configuration only. The default standard SDK still loads legacy configuration and retains its
+older routing behavior; legacy routing is not available in `no_std`.
+
 The standard and injected sessions still implement their stages separately.
 They reuse provider preparation helpers, JSON conversion, and SSE primitives,
-but complete routing, retry, response, and event behavior is not yet unified.
-The default standard SDK still loads legacy configuration and uses its older
-account pool; gateway v2 and injected execution share `tokn-accounts::PoolState`
-and selection helpers, with separate linking and route traversal.
+but complete retry, response, and event behavior is not yet unified.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
 Further unification belongs in these existing crates, with platform services for
 transport, time, credentials, state access, and event delivery. There is no

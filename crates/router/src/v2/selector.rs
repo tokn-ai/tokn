@@ -3,18 +3,18 @@ use smol_str::SmolStr;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokn_accounts::link::{AccountPoolRuntime, AccountPoolRuntimes, PoolAcquire, ProviderBinding};
-use tokn_accounts::selection::{
-  managed_binding_matches, model_candidates, model_provider_score, operation_candidates, provider_allowed,
-};
 #[cfg(test)]
-use tokn_accounts::selection::{qualification_name, DiscoveryEvidence, ProviderConstraint};
+use tokn_accounts::selection::{
+  model_candidates, operation_candidates, qualification_name, DiscoveryEvidence, ProviderConstraint,
+};
+use tokn_accounts::selection::{provider_allowed, select_route, RouteSelection, SelectionRequest};
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_policy::{
-  AccountPoolId, GatewayPlan, ManagedRoute, ProfileId, ProviderId, RelayDestination, RelayRoute, RouteId, RoutePlan,
+  AccountPoolId, GatewayPlan, ProfileId, ProviderId, RelayDestination, RelayRoute, RouteId, RoutePlan,
 };
 #[cfg(test)]
-use tokn_policy::{OperationPolicy, QualificationNamespace};
+use tokn_policy::{ManagedRoute, OperationPolicy, QualificationNamespace};
 use tokn_requests::event::Stage;
 use tokn_requests::pipeline::ctx::PipelineCtx;
 use tokn_requests::pipeline::error::{PipelineError, RequestsError};
@@ -95,89 +95,50 @@ impl V2AccountSelector {
       .expect("v2 selector route was validated during construction")
   }
 
-  fn select_managed(
-    &self,
-    ctx: &PipelineCtx,
-    extracted: &Extracted,
-    route: &ManagedRoute,
-  ) -> Result<SelectorOutcome, PipelineError> {
+  fn select_account(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<SelectorOutcome, PipelineError> {
     let endpoint = resolved_endpoint(ctx)?;
-    let allowed = allowed_provider_ids(ctx)?;
-    let candidates =
-      model_candidates(route, extracted.model.as_str()).map_err(|error| invalid_route_request(error.to_string()))?;
-    let operations = operation_candidates(route.operation(), endpoint);
-    let mut matching_binding_exists = false;
-    let mut allowed_matching_binding_exists = false;
-
-    for candidate in candidates {
-      for evidence in candidate.evidence.order().iter().copied() {
-        for operation in operations.iter().copied() {
-          for binding in &self.state.bindings {
-            if self.route().allows_provider(binding.provider_id())
-              && managed_binding_matches(route, &candidate, evidence, operation, binding)
-            {
-              matching_binding_exists = true;
-              allowed_matching_binding_exists |= provider_allowed(binding.provider_id().as_str(), allowed.as_ref());
-            }
-          }
-          match self.state.pool.acquire_ranked(
-            extracted.session_id.as_deref(),
-            |binding| {
-              self.route().allows_provider(binding.provider_id())
-                && managed_binding_matches(route, &candidate, evidence, operation, binding)
-                && provider_allowed(binding.provider_id().as_str(), allowed.as_ref())
-            },
-            |binding| model_provider_score(route, &candidate, binding),
-          ) {
-            PoolAcquire::Selected(binding) => {
-              return Ok(selected(binding, operation, candidate.model.clone()));
-            }
-            PoolAcquire::CoolingDown { .. } | PoolAcquire::NoEligible => {}
-          }
-        }
-      }
-    }
-
-    Ok(managed_unavailable_outcome(
-      matching_binding_exists,
-      allowed_matching_binding_exists,
-    ))
-  }
-
-  fn select_relay(
-    &self,
-    ctx: &PipelineCtx,
-    extracted: &Extracted,
-    route: &RelayRoute,
-  ) -> Result<SelectorOutcome, PipelineError> {
-    let endpoint = resolved_endpoint(ctx)?;
-    let RelayDestination::FixedProvider(provider) = route.destination() else {
+    if matches!(self.route(), RoutePlan::Relay(route) if !matches!(route.destination(), RelayDestination::FixedProvider(_)))
+    {
       return Err(invalid_route_request(
         "origin-based relay cannot run on an LLM API listener",
       ));
-    };
-    let allowed = allowed_provider_ids(ctx)?;
-    if !provider_allowed(provider.as_str(), allowed.as_ref()) {
-      return Ok(SelectorOutcome::ProviderAccessDenied);
     }
-    Ok(
-      match self.state.pool.acquire(extracted.session_id.as_deref(), |binding| {
-        binding.provider_id() == provider
-      }) {
-        PoolAcquire::Selected(binding) => selected(binding, endpoint, extracted.model.clone()),
-        PoolAcquire::CoolingDown { .. } | PoolAcquire::NoEligible => SelectorOutcome::NoAccount,
+    let allowed = allowed_provider_ids(ctx)?;
+    let request = SelectionRequest {
+      model: extracted.model.as_str(),
+      endpoint,
+      allowed_providers: allowed.as_ref(),
+    };
+    let result = select_route(
+      self.route(),
+      request,
+      self
+        .state
+        .bindings
+        .iter()
+        .map(|binding| (binding.key().clone(), binding.as_ref())),
+      |ranks| match self.state.pool.acquire_ranks(extracted.session_id.as_deref(), ranks) {
+        PoolAcquire::Selected(binding) => Some(binding),
+        PoolAcquire::CoolingDown { .. } | PoolAcquire::NoEligible => None,
       },
     )
+    .map_err(|error| invalid_route_request(error.to_string()))?;
+    Ok(match result {
+      RouteSelection::Selected {
+        binding,
+        model,
+        endpoint,
+      } => selected(binding, endpoint, model),
+      RouteSelection::NoAccount => SelectorOutcome::NoAccount,
+      RouteSelection::ProviderAccessDenied => SelectorOutcome::ProviderAccessDenied,
+    })
   }
 }
 
 #[async_trait]
 impl AccountSelector for V2AccountSelector {
   async fn select(&self, ctx: &PipelineCtx, extracted: &Extracted) -> Result<SelectorOutcome, PipelineError> {
-    match self.route() {
-      RoutePlan::Managed(route) => self.select_managed(ctx, extracted, route),
-      RoutePlan::Relay(route) => self.select_relay(ctx, extracted, route),
-    }
+    self.select_account(ctx, extracted)
   }
 }
 
@@ -462,17 +423,6 @@ fn selected(binding: Arc<ProviderBinding>, operation: Endpoint, model: SmolStr) 
   }
 }
 
-fn managed_unavailable_outcome(
-  matching_binding_exists: bool,
-  allowed_matching_binding_exists: bool,
-) -> SelectorOutcome {
-  if matching_binding_exists && !allowed_matching_binding_exists {
-    SelectorOutcome::ProviderAccessDenied
-  } else {
-    SelectorOutcome::NoAccount
-  }
-}
-
 fn allowed_provider_ids(ctx: &PipelineCtx) -> Result<Option<BTreeSet<String>>, PipelineError> {
   let Some(value) = ctx.config.get(ACCESS_ALLOWED_PROVIDERS_KEY) else {
     return Ok(None);
@@ -517,6 +467,10 @@ mod tests {
   use std::path::Path;
 
   fn managed_plan(model: &str) -> GatewayPlan {
+    managed_plan_with_pool(model, r#"["*"]"#)
+  }
+
+  fn managed_plan_with_pool(model: &str, pool_accounts: &str) -> GatewayPlan {
     let config = format!(
       r#"
 schema_version = 2
@@ -530,7 +484,7 @@ client_auth = "none"
 route = "default"
 
 [profiles.default.account_pool]
-accounts = ["*"]
+accounts = {pool_accounts}
 
 [routes.default]
 kind = "managed"
@@ -540,6 +494,9 @@ model = {model}
 operation = "translate_compatible"
 
 [providers.local]
+driver = "openai"
+
+[providers.outside]
 driver = "openai"
 "#
     );
@@ -619,18 +576,96 @@ driver = "openai"
     assert_eq!(qualification_name(QualificationNamespace::Provider), "provider");
   }
 
-  #[test]
-  fn allowed_but_unavailable_managed_binding_is_not_access_denied() {
+  fn selector(plan: GatewayPlan) -> (V2AccountSelector, Arc<SelectionState>) {
+    use tokn_accounts::link::{build_account_pool_runtimes, link_account_pools, link_provider_graph};
+    use tokn_accounts::registry::Registry;
+    let accounts = [
+      serde_json::from_value(serde_json::json!({ "id": "inside", "provider": "local", "api_key": "fixture" })).unwrap(),
+      serde_json::from_value(serde_json::json!({ "id": "outside", "provider": "outside", "api_key": "fixture" }))
+        .unwrap(),
+    ];
+    let providers = link_provider_graph(&plan, &accounts, &Registry::builtin()).unwrap();
+    let pools = link_account_pools(&plan, &providers).unwrap();
+    let runtimes = build_account_pool_runtimes(&pools);
+    V2AccountSelector::new(Arc::new(plan), &ProfileId::new("default").unwrap(), &runtimes).unwrap()
+  }
+
+  fn context(allowed: Option<&[&str]>) -> PipelineCtx {
+    use tokn_requests::{event::EventBus, pipeline::config::RunConfig};
+    let config = match allowed {
+      Some(allowed) => RunConfig::builder()
+        .with(ACCESS_ALLOWED_PROVIDERS_KEY, serde_json::json!(allowed))
+        .build(),
+      None => RunConfig::default(),
+    };
+    PipelineCtx::new_with_config(
+      "route-test",
+      Endpoint::Responses.into(),
+      Arc::new(EventBus::noop()),
+      Arc::new(config),
+    )
+  }
+
+  async fn extracted(ctx: &PipelineCtx, model: &str) -> Extracted {
+    use tokn_requests::pipeline::stages::{ExtractStage, RawInbound};
+    use tokn_requests::stages::DefaultExtract;
+    let body_json = serde_json::json!({ "model": model });
+    let body = tokn_core::types::Bytes::from(serde_json::to_vec(&body_json).unwrap());
+    DefaultExtract
+      .extract(
+        ctx,
+        RawInbound {
+          request_endpoint: ctx.request_endpoint.clone(),
+          headers: Default::default(),
+          raw_body: body.clone(),
+          decoded_body: body,
+          body_json,
+          request_id: None,
+        },
+      )
+      .await
+      .unwrap()
+  }
+
+  #[tokio::test]
+  async fn shared_selection_keeps_driver_identity_access_errors_and_cooldown_behavior() {
+    let (selector, state) = selector(managed_plan(r#"{ kind = "qualified", namespace = "provider" }"#));
+    let allowed_ctx = context(Some(&["local"]));
+    let extracted = extracted(&allowed_ctx, "local/unlisted-model").await;
+    let selected = selector.select(&allowed_ctx, &extracted).await.unwrap();
+    assert!(matches!(selected, SelectorOutcome::Selected {
+      account_id,
+      provider_id,
+      upstream_endpoint: Some(Endpoint::Responses),
+      upstream_model,
+      ..
+    } if account_id == "inside" && provider_id == "openai" && upstream_model == "unlisted-model"));
+    let binding = state
+      .bindings
+      .iter()
+      .find(|binding| binding.account_id() == "inside")
+      .unwrap();
+    state.pool.record_failure(binding.key()).unwrap();
     assert!(matches!(
-      managed_unavailable_outcome(true, true),
+      selector.select(&allowed_ctx, &extracted).await.unwrap(),
       SelectorOutcome::NoAccount
     ));
     assert!(matches!(
-      managed_unavailable_outcome(true, false),
+      selector.select(&context(Some(&[])), &extracted).await.unwrap(),
       SelectorOutcome::ProviderAccessDenied
     ));
+  }
+
+  #[tokio::test]
+  async fn shared_selection_ignores_matching_bindings_in_other_pools() {
+    let (selector, _) = selector(managed_plan_with_pool(
+      r#"{ kind = "qualified", namespace = "provider" }"#,
+      r#"["inside"]"#,
+    ));
+    let ctx = context(Some(&[]));
+    let extracted = extracted(&ctx, "outside/unlisted-model").await;
     assert!(matches!(
-      managed_unavailable_outcome(false, false),
+      selector.select(&ctx, &extracted).await.unwrap(),
       SelectorOutcome::NoAccount
     ));
   }

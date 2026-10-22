@@ -4,6 +4,8 @@
 //! pools and routes are separate runtime-linking stages; folding them into this
 //! graph would recreate the legacy inventory's loss of provider identity.
 
+use super::portable::{link_provider_metadata, MetadataLinkError, ProviderMetadataGraph};
+use super::{ProviderBindingKey, ProviderUrlSource};
 use crate::{registry::Registry, AccountHandle};
 use smol_str::SmolStr;
 use snafu::Snafu;
@@ -11,27 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokn_auth::descriptor::ProviderDescriptor;
 use tokn_core::account::AccountConfig;
-use tokn_core::provider::{official_provider_preset, Endpoint, Error as ProviderError, Provider, ProviderTarget};
-use tokn_core::upstream_url::{CleartextHttpPolicy, InvalidUpstreamUrl};
+use tokn_core::provider::{Endpoint, Error as ProviderError, Provider, ProviderTarget};
+use tokn_core::upstream_url::InvalidUpstreamUrl;
 use tokn_policy::{DriverId, GatewayPlan, ProviderId};
-
-/// The source of a provider URL selected during runtime linking.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderUrlSource {
-  Configured,
-  ProviderDefault,
-  DriverDefault,
-}
-
-impl std::fmt::Display for ProviderUrlSource {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::Configured => formatter.write_str("configured"),
-      Self::ProviderDefault => formatter.write_str("provider default"),
-      Self::DriverDefault => formatter.write_str("driver default"),
-    }
-  }
-}
 
 /// Linked metadata for one configured provider destination.
 ///
@@ -73,30 +57,6 @@ impl std::fmt::Debug for ProviderDestination {
       .field("driver_id", &self.driver_id)
       .field("base_url", &self.target.base_url().as_str())
       .finish()
-  }
-}
-
-/// Stable identity of one account binding under one configured provider.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ProviderBindingKey {
-  provider_id: ProviderId,
-  account_id: SmolStr,
-}
-
-impl ProviderBindingKey {
-  pub fn new(provider_id: ProviderId, account_id: impl AsRef<str>) -> Self {
-    Self {
-      provider_id,
-      account_id: SmolStr::new(account_id.as_ref()),
-    }
-  }
-
-  pub fn provider_id(&self) -> &ProviderId {
-    &self.provider_id
-  }
-
-  pub fn account_id(&self) -> &str {
-    self.account_id.as_str()
   }
 }
 
@@ -199,6 +159,7 @@ impl std::fmt::Debug for LinkedAccount {
 /// targets and model caches, while all accounts under one provider share its
 /// target.
 pub struct ProviderGraph {
+  pub(super) metadata: ProviderMetadataGraph,
   destinations: BTreeMap<ProviderId, ProviderDestination>,
   bindings: BTreeMap<ProviderBindingKey, Arc<ProviderBinding>>,
   accounts: Box<[LinkedAccount]>,
@@ -315,96 +276,50 @@ pub fn link_provider_graph(
   accounts: &[AccountConfig],
   registry: &Registry,
 ) -> LinkResult<ProviderGraph> {
-  let mut accounts = prepare_accounts(accounts)?;
+  let metadata = link_provider_metadata(plan.execution(), accounts, |provider, driver| {
+    registry
+      .resolve_provider_descriptor(provider.as_str(), driver.as_str())
+      .map(|descriptor| descriptor.base_url)
+  })
+  .map_err(LinkError::from)?;
   let mut destinations = BTreeMap::new();
-  let mut bindings = BTreeMap::new();
-
-  for (provider_id, provider) in plan.providers() {
-    let driver_id = provider.driver();
+  for (provider_id, destination) in metadata.destinations() {
+    let driver_id = destination.driver_id();
     let descriptor = registry
       .resolve_provider_descriptor(provider_id.as_str(), driver_id.as_str())
-      .ok_or_else(|| LinkError::UnknownDriver {
-        provider: provider_id.clone(),
-        driver: driver_id.clone(),
-      })?;
-    let (base_url, url_source) = match provider.base_url() {
-      Some(base_url) => (base_url, ProviderUrlSource::Configured),
-      None => {
-        let preset_destination =
-          official_provider_preset(provider_id.as_str()).is_some_and(|preset| preset.driver == driver_id.as_str());
-        let source = if preset_destination {
-          ProviderUrlSource::ProviderDefault
-        } else {
-          ProviderUrlSource::DriverDefault
-        };
-        (descriptor.base_url, source)
-      }
-    };
-    let cleartext_policy = if provider.allow_insecure_http() {
-      CleartextHttpPolicy::Allow
-    } else {
-      CleartextHttpPolicy::LoopbackOnly
-    };
-    let target = ProviderTarget::parse(base_url, cleartext_policy).map_err(|source| LinkError::InvalidProviderUrl {
-      provider: provider_id.clone(),
-      driver: driver_id.clone(),
-      url_source,
-      base_url: base_url.to_string(),
-      source,
-    })?;
+      .expect("shared linker resolved every provider descriptor");
     destinations.insert(
       provider_id.clone(),
       ProviderDestination {
         provider_id: provider_id.clone(),
         driver_id: driver_id.clone(),
-        target,
+        target: ProviderTarget::new(destination.base_url().clone()),
         descriptor,
       },
     );
   }
 
-  for account in &mut accounts.entries {
-    let provider_id = ProviderId::new(&account.config.provider).ok();
-    let provider = provider_id.as_ref().and_then(|provider_id| plan.provider(provider_id));
-    let Some(provider_id) = provider_id else {
-      return Err(LinkError::UnknownAccountProvider {
-        account_id: SmolStr::new(&account.config.id),
-        provider: SmolStr::new(&account.config.provider),
-      });
-    };
-    let Some(provider) = provider else {
-      // Official providers exist implicitly, so a built-in provider missing
-      // from the compiled plan was explicitly disabled. Keep its stored
-      // account visible to account management without binding it to routes.
-      if official_provider_preset(provider_id.as_str()).is_some() {
-        continue;
-      }
-      return Err(LinkError::UnknownAccountProvider {
-        account_id: SmolStr::new(&account.config.id),
-        provider: SmolStr::new(&account.config.provider),
-      });
-    };
-    if !account.config.enabled {
-      continue;
-    }
-
-    let driver_id = provider.driver();
+  let mut linked_accounts: Vec<_> = accounts
+    .iter()
+    .enumerate()
+    .map(|(input_order, config)| LinkedAccount {
+      config: Arc::new(config.clone()),
+      input_order,
+      binding: None,
+    })
+    .collect();
+  let mut bindings = BTreeMap::new();
+  for binding_metadata in metadata.bindings() {
+    let account = &mut linked_accounts[binding_metadata.account_order()];
+    let provider_id = binding_metadata.provider_id();
+    let driver_id = binding_metadata.driver_id();
     let target = destinations
-      .get(&provider_id)
-      .expect("every compiled provider target was linked")
+      .get(provider_id)
+      .expect("shared linker created every destination")
       .target()
       .clone();
-
-    // A driver may serve several named provider destinations. Preserve an
-    // official destination identity (for example `zhipuai`) so provider-owned
-    // catalogue and wire behavior stay correct; normalize custom providers to
-    // the reusable driver id at the legacy boundary.
     let mut driver_config = (*account.config).clone();
-    let preserves_official_identity =
-      official_provider_preset(provider_id.as_str()).is_some_and(|preset| preset.driver == driver_id.as_str());
-    if !preserves_official_identity {
-      driver_config.provider = driver_id.to_string();
-    }
+    driver_config.provider = binding_metadata.driver_identity().to_string();
     let driver_config = Arc::new(driver_config);
     let driver = registry
       .build_driver_at(driver_id.as_str(), driver_config.clone(), target)
@@ -414,7 +329,7 @@ pub fn link_provider_graph(
         driver: driver_id.clone(),
         source: Box::new(source),
       })?;
-    let key = ProviderBindingKey::new(provider_id, &account.config.id);
+    let key = binding_metadata.key().clone();
     let binding = Arc::new(ProviderBinding {
       key: key.clone(),
       driver_id: driver_id.clone(),
@@ -422,71 +337,54 @@ pub fn link_provider_graph(
       handle: Arc::new(AccountHandle::new(driver_config, driver)),
       account_order: account.input_order,
     });
-    let previous = bindings.insert(key, binding.clone());
-    debug_assert!(
-      previous.is_none(),
-      "duplicate provider binding passed account preflight"
-    );
+    bindings.insert(key, binding.clone());
     account.binding = Some(binding);
   }
-
-  let (accounts, account_indices) = accounts.finish();
+  let account_indices = metadata
+    .accounts()
+    .iter()
+    .map(|account| (SmolStr::new(account.account_id()), account.input_order()))
+    .collect();
   Ok(ProviderGraph {
+    metadata,
     destinations,
     bindings,
-    accounts,
+    accounts: linked_accounts.into_boxed_slice(),
     account_indices,
   })
 }
 
-struct PreparedAccount {
-  config: Arc<AccountConfig>,
-  input_order: usize,
-  binding: Option<Arc<ProviderBinding>>,
-}
-
-struct PreparedAccounts {
-  entries: Vec<PreparedAccount>,
-  indices: BTreeMap<SmolStr, usize>,
-}
-
-impl PreparedAccounts {
-  fn finish(self) -> (Box<[LinkedAccount]>, BTreeMap<SmolStr, usize>) {
-    let accounts = self
-      .entries
-      .into_iter()
-      .map(|account| LinkedAccount {
-        config: account.config,
-        input_order: account.input_order,
-        binding: account.binding,
-      })
-      .collect::<Vec<_>>()
-      .into_boxed_slice();
-    (accounts, self.indices)
-  }
-}
-
-fn prepare_accounts(accounts: &[AccountConfig]) -> LinkResult<PreparedAccounts> {
-  let mut indices = BTreeMap::<SmolStr, usize>::new();
-  let mut entries = Vec::with_capacity(accounts.len());
-
-  for (input_order, account) in accounts.iter().enumerate() {
-    let account_id = SmolStr::new(&account.id);
-    if let Some(first_index) = indices.insert(account_id.clone(), input_order) {
-      return Err(LinkError::DuplicateAccountId {
+impl From<MetadataLinkError> for LinkError {
+  fn from(error: MetadataLinkError) -> Self {
+    match error {
+      MetadataLinkError::DuplicateAccountId {
         account_id,
         first_index,
-        duplicate_index: input_order,
-      });
+        duplicate_index,
+      } => Self::DuplicateAccountId {
+        account_id,
+        first_index,
+        duplicate_index,
+      },
+      MetadataLinkError::UnknownDriver { provider, driver } => Self::UnknownDriver { provider, driver },
+      MetadataLinkError::UnknownAccountProvider { account_id, provider } => {
+        Self::UnknownAccountProvider { account_id, provider }
+      }
+      MetadataLinkError::InvalidProviderUrl {
+        provider,
+        driver,
+        url_source,
+        base_url,
+        source,
+      } => Self::InvalidProviderUrl {
+        provider,
+        driver,
+        url_source,
+        base_url,
+        source,
+      },
     }
-    entries.push(PreparedAccount {
-      config: Arc::new(account.clone()),
-      input_order,
-      binding: None,
-    });
   }
-
-  Ok(PreparedAccounts { entries, indices })
 }
 
 #[cfg(test)]

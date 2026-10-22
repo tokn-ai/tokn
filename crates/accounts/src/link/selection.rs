@@ -171,7 +171,27 @@ impl AccountPoolRuntime {
       .filter(|binding| eligible(binding))
       .map(|binding| (binding.key().clone(), rank(binding)))
       .collect();
-    let selected = self.state.lock().select(now(), session_id, &eligible_ranks);
+    self.acquire_ranks_with_clock(session_id, &eligible_ranks, now)
+  }
+
+  /// Select from eligibility and ranks prepared by shared route selection.
+  /// Only the pool-state transaction runs under the lock. Keys outside this
+  /// pool are ignored, matching [`PoolState::select`].
+  pub fn acquire_ranks(
+    &self,
+    session_id: Option<&str>,
+    eligible_ranks: &BTreeMap<ProviderBindingKey, i32>,
+  ) -> PoolAcquire {
+    self.acquire_ranks_with_clock(session_id, eligible_ranks, Instant::now)
+  }
+
+  fn acquire_ranks_with_clock(
+    &self,
+    session_id: Option<&str>,
+    eligible_ranks: &BTreeMap<ProviderBindingKey, i32>,
+    now: impl FnOnce() -> Instant,
+  ) -> PoolAcquire {
+    let selected = self.state.lock().select(now(), session_id, eligible_ranks);
     match selected {
       Selection::Selected(key) => PoolAcquire::Selected(
         self
@@ -720,12 +740,7 @@ mod tests {
       ranks: &BTreeMap<ProviderBindingKey, i32>,
     ) {
       let expected = shared.select(now, session, ranks);
-      let actual = runtime.acquire_ranked_with_clock(
-        session,
-        |binding| ranks.contains_key(binding.key()),
-        |binding| ranks[binding.key()],
-        || now,
-      );
+      let actual = runtime.acquire_ranks_with_clock(session, ranks, || now);
       let actual = match actual {
         PoolAcquire::Selected(binding) => Selection::Selected(binding.key().clone()),
         PoolAcquire::CoolingDown { retry_at } => Selection::CoolingDown { retry_at },

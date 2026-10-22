@@ -144,6 +144,7 @@ jobs:
           workspaces: |
             .
             crates/sdk/tests/no_std
+            crates/accounts/tests/no_std
 
       - name: Test isolated alloc-only consumer
         run: |
@@ -164,6 +165,7 @@ jobs:
             cargo build --locked -p tokn-sdk --lib --no-default-features --target "$target"
             cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target"
             cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target" --release
+            cargo build --locked --manifest-path crates/accounts/tests/no_std/Cargo.toml --target "$target"
           done
 
   sdk-std:

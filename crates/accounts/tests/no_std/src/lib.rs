@@ -8,7 +8,7 @@ extern crate alloc;
 #[path = "../../scenarios/mod.rs"]
 mod scenarios;
 
-pub use scenarios::{pool_selection_transcript, storage_round_trip};
+pub use scenarios::{configured_routing_transcript, pool_selection_transcript, storage_round_trip};
 
 /// Instantiate the real configuration compiler alongside the local selection
 /// kernel. No listener, filesystem path, or atomic ownership is required.
@@ -31,6 +31,11 @@ mod tests {
   #[test]
   fn shared_execution_compilation() {
     super::execution_compilation();
+  }
+
+  #[test]
+  fn shared_configured_routing() {
+    super::configured_routing_transcript();
   }
 
   #[test]

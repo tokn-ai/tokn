@@ -19,15 +19,14 @@ use core::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokn_accounts::{
+  link::portable::{link_pool_metadata, link_provider_metadata, DestinationMetadata},
   native,
   pool_state::{AffinityPolicy, PoolState, Selection},
-  selection::{
-    managed_binding_matches, model_candidates, model_provider_score, operation_candidates, CandidateBinding,
-  },
+  selection::{select_route, CandidateBinding, RouteSelection, SelectionRequest},
 };
 use tokn_convert::sse::{Decoder, EndpointTranslator, EventTransformer, SseEvent, TerminalState};
 use tokn_core::{
-  account::{AccountConfig, AccountTier},
+  account::AccountConfig,
   headers::{HeaderMap, HeaderName, HeaderValue},
   provider::PreparedRequest,
   types::{Bytes, SmolStr},
@@ -167,10 +166,9 @@ impl Default for Limits {
   }
 }
 
-struct Destination {
-  driver: DriverId,
-  base_url: String,
-  cleartext: CleartextHttpPolicy,
+struct LocalPool {
+  members: Vec<usize>,
+  state: RefCell<PoolState<usize>>,
 }
 
 struct Binding {
@@ -203,9 +201,9 @@ impl CandidateBinding for Binding {
 /// The standard runtime uses independent concurrent sessions instead.
 pub struct Injected<T, R> {
   plan: ExecutionPlan,
-  destinations: BTreeMap<ProviderId, Destination>,
+  destinations: BTreeMap<ProviderId, DestinationMetadata>,
   bindings: Vec<Binding>,
-  pools: RefCell<BTreeMap<AccountPoolId, PoolState<usize>>>,
+  pools: BTreeMap<AccountPoolId, LocalPool>,
   transport: RefCell<T>,
   runtime: RefCell<R>,
   limits: Limits,
@@ -227,44 +225,12 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
     if plan.profiles().is_empty() {
       return Err(Error::new("config", "no execution profiles configured"));
     }
-    // Resolve provider destinations before accounts, just like the standard
-    // linker. A v2 provider owns its URL; legacy per-account URLs do not override it.
-    let mut destinations = BTreeMap::new();
-    for (provider, destination) in plan.providers() {
-      let driver = destination.driver();
-      let preset = tokn_core::provider::official_provider_preset(provider.as_str())
-        .filter(|preset| preset.driver == driver.as_str());
-      let default_identity = preset.map_or(driver.as_str(), |preset| preset.id);
-      let base_url = destination
-        .base_url()
-        .or_else(|| native::default_base_url(default_identity))
-        .ok_or_else(|| Error::new("config", format!("unknown or unsupported driver '{driver}'")))?;
-      if ![Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages]
-        .into_iter()
-        .any(|endpoint| native::supports_endpoint(driver.as_str(), endpoint, base_url))
-      {
-        return Err(Error::new(
-          "config",
-          format!("unknown or unsupported driver '{driver}'"),
-        ));
-      }
-      let cleartext = if destination.allow_insecure_http() {
-        CleartextHttpPolicy::Allow
-      } else {
-        CleartextHttpPolicy::LoopbackOnly
-      };
-      let base_url = tokn_core::upstream_url::CanonicalUpstreamUrl::parse(base_url, cleartext)
-        .map_err(|e| Error::new("config", e))?
-        .to_string();
-      destinations.insert(
-        provider.clone(),
-        Destination {
-          driver: driver.clone(),
-          base_url,
-          cleartext,
-        },
-      );
-    }
+    let metadata = link_provider_metadata(&plan, &accounts, native::provider_default_base_url)
+      .map_err(|e| Error::new("config", e))?;
+    let destinations = metadata
+      .destinations()
+      .map(|(id, destination)| (id.clone(), destination.clone()))
+      .collect::<BTreeMap<_, _>>();
     for (id, profile) in plan.profiles() {
       let route = plan
         .route(profile.route())
@@ -322,81 +288,47 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
         ));
       }
     }
-    let mut ids = BTreeSet::new();
-    let mut bindings = Vec::new();
-    for account in accounts {
-      if !ids.insert(account.id.clone()) {
-        return Err(Error::new("config", "duplicate account id"));
-      }
-      let provider = ProviderId::new(&account.provider).map_err(|e| Error::new("config", e))?;
-      let Some(destination) = destinations.get(&provider) else {
-        // An omitted official provider was deliberately disabled by config.
-        // Keep its stored account as a valid pool reference without binding it.
-        if tokn_core::provider::official_provider_preset(provider.as_str()).is_some() {
-          continue;
+    let bindings = metadata
+      .bindings()
+      .iter()
+      .map(|binding| {
+        let provider = binding.provider_id();
+        let destination = &destinations[provider];
+        Binding {
+          account: accounts[binding.account_order()].clone(),
+          provider: provider.clone(),
+          driver: binding.driver_id().clone(),
+          base_url: destination.base_url().to_string(),
+          models: models.get(provider).cloned().unwrap_or_default(),
+          cleartext: destination.cleartext_policy(),
         }
-        return Err(Error::new("config", format!("unknown provider '{provider}'")));
-      };
-      if !account.enabled {
-        continue;
-      }
-      let (driver, base_url, cleartext) = (
-        destination.driver.clone(),
-        destination.base_url.clone(),
-        destination.cleartext,
-      );
-      bindings.push(Binding {
-        models: models.get(&provider).cloned().unwrap_or_default(),
-        account,
-        provider,
-        driver,
-        base_url,
-        cleartext,
-      });
-    }
+      })
+      .collect();
     let mut pools = BTreeMap::new();
-    for (id, policy) in plan.account_pools() {
-      if policy
-        .selector()
-        .accounts()
-        .is_some_and(|selected| selected.iter().any(|account| !ids.contains(account.as_str())))
-      {
-        return Err(Error::new(
-          "config",
-          format!("pool '{id}' references an unknown account"),
-        ));
-      }
-      let mut active = Vec::new();
-      let mut fallback = Vec::new();
-      for (index, binding) in bindings.iter().enumerate() {
-        if policy
-          .selector()
-          .providers()
-          .is_none_or(|ids| ids.contains(&binding.provider))
-          && policy
-            .selector()
-            .accounts()
-            .is_none_or(|ids| ids.contains(binding.account.id.as_str()))
-        {
-          match binding.account.tier {
-            AccountTier::Active => active.push(index),
-            AccountTier::Fallback => fallback.push(index),
-          }
-        }
-      }
+    for (id, policy) in link_pool_metadata(&plan, &metadata).map_err(|e| Error::new("config", e))? {
       let affinity = policy
         .session_affinity()
         .map(|p| AffinityPolicy::new(p.ttl(), p.expired_retention()));
+      let state = PoolState::new(
+        policy.active().to_vec(),
+        policy.fallback().to_vec(),
+        policy.failure_cooldown(),
+        affinity,
+      )
+      .map_err(|e| Error::new("config", e))?;
       pools.insert(
-        id.clone(),
-        PoolState::new(active, fallback, policy.failure_cooldown(), affinity).map_err(|e| Error::new("config", e))?,
+        id,
+        LocalPool {
+          members: policy.active().iter().chain(policy.fallback()).copied().collect(),
+          state: RefCell::new(state),
+        },
       );
     }
     Ok(Self {
       plan,
       destinations,
       bindings,
-      pools: RefCell::new(pools),
+      pools,
       transport: RefCell::new(transport),
       runtime: RefCell::new(runtime),
       limits: Limits::default(),
@@ -537,7 +469,7 @@ impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
     match &resolved.wire_identity {
       WireIdentity::None => None,
       WireIdentity::ProviderDefault => Some(
-        tokn_core::AgentId::provider_default(self.platform.destinations[&resolved.provider].driver.as_str())
+        tokn_core::AgentId::provider_default(self.platform.destinations[&resolved.provider].driver_id().as_str())
           .unwrap_or_default(),
       ),
       WireIdentity::Named(id) => Some(tokn_core::AgentId::from(id.as_str())),
@@ -612,96 +544,64 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
           opaque: true,
         });
       }
-      let pool = profile
-        .account_pool()
-        .ok_or_else(|| Error::new("resolve", "profile has no account pool"))?;
-      let now = self.platform.runtime.borrow().now();
-      let ranks = self
-        .platform
-        .bindings
-        .iter()
-        .enumerate()
-        .filter(|(_, binding)| binding.provider_id() == provider && route.allows_provider(binding.provider_id()))
-        .map(|(index, _)| (index, 0))
-        .collect();
-      let selected = self
-        .platform
-        .pools
-        .borrow_mut()
-        .get_mut(pool)
-        .ok_or_else(|| Error::new("resolve", "missing account pool"))?
-        .select(now, extracted.session_id.as_deref(), &ranks);
-      return match selected {
-        Selection::Selected(binding) => {
-          self.emit("resolve", None);
-          Ok(Resolved {
-            target: Target::Account {
-              binding,
-              pool: pool.clone(),
-            },
-            provider: self.platform.bindings[binding].provider.clone(),
-            endpoint: self.endpoint,
-            model: SmolStr::new(&extracted.model),
-            wire_identity: profile.wire_identity().clone(),
-            opaque: true,
-          })
-        }
-        Selection::CoolingDown { .. } | Selection::NoEligible => {
-          Err(Error::new("resolve", "no eligible account for this relay"))
-        }
+    } else if let RoutePlan::Managed(managed) = route {
+      self.retry = match managed.retry() {
+        ManagedRetry::Never => None,
+        ManagedRetry::Recoverable(id) => self.platform.plan.retry_policy(id).copied(),
       };
     }
-    let RoutePlan::Managed(managed) = route else {
-      unreachable!("relay returned above")
-    };
-    self.retry = match managed.retry() {
-      ManagedRetry::Never => None,
-      ManagedRetry::Recoverable(id) => self.platform.plan.retry_policy(id).copied(),
-    };
-    let pool = profile
+    let pool_id = profile
       .account_pool()
       .ok_or_else(|| Error::new("resolve", "profile has no account pool"))?;
+    let pool = self
+      .platform
+      .pools
+      .get(pool_id)
+      .ok_or_else(|| Error::new("resolve", "missing account pool"))?;
     let now = self.platform.runtime.borrow().now();
-    let candidates = model_candidates(managed, &extracted.model).map_err(|e| Error::new("resolve", e))?;
-    for candidate in candidates {
-      for evidence in candidate.evidence.order().iter().copied() {
-        for endpoint in operation_candidates(managed.operation(), self.endpoint) {
-          let ranks = self
-            .platform
-            .bindings
-            .iter()
-            .enumerate()
-            .filter(|(_, binding)| {
-              route.allows_provider(binding.provider_id())
-                && managed_binding_matches(managed, &candidate, evidence, endpoint, *binding)
-            })
-            .map(|(index, binding)| (index, model_provider_score(managed, &candidate, binding)))
-            .collect();
-          let selected = self
-            .platform
-            .pools
-            .borrow_mut()
-            .get_mut(pool)
-            .ok_or_else(|| Error::new("resolve", "missing account pool"))?
-            .select(now, extracted.session_id.as_deref(), &ranks);
-          if let Selection::Selected(binding) = selected {
-            self.emit("resolve", None);
-            return Ok(Resolved {
-              target: Target::Account {
-                binding,
-                pool: pool.clone(),
-              },
-              provider: self.platform.bindings[binding].provider.clone(),
-              endpoint,
-              model: candidate.model.clone(),
-              wire_identity: profile.wire_identity().clone(),
-              opaque: false,
-            });
-          }
-        }
+    let selection = select_route(
+      route,
+      SelectionRequest {
+        model: &extracted.model,
+        endpoint: self.endpoint,
+        allowed_providers: None,
+      },
+      pool
+        .members
+        .iter()
+        .map(|&index| (index, &self.platform.bindings[index])),
+      |ranks| match pool
+        .state
+        .borrow_mut()
+        .select(now, extracted.session_id.as_deref(), ranks)
+      {
+        Selection::Selected(binding) => Some(binding),
+        Selection::CoolingDown { .. } | Selection::NoEligible => None,
+      },
+    )
+    .map_err(|e| Error::new("resolve", e))?;
+    match selection {
+      RouteSelection::Selected {
+        binding,
+        model,
+        endpoint,
+      } => {
+        self.emit("resolve", None);
+        Ok(Resolved {
+          target: Target::Account {
+            binding,
+            pool: pool_id.clone(),
+          },
+          provider: self.platform.bindings[binding].provider.clone(),
+          endpoint,
+          model,
+          wire_identity: profile.wire_identity().clone(),
+          opaque: matches!(route, RoutePlan::Relay(_)),
+        })
       }
+      RouteSelection::NoAccount => Err(Error::new("resolve", "no eligible account for this request")),
+      RouteSelection::ProviderAccessDenied => Err(Error::new("resolve", "provider access denied")),
     }
-    Err(Error::new("resolve", "no eligible account for this request"))
   }
   async fn build_headers(&mut self, _: &RequestInterpretation, resolved: &Resolved) -> Result<HeaderMap, Error> {
     if matches!(resolved.target, Target::Client) {
@@ -748,20 +648,24 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
   ) -> Result<Converted, Error> {
     if matches!(resolved.target, Target::Client) {
       let destination = &self.platform.destinations[&resolved.provider];
-      let segments = native::operation_segments(destination.driver.as_str(), resolved.endpoint, &destination.base_url)
-        .ok_or_else(|| {
-          Error::new(
-            "convert_request",
-            "provider has no native path for this relay operation",
-          )
-        })?;
+      let segments = native::operation_segments(
+        destination.driver_id().as_str(),
+        resolved.endpoint,
+        destination.base_url().as_str(),
+      )
+      .ok_or_else(|| {
+        Error::new(
+          "convert_request",
+          "provider has no native path for this relay operation",
+        )
+      })?;
       let prepared = tokn_core::provider::prepare_request_with_policy(
-        &destination.base_url,
+        destination.base_url().as_str(),
         segments,
         resolved.endpoint,
         &self.body,
         headers.clone(),
-        destination.cleartext,
+        destination.cleartext_policy(),
       )
       .map_err(|e| Error::new("convert_request", e))?;
       let upstream_stream = self.body.get("stream").and_then(Value::as_bool).unwrap_or(false);
@@ -884,9 +788,10 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
             self
               .platform
               .pools
-              .borrow_mut()
-              .get_mut(pool)
+              .get(pool)
               .expect("linked pool")
+              .state
+              .borrow_mut()
               .record_failure(self.platform.runtime.borrow().now(), &binding)
               .map_err(|e| Error::new("send", e))?;
           }
@@ -902,9 +807,10 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
           self
             .platform
             .pools
-            .borrow_mut()
-            .get_mut(pool)
+            .get(pool)
             .expect("linked pool")
+            .state
+            .borrow_mut()
             .record_failure(self.platform.runtime.borrow().now(), &binding)
             .map_err(|e| Error::new("send", e))?;
         }
@@ -917,9 +823,10 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       self
         .platform
         .pools
-        .borrow_mut()
-        .get_mut(pool)
+        .get(pool)
         .expect("linked pool")
+        .state
+        .borrow_mut()
         .record_success(
           self.platform.runtime.borrow().now(),
           extracted.session_id.as_deref(),
