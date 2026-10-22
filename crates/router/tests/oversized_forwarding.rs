@@ -1,5 +1,5 @@
 //! Exercise oversized request forwarding through the real public frontend,
-//! Unix IPC, worker pipeline, and default request persistence policy.
+//! Unix IPC, worker pipeline, and configured request persistence policy.
 #![cfg(unix)]
 
 use axum::body::{to_bytes, Bytes};
@@ -21,7 +21,7 @@ use tokn_router::frontend::Frontend;
 use tokn_router::ipc::{serve_worker, WorkerEndpoint, WorkerPool};
 use tokn_router::v2::{build_worker_runtime_states, LiveRuntime};
 
-const CAPTURE_LIMIT: usize = 10 * 1024 * 1024;
+const DEFAULT_CAPTURE_LIMIT: usize = 10 * 1024 * 1024;
 const RESPONSE: &str = r#"{"id":"response-oversized","model":"gpt-test","output":[],"status":"completed"}"#;
 
 struct UpstreamCapture {
@@ -44,12 +44,33 @@ async fn capture_upstream(State(sender): State<mpsc::Sender<UpstreamCapture>>, r
 
 #[tokio::test]
 async fn default_frontend_and_worker_forward_oversized_api_and_proxy_requests_without_saving_bodies() {
-  tokio::time::timeout(Duration::from_secs(30), oversized_requests_are_forwarded())
-    .await
-    .expect("oversized forwarding fixture timed out");
+  assert_eq!(
+    RequestPersistenceOptions::default().body_max_bytes,
+    DEFAULT_CAPTURE_LIMIT
+  );
+  tokio::time::timeout(
+    Duration::from_secs(30),
+    requests_are_forwarded(None, &[DEFAULT_CAPTURE_LIMIT + 1]),
+  )
+  .await
+  .expect("oversized forwarding fixture timed out");
 }
 
-async fn oversized_requests_are_forwarded() {
+#[tokio::test]
+async fn configured_hundred_kib_capture_limit_preserves_forwarding_below_at_and_above_threshold() {
+  let capture_limit = 100 * 1024;
+  tokio::time::timeout(
+    Duration::from_secs(30),
+    requests_are_forwarded(
+      Some(capture_limit),
+      &[capture_limit - 1, capture_limit, capture_limit + 1],
+    ),
+  )
+  .await
+  .expect("configured capture limit fixture timed out");
+}
+
+async fn requests_are_forwarded(configured_capture_limit: Option<usize>, body_lengths: &[usize]) {
   let (capture_tx, mut capture_rx) = mpsc::channel(2);
   let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
   let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -63,12 +84,23 @@ async fn oversized_requests_are_forwarded() {
   let reserved_proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
   let api_addr = reserved_api.local_addr().unwrap();
   let proxy_addr = reserved_proxy.local_addr().unwrap();
-  let compiled = relay_config(api_addr, proxy_addr, upstream_addr);
+  let compiled = relay_config(api_addr, proxy_addr, upstream_addr, configured_capture_limit);
   let (plan, service) = compiled.into_parts();
+  let capture_limit = configured_capture_limit.unwrap_or(DEFAULT_CAPTURE_LIMIT);
+  assert_eq!(service.persistence().body_max_bytes(), capture_limit);
+  assert_eq!(service.request_limits().max_wire_bytes(), usize::MAX);
+  assert_eq!(service.request_limits().max_decoded_bytes(), usize::MAX);
   let access = Arc::new(AccessStore::disabled());
   let events = Arc::new(EventBus::new(128));
   let requests_dir = tempfile::tempdir().unwrap();
-  let persistence = RequestEventHandler::new(requests_dir.path().to_path_buf()).unwrap();
+  let persistence = RequestEventHandler::with_options(
+    requests_dir.path().to_path_buf(),
+    RequestPersistenceOptions {
+      record_request_bodies: service.persistence().record_request_bodies(),
+      body_max_bytes: service.persistence().body_max_bytes(),
+    },
+  )
+  .unwrap();
   let event_thread = spawn_event_loop(events.subscribe(), vec![Box::new(persistence)]);
 
   let states = build_worker_runtime_states(plan.clone(), service.clone(), &[], access.clone(), events.clone()).unwrap();
@@ -105,44 +137,39 @@ async fn oversized_requests_are_forwarded() {
     let _ = frontend_stopped.await;
   }));
 
-  let body = Bytes::from(
-    serde_json::to_vec(&serde_json::json!({
-      "model": "gpt-test",
-      "stream": false,
-      "input": "x".repeat(CAPTURE_LIMIT + 1)
-    }))
-    .unwrap(),
-  );
-  assert_eq!(RequestPersistenceOptions::default().body_max_bytes, CAPTURE_LIMIT);
-  assert!(body.len() > CAPTURE_LIMIT);
-
   let api_client = reqwest::Client::builder().no_proxy().build().unwrap();
   let proxy_client = reqwest::Client::builder()
     .no_proxy()
     .proxy(reqwest::Proxy::http(format!("http://{proxy_addr}")).unwrap())
     .build()
     .unwrap();
-  for (marker, client, url) in [
-    ("api", &api_client, format!("http://{api_addr}/v1/responses")),
-    // Fixed-provider proxy relays append the original path to base_url's /v1.
-    ("proxy", &proxy_client, "http://original.invalid/responses".into()),
-  ] {
-    let response = client
-      .post(url)
-      .header("x-request-id", format!("req-oversized-{marker}"))
-      .header("x-oversized-probe", marker)
-      .header("content-type", "application/json")
-      .body(body.clone())
-      .send()
-      .await
-      .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK, "{marker}");
-    assert_eq!(response.text().await.unwrap(), RESPONSE);
-    let captured = capture_rx.recv().await.unwrap();
-    assert_eq!(captured.marker, marker);
-    assert_eq!(captured.content_length, body.len());
-    assert_eq!(captured.body.len(), body.len());
-    assert!(captured.body == body, "{marker} changed the upstream request bytes");
+  let mut completed_requests = Vec::new();
+  for &body_length in body_lengths {
+    let body = request_body(body_length);
+    for (marker, client, url) in [
+      ("api", &api_client, format!("http://{api_addr}/v1/responses")),
+      // Fixed-provider proxy relays append the original path to base_url's /v1.
+      ("proxy", &proxy_client, "http://original.invalid/responses".into()),
+    ] {
+      let request_id = format!("req-capture-{marker}-{body_length}");
+      let response = client
+        .post(url)
+        .header("x-request-id", &request_id)
+        .header("x-oversized-probe", marker)
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+      assert_eq!(response.status(), reqwest::StatusCode::OK, "{request_id}");
+      assert_eq!(response.text().await.unwrap(), RESPONSE);
+      let captured = capture_rx.recv().await.unwrap();
+      assert_eq!(captured.marker, marker);
+      assert_eq!(captured.content_length, body_length);
+      assert_eq!(captured.body.len(), body_length);
+      assert!(captured.body == body, "{request_id} changed the upstream request bytes");
+      completed_requests.push((request_id, marker, body.clone()));
+    }
   }
   drop(api_client);
   drop(proxy_client);
@@ -154,24 +181,24 @@ async fn oversized_requests_are_forwarded() {
   event_thread.join().unwrap();
   upstream_task.abort();
 
-  for marker in ["api", "proxy"] {
-    let row = read_request_row(requests_dir.path(), &format!("req-oversized-{marker}"))
+  for (request_id, marker, body) in completed_requests {
+    let row = read_request_row(requests_dir.path(), &request_id)
       .unwrap()
-      .expect("successful oversized request must remain in request history");
+      .expect("successful request must remain in request history");
     assert_eq!(row["model"], "gpt-test");
     assert_eq!(row["provider_id"], "local");
     assert_eq!(row["status"], 200);
     assert_eq!(row["outbound_resp_status"], 200);
     assert_eq!(row["inbound_resp_status"], 200);
     assert!(row["request_error"].is_null());
-    assert!(
-      row["inbound_req_body"].is_null(),
-      "{marker} saved an oversized inbound body"
-    );
-    assert!(
-      row["outbound_req_body"].is_null(),
-      "{marker} saved an oversized outbound body"
-    );
+    let expected_request_body = if body.len() <= capture_limit {
+      serde_json::from_slice(&body).unwrap()
+    } else {
+      serde_json::Value::Null
+    };
+    for column in ["inbound_req_body", "outbound_req_body"] {
+      assert_eq!(row[column], expected_request_body, "{column} for {request_id}");
+    }
     assert_eq!(row["inbound_req_headers"]["x-oversized-probe"], marker);
     assert_eq!(row["outbound_req_headers"]["x-oversized-probe"], marker);
     assert!(row["ctx_json"]["latency_ms"].as_i64().is_some());
@@ -181,11 +208,29 @@ async fn oversized_requests_are_forwarded() {
   }
 }
 
-fn relay_config(api: SocketAddr, proxy: SocketAddr, upstream: SocketAddr) -> tokn_config::v2::CompiledConfig {
+fn request_body(length: usize) -> Bytes {
+  let mut request = serde_json::json!({ "model": "gpt-test", "stream": false, "input": "" });
+  let envelope_length = serde_json::to_vec(&request).unwrap().len();
+  request["input"] = serde_json::Value::String("x".repeat(length.checked_sub(envelope_length).unwrap()));
+  let body = Bytes::from(serde_json::to_vec(&request).unwrap());
+  assert_eq!(body.len(), length);
+  body
+}
+
+fn relay_config(
+  api: SocketAddr,
+  proxy: SocketAddr,
+  upstream: SocketAddr,
+  capture_limit: Option<usize>,
+) -> tokn_config::v2::CompiledConfig {
+  let persistence_config = capture_limit
+    .map(|limit| format!("[service.persistence]\nbody_max_bytes = {limit}\n"))
+    .unwrap_or_default();
   tokn_config::v2::parse_config(
     &format!(
       r#"
 schema_version = 2
+{persistence_config}
 [listeners.api]
 kind = "llm_api"
 bind = "{api}"
