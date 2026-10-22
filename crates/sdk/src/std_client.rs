@@ -9,8 +9,6 @@ use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
-use tokn_headers::keys::{ACCEPT, CONTENT_TYPE};
-use tokn_headers::{HeaderMap, HeaderName, HeaderValue};
 use tokn_requests::runtime::{ConfiguredRuntime, RequestPolicyRuntime};
 use tokn_requests::{ExecutionRequest, RawInbound, RunConfig};
 
@@ -227,16 +225,7 @@ fn select_policy(snapshot: &Snapshot, request_profile: Option<&str>) -> Result<A
 
 fn raw_request(endpoint: Endpoint, body: Value, options: &RequestOptions) -> Result<RawInbound> {
   let bytes = serde_json::to_vec(&body).map_err(|source| Error::SerializeRequest { source })?;
-  let mut headers = HeaderMap::new();
-  headers.insert(CONTENT_TYPE.clone(), HeaderValue::from_static("application/json"));
-  headers.insert(ACCEPT.clone(), HeaderValue::from_static("application/json"));
-  insert_option(&mut headers, "x-request-id", options.request_id.as_deref());
-  insert_option(&mut headers, "x-session-id", options.session_id.as_deref());
-  insert_option(&mut headers, "x-project-cwd", options.project_id.as_deref());
-  insert_option(&mut headers, "x-initiator", options.initiator.as_deref());
-  for (name, value) in &options.headers {
-    headers.insert(HeaderName::new(name.clone()), HeaderValue::from_string(value.clone()));
-  }
+  let headers = options.inbound_headers();
   let bytes = bytes::Bytes::from(bytes);
   Ok(RawInbound {
     request_endpoint: RequestEndpoint::from(endpoint),
@@ -246,12 +235,6 @@ fn raw_request(endpoint: Endpoint, body: Value, options: &RequestOptions) -> Res
     body_json: body,
     request_id: options.request_id.as_deref().map(SmolStr::new),
   })
-}
-
-fn insert_option(headers: &mut HeaderMap, name: &'static str, value: Option<&str>) {
-  if let Some(value) = value {
-    headers.insert(HeaderName::new(name), HeaderValue::from_string(value.to_string()));
-  }
 }
 
 impl crate::Platform for StdPlatform {

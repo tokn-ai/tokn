@@ -26,62 +26,8 @@ use serde_json::Value;
 use smol_str::SmolStr;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(untagged)]
-pub enum RequestEndpoint {
-  Known(Endpoint),
-  CustomPath(SmolStr),
-}
-
-impl RequestEndpoint {
-  pub fn as_str(&self) -> &str {
-    match self {
-      RequestEndpoint::Known(endpoint) => endpoint.as_str(),
-      RequestEndpoint::CustomPath(label) => label.as_str(),
-    }
-  }
-
-  pub fn custom(label: impl Into<SmolStr>) -> Self {
-    Self::CustomPath(label.into())
-  }
-
-  pub fn infer_from_path(path: impl AsRef<str>) -> Self {
-    let path = path.as_ref();
-    if let Some(endpoint) = Endpoint::infer_from(path) {
-      Self::Known(endpoint)
-    } else {
-      Self::CustomPath(SmolStr::new(path))
-    }
-  }
-
-  pub fn resolved(&self) -> Option<Endpoint> {
-    match self {
-      RequestEndpoint::Known(endpoint) => Some(*endpoint),
-      RequestEndpoint::CustomPath(_) => None,
-    }
-  }
-}
-
-impl From<Endpoint> for RequestEndpoint {
-  fn from(value: Endpoint) -> Self {
-    Self::Known(value)
-  }
-}
-
-impl PartialEq<Endpoint> for RequestEndpoint {
-  fn eq(&self, other: &Endpoint) -> bool {
-    match self {
-      RequestEndpoint::Known(endpoint) => endpoint == other,
-      RequestEndpoint::CustomPath(_) => false,
-    }
-  }
-}
-
-impl std::fmt::Display for RequestEndpoint {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(self.as_str())
-  }
-}
+// Preserve the established event-module path for standard consumers.
+pub use crate::endpoint::RequestEndpoint;
 
 /// Identifies which pipeline stage produced an event. Used both as a tag on
 /// success variants (implicit via the variant name) and as a field on

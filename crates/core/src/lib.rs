@@ -24,7 +24,6 @@ pub mod provider;
 #[path = "provider/portable.rs"]
 pub mod provider;
 mod provider_values;
-#[cfg(feature = "std")]
 pub mod request_classification;
 #[cfg(feature = "std")]
 pub mod request_event;

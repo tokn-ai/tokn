@@ -1,3 +1,4 @@
+use crate::types::SmolStr;
 use serde::Serialize;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize)]
@@ -35,6 +36,64 @@ impl Endpoint {
 }
 
 impl core::fmt::Display for Endpoint {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str(self.as_str())
+  }
+}
+
+/// The requested operation or an opaque path retained by a passthrough request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(untagged)]
+pub enum RequestEndpoint {
+  Known(Endpoint),
+  CustomPath(SmolStr),
+}
+
+impl RequestEndpoint {
+  pub fn as_str(&self) -> &str {
+    match self {
+      RequestEndpoint::Known(endpoint) => endpoint.as_str(),
+      RequestEndpoint::CustomPath(label) => label.as_str(),
+    }
+  }
+
+  pub fn custom(label: impl Into<SmolStr>) -> Self {
+    Self::CustomPath(label.into())
+  }
+
+  pub fn infer_from_path(path: impl AsRef<str>) -> Self {
+    let path = path.as_ref();
+    if let Some(endpoint) = Endpoint::infer_from(path) {
+      Self::Known(endpoint)
+    } else {
+      Self::CustomPath(SmolStr::new(path))
+    }
+  }
+
+  pub fn resolved(&self) -> Option<Endpoint> {
+    match self {
+      RequestEndpoint::Known(endpoint) => Some(*endpoint),
+      RequestEndpoint::CustomPath(_) => None,
+    }
+  }
+}
+
+impl From<Endpoint> for RequestEndpoint {
+  fn from(value: Endpoint) -> Self {
+    Self::Known(value)
+  }
+}
+
+impl PartialEq<Endpoint> for RequestEndpoint {
+  fn eq(&self, other: &Endpoint) -> bool {
+    match self {
+      RequestEndpoint::Known(endpoint) => endpoint == other,
+      RequestEndpoint::CustomPath(_) => false,
+    }
+  }
+}
+
+impl core::fmt::Display for RequestEndpoint {
   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
   }
