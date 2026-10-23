@@ -9,8 +9,8 @@ pub use scenarios::{
   buffered_content_detection, buffered_response_limits, buffered_round_trip, configured_client_relay,
   configured_provider_policies, configured_relay_policies, configured_status_policy, configured_transport_encoding,
   cross_format_round_trip, response_body_failure_does_not_retry, retry_fallback_affinity,
-  retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_round_trip,
-  transport_failure_account_feedback,
+  retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_cancellation_lifecycle,
+  streaming_failure_lifecycle, streaming_round_trip, streaming_terminal_lifecycle, transport_failure_account_feedback,
 };
 
 #[cfg(test)]
@@ -75,6 +75,18 @@ mod tests {
   #[test]
   fn stream_errors_and_borrow_release() {
     super::stream_errors_and_cancellation();
+  }
+  #[test]
+  fn streaming_terminal_lifecycle() {
+    super::streaming_terminal_lifecycle();
+  }
+  #[test]
+  fn streaming_failure_lifecycle() {
+    super::streaming_failure_lifecycle();
+  }
+  #[test]
+  fn streaming_cancellation_lifecycle() {
+    super::streaming_cancellation_lifecycle();
   }
 }
 

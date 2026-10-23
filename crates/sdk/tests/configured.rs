@@ -42,6 +42,18 @@ fn response_body_failure_does_not_retry() {
 fn stream_errors_and_borrow_release() {
   scenarios::stream_errors_and_cancellation();
 }
+#[test]
+fn streaming_terminal_lifecycle() {
+  scenarios::streaming_terminal_lifecycle();
+}
+#[test]
+fn streaming_failure_lifecycle() {
+  scenarios::streaming_failure_lifecycle();
+}
+#[test]
+fn streaming_cancellation_lifecycle() {
+  scenarios::streaming_cancellation_lifecycle();
+}
 
 #[test]
 fn provider_defaults_and_wire_identity() {

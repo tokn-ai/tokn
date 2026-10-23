@@ -253,12 +253,31 @@ by `Limits`. Opaque buffered relays preserve their bytes without normalization.
 Accumulated SSE receives `application/json`; other buffered responses retain
 their upstream content type in the converter and injected adapter. The HTTP
 gateway sets its managed response content type when constructing the HTTP reply.
-Live injected streams still require `text/event-stream`; streaming lifecycle
-and MIME policy are separate from this buffered response path.
+Live injected streams still require `text/event-stream`.
+
+Managed live streams share `tokn_convert::sse::StreamProcessor` for terminal
+validation, transformation, queued output, and completion:
+
+- The upstream protocol determines completion: Chat requires `[DONE]`, Responses
+  requires `response.completed`, and Messages requires `message_stop`. A finish
+  reason alone does not make an EOF successful.
+- A valid terminal stops upstream reads without waiting for transport EOF.
+  Success is reported only after all converted events have been delivered.
+- Upstream failure events, malformed translated payloads, framing errors, and
+  transport errors fail once. Dropping or cancelling a response with output still
+  pending reports cancellation instead of success. Neither case retries the request.
+- Dropping an injected `next_event` future leaves its response resumable; dropping
+  the response itself releases the exchange and cancels it.
+
+The standard recorder consumes the processor's outcome for managed streams,
+instead of reparsing upstream bytes as the downstream protocol. Standard opaque
+relays still forward original bytes and retain best-effort protocol telemetry.
+Generic `SsePipeline::from_stream` retains transport-EOF completion unless a
+known upstream endpoint is supplied with `with_endpoint`.
 
 The standard and injected sessions still implement their stages separately.
 They reuse provider preparation helpers, buffered response normalization, and
-SSE primitives. Transport I/O, error-body capture, live stream ownership, and
+stream processing. Transport I/O, error-body capture, live stream ownership, and
 event delivery remain platform adapters. Send decisions are shared; applying
 pool feedback uses each adapter's existing state access.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.

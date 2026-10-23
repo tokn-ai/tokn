@@ -23,7 +23,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use std::sync::Arc;
 use tokn_convert::buffered::{self, BufferedError};
-use tokn_convert::sse::{observer_channel, EndpointTranslator, ObserverMsg, SsePipeline};
+use tokn_convert::sse::{observer_channel, EndpointTranslator, ObserverMsg, SsePipeline, StreamOutcome};
 use tokn_convert::usage::{parse_usage_any_value, usage_has_any};
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RecordEvent;
@@ -36,6 +36,79 @@ pub struct DefaultConvertResponse;
 impl DefaultConvertResponse {
   pub fn new() -> Self {
     Self
+  }
+
+  fn build_stream(
+    ctx: &PipelineCtx,
+    status: u16,
+    headers: HeaderMap,
+    upstream_endpoint: Option<Endpoint>,
+    body: BoxStream<'static, std::io::Result<Bytes>>,
+    completion: Option<Box<dyn FnOnce(StreamOutcome) + Send>>,
+  ) -> Result<ConvertedResponse, PipelineError> {
+    debug!("wrapping upstream response as SSE stream");
+    let inbound_endpoint = ctx.request_endpoint.resolved().ok_or_else(|| {
+      PipelineError::permanent(
+        Stage::ConvertResponse,
+        RequestsError::MissingResolvedEndpoint {
+          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
+        },
+      )
+    })?;
+    let upstream_endpoint = upstream_endpoint.ok_or_else(|| {
+      PipelineError::permanent(
+        Stage::ConvertResponse,
+        RequestsError::MissingUpstreamEndpoint {
+          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
+        },
+      )
+    })?;
+    let mut pipeline = SsePipeline::from_stream(body).with_endpoint(upstream_endpoint);
+    if let Some(completion) = completion {
+      pipeline = pipeline.with_completion(completion);
+    }
+    if upstream_endpoint != inbound_endpoint {
+      pipeline = pipeline.with_transformer(EndpointTranslator::new(upstream_endpoint, inbound_endpoint));
+    }
+
+    // Tap parsed SSE event JSON to extract usage and emit
+    // `RecordEvent::Usage` per frame that yields new figures.
+    let (tap_tx, mut tap_rx) = observer_channel();
+    pipeline = pipeline.with_tap_parsed(tap_tx);
+    let tap_request_id = ctx.request_id.clone();
+    let tap_attempt = ctx.attempt;
+    let tap_events = ctx.events.clone();
+    let tap_guard = ctx.events.begin_finalizer();
+    tokio::spawn(async move {
+      while let Some(msg) = tap_rx.recv().await {
+        match msg {
+          ObserverMsg::Parsed(Some(value)) => {
+            let parsed = parse_usage_any_value(&value);
+            if !usage_has_any(&parsed) {
+              continue;
+            }
+            tap_events.emit(tokn_core::event::Event::Requests(
+              tokn_core::request_event::RequestEvent {
+                request_id: tap_request_id.clone(),
+                attempt: tap_attempt,
+                ts: tokn_core::util::now_unix_ms(),
+                payload: tokn_core::request_event::RequestEventPayload::Record(RecordEvent::Usage(parsed)),
+              },
+            ));
+          }
+          ObserverMsg::Done | ObserverMsg::Error(_) => break,
+          _ => {}
+        }
+      }
+      tap_guard.finish();
+    });
+
+    Ok(ConvertedResponse {
+      status,
+      headers,
+      kind: ConvertedResponseKind::Managed,
+      body: ConvertedBody::Stream { body: pipeline.run() },
+    })
   }
 }
 
@@ -131,68 +204,19 @@ impl ConvertResponseStage for DefaultConvertResponse {
     upstream_endpoint: Option<Endpoint>,
     body: BoxStream<'static, std::io::Result<Bytes>>,
   ) -> Result<ConvertedResponse, PipelineError> {
-    debug!("wrapping upstream response as SSE stream");
-    let inbound_endpoint = ctx.request_endpoint.resolved().ok_or_else(|| {
-      PipelineError::permanent(
-        Stage::ConvertResponse,
-        RequestsError::MissingResolvedEndpoint {
-          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
-        },
-      )
-    })?;
-    let upstream_endpoint = upstream_endpoint.ok_or_else(|| {
-      PipelineError::permanent(
-        Stage::ConvertResponse,
-        RequestsError::MissingUpstreamEndpoint {
-          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
-        },
-      )
-    })?;
-    let mut pipeline = SsePipeline::from_stream(body);
-    if upstream_endpoint != inbound_endpoint {
-      pipeline = pipeline.with_transformer(EndpointTranslator::new(upstream_endpoint, inbound_endpoint));
-    }
+    Self::build_stream(ctx, status, headers, upstream_endpoint, body, None)
+  }
 
-    // Tap parsed SSE event JSON to extract usage and emit
-    // `RecordEvent::Usage` per frame that yields new figures. The shared
-    // `usage_state` aggregate is also updated so the runner's periodic
-    // `StreamProgress` events carry live usage.
-    let (tap_tx, mut tap_rx) = observer_channel();
-    pipeline = pipeline.with_tap_parsed(tap_tx);
-    let tap_request_id = ctx.request_id.clone();
-    let tap_attempt = ctx.attempt;
-    let tap_events = ctx.events.clone();
-    let tap_guard = ctx.events.begin_finalizer();
-    tokio::spawn(async move {
-      while let Some(msg) = tap_rx.recv().await {
-        match msg {
-          ObserverMsg::Parsed(Some(value)) => {
-            let parsed = parse_usage_any_value(&value);
-            if !usage_has_any(&parsed) {
-              continue;
-            }
-            tap_events.emit(tokn_core::event::Event::Requests(
-              tokn_core::request_event::RequestEvent {
-                request_id: tap_request_id.clone(),
-                attempt: tap_attempt,
-                ts: tokn_core::util::now_unix_ms(),
-                payload: tokn_core::request_event::RequestEventPayload::Record(RecordEvent::Usage(parsed)),
-              },
-            ));
-          }
-          ObserverMsg::Done | ObserverMsg::Error(_) => break,
-          _ => {}
-        }
-      }
-      tap_guard.finish();
-    });
-
-    Ok(ConvertedResponse {
-      status,
-      headers,
-      kind: ConvertedResponseKind::Managed,
-      body: ConvertedBody::Stream { body: pipeline.run() },
-    })
+  async fn convert_stream_observed(
+    &self,
+    ctx: &PipelineCtx,
+    status: u16,
+    headers: HeaderMap,
+    upstream_endpoint: Option<Endpoint>,
+    body: BoxStream<'static, std::io::Result<Bytes>>,
+    completion: Box<dyn FnOnce(StreamOutcome) + Send>,
+  ) -> Result<ConvertedResponse, PipelineError> {
+    Self::build_stream(ctx, status, headers, upstream_endpoint, body, Some(completion))
   }
 }
 

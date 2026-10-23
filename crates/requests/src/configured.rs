@@ -8,7 +8,7 @@ use crate::interpretation::RequestInterpretation;
 use crate::retry::{RetryFailure, RetryPolicy};
 use crate::send_policy::{AccountFeedback, AccountFeedbackPolicy, ResponsePolicy, SendOutcome};
 use alloc::{
-  collections::{BTreeMap, BTreeSet, VecDeque},
+  collections::{BTreeMap, BTreeSet},
   format,
   string::{String, ToString},
   vec::Vec,
@@ -26,7 +26,7 @@ use tokn_accounts::{
   pool_state::{AffinityPolicy, PoolState, Selection},
   selection::{select_route, CandidateBinding, RouteSelection, SelectionRequest},
 };
-use tokn_convert::sse::{Decoder, EndpointTranslator, EventTransformer, SseEvent, TerminalState};
+use tokn_convert::sse::{Decoder, EndpointTranslator, SseEvent, StreamOutcome, StreamProcessor};
 use tokn_core::{
   account::AccountConfig,
   headers::{HeaderMap, HeaderName, HeaderValue},
@@ -966,9 +966,7 @@ pub struct EventStream<'a, T: Transport, R: Runtime> {
   platform: &'a Injected<T, R>,
   body: Option<Exchange<'a, T>>,
   decoder: Decoder,
-  terminal: TerminalState,
-  translator: Option<EndpointTranslator>,
-  pending: VecDeque<SseEvent>,
+  processor: StreamProcessor<Option<EndpointTranslator>>,
   buffer: [u8; 1024],
   position: usize,
   length: usize,
@@ -992,10 +990,10 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
       platform,
       body: Some(body),
       decoder: Decoder::new(platform.limits.max_event_bytes),
-      terminal: TerminalState::new(from),
-      translator: (from != to)
-        .then(|| EndpointTranslator::with_created_at(from, to, platform.runtime.borrow().unix_seconds())),
-      pending: VecDeque::new(),
+      processor: StreamProcessor::new(
+        Some(from),
+        (from != to).then(|| EndpointTranslator::with_created_at(from, to, platform.runtime.borrow().unix_seconds())),
+      ),
       buffer: [0; 1024],
       position: 0,
       length: 0,
@@ -1004,32 +1002,41 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
       report_terminal: true,
     }
   }
-  fn close(&mut self, success: bool) {
-    if self.body.take().is_some() && self.report_terminal {
-      self.platform.runtime.borrow_mut().observe(Lifecycle {
-        request_id: &self.request_id,
-        attempt: self.attempt,
-        stage: "completed",
-        success: Some(success),
-      });
+  fn settle(&mut self) {
+    if self.processor.input_closed() {
+      // Release the HTTP session as soon as protocol input ends; queued
+      // converted events still belong to this response until delivered.
+      self.body.take();
+    }
+    if let Some(outcome) = self.processor.outcome() {
+      if core::mem::take(&mut self.report_terminal) {
+        self.platform.runtime.borrow_mut().observe(Lifecycle {
+          request_id: &self.request_id,
+          attempt: self.attempt,
+          stage: "completed",
+          success: Some(outcome == StreamOutcome::Complete),
+        });
+      }
     }
   }
   pub fn cancel(&mut self) {
-    self.close(false);
-    self.pending.clear();
+    self.processor.cancel();
+    self.settle();
   }
   pub async fn next_event(&mut self) -> Result<Option<SseEvent>, Error> {
     let result = self.read_event().await;
     if result.is_err() {
-      self.close(false);
-      self.pending.clear();
+      self.processor.fail();
+      self.settle();
     }
     result
   }
   async fn read_event(&mut self) -> Result<Option<SseEvent>, Error> {
     loop {
-      if let Some(event) = self.pending.pop_front() {
-        return Ok(Some(event));
+      let event = self.processor.next_event();
+      self.settle();
+      if event.is_some() {
+        return Ok(event);
       }
       let Some(body) = self.body.as_mut() else {
         return Ok(None);
@@ -1040,9 +1047,8 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
           return Err(Error::new("stream", "transport returned an invalid byte count"));
         }
         if count == 0 {
-          self.terminal.finish().map_err(|e| Error::new("stream", e))?;
-          self.close(true);
-          return Ok(None);
+          self.processor.finish().map_err(|e| Error::new("stream", e))?;
+          continue;
         }
         self.position = 0;
         self.length = count;
@@ -1053,26 +1059,10 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
         let Some(record) = self.decoder.push(byte).map_err(|e| Error::new("stream", e))? else {
           continue;
         };
-        if record.data.trim().is_empty() {
-          continue;
-        }
-        let event = SseEvent::from(record);
-        let complete = self.terminal.observe(&event).map_err(|e| Error::new("stream", e))?;
-        if let Some(translator) = self.translator.as_mut() {
-          self
-            .pending
-            .extend(translator.transform(event).map_err(|e| Error::new("stream", e))?);
-          if complete {
-            self
-              .pending
-              .extend(translator.finish().map_err(|e| Error::new("stream", e))?);
-          }
-        } else {
-          self.pending.push_back(event);
-        }
-        if complete {
-          self.close(true);
-        }
+        self
+          .processor
+          .push(SseEvent::from(record))
+          .map_err(|e| Error::new("stream", e))?;
         break;
       }
     }
@@ -1080,6 +1070,6 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
 }
 impl<T: Transport, R: Runtime> Drop for EventStream<'_, T, R> {
   fn drop(&mut self) {
-    self.close(false);
+    self.cancel();
   }
 }

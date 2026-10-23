@@ -10,3 +10,20 @@ pub trait EventTransformer {
     Ok(Vec::new())
   }
 }
+
+/// An absent transformer preserves each event unchanged.
+impl<T: EventTransformer> EventTransformer for Option<T> {
+  fn transform(&mut self, event: SseEvent) -> Result<Vec<SseEvent>> {
+    match self {
+      Some(transformer) => transformer.transform(event),
+      None => Ok(vec![event]),
+    }
+  }
+
+  fn finish(&mut self) -> Result<Vec<SseEvent>> {
+    match self {
+      Some(transformer) => transformer.finish(),
+      None => Ok(Vec::new()),
+    }
+  }
+}

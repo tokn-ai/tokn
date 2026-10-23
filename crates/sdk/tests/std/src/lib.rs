@@ -42,12 +42,16 @@ mod tests {
 
   impl Fixture {
     fn start() -> Self {
+      Self::start_with_requests(2)
+    }
+
+    fn start_with_requests(expected_requests: usize) -> Self {
       let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback server");
       listener.set_nonblocking(true).expect("nonblocking listener");
       let address = listener.local_addr().unwrap();
       let stopped = Arc::new(AtomicBool::new(false));
       let stop = stopped.clone();
-      let server = thread::spawn(move || serve(listener, &stop));
+      let server = thread::spawn(move || serve(listener, &stop, expected_requests));
       let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
       let root = std::env::temp_dir().join(format!("tokn-sdk-std-{}-{unique}", std::process::id()));
       fs::create_dir(&root).expect("create isolated config directory");
@@ -79,7 +83,7 @@ mod tests {
         .expect("server still running")
         .join()
         .expect("server did not panic")
-        .expect("server completed both requests")
+        .expect("server completed all requests")
     }
   }
 
@@ -93,10 +97,10 @@ mod tests {
     }
   }
 
-  fn serve(listener: TcpListener, stopped: &AtomicBool) -> io::Result<Vec<Value>> {
+  fn serve(listener: TcpListener, stopped: &AtomicBool, expected_requests: usize) -> io::Result<Vec<Value>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
-    while requests.len() < 2 {
+    while requests.len() < expected_requests {
       if stopped.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "fixture stopped"));
       }
@@ -119,11 +123,20 @@ mod tests {
         socket.write_all(
           b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         )?;
-        for part in STREAM_PARTS {
+        let parts = if request["model"] == "test-truncated" {
+          &STREAM_PARTS[..1]
+        } else {
+          &STREAM_PARTS[..]
+        };
+        for part in parts {
           write!(socket, "{:x}\r\n{part}\r\n", part.len())?;
           socket.flush()?;
         }
-        socket.write_all(b"0\r\n\r\n")?;
+        // Closing an unterminated chunked HTTP body would produce a transport
+        // error if the SDK incorrectly read beyond the protocol terminal.
+        if request["model"] != "test-no-eof" {
+          socket.write_all(b"0\r\n\r\n")?;
+        }
       } else {
         write!(
           socket,
@@ -233,5 +246,51 @@ mod tests {
     assert_eq!(requests[0]["stream"], false);
     assert_eq!(requests[1]["model"], "test-model");
     assert_eq!(requests[1]["stream"], true);
+  }
+
+  #[test]
+  fn default_stream_lifecycle_stops_at_terminal_and_rejects_truncation() {
+    let mut fixture = Fixture::start_with_requests(4);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build runtime");
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        let endpoint = client.chat_completions();
+        let request = |model| -> ChatRequest {
+          serde_json::from_value(json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hello"}]
+          }))
+          .unwrap()
+        };
+        let complete = endpoint.stream(&request("llama-cpp/test-no-eof")).await.unwrap();
+        let bytes = complete
+          .bytes()
+          .await
+          .expect("terminal ends stream before the invalid HTTP EOF");
+        assert!(std::str::from_utf8(&bytes).unwrap().ends_with("data: [DONE]\n\n"));
+
+        let truncated = endpoint.stream(&request("llama-cpp/test-truncated")).await.unwrap();
+        let error = truncated
+          .bytes()
+          .await
+          .expect_err("clean HTTP EOF is not protocol completion");
+        assert!(error.to_string().contains("[DONE]"));
+
+        let cancelled = endpoint.stream(&request("llama-cpp/test-drop")).await.unwrap();
+        drop(cancelled);
+        let response = endpoint.create(&request("llama-cpp/test-model")).await.unwrap();
+        assert_eq!(response.data.id.as_deref(), Some("chatcmpl-std"));
+      })
+      .await
+      .expect("stream lifecycle calls completed before timeout");
+    });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 4);
+    assert!(requests[..3].iter().all(|request| request["stream"] == true));
+    assert_eq!(requests[3]["stream"], false);
   }
 }
