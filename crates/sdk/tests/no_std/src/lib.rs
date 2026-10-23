@@ -6,10 +6,11 @@ extern crate alloc;
 #[path = "../../scenarios/configured.rs"]
 mod scenarios;
 pub use scenarios::{
-  buffered_round_trip, configured_client_relay, configured_provider_policies, configured_relay_policies,
-  configured_status_policy, configured_transport_encoding, cross_format_round_trip,
-  response_body_failure_does_not_retry, retry_fallback_affinity, retry_schedule_and_exhaustion,
-  stream_errors_and_cancellation, streaming_round_trip, transport_failure_account_feedback,
+  buffered_content_detection, buffered_response_limits, buffered_round_trip, configured_client_relay,
+  configured_provider_policies, configured_relay_policies, configured_status_policy, configured_transport_encoding,
+  cross_format_round_trip, response_body_failure_does_not_retry, retry_fallback_affinity,
+  retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_round_trip,
+  transport_failure_account_feedback,
 };
 
 #[cfg(test)]
@@ -38,6 +39,14 @@ mod tests {
   #[test]
   fn all_native_formats() {
     super::buffered_round_trip();
+  }
+  #[test]
+  fn buffered_content_detection() {
+    super::buffered_content_detection();
+  }
+  #[test]
+  fn buffered_response_limits() {
+    super::buffered_response_limits();
   }
   #[test]
   fn local_streaming() {

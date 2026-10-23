@@ -235,11 +235,32 @@ stream consumption; a later body failure does not replay or cool that account.
 The standard adapter locks pool state and logs mutation errors; the injected
 adapter borrows local state and returns mutation errors to its caller.
 
+Managed buffered responses share `tokn_convert::buffered::convert_response`:
+
+- SSE is detected from `Content-Type` or a body starting with `event:` or `data:`
+  after whitespace. Accumulated SSE renders directly to the requested endpoint.
+- JSON responses keep their original bytes when the upstream and requested
+  endpoints match. Cross-endpoint responses use the shared converters.
+- Empty non-SSE bodies remain empty. Typed SDK decoding can still reject an empty body
+  when the requested response type requires JSON.
+- Invalid JSON, incomplete SSE, and conversion errors fail the response stage
+  without retrying the request or changing account feedback.
+
+Injected buffered execution now follows these standard behaviors, including
+content-based SSE detection when an upstream omits or mislabels its MIME type.
+Its decoded input, converted output, and individual SSE records remain bounded
+by `Limits`. Opaque buffered relays preserve their bytes without normalization.
+Accumulated SSE receives `application/json`; other buffered responses retain
+their upstream content type in the converter and injected adapter. The HTTP
+gateway sets its managed response content type when constructing the HTTP reply.
+Live injected streams still require `text/event-stream`; streaming lifecycle
+and MIME policy are separate from this buffered response path.
+
 The standard and injected sessions still implement their stages separately.
-They reuse provider preparation helpers, JSON conversion, and SSE primitives;
-transport I/O, error-body capture, response handling, and event delivery remain
-platform adapters. Send decisions are shared; applying pool feedback uses each
-adapter's existing state access.
+They reuse provider preparation helpers, buffered response normalization, and
+SSE primitives. Transport I/O, error-body capture, live stream ownership, and
+event delivery remain platform adapters. Send decisions are shared; applying
+pool feedback uses each adapter's existing state access.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
 Further unification belongs in these existing crates, with platform services for
 transport, time, credentials, state access, and event delivery. There is no

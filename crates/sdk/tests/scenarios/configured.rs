@@ -134,7 +134,9 @@ impl Transport for MemoryTransport<'_> {
       status: reply.status,
       headers,
     };
-    head.headers.insert("content-type", reply.content_type);
+    if !reply.content_type.is_empty() {
+      head.headers.insert("content-type", reply.content_type);
+    }
     if self.encoding != "identity" {
       head.headers.insert("content-encoding", self.encoding);
       head.headers.insert("content-length", "1");
@@ -403,6 +405,152 @@ pub fn cross_format_round_trip() {
   }
 }
 
+/// Buffered responses sniff SSE without relying on a correct Content-Type,
+/// while empty bodies remain successful at the untyped execution boundary.
+pub fn buffered_content_detection() {
+  for content_type in ["", "application/json", "text/event-stream; charset=utf-8"] {
+    for endpoint in [tokn_sdk::Endpoint::ChatCompletions, tokn_sdk::Endpoint::Messages] {
+      let sent = RefCell::new(Vec::new());
+      let platform = make_client(
+        &sent,
+        [Reply {
+          status: 200,
+          content_type,
+          bytes: CHAT_SSE,
+        }],
+        "openai",
+      )
+      .into_platform();
+      let response = run(platform.execute(
+        endpoint,
+        serde_json::to_value(messages()).unwrap(),
+        RequestOptions::default(),
+      ))
+      .unwrap();
+      let (_, headers, body) = response.into_json::<Value>().unwrap();
+      assert_eq!(headers.get("content-type").unwrap().as_str(), "application/json");
+      let text = match endpoint {
+        tokn_sdk::Endpoint::ChatCompletions => &body["choices"][0]["message"]["content"],
+        _ => &body["content"][0]["text"],
+      };
+      assert_eq!(text, "héllo 🌍");
+    }
+  }
+  for content_type in ["", "application/json"] {
+    let sent = RefCell::new(Vec::new());
+    let platform = make_client(
+      &sent,
+      [Reply {
+        status: 200,
+        content_type,
+        bytes: &[],
+      }],
+      "openai",
+    )
+    .into_platform();
+    let response = run(platform.execute(
+      tokn_sdk::Endpoint::ChatCompletions,
+      serde_json::to_value(chat()).unwrap(),
+      RequestOptions::default(),
+    ))
+    .unwrap();
+    assert_eq!(response.status, 200);
+    // Empty response bodies are accepted by execution, but have no typed JSON value.
+    assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+  }
+
+  let sent = RefCell::new(Vec::new());
+  let platform = make_client(
+    &sent,
+    [Reply {
+      status: 200,
+      content_type: "text/plain",
+      bytes: b"not JSON or SSE",
+    }],
+    "openai",
+  )
+  .into_platform();
+  let error = run(platform.execute(
+    tokn_sdk::Endpoint::ChatCompletions,
+    serde_json::to_value(chat()).unwrap(),
+    RequestOptions::default(),
+  ))
+  .err()
+  .expect("managed non-JSON bodies must fail normalization");
+  assert_eq!(error.stage, "convert_response");
+}
+
+/// Buffered normalization enforces limits before and after conversion, as well
+/// as the per-event limit when an SSE body arrives without its expected MIME.
+pub fn buffered_response_limits() {
+  const MINIMAL_CHAT: &[u8] = br#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#;
+  for (reply, endpoint, limits, succeeds) in [
+    (
+      Reply::json(CHAT_JSON),
+      tokn_sdk::Endpoint::ChatCompletions,
+      Limits {
+        max_response_bytes: CHAT_JSON.len(),
+        ..Limits::default()
+      },
+      true,
+    ),
+    (
+      Reply::json(CHAT_JSON),
+      tokn_sdk::Endpoint::ChatCompletions,
+      Limits {
+        max_response_bytes: CHAT_JSON.len() - 1,
+        ..Limits::default()
+      },
+      false,
+    ),
+    (
+      Reply::json(MINIMAL_CHAT),
+      tokn_sdk::Endpoint::Messages,
+      Limits::default(),
+      true,
+    ),
+    (
+      Reply::json(MINIMAL_CHAT),
+      tokn_sdk::Endpoint::Messages,
+      Limits {
+        max_response_bytes: MINIMAL_CHAT.len(),
+        ..Limits::default()
+      },
+      false,
+    ),
+    (
+      Reply::json(CHAT_SSE),
+      tokn_sdk::Endpoint::Messages,
+      Limits {
+        max_event_bytes: 16,
+        ..Limits::default()
+      },
+      false,
+    ),
+  ] {
+    let sent = RefCell::new(Vec::new());
+    let platform = make_client(&sent, [reply], "openai")
+      .into_platform()
+      .with_limits(limits);
+    let result = run(platform.execute(
+      endpoint,
+      serde_json::to_value(messages()).unwrap(),
+      RequestOptions::default(),
+    ));
+    match result {
+      Ok(response) => {
+        assert!(succeeds, "response limit must reject the body");
+        response.into_json::<Value>().unwrap();
+      }
+      Err(error) => {
+        assert!(!succeeds, "valid response was rejected: {error}");
+        assert_eq!(error.stage, "convert_response");
+        assert!(error.message.contains("limit"));
+      }
+    }
+  }
+}
+
 /// Retry timing, fallback tiers and committed affinity all use the configured pool.
 pub fn retry_fallback_affinity() {
   let sent = RefCell::new(Vec::new());
@@ -647,6 +795,24 @@ pub fn response_body_failure_does_not_retry() {
 
 /// EOF and event limits are errors, and dropping a stream releases the borrowed session.
 pub fn stream_errors_and_cancellation() {
+  // Content sniffing is only for buffered normalization. Live streaming still
+  // requires an SSE Content-Type even if its bytes contain a valid SSE stream.
+  for content_type in ["", "application/json"] {
+    let sent = RefCell::new(Vec::new());
+    let client = make_client(
+      &sent,
+      [Reply {
+        status: 200,
+        content_type,
+        bytes: CHAT_SSE,
+      }],
+      "openai",
+    );
+    let error = run(client.chat_completions().stream(&chat()))
+      .err()
+      .expect("live SSE requires its MIME");
+    assert_eq!(error.stage, "convert_response");
+  }
   const TRUNCATED: &[u8] = b"data: {\"choices\":[]}\n\n";
   let sent = RefCell::new(Vec::new());
   let client = make_client(&sent, [Reply::sse(TRUNCATED)], "openai");
@@ -886,11 +1052,14 @@ pub fn configured_client_relay() {
       Vec::new(),
       MemoryTransport::new(
         &sent,
-        [Reply {
-          status: 503,
-          content_type: "text/plain",
-          bytes: b"opaque upstream failure",
-        }],
+        [
+          Reply {
+            status: 503,
+            content_type: "text/plain",
+            bytes: b"opaque upstream failure",
+          },
+          Reply::sse(CHAT_SSE),
+        ],
       ),
       TestRuntime::default(),
     )
@@ -905,6 +1074,22 @@ pub fn configured_client_relay() {
   assert_eq!(response.status, 503);
   assert_eq!(response.headers.get("content-type").unwrap().as_str(), "text/plain");
   assert_eq!(sent.borrow().len(), 1);
+  assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+
+  // Opaque buffered SSE also bypasses normalization: callers receive its
+  // original media type and cannot decode its wire events as a JSON response.
+  let response = run(client.execute(
+    tokn_sdk::Endpoint::ChatCompletions,
+    json!({"model":"model","stream":false}),
+    RequestOptions::default(),
+  ))
+  .unwrap();
+  assert_eq!(
+    response.headers.get("content-type").unwrap().as_str(),
+    "text/event-stream; charset=utf-8"
+  );
+  assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+  assert_eq!(sent.borrow().len(), 2);
 }
 
 /// Managed status classification matches the standard pipeline: 429 is

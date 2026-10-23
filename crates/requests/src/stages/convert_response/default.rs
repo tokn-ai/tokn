@@ -21,8 +21,8 @@ use crate::pipeline::stages::{ConvertResponseStage, ConvertedBody, ConvertedResp
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::BoxStream;
-use serde_json::Value;
 use std::sync::Arc;
+use tokn_convert::buffered::{self, BufferedError};
 use tokn_convert::sse::{observer_channel, EndpointTranslator, ObserverMsg, SsePipeline};
 use tokn_convert::usage::{parse_usage_any_value, usage_has_any};
 use tokn_core::provider::Endpoint;
@@ -36,91 +36,6 @@ pub struct DefaultConvertResponse;
 impl DefaultConvertResponse {
   pub fn new() -> Self {
     Self
-  }
-
-  fn body_looks_like_sse(body: &[u8]) -> bool {
-    let first = body
-      .iter()
-      .position(|byte| !byte.is_ascii_whitespace())
-      .unwrap_or(body.len());
-    body[first..].starts_with(b"event:") || body[first..].starts_with(b"data:")
-  }
-
-  fn headers_indicate_sse(headers: &HeaderMap) -> bool {
-    headers.get(&CONTENT_TYPE).is_some_and(|value| {
-      value
-        .as_str()
-        .split(';')
-        .next()
-        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
-    })
-  }
-
-  #[instrument(name = "default_convert_buffered_sse", skip_all, fields(
-    status = status,
-    upstream_endpoint = ?upstream_endpoint,
-    inbound_endpoint = ?ctx.request_endpoint,
-    body_len = body.len(),
-  ))]
-  async fn convert_buffered_sse(
-    &self,
-    ctx: &PipelineCtx,
-    status: u16,
-    mut headers: HeaderMap,
-    upstream_endpoint: Option<Endpoint>,
-    body: Bytes,
-  ) -> Result<ConvertedResponse, PipelineError> {
-    let inbound_endpoint = ctx.request_endpoint.resolved().ok_or_else(|| {
-      PipelineError::permanent(
-        Stage::ConvertResponse,
-        RequestsError::MissingResolvedEndpoint {
-          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
-        },
-      )
-    })?;
-    let upstream_endpoint = upstream_endpoint.ok_or_else(|| {
-      PipelineError::permanent(
-        Stage::ConvertResponse,
-        RequestsError::MissingUpstreamEndpoint {
-          request_endpoint: smol_str::SmolStr::new(ctx.request_endpoint.as_str()),
-        },
-      )
-    })?;
-
-    let accumulated = tokn_convert::sse::accumulate_bytes(upstream_endpoint, body)
-      .await
-      .map_err(|source| {
-        PipelineError::permanent(Stage::ConvertResponse, RequestsError::ResponseConversion { source })
-      })?;
-    let body_json = match inbound_endpoint {
-      Endpoint::ChatCompletions => tokn_convert::value::chat::response_to_value(&accumulated),
-      Endpoint::Responses => tokn_convert::value::responses::response_to_value(&accumulated),
-      Endpoint::Messages => tokn_convert::value::messages::response_to_value(&accumulated),
-    }
-    .map_err(|source| PipelineError::permanent(Stage::ConvertResponse, RequestsError::ResponseConversion { source }))?;
-
-    let parsed_usage = parse_usage_any_value(&body_json);
-    if usage_has_any(&parsed_usage) {
-      ctx.emit_record(RecordEvent::Usage(parsed_usage));
-    }
-    let body_bytes = serde_json::to_vec(&body_json).map(Bytes::from).map_err(|source| {
-      PipelineError::permanent(
-        Stage::ConvertResponse,
-        RequestsError::SerializeTranslatedResponse { source },
-      )
-    })?;
-    headers.insert(&CONTENT_TYPE, "application/json");
-    headers.remove(&CONTENT_LENGTH);
-
-    Ok(ConvertedResponse {
-      status,
-      headers,
-      kind: ConvertedResponseKind::Managed,
-      body: ConvertedBody::Buffered {
-        body_json: Some(Arc::new(body_json)),
-        body_bytes,
-      },
-    })
   }
 }
 
@@ -146,15 +61,6 @@ impl ConvertResponseStage for DefaultConvertResponse {
     upstream_endpoint: Option<Endpoint>,
     body: Bytes,
   ) -> Result<ConvertedResponse, PipelineError> {
-    // Some managed upstreams require SSE even when the downstream caller
-    // requested a buffered response. Content-Type is not guaranteed to
-    // survive every transport path, so recognize the wire format as well.
-    if Self::headers_indicate_sse(&headers) || Self::body_looks_like_sse(&body) {
-      return self
-        .convert_buffered_sse(ctx, status, headers, upstream_endpoint, body)
-        .await;
-    }
-
     let inbound_endpoint = ctx.request_endpoint.resolved().ok_or_else(|| {
       PipelineError::permanent(
         Stage::ConvertResponse,
@@ -172,58 +78,42 @@ impl ConvertResponseStage for DefaultConvertResponse {
       )
     })?;
 
-    if body.is_empty() {
-      return Ok(ConvertedResponse {
-        status,
-        headers,
-        kind: ConvertedResponseKind::Managed,
-        body: ConvertedBody::Buffered {
-          body_json: None,
-          body_bytes: Bytes::new(),
-        },
-      });
-    }
-
-    let upstream_json: Value = serde_json::from_slice(&body).map_err(|source| {
-      PipelineError::permanent(
-        crate::event::Stage::ConvertResponse,
-        RequestsError::UpstreamBodyNotJson { source },
-      )
+    let output = buffered::convert_response(
+      upstream_endpoint,
+      inbound_endpoint,
+      body,
+      headers.get(&CONTENT_TYPE).map(|value| value.as_str()),
+      usize::MAX,
+      |value| {
+        // Keep usage observation before cross-endpoint JSON conversion, or
+        // after SSE rendering, even if a later conversion step fails.
+        let usage = parse_usage_any_value(value);
+        if usage_has_any(&usage) {
+          ctx.emit_record(RecordEvent::Usage(usage));
+        }
+      },
+    )
+    .map_err(|error| {
+      let inner = match error {
+        BufferedError::InvalidJson { source } => RequestsError::UpstreamBodyNotJson { source },
+        BufferedError::Conversion { source } => RequestsError::ResponseConversion { source },
+        BufferedError::Serialization { source } => RequestsError::SerializeTranslatedResponse { source },
+      };
+      PipelineError::permanent(Stage::ConvertResponse, inner)
     })?;
-
-    // Best-effort usage extraction. Emit a RecordEvent::Usage so the
-    // persistence layer (and any other subscriber) can pick it up.
-    let parsed_usage = parse_usage_any_value(&upstream_json);
-    if usage_has_any(&parsed_usage) {
-      ctx.emit_record(RecordEvent::Usage(parsed_usage));
+    let mut headers = headers;
+    if output.accumulated_sse {
+      headers.insert(&CONTENT_TYPE, "application/json");
+      headers.remove(&CONTENT_LENGTH);
     }
-
-    let (body_json, body_bytes) = if upstream_endpoint == inbound_endpoint {
-      (upstream_json, body)
-    } else {
-      let translated =
-        tokn_convert::convert_response(upstream_endpoint, inbound_endpoint, &upstream_json).map_err(|source| {
-          PipelineError::permanent(
-            crate::event::Stage::ConvertResponse,
-            RequestsError::ResponseConversion { source },
-          )
-        })?;
-      let bytes = serde_json::to_vec(&translated).map(Bytes::from).map_err(|source| {
-        PipelineError::permanent(
-          crate::event::Stage::ConvertResponse,
-          RequestsError::SerializeTranslatedResponse { source },
-        )
-      })?;
-      (translated, bytes)
-    };
 
     Ok(ConvertedResponse {
       status,
       headers,
       kind: ConvertedResponseKind::Managed,
       body: ConvertedBody::Buffered {
-        body_json: Some(Arc::new(body_json)),
-        body_bytes,
+        body_json: output.body_json.map(Arc::new),
+        body_bytes: output.body_bytes,
       },
     })
   }
@@ -312,6 +202,7 @@ mod tests {
   use crate::event::{EventBus, EventPayload};
   use crate::pipeline::stages::SentResponse;
   use futures_util::StreamExt;
+  use serde_json::Value;
   use std::sync::Arc;
   use tokn_core::provider::Endpoint;
   use tokn_core::request_event::RecordEvent;
@@ -392,6 +283,37 @@ mod tests {
     assert_eq!(err.stage, crate::event::Stage::ConvertResponse);
     assert!(!err.recoverable);
     assert!(err.message().contains("not valid JSON"));
+    assert!(matches!(err.inner(), RequestsError::UpstreamBodyNotJson { .. }));
+  }
+
+  #[tokio::test]
+  async fn usage_event_precedes_cross_endpoint_conversion_failure() {
+    let events = Arc::new(EventBus::new(8));
+    let mut observed = events.subscribe();
+    let ctx = PipelineCtx::new("req-usage-error", Endpoint::Messages.into(), events);
+    let error = DefaultConvertResponse::new()
+      .convert_buffered(
+        &ctx,
+        200,
+        HeaderMap::new(),
+        Some(Endpoint::ChatCompletions),
+        Bytes::from_static(br#"{"choices":[],"usage":{"prompt_tokens":7}}"#),
+      )
+      .await
+      .unwrap_err();
+    assert_eq!(error.stage, Stage::ConvertResponse);
+    assert!(!error.recoverable);
+    assert!(matches!(
+      error.inner(),
+      RequestsError::ResponseConversion {
+        source: tokn_convert::error::ConvertError::MissingField { field: "choices" }
+      }
+    ));
+    let event = observed.try_recv().expect("usage emitted before conversion failed");
+    let tokn_core::event::Event::Requests(event) = event.as_ref() else {
+      panic!("expected request event");
+    };
+    assert!(matches!(&event.payload, EventPayload::Record(RecordEvent::Usage(usage)) if usage.input_tokens == Some(7)));
   }
 
   #[tokio::test]

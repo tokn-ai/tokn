@@ -827,20 +827,14 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         body: ResponseBody::Buffered(Bytes::from(bytes)),
       });
     }
-    let event_stream = head.headers.get("content-type").is_some_and(|value| {
-      value
-        .as_str()
-        .split(';')
-        .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
-    });
-    if upstream_stream && !event_stream {
-      return Err(Error::new(
-        "convert_response",
-        "streaming upstream did not return text/event-stream",
-      ));
-    }
     if stream {
+      let event_stream = tokn_convert::buffered::is_sse(head.headers.get("content-type").map(HeaderValue::as_str), &[]);
+      if upstream_stream && !event_stream {
+        return Err(Error::new(
+          "convert_response",
+          "streaming upstream did not return text/event-stream",
+        ));
+      }
       if !event_stream {
         return Err(Error::new("convert_response", "expected text/event-stream"));
       }
@@ -864,39 +858,29 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         body: ResponseBody::Stream(alloc::boxed::Box::new(events)),
       });
     }
-    let value = if event_stream {
-      // Forced upstream streaming uses the same parser, terminal validation,
-      // and accumulator as the standard buffered response stage.
-      let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
-      let response =
-        tokn_convert::sse::accumulate_slice(resolved.endpoint, &bytes, self.platform.limits.max_event_bytes)
-          .map_err(|error| Error::new("convert_response", error))?;
-      match resolved.endpoint {
-        Endpoint::ChatCompletions => tokn_convert::value::chat::response_to_value(&response),
-        Endpoint::Responses => tokn_convert::value::responses::response_to_value(&response),
-        Endpoint::Messages => tokn_convert::value::messages::response_to_value(&response),
-      }
-      .map_err(|e| Error::new("convert_response", e))?
-    } else {
-      let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
-      serde_json::from_slice(&bytes).map_err(|e| Error::new("convert_response", e))?
-    };
-    let value = tokn_convert::convert_response(resolved.endpoint, self.endpoint, &value)
-      .map_err(|e| Error::new("convert_response", e))?;
-    let bytes = serde_json::to_vec(&value).map_err(|e| Error::new("convert_response", e))?;
-    if bytes.len() > self.platform.limits.max_response_bytes {
+    let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
+    let response = tokn_convert::buffered::convert_response(
+      resolved.endpoint,
+      self.endpoint,
+      Bytes::from(bytes),
+      head.headers.get("content-type").map(HeaderValue::as_str),
+      self.platform.limits.max_event_bytes,
+      |_| {},
+    )
+    .map_err(|error| Error::new("convert_response", error))?;
+    if response.body_bytes.len() > self.platform.limits.max_response_bytes {
       return Err(Error::new("convert_response", "converted response exceeds byte limit"));
     }
-    head.headers.remove("content-length");
-    head.headers.remove("transfer-encoding");
-    head.headers.insert("content-type", "application/json");
+    if response.accumulated_sse {
+      head.headers.insert("content-type", "application/json");
+    }
     self.terminal = true;
     self.emit("convert_response", None);
     self.emit("completed", Some(true));
     Ok(Response {
       status: head.status,
       headers: head.headers,
-      body: ResponseBody::Buffered(Bytes::from(bytes)),
+      body: ResponseBody::Buffered(response.body_bytes),
     })
   }
   fn failed(&mut self, attempt: u32, error: &Error) -> Option<Duration> {

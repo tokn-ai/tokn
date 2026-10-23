@@ -7,6 +7,14 @@ fn all_native_formats() {
   scenarios::buffered_round_trip();
 }
 #[test]
+fn buffered_content_detection() {
+  scenarios::buffered_content_detection();
+}
+#[test]
+fn buffered_response_limits() {
+  scenarios::buffered_response_limits();
+}
+#[test]
 fn local_streaming() {
   scenarios::streaming_round_trip();
 }
