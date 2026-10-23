@@ -28,6 +28,7 @@ use crate::pipeline::stages::{
   provider_request_kind, resolved_upstream_endpoint, BuiltHeaders, ConvertedRequest, Extracted, Resolved, SendStage,
   SentResponse,
 };
+use crate::send_policy::ResponsePolicy;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smol_str::SmolStr;
@@ -76,21 +77,21 @@ pub mod send_keys {
 
 pub struct ProxySend {
   http: reqwest::Client,
-  forward_server_errors: bool,
+  response_policy: ResponsePolicy,
 }
 
 impl ProxySend {
   pub fn new(http: reqwest::Client) -> Self {
     Self {
       http,
-      forward_server_errors: false,
+      response_policy: ResponsePolicy::LegacyProxy,
     }
   }
 
   pub fn forward_all_statuses(http: reqwest::Client) -> Self {
     Self {
       http,
-      forward_server_errors: true,
+      response_policy: ResponsePolicy::ForwardAll,
     }
   }
 }
@@ -225,8 +226,7 @@ impl SendStage for ProxySend {
       headers: resp_headers.clone(),
     });
 
-    let disposition = classify_status(status);
-    if disposition == StatusDisposition::RecoverableFailure && !self.forward_server_errors {
+    if self.response_policy.classify_status(status) == StatusDisposition::RecoverableFailure {
       let body_text = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
@@ -248,7 +248,7 @@ impl SendStage for ProxySend {
         },
       ));
     }
-    if disposition != StatusDisposition::Success {
+    if classify_status(status) != StatusDisposition::Success {
       warn!(%status, "proxy upstream error response — forwarding verbatim");
     }
 
@@ -373,6 +373,12 @@ mod tests {
   }
 
   async fn one_shot_raw_http_server() -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+    one_shot_raw_http_server_with_response(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await
+  }
+
+  async fn one_shot_raw_http_server_with_response(
+    response: &'static [u8],
+  ) -> (std::net::SocketAddr, tokio::sync::oneshot::Receiver<Vec<u8>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
@@ -397,14 +403,59 @@ mod tests {
           }
         }
       }
-      stream
-        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
-        .await
-        .unwrap();
+      stream.write_all(response).await.unwrap();
       stream.flush().await.unwrap();
       let _ = tx.send(buf);
     });
     (addr, rx)
+  }
+
+  #[tokio::test]
+  async fn proxy_error_status_handling_preserves_constructor_contract() {
+    for (status, response) in [
+      (
+        429,
+        b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 4\r\n\r\nbusy".as_slice(),
+      ),
+      (
+        503,
+        b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 4\r\n\r\nbusy".as_slice(),
+      ),
+    ] {
+      for forward_all in [false, true] {
+        let (addr, request) = one_shot_raw_http_server_with_response(response).await;
+        let ctx = ctx_with(
+          RunConfig::builder()
+            .with_str(keys::HOST, addr.to_string())
+            .with_str(send_keys::PATH, "/v1/chat/completions")
+            .with_str(send_keys::SCHEME, "http")
+            .build(),
+        );
+        let resolved = fake_resolved(&ctx).await;
+        let send = if forward_all {
+          ProxySend::forward_all_statuses(reqwest::Client::new())
+        } else {
+          ProxySend::new(reqwest::Client::new())
+        };
+        let result = send
+          .send(&ctx, &fake_extracted(), &resolved, &fake_headers(), &fake_body())
+          .await;
+        if status == 503 && !forward_all {
+          let error = result.unwrap_err();
+          assert_eq!(error.stage, Stage::Send);
+          assert!(error.recoverable);
+          assert!(matches!(
+            error.inner(),
+            RequestsError::UpstreamStatus { status: 503, body } if body == "busy"
+          ));
+        } else {
+          let sent = result.unwrap();
+          assert_eq!(sent.status, status);
+          assert_eq!(sent.response.text().await.unwrap(), "busy");
+        }
+        request.await.unwrap();
+      }
+    }
   }
 
   #[tokio::test]

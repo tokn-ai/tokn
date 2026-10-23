@@ -21,6 +21,7 @@ use tokn_requests::pipeline::error::{PipelineError, RequestsError};
 use tokn_requests::pipeline::stages::{
   BuiltHeaders, ConvertedRequest, Extracted, ResolveStage, Resolved, ResolvedRoute, SendStage, SentResponse,
 };
+use tokn_requests::send_policy::{AccountFeedback, AccountFeedbackPolicy, SendOutcome};
 use tokn_requests::stages::{
   resolve::proxy::keys as proxy_keys, AccountSelector, DefaultSend, ProxyResolve, ProxySend, SelectorOutcome,
   ACCESS_ALLOWED_PROVIDERS_KEY,
@@ -51,6 +52,38 @@ impl SelectionState {
       .bindings
       .iter()
       .find(|binding| Arc::ptr_eq(binding.handle(), handle))
+  }
+
+  fn record_send_result(
+    &self,
+    policy: AccountFeedbackPolicy,
+    binding: &ProviderBinding,
+    session_id: Option<&str>,
+    result: &Result<SentResponse, PipelineError>,
+  ) {
+    let outcome = match result {
+      Ok(response) => SendOutcome::Response {
+        status: response.status,
+      },
+      Err(error) => SendOutcome::Failure {
+        recoverable: error.recoverable,
+      },
+    };
+    // Feedback belongs to the send result, before response conversion and
+    // independently of whether the request's retry budget permits replay.
+    match policy.feedback(outcome) {
+      AccountFeedback::Success => {
+        if let Err(error) = self.pool.record_success(session_id, binding.key()) {
+          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool success");
+        }
+      }
+      AccountFeedback::Failure => {
+        if let Err(error) = self.pool.record_failure(binding.key()) {
+          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool failure");
+        }
+      }
+      AccountFeedback::None => {}
+    }
   }
 }
 
@@ -335,34 +368,14 @@ impl SendStage for ProxyPoolAwareSend {
       .binding_for_handle(&resolved.account_handle)
       .ok_or_else(|| invalid_route_request("selected account is not a member of the relay route's v2 account pool"))?;
     let result = self.inner.send(ctx, extracted, resolved, headers, body).await;
-    match &result {
-      Ok(response) if status_marks_binding_unavailable(response.status) => {
-        if let Err(error) = self.state.pool.record_failure(binding.key()) {
-          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 relay account-pool failure");
-        }
-      }
-      Ok(_) => {
-        if let Err(error) = self
-          .state
-          .pool
-          .record_success(extracted.session_id.as_deref(), binding.key())
-        {
-          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 relay account-pool success");
-        }
-      }
-      Err(error) if error.recoverable => {
-        if let Err(error) = self.state.pool.record_failure(binding.key()) {
-          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 relay account-pool failure");
-        }
-      }
-      Err(_) => {}
-    }
+    self.state.record_send_result(
+      AccountFeedbackPolicy::ForwardProxy,
+      binding,
+      extracted.session_id.as_deref(),
+      &result,
+    );
     result
   }
-}
-
-fn status_marks_binding_unavailable(status: u16) -> bool {
-  matches!(status, 401 | 403 | 408 | 425 | 429 | 500..=599)
 }
 
 impl PoolAwareSend {
@@ -389,23 +402,12 @@ impl SendStage for PoolAwareSend {
       .binding_for_handle(&resolved.account_handle)
       .ok_or_else(|| invalid_route_request("selected account is not a member of the route's v2 account pool"))?;
     let result = self.inner.send(ctx, extracted, resolved, headers, body).await;
-    match &result {
-      Ok(_) => {
-        if let Err(error) = self
-          .state
-          .pool
-          .record_success(extracted.session_id.as_deref(), binding.key())
-        {
-          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool success");
-        }
-      }
-      Err(error) if error.recoverable => {
-        if let Err(error) = self.state.pool.record_failure(binding.key()) {
-          tracing::warn!(%error, account = %binding.account_id(), "could not record v2 account-pool failure");
-        }
-      }
-      Err(_) => {}
-    }
+    self.state.record_send_result(
+      AccountFeedbackPolicy::Api,
+      binding,
+      extracted.session_id.as_deref(),
+      &result,
+    );
     result
   }
 }

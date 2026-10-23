@@ -50,14 +50,16 @@ use tokn_core::upstream_url::{CanonicalHttpOrigin, CanonicalUpstreamUrl, Clearte
 use tokn_core::AgentId;
 use tokn_policy::{
   ClientAuthPlan, ConnectAction, CredentialPolicy, DriverId, ForwardProxyListenerPlan, GatewayPlan, HttpAction,
-  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ManagedRetry, ModelSelector, ProfileId,
-  ProviderId, RelayCredentials, RelayDestination, RelayRetry, RetryPolicyId, RouteKind, RoutePlan, WireIdentity,
+  HttpMatch, IngressAuthority, ListenerId, ListenerPlan, LlmApiListenerPlan, ModelSelector, ProfileId, ProviderId,
+  RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
 };
 use tokn_requests::stages::{
   DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
   PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxySend,
 };
-use tokn_requests::{ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RunConfig, RunConfigBuilder};
+use tokn_requests::{
+  ExecutionRequest, Pipeline, Profile, RawInbound, RequestService, RetryPolicy, RunConfig, RunConfigBuilder,
+};
 use tower_http::request_id::SetRequestIdLayer;
 
 use crate::request_id::REQUEST_ID_HEADER;
@@ -1027,13 +1029,13 @@ fn build_profile_runtimes(
         profile_plan.route()
       )
     })?;
+    let retry = RetryPolicy::from_route(plan.execution(), route)?;
     let agent_id = wire_agent(profile_plan.wire_identity());
     let (api_service, proxy_service, api_destination, proxy_destination) = match route {
       RoutePlan::Managed(route) => {
         if route.header_patches().is_some() {
           anyhow::bail!("profile '{profile_id}' uses unsupported managed header patches");
         }
-        let retry = managed_retry_policy(&plan, route.retry())?;
         let (selector, selection_state) = V2AccountSelector::new(plan.clone(), &profile_id, &pools)?;
         let name = format!("v2-{profile_id}");
         let extract = Arc::new(DefaultExtract);
@@ -1063,7 +1065,6 @@ fn build_profile_runtimes(
         if route.header_patches().is_some() {
           anyhow::bail!("profile '{profile_id}' uses unsupported relay header patches");
         }
-        let retry = relay_retry_policy(&plan, route.retry())?;
         let proxy_service = build_proxy_relay_service(
           &profile_id,
           route,
@@ -1185,17 +1186,17 @@ fn build_proxy_relay_service(
   http: reqwest::Client,
   events: Arc<EventBus>,
 ) -> anyhow::Result<tokn_service::HttpService> {
-  let retry = relay_retry_policy(plan, route.retry())?;
+  let profile_plan = plan
+    .profile(profile_id)
+    .ok_or_else(|| anyhow::anyhow!("missing profile '{profile_id}'"))?;
+  let policy = plan.route(profile_plan.route()).expect("validated profile route");
+  let retry = RetryPolicy::from_route(plan.execution(), policy)?;
   let name = format!("v2-{profile_id}-proxy");
   let profile = match route.credentials() {
     RelayCredentials::AccountPool => {
-      let profile_plan = plan
-        .profile(profile_id)
-        .ok_or_else(|| anyhow::anyhow!("missing profile '{profile_id}'"))?;
       let account_pool = profile_plan
         .account_pool()
         .ok_or_else(|| anyhow::anyhow!("profile '{profile_id}' has no account pool"))?;
-      let policy = plan.route(profile_plan.route()).expect("validated profile route");
       let origins = match route.destination() {
         RelayDestination::FixedProvider(_) => BTreeMap::new(),
         RelayDestination::Original => provider_origins(plan, providers, pools, account_pool, policy)?,
@@ -1216,9 +1217,6 @@ fn build_proxy_relay_service(
       )
     }
     RelayCredentials::Client => {
-      let policy = plan
-        .route(plan.profile(profile_id).expect("validated profile").route())
-        .expect("validated route");
       let allowed_origins = if matches!(route.destination(), RelayDestination::Original) {
         policy
           .providers()
@@ -1251,38 +1249,6 @@ fn build_proxy_relay_service(
     events,
     retry,
   ))))
-}
-
-fn managed_retry_policy(plan: &GatewayPlan, retry: &ManagedRetry) -> anyhow::Result<tokn_requests::RetryPolicy> {
-  match retry {
-    ManagedRetry::Never => Ok(tokn_requests::RetryPolicy::default()),
-    ManagedRetry::Recoverable(policy_id) => retry_policy(plan, policy_id, false),
-  }
-}
-
-fn relay_retry_policy(plan: &GatewayPlan, retry: &RelayRetry) -> anyhow::Result<tokn_requests::RetryPolicy> {
-  match retry {
-    RelayRetry::Never => Ok(tokn_requests::RetryPolicy::default()),
-    RelayRetry::SafeMethods(policy_id) => retry_policy(plan, policy_id, true),
-    RelayRetry::Buffered(policy_id) => retry_policy(plan, policy_id, false),
-  }
-}
-
-fn retry_policy(
-  plan: &GatewayPlan,
-  policy_id: &RetryPolicyId,
-  safe_methods: bool,
-) -> anyhow::Result<tokn_requests::RetryPolicy> {
-  let policy = plan
-    .retry_policy(policy_id)
-    .ok_or_else(|| anyhow::anyhow!("route references missing retry policy '{policy_id}'"))?;
-  let max_retries = policy.max_retries();
-  let initial_backoff = policy.initial_backoff();
-  Ok(if safe_methods {
-    tokn_requests::RetryPolicy::safe_methods(max_retries, initial_backoff)
-  } else {
-    tokn_requests::RetryPolicy::new(max_retries, initial_backoff)
-  })
 }
 
 fn provider_origins(
@@ -1787,6 +1753,7 @@ mod tests {
   use tokn_core::account::{AccountTier, AuthType, Secret};
   use tokn_core::request_event::StageEvent;
   use tokn_policy::{HostPattern, OperationId, WireIdentityId};
+  use tokn_policy::{ManagedRetry, RelayRetry};
   use tower::ServiceExt;
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {

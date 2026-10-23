@@ -200,12 +200,46 @@ selection in `tokn-accounts`:
 Standard provider objects, refreshable model caches, and injected native driver
 capabilities remain platform adapters. Routing parity depends on equivalent
 plans, accounts, capability inventories, and pool state. The injected executor
-accepts v2 configuration only. The default standard SDK still loads legacy configuration and retains its
-older routing behavior; legacy routing is not available in `no_std`.
+accepts v2 configuration only. The default standard SDK still loads legacy
+configuration and retains its older routing behavior; legacy routing is not available in `no_std`.
+
+Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
+The v2 gateway and injected executor resolve named policies through `from_route`;
+standard pipelines keep the existing `RetryPolicy::new` and `safe_methods` APIs.
+Both sessions supply error facts and the transport method to `next_delay`:
+
+- Only recoverable send failures can replay; deliberate stops and later response
+  or stream failures do not replay a request.
+- The retry limit counts additional attempts. Backoff doubles from the configured
+  initial delay; a zero delay skips the timer.
+- Safe-method policies allow only GET, HEAD, OPTIONS, and TRACE. Injected LLM API
+  calls use POST, so account relays require an explicit buffered policy to replay.
+- The shared driver resolves an account again for every retry. Account cooldown
+  still applies to recoverable send failures even when retries are disabled.
+
+Timers and concrete transport-error classification remain platform services.
+HTTP status handling and account feedback share `tokn_requests::send_policy`.
+Response handling and pool feedback are separate decisions:
+
+| Request path | Received status handling | Account feedback |
+| --- | --- | --- |
+| Managed or account-credential API | Below 400 proceeds; 4xx fails permanently; 500 and above fails recoverably | Successful send records success; recoverable failure starts cooldown; permanent failure leaves state unchanged |
+| Client-credential v2 relay | Every status is forwarded | No account feedback |
+| Account-credential v2 forward proxy | Every status is forwarded | 401, 403, 408, 425, 429, and 500–599 start cooldown; other received statuses record success |
+| Legacy standard proxy | Below 500 is forwarded; 500 and above fails recoverably | No v2 account feedback |
+
+Forwarding an HTTP error does not itself trigger replay. A recoverable send
+error cools the selected v2 account even if retries are disabled or exhausted.
+Successful send feedback commits session affinity before response decoding or
+stream consumption; a later body failure does not replay or cool that account.
+The standard adapter locks pool state and logs mutation errors; the injected
+adapter borrows local state and returns mutation errors to its caller.
 
 The standard and injected sessions still implement their stages separately.
-They reuse provider preparation helpers, JSON conversion, and SSE primitives,
-but complete retry, response, and event behavior is not yet unified.
+They reuse provider preparation helpers, JSON conversion, and SSE primitives;
+transport I/O, error-body capture, response handling, and event delivery remain
+platform adapters. Send decisions are shared; applying pool feedback uses each
+adapter's existing state access.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
 Further unification belongs in these existing crates, with platform services for
 transport, time, credentials, state access, and event delivery. There is no

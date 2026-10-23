@@ -5,6 +5,8 @@
 //! from their existing domain crates.
 
 use crate::interpretation::RequestInterpretation;
+use crate::retry::{RetryFailure, RetryPolicy};
+use crate::send_policy::{AccountFeedback, AccountFeedbackPolicy, ResponsePolicy, SendOutcome};
 use alloc::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   format,
@@ -34,8 +36,7 @@ use tokn_core::{
   Endpoint,
 };
 use tokn_policy::{
-  AccountPoolId, DriverId, ExecutionPlan, ManagedRetry, ProviderId, RelayCredentials, RelayDestination, RelayRetry,
-  RetryPolicyPlan, RoutePlan, WireIdentity,
+  AccountPoolId, DriverId, ExecutionPlan, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
@@ -241,30 +242,15 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
           format!("profile '{id}' uses unsupported header patches"),
         ));
       }
-      let retry = match route {
-        RoutePlan::Managed(managed) => match managed.retry() {
-          ManagedRetry::Never => None,
-          ManagedRetry::Recoverable(retry) => Some(retry),
-        },
-        RoutePlan::Relay(relay) => {
-          if !matches!(relay.destination(), RelayDestination::FixedProvider(_)) {
-            return Err(Error::new(
-              "config",
-              format!("profile '{id}' requires original-destination proxy context"),
-            ));
-          }
-          match relay.retry() {
-            RelayRetry::Never => None,
-            RelayRetry::SafeMethods(retry) | RelayRetry::Buffered(retry) => Some(retry),
-          }
-        }
-      };
-      if retry.is_some_and(|retry| plan.retry_policy(retry).is_none()) {
+      if matches!(route, RoutePlan::Relay(relay) if !matches!(relay.destination(), RelayDestination::FixedProvider(_)))
+      {
         return Err(Error::new(
           "config",
-          format!("profile '{id}' references an unknown retry policy"),
+          format!("profile '{id}' requires original-destination proxy context"),
         ));
       }
+      RetryPolicy::from_route(&plan, route)
+        .map_err(|error| Error::new("config", format!("profile '{id}': {error}")))?;
       if let RoutePlan::Relay(relay) = route {
         if let RelayDestination::FixedProvider(provider) = relay.destination() {
           if !destinations.contains_key(provider) {
@@ -373,7 +359,7 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
       options,
       request_id,
       attempt: 0,
-      retry: None,
+      retry: RetryPolicy::default(),
       terminal: false,
     })
     .await
@@ -446,7 +432,7 @@ struct LocalSession<'a, T: Transport, R: Runtime> {
   options: RequestOptions,
   request_id: String,
   attempt: u32,
-  retry: Option<RetryPolicyPlan>,
+  retry: RetryPolicy,
   terminal: bool,
 }
 impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
@@ -457,6 +443,24 @@ impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
       stage,
       success,
     });
+  }
+
+  fn record_send_outcome(&self, target: &Target, session_id: Option<&str>, outcome: SendOutcome) -> Result<(), Error> {
+    let Target::Account { binding, pool } = target else {
+      return Ok(());
+    };
+    let feedback = AccountFeedbackPolicy::Api.feedback(outcome);
+    if feedback == AccountFeedback::None {
+      return Ok(());
+    }
+    let now = self.platform.runtime.borrow().now();
+    let mut state = self.platform.pools.get(pool).expect("linked pool").state.borrow_mut();
+    match feedback {
+      AccountFeedback::Success => state.record_success(now, session_id, binding),
+      AccountFeedback::Failure => state.record_failure(now, binding).map(|_| ()),
+      AccountFeedback::None => unreachable!("no feedback returned above"),
+    }
+    .map_err(|error| Error::new("send", error))
   }
 
   fn template_vars(&self) -> tokn_core::headers::TemplateVars {
@@ -520,15 +524,10 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     }) {
       return Err(Error::new("resolve", "profile does not expose this operation"));
     }
+    self.retry = RetryPolicy::from_route(&self.platform.plan, route).map_err(|error| Error::new("resolve", error))?;
     if let RoutePlan::Relay(relay) = route {
       let RelayDestination::FixedProvider(provider) = relay.destination() else {
         return Err(Error::new("resolve", "original destination requires proxy context"));
-      };
-      // SDK requests are POSTs. Safe-method retry policies therefore do not
-      // permit replay; explicitly buffered relays do.
-      self.retry = match relay.retry() {
-        RelayRetry::Buffered(id) => self.platform.plan.retry_policy(id).copied(),
-        RelayRetry::Never | RelayRetry::SafeMethods(_) => None,
       };
       if matches!(relay.credentials(), RelayCredentials::Client) {
         if !route.allows_provider(provider) {
@@ -544,11 +543,6 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
           opaque: true,
         });
       }
-    } else if let RoutePlan::Managed(managed) = route {
-      self.retry = match managed.retry() {
-        ManagedRetry::Never => None,
-        ManagedRetry::Recoverable(id) => self.platform.plan.retry_policy(id).copied(),
-      };
     }
     let pool_id = profile
       .account_pool()
@@ -783,57 +777,32 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       Err(source) => {
         let mut error = Error::new("send", &source);
         error.recoverable = transport.recoverable(&source);
-        if error.recoverable {
-          if let Target::Account { binding, ref pool } = resolved.target {
-            self
-              .platform
-              .pools
-              .get(pool)
-              .expect("linked pool")
-              .state
-              .borrow_mut()
-              .record_failure(self.platform.runtime.borrow().now(), &binding)
-              .map_err(|e| Error::new("send", e))?;
-          }
-        }
+        self.record_send_outcome(
+          &resolved.target,
+          extracted.session_id.as_deref(),
+          SendOutcome::Failure {
+            recoverable: error.recoverable,
+          },
+        )?;
         return Err(error);
       }
     };
-    let disposition = crate::driver::classify_status(head.status);
-    if disposition != crate::driver::StatusDisposition::Success && !matches!(resolved.target, Target::Client) {
+    // Account-credential API relays have the same failure policy as managed
+    // API calls. Only client-credential relays forward every received status.
+    let policy = match resolved.target {
+      Target::Account { .. } => ResponsePolicy::Api,
+      Target::Client => ResponsePolicy::ForwardAll,
+    };
+    let outcome = SendOutcome::Response { status: head.status };
+    let disposition = policy.classify_status(head.status);
+    if disposition != crate::driver::StatusDisposition::Success {
       let detail = read_error_body(&mut **transport, self.platform.limits.max_error_body_bytes).await;
-      if disposition == crate::driver::StatusDisposition::RecoverableFailure {
-        if let Target::Account { binding, ref pool } = resolved.target {
-          self
-            .platform
-            .pools
-            .get(pool)
-            .expect("linked pool")
-            .state
-            .borrow_mut()
-            .record_failure(self.platform.runtime.borrow().now(), &binding)
-            .map_err(|e| Error::new("send", e))?;
-        }
-      }
+      self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
       let mut error = Error::new("send", format!("upstream {}: {detail}", head.status));
       error.recoverable = disposition == crate::driver::StatusDisposition::RecoverableFailure;
       return Err(error);
     }
-    if let Target::Account { binding, ref pool } = resolved.target {
-      self
-        .platform
-        .pools
-        .get(pool)
-        .expect("linked pool")
-        .state
-        .borrow_mut()
-        .record_success(
-          self.platform.runtime.borrow().now(),
-          extracted.session_id.as_deref(),
-          &binding,
-        )
-        .map_err(|e| Error::new("send", e))?;
-    }
+    self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
     self.emit("send", None);
     Ok((head, resolved.clone(), extracted.stream, converted.upstream_stream))
   }
@@ -934,10 +903,16 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     self.terminal = true;
     self.emit(error.stage, Some(false));
     self.emit("completed", Some(false));
-    self
-      .retry
-      .filter(|policy| error.stage == "send" && error.recoverable && attempt < policy.max_retries())
-      .map(|policy| crate::driver::backoff(policy.initial_backoff(), attempt))
+    self.retry.next_delay(
+      attempt,
+      RetryFailure {
+        send_stage: error.stage == "send",
+        recoverable: error.recoverable,
+        stop: false,
+      },
+      // The injected SDK dispatches POST requests for all native LLM APIs.
+      Some("POST"),
+    )
   }
   #[allow(
     clippy::await_holding_refcell_ref,

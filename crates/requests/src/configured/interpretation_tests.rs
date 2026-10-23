@@ -69,7 +69,7 @@ async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) 
     options,
     request_id: "parity".into(),
     attempt: 0,
-    retry: None,
+    retry: RetryPolicy::default(),
     terminal: false,
   };
   let injected = local.extract().await.unwrap();

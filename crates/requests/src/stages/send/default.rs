@@ -14,13 +14,14 @@
 //! The returned [`SentResponse`] carries the live [`reqwest::Response`];
 //! draining or wrapping it as an SSE stream is the next stage's job.
 
-use crate::driver::{classify_status, StatusDisposition};
+use crate::driver::StatusDisposition;
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, ProviderError, RequestsError};
 use crate::pipeline::stages::{
   require_upstream_endpoint, BuiltHeaders, ConvertedRequest, Extracted, Resolved, SendStage, SentResponse,
 };
+use crate::send_policy::ResponsePolicy;
 use async_trait::async_trait;
 use bytes::Bytes;
 use smol_str::SmolStr;
@@ -135,7 +136,7 @@ impl SendStage for DefaultSend {
     // Status-based classification: 5xx is recoverable (transient
     // upstream issue), 4xx is permanent (won't change on retry). 2xx/3xx
     // flow through normally.
-    let disposition = classify_status(status);
+    let disposition = ResponsePolicy::Api.classify_status(status);
     if disposition == StatusDisposition::RecoverableFailure {
       let body_text = match resp.text().await {
         Ok(t) => t,
