@@ -18,6 +18,13 @@ use tokn_sdk::{
   Client, Endpoint, Injected, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
 };
 
+#[path = "typed_events.rs"]
+mod typed_events;
+pub use typed_events::{
+  buffered_usage_events, event_timestamps_and_local_sink, streaming_usage_events, typed_event_failures,
+  typed_event_retry_attribution, typed_event_summaries,
+};
+
 const CHAT_JSON: &[u8] = br#"{"id":"chat-test","object":"chat.completion","model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
 const RESPONSES_JSON: &[u8] = br#"{"id":"resp-test","status":"completed","model":"model","output":[{"type":"message","id":"message-test","status":"completed","role":"assistant","content":[{"type":"output_text","text":"hello","annotations":[]}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}"#;
 const MESSAGES_JSON: &[u8] = br#"{"id":"msg-test","type":"message","model":"model","role":"assistant","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":2}}"#;

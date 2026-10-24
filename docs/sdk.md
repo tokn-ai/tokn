@@ -295,10 +295,52 @@ Implement `transport::Transport` on the application's HTTP/TLS session:
 - `close_response` aborts/releases the active exchange on completion or drop.
 
 Implement `Runtime` for monotonic time, wall-clock timestamps, asynchronous
-sleep, and optional lifecycle observation. Networking, TLS validation, an
+sleep, and optional event delivery. Networking, TLS validation, an
 allocator, and an async executor are supplied by firmware. Explicit API keys
 and access tokens are supplied in memory; desktop login and refresh adapters
 remain standard features.
+
+Request events use the same `RequestEvent`, `StageEvent`, `RecordEvent`, and
+`usage::Usage` types in both builds. Attach a `RequestEventSink` or a local
+`FnMut(RequestEvent)` callback to the injected platform:
+
+```rust
+use tokn_sdk::{Injected, RequestEvent, RequestEventPayload, RecordEvent};
+
+let platform = Injected::new(plan, accounts, transport, runtime)?
+  .with_event_sink(|event: RequestEvent| {
+    if let RequestEventPayload::Record(RecordEvent::Usage(usage)) = event.payload {
+      // Store or forward this observation using application-owned services.
+      observe_usage(event.request_id, event.attempt, usage);
+    }
+  });
+```
+
+The sink may borrow local state and does not require `Send` or `'static`.
+Delivery is synchronous; callbacks should return promptly. Re-entering the
+same client from a callback returns a busy error. Applications can instead
+expose a sink through `Runtime::event_sink`; `Runtime::observe` remains available
+for existing lifecycle observers and is called alongside the typed sink.
+`Runtime::unix_millis` supplies event timestamps, defaulting to `unix_seconds`
+converted to milliseconds when the application does not override it.
+
+The injected adapter emits stage summaries, errors, completion, and usage.
+Each attempt has its own Started/Completed pair; `attempt` is zero-based and
+Completed's `attempts` is one-based. Stream completion follows the shared
+terminal rules above. Cancellation and response failures emit Error followed
+by Completed with `success: false`. Summary payloads and usage observations
+are constructed only when a typed sink is installed. Installing a sink opts
+into body/header copies for summaries; live response bodies are not retained.
+Injected ingress summaries serialize the supplied JSON value because this
+adapter has no original HTTP wire body or agent-detection context.
+
+Usage observations preserve the existing parser's zero, partial, and repeated
+figures; they are snapshots, not additive token deltas. Managed buffered JSON
+is observed before conversion, buffered SSE after rendering, and live SSE
+before translation. Opaque buffered responses use a best-effort JSON parse.
+The standard event bus implements the sink interface and retains its existing
+Tokio delivery, additional transport/body capture records, and persistence
+subscribers. No database or file I/O is introduced into the alloc-only path.
 
 The injected platform supports managed profiles and fixed-provider relays,
 including caller-supplied credentials. Origin-based proxy routing remains a
@@ -311,7 +353,7 @@ capability-based routing. `Limits` bounds buffered responses and SSE records.
 The friendly generation builder and gateway relay/proxy adapters currently
 remain standard-only.
 
-Shared `tokn_core::types::{Bytes, SmolStr}` are concrete types selected at build
+Shared `tokn_core::types::{Bytes, SmolStr, Shared}` are concrete types selected at build
 time. Standard builds re-export the original upstream types; embedded builds
 use local static/inline/`Rc` storage. The local backend supports single-threaded,
 non-atomic targets and is intentionally neither `Send` nor `Sync`.
@@ -321,6 +363,9 @@ clients using controlled upstream responses: stream mode, initiator headers,
 session aliases, option precedence, and account affinity. Extraction-stage
 comparisons also cover request purpose across all three APIs and missing-model
 behavior. These checks establish interpretation parity, not full stage parity.
+`crates/requests/tests/injected_event_parity.rs` compares usage and terminal
+events across all nine upstream/requested API pairs for buffered JSON,
+buffered SSE, and live SSE, including conversion failure and cancellation.
 
 Verification also includes an isolated default-feature SDK consumer and an isolated
 alloc-only consumer that exercises configured requests, injected transports,

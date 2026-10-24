@@ -5,7 +5,7 @@
 //! * **Non-SSE** responses: drain into bytes and return
 //!   [`ConvertedBody::Buffered`] with the original byte payload. Usage is
 //!   parsed synchronously from the JSON body via
-//!   [`parse_usage_any_json`](tokn_convert::usage::parse_usage_any_json)
+//!   [`observed_usage_json`](tokn_convert::usage::observed_usage_json)
 //!   and emitted as [`RecordEvent::Usage`].
 //! * **SSE** responses (`Content-Type: text/event-stream`): return
 //!   [`ConvertedBody::Stream`] forwarding the upstream byte chunks
@@ -34,7 +34,7 @@ use bytes::Bytes;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use tokn_convert::sse::{observer_channel, ObserverMsg, SsePipeline};
-use tokn_convert::usage::{parse_usage_any_json, parse_usage_any_value, usage_has_any};
+use tokn_convert::usage::{observed_usage, observed_usage_json};
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RecordEvent;
 use tokn_headers::HeaderMap;
@@ -76,11 +76,8 @@ impl ConvertResponseStage for PassthroughConvertResponse {
     // Best-effort usage parse, synchronous on the full body. Cheap
     // relative to network IO and avoids spawning a task per request
     // for the buffered path.
-    if !body.is_empty() {
-      let usage = parse_usage_any_json(&body);
-      if usage_has_any(&usage) {
-        ctx.emit_record(RecordEvent::Usage(usage));
-      }
+    if let Some(usage) = observed_usage_json(&body) {
+      ctx.emit_record(RecordEvent::Usage(usage));
     }
 
     Ok(ConvertedResponse {
@@ -163,10 +160,9 @@ impl ConvertResponseStage for PassthroughConvertResponse {
         while let Some(msg) = tap_rx.recv().await {
           match msg {
             ObserverMsg::Parsed(Some(value)) => {
-              let parsed = parse_usage_any_value(&value);
-              if !usage_has_any(&parsed) {
+              let Some(parsed) = observed_usage(&value) else {
                 continue;
-              }
+              };
               parse_events.emit(tokn_core::event::Event::Requests(
                 tokn_core::request_event::RequestEvent {
                   request_id: parse_request_id.clone(),

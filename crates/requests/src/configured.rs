@@ -31,7 +31,8 @@ use tokn_core::{
   account::AccountConfig,
   headers::{HeaderMap, HeaderName, HeaderValue},
   provider::PreparedRequest,
-  types::{Bytes, SmolStr},
+  request_event::{ConvertedResponseSummary, RequestEventPayload, RequestEventSink, SentSummary, Stage, StageEvent},
+  types::{Bytes, Shared, SmolStr},
   upstream_url::CleartextHttpPolicy,
   Endpoint,
 };
@@ -40,8 +41,10 @@ use tokn_policy::{
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
+mod events;
 #[cfg(all(test, feature = "std"))]
 mod interpretation_tests;
+pub use events::EventRuntime;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,7 +120,14 @@ impl RequestOptions {
 pub trait Runtime {
   fn now(&self) -> Duration;
   fn unix_seconds(&self) -> u64;
+  fn unix_millis(&self) -> i64 {
+    self.unix_seconds().saturating_mul(1_000).min(i64::MAX as u64) as i64
+  }
   async fn sleep(&mut self, duration: Duration);
+  /// Optional typed request-event destination. Delivery is synchronous and local.
+  fn event_sink(&mut self) -> Option<&mut dyn RequestEventSink> {
+    None
+  }
   fn observe(&mut self, _event: Lifecycle<'_>) {}
 }
 
@@ -176,6 +186,7 @@ struct Binding {
   account: AccountConfig,
   provider: ProviderId,
   driver: DriverId,
+  driver_identity: SmolStr,
   base_url: String,
   models: BTreeSet<SmolStr>,
   cleartext: CleartextHttpPolicy,
@@ -284,6 +295,7 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
           account: accounts[binding.account_order()].clone(),
           provider: provider.clone(),
           driver: binding.driver_id().clone(),
+          driver_identity: SmolStr::new(binding.driver_identity()),
           base_url: destination.base_url().to_string(),
           models: models.get(provider).cloned().unwrap_or_default(),
           cleartext: destination.cleartext_policy(),
@@ -327,6 +339,20 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
     self
   }
 
+  /// Attach a local sink without changing the application's time/transport services.
+  pub fn with_event_sink<S: RequestEventSink>(self, sink: S) -> Injected<T, EventRuntime<R, S>> {
+    Injected {
+      plan: self.plan,
+      destinations: self.destinations,
+      bindings: self.bindings,
+      pools: self.pools,
+      transport: self.transport,
+      runtime: RefCell::new(EventRuntime::new(self.runtime.into_inner(), sink)),
+      limits: self.limits,
+      request_sequence: self.request_sequence,
+    }
+  }
+
   pub async fn execute(
     &self,
     endpoint: Endpoint,
@@ -361,6 +387,7 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
       attempt: 0,
       retry: RetryPolicy::default(),
       terminal: false,
+      stage: Stage::Extract,
     })
     .await
   }
@@ -434,17 +461,9 @@ struct LocalSession<'a, T: Transport, R: Runtime> {
   attempt: u32,
   retry: RetryPolicy,
   terminal: bool,
+  stage: Stage,
 }
 impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
-  fn emit(&self, stage: &'static str, success: Option<bool>) {
-    self.platform.runtime.borrow_mut().observe(Lifecycle {
-      request_id: &self.request_id,
-      attempt: self.attempt,
-      stage,
-      success,
-    });
-  }
-
   fn record_send_outcome(&self, target: &Target, session_id: Option<&str>, outcome: SendOutcome) -> Result<(), Error> {
     let Target::Account { binding, pool } = target else {
       return Ok(());
@@ -493,14 +512,23 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
   fn start(&mut self, attempt: u32) {
     self.attempt = attempt;
     self.terminal = false;
-    self.emit("started", None);
+    self.stage = Stage::Extract;
+    self
+      .platform
+      .emit_event(&self.request_id, self.attempt, Some(("started", None)), || {
+        Some(RequestEventPayload::Stage(StageEvent::Started {
+          request_endpoint: self.endpoint.into(),
+        }))
+      });
   }
   async fn extract(&mut self) -> Result<RequestInterpretation, Error> {
+    self.stage = Stage::Extract;
     let extracted = RequestInterpretation::from_json(&self.endpoint.into(), &self.headers, &self.body);
-    self.emit("extract", None);
+    self.emit_extracted(&extracted);
     Ok(extracted)
   }
   async fn resolve(&mut self, extracted: &RequestInterpretation) -> Result<Resolved, Error> {
+    self.stage = Stage::Resolve;
     let profile = match self.options.profile.as_deref() {
       Some(id) => self.platform.plan.profiles().get(id),
       None => self
@@ -533,15 +561,16 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         if !route.allows_provider(provider) {
           return Err(Error::new("resolve", "relay provider is excluded by its policy"));
         }
-        self.emit("resolve", None);
-        return Ok(Resolved {
+        let resolved = Resolved {
           target: Target::Client,
           provider: provider.clone(),
           endpoint: self.endpoint,
           model: SmolStr::new(&extracted.model),
           wire_identity: WireIdentity::None,
           opaque: true,
-        });
+        };
+        self.emit_resolved(extracted, &resolved);
+        return Ok(resolved);
       }
     }
     let pool_id = profile
@@ -580,8 +609,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         model,
         endpoint,
       } => {
-        self.emit("resolve", None);
-        Ok(Resolved {
+        let resolved = Resolved {
           target: Target::Account {
             binding,
             pool: pool_id.clone(),
@@ -591,13 +619,16 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
           model,
           wire_identity: profile.wire_identity().clone(),
           opaque: matches!(route, RoutePlan::Relay(_)),
-        })
+        };
+        self.emit_resolved(extracted, &resolved);
+        Ok(resolved)
       }
       RouteSelection::NoAccount => Err(Error::new("resolve", "no eligible account for this request")),
       RouteSelection::ProviderAccessDenied => Err(Error::new("resolve", "provider access denied")),
     }
   }
   async fn build_headers(&mut self, _: &RequestInterpretation, resolved: &Resolved) -> Result<HeaderMap, Error> {
+    self.stage = Stage::BuildHeaders;
     if matches!(resolved.target, Target::Client) {
       let mut headers = crate::header_policy::passthrough_headers(&self.headers, false, true);
       headers.remove("content-length");
@@ -608,7 +639,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         headers.insert("accept", "application/json");
       }
       headers.insert("x-request-id", self.request_id.clone());
-      self.emit("build_headers", None);
+      self.emit_headers(&headers, resolved);
       return Ok(headers);
     }
     let Target::Account { binding, .. } = resolved.target else {
@@ -631,7 +662,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       headers.insert(HeaderName::new(name.as_str()), HeaderValue::from_string(value.clone()));
     }
     headers.insert("x-request-id", self.request_id.clone());
-    self.emit("build_headers", None);
+    self.emit_headers(&headers, resolved);
     Ok(headers)
   }
   async fn convert_request(
@@ -640,6 +671,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     resolved: &Resolved,
     headers: &HeaderMap,
   ) -> Result<Converted, Error> {
+    self.stage = Stage::ConvertRequest;
     if matches!(resolved.target, Target::Client) {
       let destination = &self.platform.destinations[&resolved.provider];
       let segments = native::operation_segments(
@@ -663,7 +695,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       )
       .map_err(|e| Error::new("convert_request", e))?;
       let upstream_stream = self.body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-      self.emit("convert_request", None);
+      self.emit_converted_request(&prepared);
       return Ok(Converted {
         prepared,
         upstream_stream,
@@ -747,7 +779,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       &binding.account,
     )
     .map_err(|error| Error::new("convert_request", error))?;
-    self.emit("convert_request", None);
+    self.emit_converted_request(&prepared);
     Ok(Converted {
       prepared,
       upstream_stream,
@@ -760,6 +792,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     _headers: &HeaderMap,
     converted: &Converted,
   ) -> Result<Self::Sent, Error> {
+    self.stage = Stage::Send;
     let mut prepared = converted.prepared.clone();
     let transport = self.transport.as_mut().expect("session owns transport");
     prepared.headers.insert(
@@ -803,13 +836,50 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       return Err(error);
     }
     self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
-    self.emit("send", None);
+    self.emit_stage(Stage::Send, || {
+      StageEvent::Send(SentSummary {
+        status: head.status,
+        headers: head.headers.clone(),
+        upstream_endpoint: Some(resolved.endpoint),
+        stream: extracted.stream,
+      })
+    });
     Ok((head, resolved.clone(), extracted.stream, converted.upstream_stream))
   }
-  async fn convert_response(
-    mut self,
-    (mut head, resolved, stream, upstream_stream): Self::Sent,
-  ) -> Result<Self::Output, Error> {
+  async fn convert_response(mut self, sent: Self::Sent) -> Result<Self::Output, Error> {
+    self.stage = Stage::ConvertResponse;
+    let result = self.finish_response(sent).await;
+    if let Err(error) = &result {
+      self.report_failure(error, false);
+    }
+    result
+  }
+  fn failed(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
+    self.report_failure(error, true);
+    self.retry.next_delay(
+      attempt,
+      RetryFailure {
+        send_stage: error.stage == "send",
+        recoverable: error.recoverable,
+        stop: false,
+      },
+      // The injected SDK dispatches POST requests for all native LLM APIs.
+      Some("POST"),
+    )
+  }
+  #[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "the injected timer is local and serialized; cancellation drops the borrow and concurrent execution is rejected by the transport lease"
+  )]
+  async fn sleep(&mut self, delay: Duration) {
+    self.platform.runtime.borrow_mut().sleep(delay).await;
+  }
+}
+impl<'a, T: Transport, R: Runtime> LocalSession<'a, T, R> {
+  async fn finish_response(
+    &mut self,
+    (mut head, resolved, stream, upstream_stream): (ResponseHead, Resolved, bool, bool),
+  ) -> Result<Response<'a, T, R>, Error> {
     let mut body = self.transport.take().expect("session owns transport");
     // The transport yields decoded entities, so wire compression/framing no
     // longer describes any returned body, including transparent relays.
@@ -818,9 +888,19 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
     head.headers.remove("transfer-encoding");
     if resolved.opaque && !stream {
       let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
+      self.platform.emit_event(&self.request_id, self.attempt, None, || {
+        tokn_convert::usage::observed_usage_json(&bytes)
+          .map(|usage| RequestEventPayload::Record(tokn_core::request_event::RecordEvent::Usage(usage)))
+      });
       self.terminal = true;
-      self.emit("convert_response", None);
-      self.emit("completed", Some(true));
+      self.emit_stage(Stage::ConvertResponse, || {
+        StageEvent::ConvertResponse(ConvertedResponseSummary {
+          status: head.status,
+          headers: head.headers.clone(),
+          body: None,
+        })
+      });
+      self.platform.emit_complete(&self.request_id, self.attempt, true);
       return Ok(Response {
         status: head.status,
         headers: head.headers,
@@ -851,7 +931,13 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
         head.clone(),
       );
       self.terminal = true;
-      self.emit("convert_response", None);
+      self.emit_stage(Stage::ConvertResponse, || {
+        StageEvent::ConvertResponse(ConvertedResponseSummary {
+          status: head.status,
+          headers: head.headers.clone(),
+          body: None,
+        })
+      });
       return Ok(Response {
         status: head.status,
         headers: head.headers,
@@ -865,7 +951,7 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       Bytes::from(bytes),
       head.headers.get("content-type").map(HeaderValue::as_str),
       self.platform.limits.max_event_bytes,
-      |_| {},
+      |value| self.platform.emit_usage(&self.request_id, self.attempt, value),
     )
     .map_err(|error| Error::new("convert_response", error))?;
     if response.body_bytes.len() > self.platform.limits.max_response_bytes {
@@ -875,41 +961,28 @@ impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T
       head.headers.insert("content-type", "application/json");
     }
     self.terminal = true;
-    self.emit("convert_response", None);
-    self.emit("completed", Some(true));
+    self.emit_stage(Stage::ConvertResponse, || {
+      StageEvent::ConvertResponse(ConvertedResponseSummary {
+        status: head.status,
+        headers: head.headers.clone(),
+        body: response.body_json.map(Shared::new),
+      })
+    });
+    self.platform.emit_complete(&self.request_id, self.attempt, true);
     Ok(Response {
       status: head.status,
       headers: head.headers,
       body: ResponseBody::Buffered(response.body_bytes),
     })
   }
-  fn failed(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
-    self.terminal = true;
-    self.emit(error.stage, Some(false));
-    self.emit("completed", Some(false));
-    self.retry.next_delay(
-      attempt,
-      RetryFailure {
-        send_stage: error.stage == "send",
-        recoverable: error.recoverable,
-        stop: false,
-      },
-      // The injected SDK dispatches POST requests for all native LLM APIs.
-      Some("POST"),
-    )
-  }
-  #[allow(
-    clippy::await_holding_refcell_ref,
-    reason = "the injected timer is local and serialized; cancellation drops the borrow and concurrent execution is rejected by the transport lease"
-  )]
-  async fn sleep(&mut self, delay: Duration) {
-    self.platform.runtime.borrow_mut().sleep(delay).await;
-  }
 }
 impl<T: Transport, R: Runtime> Drop for LocalSession<'_, T, R> {
   fn drop(&mut self) {
     if !self.terminal {
-      self.emit("completed", Some(false));
+      self.report_failure(
+        &Error::new(self.stage.as_str(), "pipeline attempt cancelled before completion"),
+        false,
+      );
     }
   }
 }
@@ -1002,7 +1075,7 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
       report_terminal: true,
     }
   }
-  fn settle(&mut self) {
+  fn settle(&mut self, error: Option<&Error>) {
     if self.processor.input_closed() {
       // Release the HTTP session as soon as protocol input ends; queued
       // converted events still belong to this response until delivered.
@@ -1010,31 +1083,44 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
     }
     if let Some(outcome) = self.processor.outcome() {
       if core::mem::take(&mut self.report_terminal) {
-        self.platform.runtime.borrow_mut().observe(Lifecycle {
-          request_id: &self.request_id,
-          attempt: self.attempt,
-          stage: "completed",
-          success: Some(outcome == StreamOutcome::Complete),
-        });
+        if outcome != StreamOutcome::Complete {
+          let fallback = Error::new(
+            "stream",
+            match outcome {
+              StreamOutcome::Cancelled => "stream cancelled before completion",
+              _ => "stream failed",
+            },
+          );
+          self.platform.emit_error(
+            &self.request_id,
+            self.attempt,
+            Stage::ConvertResponse,
+            error.unwrap_or(&fallback),
+            false,
+          );
+        }
+        self
+          .platform
+          .emit_complete(&self.request_id, self.attempt, outcome == StreamOutcome::Complete);
       }
     }
   }
   pub fn cancel(&mut self) {
     self.processor.cancel();
-    self.settle();
+    self.settle(None);
   }
   pub async fn next_event(&mut self) -> Result<Option<SseEvent>, Error> {
     let result = self.read_event().await;
-    if result.is_err() {
+    if let Err(error) = &result {
       self.processor.fail();
-      self.settle();
+      self.settle(Some(error));
     }
     result
   }
   async fn read_event(&mut self) -> Result<Option<SseEvent>, Error> {
     loop {
       let event = self.processor.next_event();
-      self.settle();
+      self.settle(None);
       if event.is_some() {
         return Ok(event);
       }
@@ -1059,10 +1145,11 @@ impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
         let Some(record) = self.decoder.push(byte).map_err(|e| Error::new("stream", e))? else {
           continue;
         };
-        self
-          .processor
-          .push(SseEvent::from(record))
-          .map_err(|e| Error::new("stream", e))?;
+        let event = SseEvent::from(record);
+        if let Some(value) = &event.json {
+          self.platform.emit_usage(&self.request_id, self.attempt, value);
+        }
+        self.processor.push(event).map_err(|e| Error::new("stream", e))?;
         break;
       }
     }

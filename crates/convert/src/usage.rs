@@ -73,6 +73,23 @@ pub fn usage_has_any(usage: &Usage) -> bool {
     || usage.details.reasoning.is_some()
 }
 
+/// Extract one usage observation from parsed response JSON.
+///
+/// Missing figures do not produce an observation. Zero and partial figures
+/// remain meaningful; callers emit observations as supplied rather than
+/// summing them or suppressing repeated snapshots.
+pub fn observed_usage(value: &Value) -> Option<Usage> {
+  let usage = parse_usage_any_value(value);
+  usage_has_any(&usage).then_some(usage)
+}
+
+/// Best-effort usage observation from a buffered JSON body. Invalid JSON and
+/// unrecognized usage shapes do not produce an observation.
+pub fn observed_usage_json(bytes: &[u8]) -> Option<Usage> {
+  let value = serde_json::from_slice(bytes).ok()?;
+  observed_usage(&value)
+}
+
 fn ptr_u64(v: Option<&Value>, path: &str) -> Option<u64> {
   v.and_then(|value| value.pointer(path)).and_then(Value::as_u64)
 }
@@ -310,5 +327,38 @@ mod tests {
   fn json_helper_handles_invalid_input() {
     let u = parse_usage_any_json(b"not json");
     assert!(!usage_has_any(&u));
+  }
+
+  #[test]
+  fn observations_ignore_missing_or_unrecognized_usage() {
+    for value in [Value::Null, json!({"usage":{}}), json!({"usage":{"prompt_tokens":"7"}})] {
+      assert_eq!(observed_usage(&value), None);
+    }
+    assert_eq!(observed_usage_json(b"not json"), None);
+    assert_eq!(observed_usage_json(b"{}"), None);
+  }
+
+  #[test]
+  fn observations_preserve_zero_and_partial_figures() {
+    let zero = observed_usage_json(br#"{"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#)
+      .expect("zero token counts are still reported usage");
+    assert_eq!(zero.input_tokens, Some(0));
+    assert_eq!(zero.output_tokens, Some(0));
+    assert_eq!(zero.total_tokens, Some(0));
+    assert_eq!(zero.usage_type, Some(UsageType::Chat));
+
+    let partial = observed_usage(&json!({"type":"message_delta","usage":{"output_tokens":5}})).unwrap();
+    assert_eq!(partial.input_tokens, None);
+    assert_eq!(partial.output_tokens, Some(5));
+    assert_eq!(partial.total_tokens, None);
+    // Preserve the established best-effort parser's treatment of an ambiguous
+    // input/output shape; this helper does not add endpoint inference.
+    assert_eq!(partial.usage_type, Some(UsageType::Responses));
+
+    let input = observed_usage(&json!({"message":{"usage":{"input_tokens":3,"cache_read_input_tokens":0}}})).unwrap();
+    assert_eq!(input.input_tokens, Some(3));
+    assert_eq!(input.output_tokens, None);
+    assert_eq!(input.details.cache_read, Some(0));
+    assert_eq!(input.usage_type, Some(UsageType::Messages));
   }
 }

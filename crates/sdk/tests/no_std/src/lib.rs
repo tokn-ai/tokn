@@ -6,15 +6,41 @@ extern crate alloc;
 #[path = "../../scenarios/configured.rs"]
 mod scenarios;
 pub use scenarios::{
-  buffered_content_detection, buffered_response_limits, buffered_round_trip, configured_client_relay,
-  configured_provider_policies, configured_relay_policies, configured_status_policy, configured_transport_encoding,
-  cross_format_round_trip, response_body_failure_does_not_retry, retry_fallback_affinity,
-  retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_cancellation_lifecycle,
-  streaming_failure_lifecycle, streaming_round_trip, streaming_terminal_lifecycle, transport_failure_account_feedback,
+  buffered_content_detection, buffered_response_limits, buffered_round_trip, buffered_usage_events,
+  configured_client_relay, configured_provider_policies, configured_relay_policies, configured_status_policy,
+  configured_transport_encoding, cross_format_round_trip, event_timestamps_and_local_sink,
+  response_body_failure_does_not_retry, retry_fallback_affinity, retry_schedule_and_exhaustion,
+  stream_errors_and_cancellation, streaming_cancellation_lifecycle, streaming_failure_lifecycle, streaming_round_trip,
+  streaming_terminal_lifecycle, streaming_usage_events, transport_failure_account_feedback, typed_event_failures,
+  typed_event_retry_attribution, typed_event_summaries,
 };
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn typed_event_summaries() {
+    super::typed_event_summaries();
+  }
+  #[test]
+  fn buffered_usage_events() {
+    super::buffered_usage_events();
+  }
+  #[test]
+  fn streaming_usage_events() {
+    super::streaming_usage_events();
+  }
+  #[test]
+  fn typed_event_retry_attribution() {
+    super::typed_event_retry_attribution();
+  }
+  #[test]
+  fn typed_event_failures() {
+    super::typed_event_failures();
+  }
+  #[test]
+  fn event_timestamps_and_local_sink() {
+    super::event_timestamps_and_local_sink();
+  }
   #[test]
   fn transport_encoding_capability() {
     super::configured_transport_encoding();

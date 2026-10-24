@@ -24,7 +24,7 @@ use futures_util::stream::BoxStream;
 use std::sync::Arc;
 use tokn_convert::buffered::{self, BufferedError};
 use tokn_convert::sse::{observer_channel, EndpointTranslator, ObserverMsg, SsePipeline, StreamOutcome};
-use tokn_convert::usage::{parse_usage_any_value, usage_has_any};
+use tokn_convert::usage::observed_usage;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RecordEvent;
 use tokn_headers::keys::{CONTENT_LENGTH, CONTENT_TYPE};
@@ -83,10 +83,9 @@ impl DefaultConvertResponse {
       while let Some(msg) = tap_rx.recv().await {
         match msg {
           ObserverMsg::Parsed(Some(value)) => {
-            let parsed = parse_usage_any_value(&value);
-            if !usage_has_any(&parsed) {
+            let Some(parsed) = observed_usage(&value) else {
               continue;
-            }
+            };
             tap_events.emit(tokn_core::event::Event::Requests(
               tokn_core::request_event::RequestEvent {
                 request_id: tap_request_id.clone(),
@@ -160,8 +159,7 @@ impl ConvertResponseStage for DefaultConvertResponse {
       |value| {
         // Keep usage observation before cross-endpoint JSON conversion, or
         // after SSE rendering, even if a later conversion step fails.
-        let usage = parse_usage_any_value(value);
-        if usage_has_any(&usage) {
+        if let Some(usage) = observed_usage(value) {
           ctx.emit_record(RecordEvent::Usage(usage));
         }
       },

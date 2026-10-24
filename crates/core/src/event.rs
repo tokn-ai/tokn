@@ -1,5 +1,5 @@
 use crate::db::Usage;
-use crate::request_event::RequestEvent;
+use crate::request_event::{RequestEvent, RequestEventSink};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::{broadcast, oneshot};
@@ -113,6 +113,11 @@ impl EventBus {
     let _ = self.tx.send(Arc::new(event));
   }
 
+  /// Publish the portable request event through the standard event bus.
+  pub fn emit_request(&self, event: RequestEvent) {
+    self.emit(Event::Requests(event));
+  }
+
   pub fn begin_finalizer(&self) -> EventFinalizerGuard {
     self.active_finalizers.fetch_add(1, Ordering::AcqRel);
     EventFinalizerGuard {
@@ -134,6 +139,18 @@ impl EventBus {
     let (tx, rx) = oneshot::channel();
     let _ = self.tx.send(Arc::new(Event::Shutdown(Mutex::new(Some(tx)))));
     let _ = rx.await;
+  }
+}
+
+impl RequestEventSink for EventBus {
+  fn emit_request(&mut self, event: RequestEvent) {
+    EventBus::emit_request(self, event);
+  }
+}
+
+impl RequestEventSink for Arc<EventBus> {
+  fn emit_request(&mut self, event: RequestEvent) {
+    EventBus::emit_request(self, event);
   }
 }
 

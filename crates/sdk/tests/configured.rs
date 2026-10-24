@@ -3,6 +3,31 @@ extern crate alloc;
 mod scenarios;
 
 #[test]
+fn typed_event_summaries() {
+  scenarios::typed_event_summaries();
+}
+#[test]
+fn buffered_usage_events() {
+  scenarios::buffered_usage_events();
+}
+#[test]
+fn streaming_usage_events() {
+  scenarios::streaming_usage_events();
+}
+#[test]
+fn typed_event_retry_attribution() {
+  scenarios::typed_event_retry_attribution();
+}
+#[test]
+fn typed_event_failures() {
+  scenarios::typed_event_failures();
+}
+#[test]
+fn event_timestamps_and_local_sink() {
+  scenarios::event_timestamps_and_local_sink();
+}
+
+#[test]
 fn all_native_formats() {
   scenarios::buffered_round_trip();
 }
