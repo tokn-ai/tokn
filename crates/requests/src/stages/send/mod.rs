@@ -17,13 +17,7 @@ pub mod proxy;
 pub use default::DefaultSend;
 pub use proxy::ProxySend;
 
-const BODY_DIGEST_HEADERS: &[&str] = &["content-md5", "digest", "content-digest", "repr-digest"];
-
-fn remove_body_digests(headers: &mut tokn_headers::HeaderMap) {
-  for name in BODY_DIGEST_HEADERS {
-    headers.remove(*name);
-  }
-}
+use crate::header_policy::remove_body_digests;
 
 fn patch_compaction_routing_hint(
   ctx: &PipelineCtx,

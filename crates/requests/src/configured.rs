@@ -1,12 +1,9 @@
-//! Configured execution with injected platform services.
+//! In-memory configuration and borrowed adapters for the shared request session.
 //!
-//! This is an adapter to the shared six-stage driver. Routing predicates,
-//! mutable pool selection, provider preparation, and protocol conversion come
-//! from their existing domain crates.
+//! The application owns transport and runtime services. All interpretation,
+//! routing, provider policy, retries, and response lifecycle run in `session`.
 
-use crate::interpretation::RequestInterpretation;
-use crate::retry::{RetryFailure, RetryPolicy};
-use crate::send_policy::{AccountFeedback, AccountFeedbackPolicy, ResponsePolicy, SendOutcome};
+use crate::session::{self, ExecutionState, ModelCapabilities, ModelInventory, RequestInput};
 use alloc::{
   collections::{BTreeMap, BTreeSet},
   format,
@@ -15,35 +12,24 @@ use alloc::{
 };
 use core::{
   cell::{Cell, RefCell, RefMut},
-  fmt,
   time::Duration,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokn_accounts::{
-  link::portable::{link_pool_metadata, link_provider_metadata, DestinationMetadata},
-  native,
-  pool_state::{AffinityPolicy, PoolState, Selection},
-  selection::{select_route, CandidateBinding, RouteSelection, SelectionRequest},
-};
-use tokn_convert::sse::{Decoder, EndpointTranslator, SseEvent, StreamOutcome, StreamProcessor};
 use tokn_core::{
   account::AccountConfig,
   headers::{HeaderMap, HeaderName, HeaderValue},
-  provider::PreparedRequest,
-  request_event::{ConvertedResponseSummary, RequestEventPayload, RequestEventSink, SentSummary, Stage, StageEvent},
+  request_event::{RequestEvent, RequestEventSink},
   types::{Bytes, Shared, SmolStr},
-  upstream_url::CleartextHttpPolicy,
   Endpoint,
 };
-use tokn_policy::{
-  AccountPoolId, DriverId, ExecutionPlan, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
-};
-use tokn_service::transport::{Request, ResponseHead, Transport};
+use tokn_policy::{ExecutionPlan, ProviderId, RelayDestination, RoutePlan};
+use tokn_service::transport::{EncodeError, Request, ResponseHead, Transport};
 
 mod events;
 #[cfg(all(test, feature = "std"))]
 mod interpretation_tests;
+pub use crate::session::{Error, Limits};
 pub use events::EventRuntime;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,91 +117,14 @@ pub trait Runtime {
   fn observe(&mut self, _event: Lifecycle<'_>) {}
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Lifecycle<'a> {
-  pub request_id: &'a str,
-  pub attempt: u32,
-  pub stage: &'static str,
-  pub success: Option<bool>,
-}
+pub use crate::session::Lifecycle;
 
-#[derive(Debug)]
-pub struct Error {
-  pub stage: &'static str,
-  pub message: SmolStr,
-  pub recoverable: bool,
-}
-impl Error {
-  pub fn new(stage: &'static str, message: impl fmt::Display) -> Self {
-    Self {
-      stage,
-      message: SmolStr::new(message.to_string()),
-      recoverable: false,
-    }
-  }
-}
-impl fmt::Display for Error {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    write!(f, "[{}] {}", self.stage, self.message)
-  }
-}
-impl core::error::Error for Error {}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Limits {
-  pub max_response_bytes: usize,
-  pub max_event_bytes: usize,
-  pub max_error_body_bytes: usize,
-}
-impl Default for Limits {
-  fn default() -> Self {
-    Self {
-      max_response_bytes: 4 * 1024 * 1024,
-      max_event_bytes: 64 * 1024,
-      max_error_body_bytes: 8 * 1024,
-    }
-  }
-}
-
-struct LocalPool {
-  members: Vec<usize>,
-  state: RefCell<PoolState<usize>>,
-}
-
-struct Binding {
-  account: AccountConfig,
-  provider: ProviderId,
-  driver: DriverId,
-  driver_identity: SmolStr,
-  base_url: String,
-  models: BTreeSet<SmolStr>,
-  cleartext: CleartextHttpPolicy,
-}
-impl CandidateBinding for Binding {
-  fn provider_id(&self) -> &ProviderId {
-    &self.provider
-  }
-  fn driver_id(&self) -> &DriverId {
-    &self.driver
-  }
-  fn supports(&self, model: &str, endpoint: Endpoint) -> bool {
-    self.models.contains(model) && self.has_endpoint(model, endpoint)
-  }
-  fn has_endpoint(&self, model: &str, endpoint: Endpoint) -> bool {
-    native::supports_model_endpoint(self.driver.as_str(), model, endpoint, &self.base_url)
-  }
-}
-
-/// An in-memory configured platform with one injected HTTP session.
+/// An in-memory client with one exclusive, application-owned HTTP exchange.
 ///
-/// Borrowing the session fails immediately while an earlier stream retains it.
-/// Pool borrows are short state transactions and are never held during I/O.
-/// The standard runtime uses independent concurrent sessions instead.
+/// A streaming response retains the transport lease. State transactions are
+/// shared with standard execution and never retain a lock across I/O.
 pub struct Injected<T, R> {
-  plan: ExecutionPlan,
-  destinations: BTreeMap<ProviderId, DestinationMetadata>,
-  bindings: Vec<Binding>,
-  pools: BTreeMap<AccountPoolId, LocalPool>,
+  state: Shared<ExecutionState>,
   transport: RefCell<T>,
   runtime: RefCell<R>,
   limits: Limits,
@@ -234,99 +143,44 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
     transport: T,
     runtime: R,
   ) -> Result<Self, Error> {
+    let models = models
+      .into_iter()
+      .map(|(provider, models)| {
+        (
+          provider,
+          models
+            .into_iter()
+            .map(|model| (model, ModelCapabilities::default()))
+            .collect(),
+        )
+      })
+      .collect();
+    Self::with_model_metadata(plan, accounts, models, transport, runtime)
+  }
+
+  /// Supply the same model evidence used by standard catalogue/discovery clients.
+  pub fn with_model_metadata(
+    plan: ExecutionPlan,
+    accounts: Vec<AccountConfig>,
+    models: BTreeMap<ProviderId, ModelInventory>,
+    transport: T,
+    runtime: R,
+  ) -> Result<Self, Error> {
     if plan.profiles().is_empty() {
       return Err(Error::new("config", "no execution profiles configured"));
     }
-    let metadata = link_provider_metadata(&plan, &accounts, native::provider_default_base_url)
-      .map_err(|e| Error::new("config", e))?;
-    let destinations = metadata
-      .destinations()
-      .map(|(id, destination)| (id.clone(), destination.clone()))
-      .collect::<BTreeMap<_, _>>();
     for (id, profile) in plan.profiles() {
-      let route = plan
-        .route(profile.route())
-        .ok_or_else(|| Error::new("config", format!("profile '{id}' references an unknown route")))?;
-      if route.header_patches().is_some() {
-        return Err(Error::new(
-          "config",
-          format!("profile '{id}' uses unsupported header patches"),
-        ));
-      }
-      if matches!(route, RoutePlan::Relay(relay) if !matches!(relay.destination(), RelayDestination::FixedProvider(_)))
+      if matches!(plan.route(profile.route()), Some(RoutePlan::Relay(relay))
+        if !matches!(relay.destination(), RelayDestination::FixedProvider(_)))
       {
         return Err(Error::new(
           "config",
           format!("profile '{id}' requires original-destination proxy context"),
         ));
       }
-      RetryPolicy::from_route(&plan, route)
-        .map_err(|error| Error::new("config", format!("profile '{id}': {error}")))?;
-      if let RoutePlan::Relay(relay) = route {
-        if let RelayDestination::FixedProvider(provider) = relay.destination() {
-          if !destinations.contains_key(provider) {
-            return Err(Error::new(
-              "config",
-              format!("profile '{id}' references an unknown provider"),
-            ));
-          }
-        }
-        if matches!(relay.credentials(), RelayCredentials::Client) {
-          continue;
-        }
-      }
-      let pool = profile
-        .account_pool()
-        .ok_or_else(|| Error::new("config", format!("profile '{id}' has no account pool")))?;
-      if plan.account_pool(pool).is_none() {
-        return Err(Error::new(
-          "config",
-          format!("profile '{id}' references an unknown account pool"),
-        ));
-      }
-    }
-    let bindings = metadata
-      .bindings()
-      .iter()
-      .map(|binding| {
-        let provider = binding.provider_id();
-        let destination = &destinations[provider];
-        Binding {
-          account: accounts[binding.account_order()].clone(),
-          provider: provider.clone(),
-          driver: binding.driver_id().clone(),
-          driver_identity: SmolStr::new(binding.driver_identity()),
-          base_url: destination.base_url().to_string(),
-          models: models.get(provider).cloned().unwrap_or_default(),
-          cleartext: destination.cleartext_policy(),
-        }
-      })
-      .collect();
-    let mut pools = BTreeMap::new();
-    for (id, policy) in link_pool_metadata(&plan, &metadata).map_err(|e| Error::new("config", e))? {
-      let affinity = policy
-        .session_affinity()
-        .map(|p| AffinityPolicy::new(p.ttl(), p.expired_retention()));
-      let state = PoolState::new(
-        policy.active().to_vec(),
-        policy.fallback().to_vec(),
-        policy.failure_cooldown(),
-        affinity,
-      )
-      .map_err(|e| Error::new("config", e))?;
-      pools.insert(
-        id,
-        LocalPool {
-          members: policy.active().iter().chain(policy.fallback()).copied().collect(),
-          state: RefCell::new(state),
-        },
-      );
     }
     Ok(Self {
-      plan,
-      destinations,
-      bindings,
-      pools,
+      state: Shared::new(ExecutionState::with_models(plan, accounts, models)?),
       transport: RefCell::new(transport),
       runtime: RefCell::new(runtime),
       limits: Limits::default(),
@@ -339,13 +193,10 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
     self
   }
 
-  /// Attach a local sink without changing the application's time/transport services.
+  /// Attach event delivery without changing transport or timing services.
   pub fn with_event_sink<S: RequestEventSink>(self, sink: S) -> Injected<T, EventRuntime<R, S>> {
     Injected {
-      plan: self.plan,
-      destinations: self.destinations,
-      bindings: self.bindings,
-      pools: self.pools,
+      state: self.state,
       transport: self.transport,
       runtime: RefCell::new(EventRuntime::new(self.runtime.into_inner(), sink)),
       limits: self.limits,
@@ -363,8 +214,8 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
       .transport
       .try_borrow_mut()
       .map_err(|_| Error::new("send", "previous response still owns the transport"))?;
-    // Observers may try to start a request after a stream releases its HTTP
-    // session. Return a normal busy error while that observer owns the runtime.
+    // Callbacks may reenter after a stream releases its transport. Report busy
+    // while a callback owns the runtime instead of panicking on its RefCell.
     drop(
       self
         .runtime
@@ -376,787 +227,94 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
       self.request_sequence.set(sequence.wrapping_add(1));
       format!("req-{}-{sequence}", self.runtime.borrow().now().as_nanos())
     });
-    crate::driver::run(LocalSession {
-      platform: self,
-      transport: Some(Exchange(transport)),
-      endpoint,
-      body,
-      headers: options.inbound_headers(),
-      options,
-      request_id,
-      attempt: 0,
-      retry: RetryPolicy::default(),
-      terminal: false,
-      stage: Stage::Extract,
-    })
+    let mut input = RequestInput::new(endpoint, body, options.inbound_headers(), request_id);
+    input.profile = options.profile;
+    session::Session::new(
+      self.state.clone(),
+      input,
+      BorrowedTransport(transport),
+      LocalClock(&self.runtime),
+      LocalEvents(&self.runtime),
+    )
+    .with_limits(self.limits)
+    .run()
     .await
   }
 }
 
-pub struct Response<'a, T: Transport, R: Runtime> {
-  pub status: u16,
-  pub headers: HeaderMap,
-  pub body: ResponseBody<'a, T, R>,
-}
-pub enum ResponseBody<'a, T: Transport, R: Runtime> {
-  Buffered(Bytes),
-  Stream(alloc::boxed::Box<EventStream<'a, T, R>>),
-}
-impl<T: Transport, R: Runtime> Response<'_, T, R> {
-  pub fn into_json<D: serde::de::DeserializeOwned>(self) -> Result<(u16, HeaderMap, D), Error> {
-    let ResponseBody::Buffered(bytes) = self.body else {
-      return Err(Error::new("response", "expected a buffered response"));
-    };
-    let data = serde_json::from_slice(&bytes).map_err(|e| Error::new("response", e))?;
-    Ok((self.status, self.headers, data))
-  }
-}
+/// Standard and injected callers receive the same response and stream objects.
+pub type Response<'a, T, R> = session::Response<BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>>;
+pub type ResponseBody<'a, T, R> =
+  session::ResponseBody<BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>>;
+pub type EventStream<'a, T, R> = session::EventStream<BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>>;
 
-/// Ensures every exit releases transport-owned response resources, not only
-/// the runtime borrow of the injected driver.
-struct Exchange<'a, T: Transport>(RefMut<'a, T>);
-impl<T: Transport> core::ops::Deref for Exchange<'_, T> {
-  type Target = T;
-  fn deref(&self) -> &T {
-    &self.0
+/// Exclusive lease on an application's transport, retained by streamed responses.
+pub struct BorrowedTransport<'a, T>(RefMut<'a, T>);
+impl<T: Transport> Transport for BorrowedTransport<'_, T> {
+  type Error = T::Error;
+  async fn send(&mut self, request: Request) -> Result<ResponseHead, Self::Error> {
+    self.0.send(request).await
   }
-}
-impl<T: Transport> core::ops::DerefMut for Exchange<'_, T> {
-  fn deref_mut(&mut self) -> &mut T {
-    &mut self.0
+  async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+    self.0.read(buffer).await
   }
-}
-impl<T: Transport> Drop for Exchange<'_, T> {
-  fn drop(&mut self) {
+  fn configure_body_mode(&mut self, preserve_encoding: bool) {
+    self.0.configure_body_mode(preserve_encoding);
+  }
+  fn response_is_decoded(&self) -> bool {
+    self.0.response_is_decoded()
+  }
+  fn encode_body(&self, body: &[u8], encoding: Option<&str>) -> Result<Bytes, EncodeError> {
+    self.0.encode_body(body, encoding)
+  }
+  fn accept_encoding(&self) -> &str {
+    self.0.accept_encoding()
+  }
+  fn close_response(&mut self) {
     self.0.close_response();
   }
-}
-
-#[derive(Clone)]
-enum Target {
-  Account { binding: usize, pool: AccountPoolId },
-  Client,
-}
-#[derive(Clone)]
-struct Resolved {
-  target: Target,
-  provider: ProviderId,
-  endpoint: Endpoint,
-  model: SmolStr,
-  wire_identity: WireIdentity,
-  opaque: bool,
-}
-struct Converted {
-  prepared: PreparedRequest,
-  upstream_stream: bool,
-}
-struct LocalSession<'a, T: Transport, R: Runtime> {
-  platform: &'a Injected<T, R>,
-  transport: Option<Exchange<'a, T>>,
-  endpoint: Endpoint,
-  body: Value,
-  headers: HeaderMap,
-  options: RequestOptions,
-  request_id: String,
-  attempt: u32,
-  retry: RetryPolicy,
-  terminal: bool,
-  stage: Stage,
-}
-impl<T: Transport, R: Runtime> LocalSession<'_, T, R> {
-  fn record_send_outcome(&self, target: &Target, session_id: Option<&str>, outcome: SendOutcome) -> Result<(), Error> {
-    let Target::Account { binding, pool } = target else {
-      return Ok(());
-    };
-    let feedback = AccountFeedbackPolicy::Api.feedback(outcome);
-    if feedback == AccountFeedback::None {
-      return Ok(());
-    }
-    let now = self.platform.runtime.borrow().now();
-    let mut state = self.platform.pools.get(pool).expect("linked pool").state.borrow_mut();
-    match feedback {
-      AccountFeedback::Success => state.record_success(now, session_id, binding),
-      AccountFeedback::Failure => state.record_failure(now, binding).map(|_| ()),
-      AccountFeedback::None => unreachable!("no feedback returned above"),
-    }
-    .map_err(|error| Error::new("send", error))
-  }
-
-  fn template_vars(&self) -> tokn_core::headers::TemplateVars {
-    let mut vars = tokn_headers::inbound::build_template_vars(&self.headers);
-    vars.request_id.get_or_insert_with(|| SmolStr::new(&self.request_id));
-    vars
-  }
-
-  fn wire_identity(&self, resolved: &Resolved) -> Option<tokn_core::AgentId> {
-    match &resolved.wire_identity {
-      WireIdentity::None => None,
-      WireIdentity::ProviderDefault => Some(
-        tokn_core::AgentId::provider_default(self.platform.destinations[&resolved.provider].driver_id().as_str())
-          .unwrap_or_default(),
-      ),
-      WireIdentity::Named(id) => Some(tokn_core::AgentId::from(id.as_str())),
-    }
+  fn recoverable(&self, error: &Self::Error) -> bool {
+    self.0.recoverable(error)
   }
 }
 
-impl<'a, T: Transport, R: Runtime> crate::driver::Session for LocalSession<'a, T, R> {
-  type Extracted = RequestInterpretation;
-  type Resolved = Resolved;
-  type Headers = HeaderMap;
-  type Converted = Converted;
-  type Sent = (ResponseHead, Resolved, bool, bool);
-  type Output = Response<'a, T, R>;
-  type Error = Error;
-
-  fn start(&mut self, attempt: u32) {
-    self.attempt = attempt;
-    self.terminal = false;
-    self.stage = Stage::Extract;
-    self
-      .platform
-      .emit_event(&self.request_id, self.attempt, Some(("started", None)), || {
-        Some(RequestEventPayload::Stage(StageEvent::Started {
-          request_endpoint: self.endpoint.into(),
-        }))
-      });
+/// Borrowed timing adapter for application runtime services.
+pub struct LocalClock<'a, R>(&'a RefCell<R>);
+impl<R: Runtime> session::Clock for LocalClock<'_, R> {
+  fn now(&self) -> Duration {
+    self.0.borrow().now()
   }
-  async fn extract(&mut self) -> Result<RequestInterpretation, Error> {
-    self.stage = Stage::Extract;
-    let extracted = RequestInterpretation::from_json(&self.endpoint.into(), &self.headers, &self.body);
-    self.emit_extracted(&extracted);
-    Ok(extracted)
+  fn unix_seconds(&self) -> u64 {
+    self.0.borrow().unix_seconds()
   }
-  async fn resolve(&mut self, extracted: &RequestInterpretation) -> Result<Resolved, Error> {
-    self.stage = Stage::Resolve;
-    let profile = match self.options.profile.as_deref() {
-      Some(id) => self.platform.plan.profiles().get(id),
-      None => self
-        .platform
-        .plan
-        .profiles()
-        .get("default")
-        .or_else(|| self.platform.plan.profiles().values().next()),
-    }
-    .ok_or_else(|| Error::new("resolve", "unknown profile"))?;
-    let route = self
-      .platform
-      .plan
-      .route(profile.route())
-      .ok_or_else(|| Error::new("resolve", "unknown route"))?;
-    if profile.api_binding().is_some_and(|binding| {
-      !binding
-        .endpoints()
-        .iter()
-        .any(|operation| operation.as_str() == self.endpoint.as_str())
-    }) {
-      return Err(Error::new("resolve", "profile does not expose this operation"));
-    }
-    self.retry = RetryPolicy::from_route(&self.platform.plan, route).map_err(|error| Error::new("resolve", error))?;
-    if let RoutePlan::Relay(relay) = route {
-      let RelayDestination::FixedProvider(provider) = relay.destination() else {
-        return Err(Error::new("resolve", "original destination requires proxy context"));
-      };
-      if matches!(relay.credentials(), RelayCredentials::Client) {
-        if !route.allows_provider(provider) {
-          return Err(Error::new("resolve", "relay provider is excluded by its policy"));
-        }
-        let resolved = Resolved {
-          target: Target::Client,
-          provider: provider.clone(),
-          endpoint: self.endpoint,
-          model: SmolStr::new(&extracted.model),
-          wire_identity: WireIdentity::None,
-          opaque: true,
-        };
-        self.emit_resolved(extracted, &resolved);
-        return Ok(resolved);
-      }
-    }
-    let pool_id = profile
-      .account_pool()
-      .ok_or_else(|| Error::new("resolve", "profile has no account pool"))?;
-    let pool = self
-      .platform
-      .pools
-      .get(pool_id)
-      .ok_or_else(|| Error::new("resolve", "missing account pool"))?;
-    let now = self.platform.runtime.borrow().now();
-    let selection = select_route(
-      route,
-      SelectionRequest {
-        model: &extracted.model,
-        endpoint: self.endpoint,
-        allowed_providers: None,
-      },
-      pool
-        .members
-        .iter()
-        .map(|&index| (index, &self.platform.bindings[index])),
-      |ranks| match pool
-        .state
-        .borrow_mut()
-        .select(now, extracted.session_id.as_deref(), ranks)
-      {
-        Selection::Selected(binding) => Some(binding),
-        Selection::CoolingDown { .. } | Selection::NoEligible => None,
-      },
-    )
-    .map_err(|e| Error::new("resolve", e))?;
-    match selection {
-      RouteSelection::Selected {
-        binding,
-        model,
-        endpoint,
-      } => {
-        let resolved = Resolved {
-          target: Target::Account {
-            binding,
-            pool: pool_id.clone(),
-          },
-          provider: self.platform.bindings[binding].provider.clone(),
-          endpoint,
-          model,
-          wire_identity: profile.wire_identity().clone(),
-          opaque: matches!(route, RoutePlan::Relay(_)),
-        };
-        self.emit_resolved(extracted, &resolved);
-        Ok(resolved)
-      }
-      RouteSelection::NoAccount => Err(Error::new("resolve", "no eligible account for this request")),
-      RouteSelection::ProviderAccessDenied => Err(Error::new("resolve", "provider access denied")),
-    }
-  }
-  async fn build_headers(&mut self, _: &RequestInterpretation, resolved: &Resolved) -> Result<HeaderMap, Error> {
-    self.stage = Stage::BuildHeaders;
-    if matches!(resolved.target, Target::Client) {
-      let mut headers = crate::header_policy::passthrough_headers(&self.headers, false, true);
-      headers.remove("content-length");
-      if !headers.contains_key("content-type") {
-        headers.insert("content-type", "application/json");
-      }
-      if !headers.contains_key("accept") {
-        headers.insert("accept", "application/json");
-      }
-      headers.insert("x-request-id", self.request_id.clone());
-      self.emit_headers(&headers, resolved);
-      return Ok(headers);
-    }
-    let Target::Account { binding, .. } = resolved.target else {
-      unreachable!("client relay returned above")
-    };
-    let binding = &self.platform.bindings[binding];
-    let inbound = &self.headers;
-    let vars = self.template_vars();
-    let identity = self.wire_identity(resolved);
-    let mut headers = if resolved.opaque {
-      let mut headers = crate::header_policy::passthrough_headers(inbound, false, false);
-      headers.remove("content-length");
-      headers
-    } else {
-      identity.map_or_else(HeaderMap::new, |identity| {
-        tokn_headers::registry::build_wire_identity_headers(binding.driver.as_str(), identity.as_str(), &vars, inbound)
-      })
-    };
-    for (name, value) in &binding.account.headers {
-      headers.insert(HeaderName::new(name.as_str()), HeaderValue::from_string(value.clone()));
-    }
-    headers.insert("x-request-id", self.request_id.clone());
-    self.emit_headers(&headers, resolved);
-    Ok(headers)
-  }
-  async fn convert_request(
-    &mut self,
-    extracted: &RequestInterpretation,
-    resolved: &Resolved,
-    headers: &HeaderMap,
-  ) -> Result<Converted, Error> {
-    self.stage = Stage::ConvertRequest;
-    if matches!(resolved.target, Target::Client) {
-      let destination = &self.platform.destinations[&resolved.provider];
-      let segments = native::operation_segments(
-        destination.driver_id().as_str(),
-        resolved.endpoint,
-        destination.base_url().as_str(),
-      )
-      .ok_or_else(|| {
-        Error::new(
-          "convert_request",
-          "provider has no native path for this relay operation",
-        )
-      })?;
-      let prepared = tokn_core::provider::prepare_request_with_policy(
-        destination.base_url().as_str(),
-        segments,
-        resolved.endpoint,
-        &self.body,
-        headers.clone(),
-        destination.cleartext_policy(),
-      )
-      .map_err(|e| Error::new("convert_request", e))?;
-      let upstream_stream = self.body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-      self.emit_converted_request(&prepared);
-      return Ok(Converted {
-        prepared,
-        upstream_stream,
-      });
-    }
-    let Target::Account { binding, .. } = resolved.target else {
-      unreachable!("client relay returned above")
-    };
-    let binding = &self.platform.bindings[binding];
-    let mut body = if resolved.opaque {
-      self.body.clone()
-    } else {
-      tokn_convert::convert_request(self.endpoint, resolved.endpoint, &self.body)
-        .map_err(|e| Error::new("convert_request", e))?
-    };
-    if !resolved.opaque {
-      if let Some(object) = body.as_object_mut() {
-        object.insert("model".into(), Value::String(resolved.model.to_string()));
-      }
-    }
-    // Apply the selected driver to the headers already built by the profile.
-    let credential = if matches!(binding.driver.as_str(), "codex" | "github-copilot") {
-      binding
-        .account
-        .access_token
-        .as_ref()
-        .or(binding.account.api_key.as_ref())
-    } else {
-      binding
-        .account
-        .api_key
-        .as_ref()
-        .or(binding.account.access_token.as_ref())
-    }
-    .map(|secret| secret.expose().as_str())
-    .unwrap_or("");
-    let mut prepared = native::prepare_with_policy(
-      binding.driver.as_str(),
-      resolved.endpoint,
-      &binding.base_url,
-      credential,
-      body,
-      headers.clone(),
-      binding.cleartext,
-    )
-    .map_err(|e| Error::new("convert_request", e))?;
-    if resolved.opaque {
-      prepared.body = Bytes::from(serde_json::to_vec(&self.body).map_err(|e| Error::new("convert_request", e))?);
-      prepared.headers.insert(
-        "accept",
-        if self.body["stream"].as_bool().unwrap_or(false) {
-          "text/event-stream"
-        } else {
-          "application/json"
-        },
-      );
-    }
-    let upstream_stream = serde_json::from_slice::<Value>(&prepared.body)
-      .ok()
-      .and_then(|body| body.get("stream").and_then(Value::as_bool))
-      .unwrap_or(false);
-    let shaped_body: Value =
-      serde_json::from_slice(&prepared.body).map_err(|error| Error::new("convert_request", error))?;
-    let vars = self.template_vars();
-    let agent_id = self.wire_identity(resolved).unwrap_or_default();
-    let context = tokn_core::provider::HeaderPatchCtx {
-      request_kind: tokn_core::provider::ProviderRequestKind::Operation(resolved.endpoint),
-      body: &shaped_body,
-      bearer_token: Some(credential),
-      content_encoding: None,
-      stream: extracted.stream,
-      initiator: extracted.initiator.as_deref().unwrap_or("user"),
-      inbound_headers: &self.headers,
-      vars: &vars,
-      agent_id: &agent_id,
-    };
-    native::normalize_headers(
-      binding.driver.as_str(),
-      &mut prepared.headers,
-      &context,
-      &binding.account,
-    )
-    .map_err(|error| Error::new("convert_request", error))?;
-    self.emit_converted_request(&prepared);
-    Ok(Converted {
-      prepared,
-      upstream_stream,
-    })
-  }
-  async fn send(
-    &mut self,
-    extracted: &RequestInterpretation,
-    resolved: &Resolved,
-    _headers: &HeaderMap,
-    converted: &Converted,
-  ) -> Result<Self::Sent, Error> {
-    self.stage = Stage::Send;
-    let mut prepared = converted.prepared.clone();
-    let transport = self.transport.as_mut().expect("session owns transport");
-    prepared.headers.insert(
-      "accept-encoding",
-      HeaderValue::from_string(transport.accept_encoding().to_string()),
-    );
-    let request = Request {
-      method: "POST",
-      url: prepared.url,
-      headers: prepared.headers,
-      body: prepared.body,
-    };
-    let head = match transport.send(request).await {
-      Ok(head) => head,
-      Err(source) => {
-        let mut error = Error::new("send", &source);
-        error.recoverable = transport.recoverable(&source);
-        self.record_send_outcome(
-          &resolved.target,
-          extracted.session_id.as_deref(),
-          SendOutcome::Failure {
-            recoverable: error.recoverable,
-          },
-        )?;
-        return Err(error);
-      }
-    };
-    // Account-credential API relays have the same failure policy as managed
-    // API calls. Only client-credential relays forward every received status.
-    let policy = match resolved.target {
-      Target::Account { .. } => ResponsePolicy::Api,
-      Target::Client => ResponsePolicy::ForwardAll,
-    };
-    let outcome = SendOutcome::Response { status: head.status };
-    let disposition = policy.classify_status(head.status);
-    if disposition != crate::driver::StatusDisposition::Success {
-      let detail = read_error_body(&mut **transport, self.platform.limits.max_error_body_bytes).await;
-      self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
-      let mut error = Error::new("send", format!("upstream {}: {detail}", head.status));
-      error.recoverable = disposition == crate::driver::StatusDisposition::RecoverableFailure;
-      return Err(error);
-    }
-    self.record_send_outcome(&resolved.target, extracted.session_id.as_deref(), outcome)?;
-    self.emit_stage(Stage::Send, || {
-      StageEvent::Send(SentSummary {
-        status: head.status,
-        headers: head.headers.clone(),
-        upstream_endpoint: Some(resolved.endpoint),
-        stream: extracted.stream,
-      })
-    });
-    Ok((head, resolved.clone(), extracted.stream, converted.upstream_stream))
-  }
-  async fn convert_response(mut self, sent: Self::Sent) -> Result<Self::Output, Error> {
-    self.stage = Stage::ConvertResponse;
-    let result = self.finish_response(sent).await;
-    if let Err(error) = &result {
-      self.report_failure(error, false);
-    }
-    result
-  }
-  fn failed(&mut self, attempt: u32, error: &Error) -> Option<Duration> {
-    self.report_failure(error, true);
-    self.retry.next_delay(
-      attempt,
-      RetryFailure {
-        send_stage: error.stage == "send",
-        recoverable: error.recoverable,
-        stop: false,
-      },
-      // The injected SDK dispatches POST requests for all native LLM APIs.
-      Some("POST"),
-    )
+  fn unix_millis(&self) -> i64 {
+    self.0.borrow().unix_millis()
   }
   #[allow(
     clippy::await_holding_refcell_ref,
-    reason = "the injected timer is local and serialized; cancellation drops the borrow and concurrent execution is rejected by the transport lease"
+    reason = "the application's timer is exclusive; the transport lease rejects concurrent execution and cancellation releases the borrow"
   )]
-  async fn sleep(&mut self, delay: Duration) {
-    self.platform.runtime.borrow_mut().sleep(delay).await;
-  }
-}
-impl<'a, T: Transport, R: Runtime> LocalSession<'a, T, R> {
-  async fn finish_response(
-    &mut self,
-    (mut head, resolved, stream, upstream_stream): (ResponseHead, Resolved, bool, bool),
-  ) -> Result<Response<'a, T, R>, Error> {
-    let mut body = self.transport.take().expect("session owns transport");
-    // The transport yields decoded entities, so wire compression/framing no
-    // longer describes any returned body, including transparent relays.
-    head.headers.remove("content-encoding");
-    head.headers.remove("content-length");
-    head.headers.remove("transfer-encoding");
-    if resolved.opaque && !stream {
-      let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
-      self.platform.emit_event(&self.request_id, self.attempt, None, || {
-        tokn_convert::usage::observed_usage_json(&bytes)
-          .map(|usage| RequestEventPayload::Record(tokn_core::request_event::RecordEvent::Usage(usage)))
-      });
-      self.terminal = true;
-      self.emit_stage(Stage::ConvertResponse, || {
-        StageEvent::ConvertResponse(ConvertedResponseSummary {
-          status: head.status,
-          headers: head.headers.clone(),
-          body: None,
-        })
-      });
-      self.platform.emit_complete(&self.request_id, self.attempt, true);
-      return Ok(Response {
-        status: head.status,
-        headers: head.headers,
-        body: ResponseBody::Buffered(Bytes::from(bytes)),
-      });
-    }
-    if stream {
-      let event_stream = tokn_convert::buffered::is_sse(head.headers.get("content-type").map(HeaderValue::as_str), &[]);
-      if upstream_stream && !event_stream {
-        return Err(Error::new(
-          "convert_response",
-          "streaming upstream did not return text/event-stream",
-        ));
-      }
-      if !event_stream {
-        return Err(Error::new("convert_response", "expected text/event-stream"));
-      }
-      head.headers.remove("content-length");
-      head.headers.remove("transfer-encoding");
-      head.headers.insert("content-type", "text/event-stream");
-      let events = EventStream::new(
-        self.platform,
-        body,
-        resolved.endpoint,
-        self.endpoint,
-        self.request_id.clone(),
-        self.attempt,
-        head.clone(),
-      );
-      self.terminal = true;
-      self.emit_stage(Stage::ConvertResponse, || {
-        StageEvent::ConvertResponse(ConvertedResponseSummary {
-          status: head.status,
-          headers: head.headers.clone(),
-          body: None,
-        })
-      });
-      return Ok(Response {
-        status: head.status,
-        headers: head.headers,
-        body: ResponseBody::Stream(alloc::boxed::Box::new(events)),
-      });
-    }
-    let bytes = read_all(&mut *body, self.platform.limits.max_response_bytes).await?;
-    let response = tokn_convert::buffered::convert_response(
-      resolved.endpoint,
-      self.endpoint,
-      Bytes::from(bytes),
-      head.headers.get("content-type").map(HeaderValue::as_str),
-      self.platform.limits.max_event_bytes,
-      |value| self.platform.emit_usage(&self.request_id, self.attempt, value),
-    )
-    .map_err(|error| Error::new("convert_response", error))?;
-    if response.body_bytes.len() > self.platform.limits.max_response_bytes {
-      return Err(Error::new("convert_response", "converted response exceeds byte limit"));
-    }
-    if response.accumulated_sse {
-      head.headers.insert("content-type", "application/json");
-    }
-    self.terminal = true;
-    self.emit_stage(Stage::ConvertResponse, || {
-      StageEvent::ConvertResponse(ConvertedResponseSummary {
-        status: head.status,
-        headers: head.headers.clone(),
-        body: response.body_json.map(Shared::new),
-      })
-    });
-    self.platform.emit_complete(&self.request_id, self.attempt, true);
-    Ok(Response {
-      status: head.status,
-      headers: head.headers,
-      body: ResponseBody::Buffered(response.body_bytes),
-    })
-  }
-}
-impl<T: Transport, R: Runtime> Drop for LocalSession<'_, T, R> {
-  fn drop(&mut self) {
-    if !self.terminal {
-      self.report_failure(
-        &Error::new(self.stage.as_str(), "pipeline attempt cancelled before completion"),
-        false,
-      );
-    }
+  #[allow(
+    clippy::await_holding_refcell_ref,
+    reason = "the exclusive injected runtime lease is retained across sleep and released on cancellation"
+  )]
+  async fn sleep(&mut self, duration: Duration) {
+    self.0.borrow_mut().sleep(duration).await;
   }
 }
 
-async fn read_all<T: Transport>(transport: &mut T, limit: usize) -> Result<Vec<u8>, Error> {
-  let mut bytes = Vec::new();
-  let mut buffer = [0u8; 1024];
-  loop {
-    let count = transport
-      .read(&mut buffer)
-      .await
-      .map_err(|e| Error::new("convert_response", e))?;
-    if count > buffer.len() {
-      return Err(Error::new(
-        "convert_response",
-        "transport returned an invalid byte count",
-      ));
-    }
-    if count == 0 {
-      return Ok(bytes);
-    }
-    if count > limit.saturating_sub(bytes.len()) {
-      return Err(Error::new("convert_response", "response exceeds byte limit"));
-    }
-    bytes.extend_from_slice(&buffer[..count]);
+/// Borrowed event adapter. The runtime stays borrowed for each callback.
+pub struct LocalEvents<'a, R>(&'a RefCell<R>);
+impl<R: Runtime> session::Events for LocalEvents<'_, R> {
+  fn enabled(&self) -> bool {
+    self.0.borrow_mut().event_sink().is_some()
   }
-}
-
-async fn read_error_body<T: Transport>(transport: &mut T, limit: usize) -> String {
-  let mut bytes = Vec::new();
-  let mut buffer = [0u8; 1024];
-  loop {
-    let capacity = buffer.len().min(limit.saturating_sub(bytes.len()).saturating_add(1));
-    let count = match transport.read(&mut buffer[..capacity]).await {
-      Ok(count) if count <= capacity => count,
-      Ok(_) => return "transport returned an invalid byte count".into(),
-      Err(error) => return format!("failed to read error body: {error}"),
-    };
-    if count == 0 {
-      return String::from_utf8_lossy(&bytes).into_owned();
-    }
-    let remaining = limit.saturating_sub(bytes.len());
-    bytes.extend_from_slice(&buffer[..count.min(remaining)]);
-    if count > remaining {
-      return format!("{} [truncated]", String::from_utf8_lossy(&bytes));
+  fn emit(&self, event: RequestEvent) {
+    if let Some(sink) = self.0.borrow_mut().event_sink() {
+      sink.emit_request(event);
     }
   }
-}
-
-/// Pull-based SSE response retaining only its borrowed HTTP session and parser state.
-pub struct EventStream<'a, T: Transport, R: Runtime> {
-  pub status: u16,
-  pub headers: HeaderMap,
-  platform: &'a Injected<T, R>,
-  body: Option<Exchange<'a, T>>,
-  decoder: Decoder,
-  processor: StreamProcessor<Option<EndpointTranslator>>,
-  buffer: [u8; 1024],
-  position: usize,
-  length: usize,
-  request_id: String,
-  attempt: u32,
-  report_terminal: bool,
-}
-impl<'a, T: Transport, R: Runtime> EventStream<'a, T, R> {
-  fn new(
-    platform: &'a Injected<T, R>,
-    body: Exchange<'a, T>,
-    from: Endpoint,
-    to: Endpoint,
-    request_id: String,
-    attempt: u32,
-    head: ResponseHead,
-  ) -> Self {
-    Self {
-      status: head.status,
-      headers: head.headers,
-      platform,
-      body: Some(body),
-      decoder: Decoder::new(platform.limits.max_event_bytes),
-      processor: StreamProcessor::new(
-        Some(from),
-        (from != to).then(|| EndpointTranslator::with_created_at(from, to, platform.runtime.borrow().unix_seconds())),
-      ),
-      buffer: [0; 1024],
-      position: 0,
-      length: 0,
-      request_id,
-      attempt,
-      report_terminal: true,
-    }
-  }
-  fn settle(&mut self, error: Option<&Error>) {
-    if self.processor.input_closed() {
-      // Release the HTTP session as soon as protocol input ends; queued
-      // converted events still belong to this response until delivered.
-      self.body.take();
-    }
-    if let Some(outcome) = self.processor.outcome() {
-      if core::mem::take(&mut self.report_terminal) {
-        if outcome != StreamOutcome::Complete {
-          let fallback = Error::new(
-            "stream",
-            match outcome {
-              StreamOutcome::Cancelled => "stream cancelled before completion",
-              _ => "stream failed",
-            },
-          );
-          self.platform.emit_error(
-            &self.request_id,
-            self.attempt,
-            Stage::ConvertResponse,
-            error.unwrap_or(&fallback),
-            false,
-          );
-        }
-        self
-          .platform
-          .emit_complete(&self.request_id, self.attempt, outcome == StreamOutcome::Complete);
-      }
-    }
-  }
-  pub fn cancel(&mut self) {
-    self.processor.cancel();
-    self.settle(None);
-  }
-  pub async fn next_event(&mut self) -> Result<Option<SseEvent>, Error> {
-    let result = self.read_event().await;
-    if let Err(error) = &result {
-      self.processor.fail();
-      self.settle(Some(error));
-    }
-    result
-  }
-  async fn read_event(&mut self) -> Result<Option<SseEvent>, Error> {
-    loop {
-      let event = self.processor.next_event();
-      self.settle(None);
-      if event.is_some() {
-        return Ok(event);
-      }
-      let Some(body) = self.body.as_mut() else {
-        return Ok(None);
-      };
-      if self.position == self.length {
-        let count = body.read(&mut self.buffer).await.map_err(|e| Error::new("stream", e))?;
-        if count > self.buffer.len() {
-          return Err(Error::new("stream", "transport returned an invalid byte count"));
-        }
-        if count == 0 {
-          self.processor.finish().map_err(|e| Error::new("stream", e))?;
-          continue;
-        }
-        self.position = 0;
-        self.length = count;
-      }
-      while self.position < self.length {
-        let byte = self.buffer[self.position];
-        self.position += 1;
-        let Some(record) = self.decoder.push(byte).map_err(|e| Error::new("stream", e))? else {
-          continue;
-        };
-        let event = SseEvent::from(record);
-        if let Some(value) = &event.json {
-          self.platform.emit_usage(&self.request_id, self.attempt, value);
-        }
-        self.processor.push(event).map_err(|e| Error::new("stream", e))?;
-        break;
-      }
-    }
-  }
-}
-impl<T: Transport, R: Runtime> Drop for EventStream<'_, T, R> {
-  fn drop(&mut self) {
-    self.cancel();
+  fn observe(&self, event: Lifecycle<'_>) {
+    self.0.borrow_mut().observe(event);
   }
 }

@@ -8,19 +8,7 @@ use tokn_headers::{HeaderMap, HeaderValue};
 
 /// Headers for the Copilot API token exchange (`api.github.com`).
 pub fn token_exchange_headers(github_token: &str, h: &CopilotHeaders) -> Result<HeaderMap> {
-  let mut m = HeaderMap::new();
-  m.insert(
-    &AUTHORIZATION,
-    HeaderValue::from_string(format!("token {github_token}")),
-  );
-  m.insert(&ACCEPT, HeaderValue::from_static("application/json"));
-  m.insert(&USER_AGENT, HeaderValue::from_string(h.user_agent.clone()));
-  m.insert(&EDITOR_VERSION, HeaderValue::from_string(h.editor_version.clone()));
-  m.insert(
-    &EDITOR_PLUGIN_VERSION,
-    HeaderValue::from_string(h.editor_plugin_version.clone()),
-  );
-  Ok(m)
+  Ok(crate::native::token_exchange_headers(github_token, h))
 }
 
 /// Headers for upstream Copilot API requests (chat / models).

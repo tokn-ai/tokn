@@ -36,6 +36,7 @@ pub use tokn_config as config;
 pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
 pub use tokn_requests::configured::{EventRuntime, Injected, Lifecycle, Limits, Runtime};
+pub use tokn_requests::session::{ModelCapabilities, ModelInventory};
 pub use tokn_service::transport;
 
 #[cfg(feature = "std")]

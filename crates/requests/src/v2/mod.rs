@@ -1,5 +1,6 @@
 //! Standard execution of compiled v2 profiles, independent of gateway listeners.
 
+mod adapters;
 pub mod selection;
 
 use anyhow::Context;
@@ -7,8 +8,8 @@ use http::Method;
 use std::{collections::BTreeMap, sync::Arc};
 use tokn_accounts::{
   link::{
-    build_account_pool_runtimes, link_execution_account_pools, link_execution_provider_graph, AccountPoolRuntimes,
-    ProviderDestination, ProviderGraph,
+    build_account_pool_runtimes, link_execution_account_pools, link_execution_provider_graph, ProviderDestination,
+    ProviderGraph,
   },
   registry::Registry,
 };
@@ -17,14 +18,7 @@ use tokn_policy::{
   CredentialPolicy, ExecutionPlan, ProfileId, RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
 };
 
-use crate::{
-  stages::{
-    DefaultBuildHeaders, DefaultConvertRequest, DefaultConvertResponse, DefaultExtract, PassthroughBuildHeaders,
-    PassthroughConvertRequest, PassthroughConvertResponse, PassthroughExtract, PoolResolve, ProxySend,
-  },
-  Pipeline, Profile, RequestService, RetryPolicy, RunConfig, RunConfigBuilder,
-};
-use selection::{ClientResolve, PoolAwareSend, V2AccountSelector};
+use crate::{session::ExecutionState, RequestService, RetryPolicy, RunConfig, RunConfigBuilder};
 
 /// Whether profile assembly includes the upstream send and response stages.
 #[derive(Clone, Copy)]
@@ -65,9 +59,20 @@ impl ConfiguredRuntime {
     let linked_pools = link_execution_account_pools(plan, &providers)?;
     let pools = build_account_pool_runtimes(&linked_pools);
     let http = HttpClients::build(outbound)?;
+    let execution = ExecutionState::new(plan.clone(), accounts.to_vec())?;
+    execution.use_standard_pools(&pools);
+    let execution = Arc::new(execution);
     let mut profiles = BTreeMap::new();
     for id in plan.profiles().keys() {
-      if let Some(profile) = build_api_profile(plan, id, &providers, &pools, &http, events.clone(), BuildMode::Full)? {
+      if let Some(profile) = build_api_profile(
+        plan,
+        id,
+        &providers,
+        &http,
+        execution.clone(),
+        events.clone(),
+        BuildMode::Full,
+      )? {
         profiles.insert(id.clone(), profile);
       }
     }
@@ -150,15 +155,15 @@ impl ApiProfileRuntime {
   }
 }
 
-/// Assemble the same API stages for SDK and gateway callers. Original-origin
+/// Assemble the same generic API execution for SDK and gateway callers. Original-origin
 /// relay profiles require gateway proxy context and therefore return `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_profile(
   plan: &ExecutionPlan,
   id: &ProfileId,
   providers: &ProviderGraph,
-  pools: &AccountPoolRuntimes,
   http: &HttpClients,
+  execution: Arc<ExecutionState>,
   events: Arc<EventBus>,
   mode: BuildMode,
 ) -> anyhow::Result<Option<ApiProfileRuntime>> {
@@ -174,80 +179,22 @@ pub fn build_api_profile(
   if matches!(route, RoutePlan::Relay(relay) if matches!(relay.destination(), RelayDestination::Original)) {
     return Ok(None);
   }
-  let retry = RetryPolicy::from_route(plan, route)?;
-  let name = format!("v2-{id}");
-  let mut destination = None;
-  let stages = match route {
-    RoutePlan::Managed(_) => {
-      let (selector, selection) = V2AccountSelector::new(plan, id, pools)?;
-      let extract = Arc::new(DefaultExtract);
-      let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
-      let headers = Arc::new(DefaultBuildHeaders::with_provider_defaults());
-      let convert = Arc::new(DefaultConvertRequest);
-      match mode {
-        BuildMode::Full => Profile::full(
-          name,
-          extract,
-          resolve,
-          headers,
-          convert,
-          Arc::new(PoolAwareSend::new(http.managed.clone(), selection)),
-          Arc::new(DefaultConvertResponse::new()),
-        ),
-        BuildMode::DryRun => Profile::without_send(name, extract, resolve, headers, convert),
-      }
-    }
-    RoutePlan::Relay(relay) => {
+  RetryPolicy::from_route(plan, route)?;
+  let destination = match route {
+    RoutePlan::Relay(relay) if *relay.credentials() == RelayCredentials::Client => {
       let RelayDestination::FixedProvider(provider) = relay.destination() else {
         unreachable!("original-origin relay returned above")
       };
-      let name = format!("v2-{id}-api");
-      let extract = Arc::new(PassthroughExtract);
-      let convert = Arc::new(PassthroughConvertRequest);
-      match relay.credentials() {
-        RelayCredentials::AccountPool => {
-          let (selector, selection) = V2AccountSelector::new(plan, id, pools)?;
-          let resolve = Arc::new(PoolResolve::new(Arc::new(selector)));
-          let headers = Arc::new(PassthroughBuildHeaders::router_auth());
-          match mode {
-            BuildMode::Full => Profile::full(
-              name,
-              extract,
-              resolve,
-              headers,
-              convert,
-              Arc::new(PoolAwareSend::new(http.opaque.clone(), selection)),
-              Arc::new(PassthroughConvertResponse::new()),
-            ),
-            BuildMode::DryRun => Profile::without_send(name, extract, resolve, headers, convert),
-          }
-        }
-        RelayCredentials::Client => {
-          destination = Some(
-            providers
-              .destination(provider)
-              .cloned()
-              .ok_or_else(|| anyhow::anyhow!("profile '{id}' references missing provider '{provider}'"))?,
-          );
-          let resolve = Arc::new(ClientResolve::new(provider.clone()));
-          let headers = Arc::new(PassthroughBuildHeaders::new());
-          match mode {
-            BuildMode::Full => Profile::full(
-              name,
-              extract,
-              resolve,
-              headers,
-              convert,
-              Arc::new(ProxySend::forward_all_statuses(http.opaque.clone())),
-              Arc::new(PassthroughConvertResponse::new()),
-            ),
-            BuildMode::DryRun => Profile::without_send(name, extract, resolve, headers, convert),
-          }
-        }
-      }
+      Some(
+        providers
+          .destination(provider)
+          .cloned()
+          .ok_or_else(|| anyhow::anyhow!("profile '{id}' references missing provider '{provider}'"))?,
+      )
     }
+    _ => None,
   };
-  let service = RequestService::from_pipeline(Arc::new(Pipeline::new_with_retry(Arc::new(stages), events, retry)));
+  let service = adapters::request_service(execution, id.clone(), providers, http, events, mode);
   let http = service.http_service();
   Ok(Some(ApiProfileRuntime {
     service,

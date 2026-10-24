@@ -26,16 +26,17 @@
 
 use super::apply_compaction_priority;
 use super::compaction::compaction_provider_id;
-use super::generation::{ensure_model_supports_effort, ensure_model_supports_reasoning, lower_generation_options};
 use crate::event::Stage;
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::{PipelineError, RequestsError};
 use crate::pipeline::stages::{
   require_resolved_endpoint, require_upstream_endpoint, ConvertRequestStage, ConvertedRequest, Extracted, Resolved,
 };
+use crate::preparation::{prepare_managed_body, GenerationTarget};
 use crate::utils::codec::{encode_body_bytes, ContentEncodingKind};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(test)]
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -52,52 +53,23 @@ impl ConvertRequestStage for DefaultConvertRequest {
     let inbound_endpoint = require_resolved_endpoint(ctx, resolved, Stage::ConvertRequest)?;
     let upstream_endpoint = require_upstream_endpoint(ctx, resolved, Stage::ConvertRequest)?;
     let generation_options = ctx.config.generation_options();
-    if let Some(options) = generation_options {
-      options
-        .validate()
-        .map_err(|source| perm(RequestsError::InvalidGenerationOptions { source }))?;
-      let provider = &resolved.account_handle.provider;
-      let efforts = provider.reasoning_efforts(resolved.upstream_model.as_str());
-      ensure_model_supports_effort(
-        upstream_endpoint,
-        provider.info().id.as_str(),
-        resolved.upstream_model.as_str(),
-        efforts.as_deref(),
-        options,
-      )
-      .map_err(perm)?;
-      let reasoning_supported = if efforts.as_ref().is_some_and(|values| !values.is_empty()) {
-        Some(true)
-      } else {
-        provider
+    let provider = &resolved.account_handle.provider;
+    let efforts = provider.reasoning_efforts(resolved.upstream_model.as_str());
+    let mut upstream_body = prepare_managed_body(
+      inbound_endpoint,
+      &extracted.body_json,
+      GenerationTarget {
+        endpoint: upstream_endpoint,
+        provider_id: provider.info().id.as_str(),
+        model: resolved.upstream_model.as_str(),
+        reasoning_efforts: efforts.as_deref(),
+        reasoning_supported: provider
           .model_info(resolved.upstream_model.as_str())
-          .map(|info| info.capabilities.reasoning)
-      };
-      ensure_model_supports_reasoning(
-        upstream_endpoint,
-        provider.info().id.as_str(),
-        reasoning_supported,
-        options,
-      )
-      .map_err(perm)?;
-    }
-    let mut upstream_body = rewrite_model(&extracted.body_json, resolved.upstream_model.as_str());
-
-    if upstream_endpoint != inbound_endpoint {
-      upstream_body = tokn_convert::convert_request(inbound_endpoint, upstream_endpoint, &upstream_body)
-        .map_err(|source| perm(RequestsError::RequestConversion { source }))?;
-    }
-
-    if let Some(options) = generation_options {
-      lower_generation_options(
-        &mut upstream_body,
-        upstream_endpoint,
-        resolved.account_handle.provider.info().id.as_str(),
-        resolved.upstream_model.as_str(),
-        options,
-      )
-      .map_err(perm)?;
-    }
+          .map(|info| info.capabilities.reasoning),
+      },
+      generation_options,
+    )
+    .map_err(|error| perm(error.into()))?;
 
     if let Some(transformer) = resolved.account_handle.provider.input_transformer() {
       upstream_body = transformer
@@ -136,14 +108,6 @@ impl ConvertRequestStage for DefaultConvertRequest {
 
 fn maybe_encode(body: &Bytes, encoding: Option<ContentEncodingKind>) -> Result<Bytes, PipelineError> {
   encode_body_bytes(body.as_ref(), encoding).map_err(|source| perm(RequestsError::ReencodeOutboundBody { source }))
-}
-
-fn rewrite_model(body: &Value, model: &str) -> Value {
-  let mut body = body.clone();
-  if let Some(obj) = body.as_object_mut() {
-    obj.insert("model".into(), Value::String(model.to_string()));
-  }
-  body
 }
 
 fn perm(source: RequestsError) -> PipelineError {

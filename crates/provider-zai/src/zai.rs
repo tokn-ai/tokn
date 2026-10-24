@@ -146,11 +146,8 @@ impl ZaiProvider {
 impl InputTransformer for ZaiProvider {
   fn transform_input(&self, _endpoint: crate::Endpoint, body: Value) -> Result<Value> {
     let model_id = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
-    let reasoning = self
-      .model_info(model_id)
-      .map(|m| m.capabilities.reasoning)
-      .unwrap_or_else(|| model_id.starts_with("glm-"));
-    Ok(transform::shape_request(&body, reasoning))
+    let reasoning = self.model_info(model_id).map(|m| m.capabilities.reasoning);
+    Ok(crate::native::transform_input_with_reasoning(body, reasoning))
   }
 }
 

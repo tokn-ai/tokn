@@ -1011,6 +1011,24 @@ fn build_profile_runtimes(
     &reachable_profiles,
   )?);
   let pools = build_account_pool_runtimes(&linked_pools);
+  // Runtime-only profile checks apply to profiles admitted by this gateway.
+  // Provider and pool resources remain complete, matching their existing
+  // global linking/validation and preserving shared proxy/API pool state.
+  let execution_plan = tokn_policy::ExecutionPlan::new(
+    plan
+      .profiles()
+      .iter()
+      .filter(|(id, _)| reachable_profiles.contains(*id))
+      .map(|(id, profile)| (id.clone(), profile.clone()))
+      .collect(),
+    plan.execution().routes().clone(),
+    plan.execution().retry_policies().clone(),
+    plan.execution().account_pools().clone(),
+    plan.execution().providers().clone(),
+  );
+  let execution = tokn_requests::session::ExecutionState::new(execution_plan, accounts.to_vec())?;
+  execution.use_standard_pools(&pools);
+  let execution = Arc::new(execution);
 
   let mut profiles = BTreeMap::new();
   for profile_id in reachable_profiles {
@@ -1028,8 +1046,8 @@ fn build_profile_runtimes(
       plan.execution(),
       &profile_id,
       &providers,
-      &pools,
       &http,
+      execution.clone(),
       events.clone(),
       mode,
     )?;
@@ -1646,6 +1664,30 @@ mod tests {
 
   fn canonical_host(value: &str) -> tokn_policy::CanonicalHost {
     tokn_policy::CanonicalAuthority::parse(value).unwrap().host().clone()
+  }
+
+  #[test]
+  fn runtime_only_links_profiles_admitted_by_the_gateway() {
+    let plan = GatewayPlan::new(
+      BTreeMap::new(),
+      BTreeMap::from([(
+        ProfileId::new("unmounted").unwrap(),
+        tokn_policy::ProfilePlan::new(tokn_policy::RouteId::new("missing").unwrap(), WireIdentity::None),
+      )]),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+      BTreeMap::new(),
+    );
+    let linked = build_profile_runtimes(
+      Arc::new(plan),
+      &[],
+      Arc::new(EventBus::noop()),
+      &Default::default(),
+      PipelineMode::Full,
+    )
+    .unwrap();
+    assert!(linked.profiles.is_empty());
   }
 
   fn reload_test_states(api_bind: &str, proxy_bind: &str, default_connect: &str) -> RuntimeStates {

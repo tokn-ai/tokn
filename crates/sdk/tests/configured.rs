@@ -3,6 +3,21 @@ extern crate alloc;
 mod scenarios;
 
 #[test]
+fn explicit_profiles_do_not_imply_default() {
+  scenarios::explicit_profiles_do_not_imply_default();
+}
+
+#[test]
+fn copilot_refresh_uses_injected_transport_and_reuses_credentials() {
+  scenarios::copilot_refresh_uses_injected_transport_and_reuses_credentials();
+}
+
+#[test]
+fn recoverable_refresh_failure_reselects_accounts() {
+  scenarios::recoverable_refresh_failure_reselects_accounts();
+}
+
+#[test]
 fn typed_event_summaries() {
   scenarios::typed_event_summaries();
 }

@@ -1,8 +1,12 @@
+use alloc::{collections::BTreeMap, string::String};
+#[cfg(feature = "std")]
 use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "std")]
 use serde_json::Value;
+#[cfg(feature = "std")]
 use snafu::ResultExt;
-use std::collections::BTreeMap;
+#[cfg(feature = "std")]
 use tokn_core::provider::error;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -67,6 +71,17 @@ fn default_openai_intent() -> String {
 }
 
 impl CopilotHeaders {
+  /// Decode provider policy once for both platform implementations.
+  pub fn from_account(account: &tokn_core::account::AccountConfig) -> Result<Self, serde_json::Error> {
+    let value = serde_json::to_value(&account.settings)?;
+    let mut headers: Self = serde_json::from_value(value)?;
+    for (name, value) in &account.headers {
+      headers.extra_headers.insert(name.clone(), value.clone());
+    }
+    Ok(headers)
+  }
+
+  #[cfg(feature = "std")]
   pub fn from_value(value: &Value) -> tokn_core::provider::Result<Self> {
     if value.is_null() {
       return Ok(Self::default());
@@ -99,6 +114,7 @@ impl CopilotHeaders {
     }
   }
 
+  #[cfg(feature = "std")]
   pub fn validate(&self) -> tokn_core::provider::Result<()> {
     for name in self.extra_headers.keys() {
       if !is_token(name) {
@@ -109,6 +125,7 @@ impl CopilotHeaders {
   }
 }
 
+#[cfg(feature = "std")]
 fn is_token(s: &str) -> bool {
   !s.is_empty()
     && s.bytes().all(|b| {

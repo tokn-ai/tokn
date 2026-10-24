@@ -32,7 +32,32 @@ pub struct RequestInterpretation {
   pub route_mode_hint: Option<SmolStr>,
 }
 
+/// Relays retain an all-or-nothing typed peek. Invalid field types and duplicate
+/// keys make both routing fields unavailable without rejecting opaque bytes.
+#[derive(Default, serde::Deserialize)]
+struct ModelPeek {
+  #[serde(default)]
+  model: Option<SmolStr>,
+  #[serde(default)]
+  stream: Option<bool>,
+}
+
 impl RequestInterpretation {
+  /// Best-effort relay metadata without changing the caller's wire payload.
+  pub fn from_wire(endpoint: &RequestEndpoint, headers: &HeaderMap, decoded: &[u8]) -> Self {
+    Self::inspect_wire(endpoint, headers, decoded).0
+  }
+
+  /// Also retain the inspected JSON for provider context and scoped compaction
+  /// policy. Original wire bytes remain authoritative for relay transmission.
+  pub(crate) fn inspect_wire(endpoint: &RequestEndpoint, headers: &HeaderMap, decoded: &[u8]) -> (Self, Value) {
+    let peek = serde_json::from_slice::<ModelPeek>(decoded).unwrap_or_default();
+    let body = serde_json::from_slice::<Value>(decoded).unwrap_or(Value::Null);
+    let mut interpreted = Self::from_headers(headers).with_body_metadata(peek.model.as_deref(), peek.stream);
+    interpreted.request_classification = classify_request(endpoint, &body);
+    (interpreted, body)
+  }
+
   pub fn from_json(endpoint: &RequestEndpoint, headers: &HeaderMap, body: &Value) -> Self {
     let mut interpreted = Self::from_headers(headers).with_body_metadata(
       body.get("model").and_then(Value::as_str),

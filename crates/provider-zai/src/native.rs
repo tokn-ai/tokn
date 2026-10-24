@@ -28,10 +28,17 @@ pub fn inject_credentials(headers: &mut HeaderMap, _endpoint: Endpoint, credenti
 
 /// Apply the provider's request-body contract independently of transport.
 pub fn transform_input(_endpoint: Endpoint, body: Value) -> Value {
-  let reasoning = body
-    .get("model")
-    .and_then(Value::as_str)
-    .is_some_and(|model| model.starts_with("glm-"));
+  transform_input_with_reasoning(body, None)
+}
+
+/// Known catalogue or discovery metadata overrides the driver's model fallback.
+pub fn transform_input_with_reasoning(body: Value, reasoning_supported: Option<bool>) -> Value {
+  let reasoning = reasoning_supported.unwrap_or_else(|| {
+    body
+      .get("model")
+      .and_then(Value::as_str)
+      .is_some_and(|model| model.starts_with("glm-"))
+  });
   crate::transform::shape_request(&body, reasoning)
 }
 
@@ -57,12 +64,24 @@ pub fn prepare_with_policy(
   endpoint: Endpoint,
   body: Value,
   credential: &str,
+  headers: HeaderMap,
+  cleartext: CleartextHttpPolicy,
+) -> Result<PreparedRequest, PrepareError> {
+  prepare_with_metadata(base_url, endpoint, body, credential, headers, cleartext, None)
+}
+
+pub fn prepare_with_metadata(
+  base_url: &str,
+  endpoint: Endpoint,
+  body: Value,
+  credential: &str,
   mut headers: HeaderMap,
   cleartext: CleartextHttpPolicy,
+  reasoning_supported: Option<bool>,
 ) -> Result<PreparedRequest, PrepareError> {
   validate_credential(credential)?;
   let segments = operation_segments(endpoint, base_url).ok_or(PrepareError::UnsupportedEndpoint(endpoint))?;
-  let body = transform_input(endpoint, body);
+  let body = transform_input_with_reasoning(body, reasoning_supported);
   inject_credentials(&mut headers, endpoint, credential);
   headers.insert(&CONTENT_TYPE, HeaderValue::from_static("application/json"));
   headers.insert(

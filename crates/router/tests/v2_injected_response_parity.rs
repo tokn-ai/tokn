@@ -281,11 +281,22 @@ impl Fixture {
       } else {
         assert_eq!(injected_type, standard_type);
       }
-      let ResponseBody::Buffered(injected_body) = injected.body else {
-        panic!("request was buffered")
+      let opaque_stream = !matches!(self.mode, Mode::Managed)
+        && self.standard.reply.status < 400
+        && self.standard.reply.content_type == Some("text/event-stream");
+      let injected_body = match injected.body {
+        ResponseBody::Buffered(bytes) if !opaque_stream => bytes.to_vec(),
+        ResponseBody::Stream(mut stream) if opaque_stream => {
+          let mut bytes = Vec::new();
+          while let Some(chunk) = stream.next_chunk().await.expect("opaque bytes are forwarded") {
+            bytes.extend_from_slice(&chunk);
+          }
+          bytes
+        }
+        _ => panic!("response body must follow the shared managed/opaque MIME policy"),
       };
       assert_eq!(
-        injected_body.as_ref(),
+        injected_body.as_slice(),
         standard_body.as_ref(),
         "{upstream:?} -> {inbound:?}"
       );
@@ -500,7 +511,7 @@ async fn buffered_detection_empty_and_malformed_responses_match_without_retries(
 }
 
 #[tokio::test]
-async fn opaque_buffered_relays_preserve_bytes_without_sniffing_or_conversion() {
+async fn opaque_relays_preserve_bytes_without_sniffing_or_conversion() {
   for mode in [Mode::AccountRelay, Mode::ClientRelay] {
     for (content_type, bytes) in [
       (Some("application/octet-stream"), b"opaque \0\xff".as_slice()),

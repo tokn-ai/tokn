@@ -1,4 +1,4 @@
-//! Local sessions must release driver resources on cancellation and reject
+//! Injected exchanges must release driver resources on cancellation and reject
 //! synchronous observer reentry without panicking or closing a newer response.
 
 use std::{

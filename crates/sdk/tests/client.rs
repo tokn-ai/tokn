@@ -154,6 +154,91 @@ async fn lifecycle_subscription_survives_reload_and_serializes_request_events() 
 }
 
 #[tokio::test]
+async fn concurrent_requests_share_one_credential_refresh_and_reuse_the_result() {
+  let mock = MockLlmServer::start(MockLlmConfig::default().with_route(MockRoute::new(
+    MockEndpoint::Custom {
+      method: "GET".parse().unwrap(),
+      path: "/token".into(),
+    },
+    MockResponse::json(json!({"token": "fresh-api-token", "expires_at": 4_102_444_800_i64})),
+  )))
+  .await;
+  let fixture = Fixture::with_account(
+    mock.base_url(),
+    "github-copilot",
+    &format!(
+      "    access_token: expired-api-token\n    access_token_expires_at: 1\n    refresh_token: github-credential\n    refresh_url: {}/token\n",
+      mock.base_url()
+    ),
+  );
+  let client = fixture.client();
+  let request: ChatRequest = serde_json::from_value(json!({
+    "model": "github-copilot/gpt-4o", "messages": [{"role": "user", "content": "hello"}]
+  }))
+  .unwrap();
+  let endpoint = client.chat_completions();
+  tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (first, second) = tokio::join!(endpoint.create(&request), endpoint.create(&request));
+    assert_eq!(first.unwrap().data.id.as_deref(), Some("chatcmpl-mock"));
+    assert_eq!(second.unwrap().data.id.as_deref(), Some("chatcmpl-mock"));
+    endpoint
+      .create(&request)
+      .await
+      .expect("later requests reuse the cached credential");
+  })
+  .await
+  .expect("refresh waiters wake after the credential is published");
+  let requests = mock.requests();
+  let exchanges: Vec<_> = requests.iter().filter(|request| request.path == "/token").collect();
+  assert_eq!(exchanges.len(), 1, "concurrent requests share the credential exchange");
+  assert_eq!(exchanges[0].header("authorization"), Some("token github-credential"));
+  let calls: Vec<_> = requests
+    .iter()
+    .filter(|request| request.path == "/chat/completions")
+    .collect();
+  assert_eq!(calls.len(), 3);
+  assert!(calls
+    .iter()
+    .all(|request| request.header("authorization") == Some("Bearer fresh-api-token")));
+}
+
+#[tokio::test]
+async fn client_credential_codex_relay_retains_compaction_policy() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::relay(mock.base_url(), "codex", "", "client");
+  fs::write(&fixture.auth_path, "version: 1\naccounts: []\n").unwrap();
+  let client = fixture.client();
+  let response = client
+    .execute(
+      tokn_sdk::Endpoint::Responses,
+      json!({
+        "model": "gpt-5",
+        "input": [{"type": "compaction_trigger"}],
+        "service_tier": "auto",
+        "max_output_tokens": 32
+      }),
+      RequestOptions::default()
+        .with_header("authorization", "Bearer caller-token")
+        .with_header("x-codex-routing-hint", "model=old;tier=default;region=west"),
+    )
+    .await
+    .expect("client-owned relay credentials still receive shared compaction policy");
+  assert_eq!(response.status, 200);
+  let request = mock.last_request().unwrap();
+  let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+  assert_eq!(body["service_tier"], "priority");
+  assert_eq!(
+    body["max_output_tokens"], 32,
+    "relay must not apply managed native transformation"
+  );
+  assert_eq!(request.header("authorization"), Some("Bearer caller-token"));
+  assert_eq!(
+    request.header("x-codex-routing-hint"),
+    Some("model=gpt-5;tier=priority;region=west")
+  );
+}
+
+#[tokio::test]
 async fn typed_request_uses_configured_provider_and_returns_typed_response() {
   let mock = MockLlmServer::start(MockLlmConfig::default()).await;
   let fixture = Fixture::new(mock.base_url());

@@ -32,33 +32,13 @@ impl ConvertRequestStage for PassthroughConvertRequest {
     resolved: &Resolved,
   ) -> Result<ConvertedRequest, PipelineError> {
     if let Some(options) = ctx.config.generation_options() {
-      options.validate().map_err(|source| {
-        PipelineError::permanent(
-          Stage::ConvertRequest,
-          RequestsError::InvalidGenerationOptions { source },
-        )
-      })?;
-      let control = if options.max_output_tokens.is_some() {
-        Some("max_output_tokens")
-      } else if options.top_k.is_some() {
-        Some("top_k")
-      } else if options.reasoning.is_some() {
-        Some("reasoning")
-      } else {
-        None
-      };
-      if let Some(control) = control {
-        let endpoint = require_upstream_endpoint(ctx, resolved, Stage::ConvertRequest)?;
-        return Err(PipelineError::permanent(
-          Stage::ConvertRequest,
-          RequestsError::UnsupportedGenerationControl {
-            control,
-            provider_id: resolved.account_handle.provider.info().id.clone().into(),
-            endpoint,
-            reason: "verbatim routing cannot lower provider-neutral generation controls",
-          },
-        ));
-      }
+      let endpoint = require_upstream_endpoint(ctx, resolved, Stage::ConvertRequest)?;
+      crate::preparation::validate_relay_options(
+        resolved.account_handle.provider.info().id.as_str(),
+        endpoint,
+        Some(options),
+      )
+      .map_err(|error| PipelineError::permanent(Stage::ConvertRequest, error.into()))?;
     }
     let provider_id = compaction_provider_id(ctx, resolved);
     if requires_compaction_priority(provider_id, extracted.request_classification)

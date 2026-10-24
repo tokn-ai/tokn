@@ -7,7 +7,6 @@ pub mod oauth;
 pub mod token;
 pub mod user;
 
-pub mod config;
 
 pub use tokn_catalogue as catalogue;
 pub use tokn_core::provider::{
@@ -26,7 +25,7 @@ use tokn_core::provider::ProviderTarget;
 pub use crate::native::COPILOT_BASE_URL;
 pub const COPILOT_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 pub const COPILOT_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
-pub const COPILOT_TOKEN_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+pub use crate::native::COPILOT_TOKEN_EXCHANGE_URL;
 pub const COPILOT_USER_INFO_URL: &str = "https://api.github.com/copilot_internal/user";
 
 /// Endpoints Copilot serves; mirrored on `DESCRIPTOR.endpoints` and used

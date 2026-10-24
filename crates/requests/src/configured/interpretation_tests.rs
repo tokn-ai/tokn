@@ -1,4 +1,5 @@
 use super::*;
+use crate::interpretation::RequestInterpretation;
 use crate::{driver::Session, stage_traits::ExtractStage, stages::DefaultExtract, EventBus, PipelineCtx, RawInbound};
 use core::convert::Infallible;
 use serde_json::json;
@@ -60,19 +61,15 @@ async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) 
   .unwrap();
   let plan = tokn_config::v2::compile_execution(&raw).unwrap();
   let platform = Injected::new(plan, Vec::new(), NoIo, NoIo).unwrap();
-  let mut local = LocalSession {
-    platform: &platform,
-    transport: None,
-    endpoint,
-    body,
-    headers,
-    options,
-    request_id: "parity".into(),
-    attempt: 0,
-    retry: RetryPolicy::default(),
-    terminal: false,
-    stage: Stage::Extract,
-  };
+  let mut input = RequestInput::new(endpoint, body, headers, "parity".into());
+  input.profile = options.profile;
+  let mut local = crate::session::Session::new(
+    platform.state.clone(),
+    input,
+    NoIo,
+    LocalClock(&platform.runtime),
+    LocalEvents(&platform.runtime),
+  );
   let injected = local.extract().await.unwrap();
   assert_eq!(
     injected,

@@ -2,7 +2,7 @@
 
 pub use crate::{headers, models, oauth, token, user};
 
-use crate::config::{CopilotHeaders, InitiatorMode};
+use crate::config::CopilotHeaders;
 use crate::util::secret::Secret;
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -110,10 +110,9 @@ impl CopilotProvider {
   /// Ensure we have a non-expired Copilot API token; refresh if needed.
   #[instrument(name = "ensure_api_token", skip_all, fields(account = %self.id, refreshed = tracing::field::Empty, fp = tracing::field::Empty))]
   pub async fn ensure_api_token(&self, http: &reqwest::Client) -> Result<Secret<String>> {
-    const SKEW_SECS: i64 = 300;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     if let (Some(tok), Some(exp)) = self.snapshot() {
-      if exp - SKEW_SECS > now {
+      if crate::native::api_token_valid_at(exp, now) {
         let span = tracing::Span::current();
         span.record("refreshed", false);
         span.record("fp", tracing::field::display(tok.fingerprint()));
@@ -122,7 +121,7 @@ impl CopilotProvider {
     }
     let _g = self.refresh_lock.lock().await;
     if let (Some(tok), Some(exp)) = self.snapshot() {
-      if exp - SKEW_SECS > now {
+      if crate::native::api_token_valid_at(exp, now) {
         let span = tracing::Span::current();
         span.record("refreshed", false);
         span.record("fp", tracing::field::display(tok.fingerprint()));
@@ -153,25 +152,13 @@ impl CopilotProvider {
   /// Resolve the X-Initiator value to send.
   /// Precedence: inbound `X-Initiator` header > config mode > auto-classify.
   fn resolve_initiator(&self, body: &Value, inbound: &HeaderMap, fallback: &str) -> String {
-    if let Some(v) = inbound.get("x-initiator") {
-      let v = v.as_str().trim().to_ascii_lowercase();
-      if v == "user" || v == "agent" {
-        return v;
-      }
-    }
-    match self.headers.initiator_mode {
-      InitiatorMode::AlwaysUser => "user".into(),
-      InitiatorMode::AlwaysAgent => "agent".into(),
-      InitiatorMode::Auto => {
-        // If caller already classified, trust it.
-        if fallback == "user" || fallback == "agent" {
-          return fallback.into();
-        }
-        crate::util::initiator::classify_initiator(body)
-          .unwrap_or("user")
-          .into()
-      }
-    }
+    crate::native::resolve_initiator(
+      Endpoint::ChatCompletions,
+      body,
+      inbound,
+      fallback,
+      self.headers.initiator_mode,
+    )
   }
 }
 
@@ -233,11 +220,10 @@ impl Provider for CopilotProvider {
   }
 
   fn needs_refresh(&self, cfg: &AccountConfig) -> bool {
-    const SKEW_SECS: i64 = 300;
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     cfg
       .access_token_expires_at
-      .map(|exp| exp - SKEW_SECS <= now)
+      .map(|exp| !crate::native::api_token_valid_at(exp, now))
       .unwrap_or(true)
       || cfg.access_token.is_none()
   }
@@ -254,16 +240,11 @@ impl Provider for CopilotProvider {
 }
 
 fn headers_from_settings(a: &AccountConfig) -> Result<CopilotHeaders> {
-  let value = serde_json::to_value(&a.settings).map_err(|source| error::Error::Json {
+  CopilotHeaders::from_account(a).map_err(|source| error::Error::Json {
     what: "copilot account settings",
     body: format!("{:?}", a.settings),
     source,
-  })?;
-  let mut headers = CopilotHeaders::from_value(&value)?;
-  for (name, value) in &a.headers {
-    headers.extra_headers.insert(name.clone(), value.clone());
-  }
-  Ok(headers)
+  })
 }
 
 impl CopilotProvider {
@@ -332,24 +313,13 @@ impl CopilotProvider {
   /// body is shaped `{ input: …, instructions: …, … }` rather than
   /// `{ messages: [...] }`.
   fn resolve_initiator_responses(&self, body: &Value, inbound: &HeaderMap, fallback: &str) -> String {
-    if let Some(v) = inbound.get("x-initiator") {
-      let v = v.as_str().trim().to_ascii_lowercase();
-      if v == "user" || v == "agent" {
-        return v;
-      }
-    }
-    match self.headers.initiator_mode {
-      InitiatorMode::AlwaysUser => "user".into(),
-      InitiatorMode::AlwaysAgent => "agent".into(),
-      InitiatorMode::Auto => {
-        if fallback == "user" || fallback == "agent" {
-          return fallback.into();
-        }
-        crate::util::initiator::classify_initiator_responses(body)
-          .unwrap_or("user")
-          .into()
-      }
-    }
+    crate::native::resolve_initiator(
+      Endpoint::Responses,
+      body,
+      inbound,
+      fallback,
+      self.headers.initiator_mode,
+    )
   }
 }
 

@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 use std::{cell::RefCell, convert::Infallible, fs, rc::Rc, time::Duration};
 use tempfile::TempDir;
-use tokn_mock_server::{MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
+use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_requests::configured::ResponseBody as InjectedBody;
 use tokn_sdk::{
   account::AccountConfig,
@@ -74,9 +74,13 @@ struct Fixture {
 
 #[derive(Debug)]
 struct Observation {
+  path: String,
   authorization: String,
   initiator: Option<String>,
   accept: Option<String>,
+  content_type: Option<String>,
+  anthropic_version: Option<String>,
+  routing_hint: Option<String>,
   body: Value,
   streaming: bool,
 }
@@ -159,9 +163,18 @@ impl Fixture {
   }
 
   async fn execute(&self, body: Value, options: RequestOptions) -> (Observation, Observation) {
+    self.execute_endpoint(Endpoint::ChatCompletions, body, options).await
+  }
+
+  async fn execute_endpoint(
+    &self,
+    endpoint: Endpoint,
+    body: Value,
+    options: RequestOptions,
+  ) -> (Observation, Observation) {
     let standard = self
       .standard
-      .execute(Endpoint::ChatCompletions, body.clone(), options.clone())
+      .execute(endpoint, body.clone(), options.clone())
       .await
       .expect("execute standard request");
     assert_eq!(standard.status, 200);
@@ -176,7 +189,7 @@ impl Fixture {
     }
     let injected = self
       .injected
-      .execute(Endpoint::ChatCompletions, body, options)
+      .execute(endpoint, body, options)
       .await
       .expect("execute injected request");
     assert_eq!(injected.status, 200);
@@ -189,24 +202,125 @@ impl Fixture {
     let injected = requests.last().expect("injected upstream request");
     (
       Observation {
+        path: standard.path.clone(),
         authorization: standard.header("authorization").unwrap().to_string(),
         initiator: standard.header("x-initiator").map(str::to_string),
         accept: standard.header("accept").map(str::to_string),
+        content_type: standard.header("content-type").map(str::to_string),
+        anthropic_version: standard.header("anthropic-version").map(str::to_string),
+        routing_hint: standard.header("x-codex-routing-hint").map(str::to_string),
         body: serde_json::from_slice(&standard.body).unwrap(),
         streaming: standard_streaming,
       },
       Observation {
+        path: injected.url.strip_prefix(self.server.base_url()).unwrap().to_string(),
         authorization: injected.headers.get("authorization").unwrap().as_str().to_string(),
         initiator: injected
           .headers
           .get("x-initiator")
           .map(|value| value.as_str().to_string()),
         accept: injected.headers.get("accept").map(|value| value.as_str().to_string()),
+        content_type: injected
+          .headers
+          .get("content-type")
+          .map(|value| value.as_str().to_string()),
+        anthropic_version: injected
+          .headers
+          .get("anthropic-version")
+          .map(|value| value.as_str().to_string()),
+        routing_hint: injected
+          .headers
+          .get("x-codex-routing-hint")
+          .map(|value| value.as_str().to_string()),
         body: serde_json::from_slice(&injected.body).unwrap(),
         streaming: injected_streaming,
       },
     )
   }
+}
+
+#[tokio::test]
+async fn native_formats_share_provider_preparation_and_wire_controls() {
+  for (endpoint, route, mut body, path) in [
+    (
+      Endpoint::ChatCompletions,
+      MockRoute::chat_completions(),
+      json!({"messages": [{"role": "user", "content": "hello"}], "max_completion_tokens": 32}),
+      "/chat/completions",
+    ),
+    (
+      Endpoint::Responses,
+      MockRoute::responses(),
+      json!({"input": "hello", "max_output_tokens": 32}),
+      "/responses",
+    ),
+    (
+      Endpoint::Messages,
+      MockRoute::new(
+        MockEndpoint::Custom {
+          method: "POST".parse().unwrap(),
+          path: "/v1/messages".into(),
+        },
+        MockRoute::messages().response,
+      ),
+      json!({"messages": [{"role": "user", "content": "hello"}], "max_tokens": 32}),
+      "/v1/messages",
+    ),
+  ] {
+    let fixture = Fixture::new("github-copilot", 1, route).await;
+    body["model"] = json!("github-copilot/gpt-4o");
+    body["temperature"] = json!(0.4);
+    body["stream"] = json!(false);
+    let (standard, injected) = fixture
+      .execute_endpoint(
+        endpoint,
+        body,
+        RequestOptions::default()
+          .with_request_id("native-format-parity")
+          .with_initiator("agent"),
+      )
+      .await;
+    assert_eq!(standard.path, path, "standard: {standard:?}");
+    assert_eq!(injected.path, standard.path, "injected: {injected:?}");
+    assert_eq!(standard.body["model"], "gpt-4o");
+    assert_eq!(standard.body["temperature"], 0.4);
+    assert_eq!(standard.body, injected.body);
+    assert_eq!(standard.authorization, injected.authorization);
+    assert_eq!(standard.initiator.as_deref(), Some("agent"));
+    assert_eq!(standard.initiator, injected.initiator);
+    assert_eq!(standard.content_type, injected.content_type);
+    assert_eq!(standard.anthropic_version, injected.anthropic_version);
+    assert!(!standard.streaming && !injected.streaming);
+  }
+}
+
+#[tokio::test]
+async fn codex_compaction_priority_and_native_transformation_match() {
+  let fixture = Fixture::new("codex", 1, MockRoute::responses()).await;
+  let (standard, injected) = fixture
+    .execute_endpoint(
+      Endpoint::Responses,
+      json!({
+        "model": "codex/gpt-5",
+        "input": [{"type": "compaction_trigger"}],
+        "service_tier": "auto",
+        "store": true,
+        "max_output_tokens": 32,
+        "stream": false
+      }),
+      RequestOptions::default().with_request_id("compaction-parity"),
+    )
+    .await;
+  assert_eq!(standard.path, "/responses");
+  assert_eq!(standard.body["model"], "gpt-5");
+  assert_eq!(standard.body["service_tier"], "priority");
+  assert_eq!(standard.body["store"], false);
+  assert_eq!(standard.body["stream"], true);
+  assert!(standard.body.get("max_output_tokens").is_none());
+  assert_eq!(standard.body, injected.body);
+  assert_eq!(standard.path, injected.path);
+  assert_eq!(standard.routing_hint.as_deref(), Some("model=gpt-5;tier=priority"));
+  assert_eq!(standard.routing_hint, injected.routing_hint);
 }
 
 #[tokio::test]

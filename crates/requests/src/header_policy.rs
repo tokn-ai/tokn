@@ -31,3 +31,12 @@ pub(crate) fn passthrough_headers(inbound: &HeaderMap, preserve_host: bool, pres
   }
   headers
 }
+
+pub(crate) const BODY_DIGEST_HEADERS: &[&str] = &["content-md5", "digest", "content-digest", "repr-digest"];
+
+/// Body digests cease to describe a transformed request payload.
+pub(crate) fn remove_body_digests(headers: &mut HeaderMap) {
+  for name in BODY_DIGEST_HEADERS {
+    headers.remove(*name);
+  }
+}

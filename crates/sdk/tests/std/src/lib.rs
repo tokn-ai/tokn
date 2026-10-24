@@ -20,7 +20,7 @@ mod tests {
   };
 
   use serde_json::{json, Value};
-  use tokn_sdk::{chat_completions::ChatRequest, Client, RequestOptions};
+  use tokn_sdk::{chat_completions::ChatRequest, Client, Event, RequestEventPayload, RequestOptions, StageEvent};
 
   fn assert_send_sync<T: Send + Sync>() {}
 
@@ -121,7 +121,14 @@ mod tests {
       socket.set_read_timeout(Some(Duration::from_secs(5)))?;
       socket.set_write_timeout(Some(Duration::from_secs(5)))?;
       let request = read_request(&mut socket)?;
-      if request["stream"] == true {
+      if request["model"] == "test-retry" && requests.is_empty() {
+        let body = r#"{"error":{"message":"retry on another account"}}"#;
+        write!(
+          socket,
+          "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+          body.len()
+        )?;
+      } else if request["stream"] == true {
         socket.write_all(
           b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
         )?;
@@ -294,5 +301,154 @@ mod tests {
     assert_eq!(requests.len(), 4);
     assert!(requests[..3].iter().all(|request| request["stream"] == true));
     assert_eq!(requests[3]["stream"], false);
+  }
+
+  #[test]
+  fn live_std_streams_keep_independent_ownership_and_complete_once() {
+    let mut fixture = Fixture::start_with_requests(3);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build runtime");
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        let mut events = client.subscribe_events();
+        let endpoint = client.chat_completions();
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model",
+          "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let cancelled = assert_send(endpoint.stream_with(
+          &request,
+          RequestOptions::default().with_request_id("isolated-cancelled"),
+        ))
+        .await
+        .expect("open first live stream");
+        // Keep the first response alive while opening a second exchange. A
+        // shared exclusive transport borrow would either fail or deadlock here.
+        let surviving = assert_send(endpoint.stream_with(
+          &request,
+          RequestOptions::default().with_request_id("isolated-surviving"),
+        ))
+        .await
+        .expect("a live std response must not lock the client");
+        while let Ok(event) = events.try_recv() {
+          if let Event::Requests(event) = event.as_ref() {
+            assert!(
+              !matches!(event.payload, RequestEventPayload::Stage(StageEvent::Completed { .. })),
+              "returning a response must not finish an unread stream"
+            );
+          }
+        }
+        drop(cancelled);
+        let bytes = assert_send(surviving.bytes())
+          .await
+          .expect("cancelling one exchange must not close its sibling");
+        assert!(std::str::from_utf8(&bytes).unwrap().ends_with("data: [DONE]\n\n"));
+        endpoint
+          .create_with(
+            &request,
+            RequestOptions::default().with_request_id("isolated-after-streams"),
+          )
+          .await
+          .expect("client remains usable after both streams finish");
+        let mut outcomes = Vec::new();
+        let mut failures = Vec::new();
+        while let Ok(event) = events.try_recv() {
+          if let Event::Requests(event) = event.as_ref() {
+            match event.payload {
+              RequestEventPayload::Stage(StageEvent::Completed { success, attempts }) => {
+                outcomes.push((event.request_id.to_string(), success, attempts));
+              }
+              RequestEventPayload::Stage(StageEvent::Error { .. }) => {
+                failures.push(event.request_id.to_string());
+              }
+              _ => {}
+            }
+          }
+        }
+        assert_eq!(
+          outcomes,
+          [
+            ("isolated-cancelled".into(), false, 1),
+            ("isolated-surviving".into(), true, 1),
+            ("isolated-after-streams".into(), true, 1),
+          ]
+        );
+        assert_eq!(failures, ["isolated-cancelled"]);
+      })
+      .await
+      .expect("independent std exchanges completed before timeout");
+    });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[..2].iter().all(|request| request["stream"] == true));
+    assert_eq!(requests[2]["stream"], false);
+  }
+
+  #[test]
+  fn retry_reselects_an_account_and_attributes_each_attempt() {
+    let mut fixture = Fixture::start_with_requests(2);
+    let config_path = fixture.root.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+      "[defaults]",
+      "[defaults]\nretry = { kind = 'recoverable', policy = 'retry' }",
+    );
+    fs::write(
+      config_path,
+      format!("{config}\n[retry_policies.retry]\nmax_retries = 1\ninitial_backoff_ms = 1\n"),
+    )
+    .unwrap();
+    fs::write(
+      fixture.root.join("auth.yaml"),
+      "version: 1\naccounts:\n  - id: primary\n    provider: llama-cpp\n  - id: backup\n    provider: llama-cpp\n    tier: fallback\n",
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build runtime");
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        let mut events = client.subscribe_events();
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-retry",
+          "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let response = client
+          .chat_completions()
+          .create_with(&request, RequestOptions::default().with_request_id("isolated-retry"))
+          .await
+          .expect("recoverable send failure retries with the fallback account");
+        assert_eq!(response.data.id.as_deref(), Some("chatcmpl-std"));
+        let mut accounts = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+          if let Event::Requests(event) = event.as_ref() {
+            assert_eq!(event.request_id, "isolated-retry");
+            match &event.payload {
+              RequestEventPayload::Stage(StageEvent::Resolve(summary)) => {
+                accounts.push((event.attempt, summary.account_id.to_string()));
+              }
+              RequestEventPayload::Stage(StageEvent::Completed { success, attempts }) => {
+                outcomes.push((event.attempt, *success, *attempts));
+              }
+              _ => {}
+            }
+          }
+        }
+        assert_eq!(accounts, [(0, "primary".into()), (1, "backup".into())]);
+        assert_eq!(outcomes, [(0, false, 1), (1, true, 2)]);
+      })
+      .await
+      .expect("retried request completed before timeout");
+    });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
   }
 }
