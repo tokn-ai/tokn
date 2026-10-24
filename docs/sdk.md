@@ -1,7 +1,7 @@
 # Embedded SDKs
 
 With their default features, the SDKs execute requests in-process using the
-standard configuration, credentials, account pool, routing, conversion, retry,
+v2 configuration, credentials, account pool, routing, conversion, retry,
 and provider runtime. They do not require a gateway process.
 Rust also supports configured requests with caller-supplied networking in
 `no_std + alloc` environments.
@@ -10,8 +10,8 @@ Rust also supports configured requests with caller-supplied networking in
 
 The `tokn-sdk` crate is the stable façade. It provides:
 
-- default and explicit `config.toml` / `auth.yaml` loading, including
-  `config.d` and `auth.d`;
+- default and explicit v2 `config.toml` / `auth.yaml` loading, including `auth.d`
+  credential fragments;
 - atomic `reload()` of configuration and credentials;
 - default and per-request profile selection;
 - a provider-neutral generation builder with friendly text, reasoning, tool
@@ -21,6 +21,37 @@ The `tokn-sdk` crate is the stable façade. It provides:
 - typed clients for Responses, Chat Completions, and Messages;
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
+
+The standard client requires `schema_version = 2`. Legacy config files and
+legacy `config.d` overlays are no longer SDK inputs. A missing config file is
+an error. Provider destinations belong in v2 configuration; account files
+supply credentials. A minimal SDK config needs no listener:
+
+```toml
+schema_version = 2
+
+[defaults]
+provider = { kind = "fixed", provider = "openai" }
+model = { kind = "qualified", namespace = "provider" }
+
+[providers.openai]
+driver = "openai"
+base_url = "https://api.openai.com"
+```
+
+With an OpenAI account in `auth.yaml`, select a model such as `openai/gpt-5`.
+`Client::builder()` selects profile `default`, created by `[defaults]` or an
+explicit `[profiles.default]`. Use `.profile("name")` for another default;
+`RequestOptions.profile` overrides it for an individual request. Unknown
+profiles fail explicitly, including a missing `default` profile at build time.
+
+The SDK accepts gateway v2 documents too, but only builds their request runtime.
+It does not start listeners, persistence, or proxy certificate management.
+Managed routes and fixed-provider relays are available; original-destination
+proxy routes require gateway context. `service.outbound` configures SDK HTTP
+clients. A failed `reload()` preserves the previous configuration and credentials;
+successful reloads keep event subscriptions valid and let in-flight requests
+finish with their original snapshot.
 
 The client-bound builder is the shortest path for a one-off request:
 
@@ -111,13 +142,13 @@ Unsupported explicit controls fail clearly after routing rather than being
 silently dropped or reinterpreted. Raw endpoint clients remain the escape
 hatch for an exact provider wire shape.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload,
+V2 relay profiles preserve the generated Responses payload,
 except detected compaction requests sent to Codex always use
 `service_tier: "priority"`, overriding any incoming tier. Their outgoing
 `x-codex-routing-hint` also uses the outgoing model and `tier=priority`,
 preserving unrelated routing directives. These profiles
 reject typed `top_k` and reasoning controls that would
-require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
+require post-route lowering. Use a managed route for
 the provider-neutral control API.
 
 Build a request without a client when it needs to be serialized, transformed,
@@ -184,7 +215,7 @@ is portable metadata; this does not yet port standard Codex compaction priority
 or routing-header policy. Standard passthrough keeps its distinct typed metadata
 peek, header-only initiator, and original body bytes.
 
-The v2 gateway and injected executor share provider/account linking and route
+The standard SDK, v2 gateway, and injected executor share provider/account linking and route
 selection in `tokn-accounts`:
 
 - `link::portable` validates provider destinations, account identities, and pool
@@ -199,12 +230,13 @@ selection in `tokn-accounts`:
 
 Standard provider objects, refreshable model caches, and injected native driver
 capabilities remain platform adapters. Routing parity depends on equivalent
-plans, accounts, capability inventories, and pool state. The injected executor
-accepts v2 configuration only. The default standard SDK still loads legacy
-configuration and retains its older routing behavior; legacy routing is not available in `no_std`.
+plans, accounts, capability inventories, and pool state. Both SDK platforms
+accept v2 configuration only. Standard SDK and gateway API profiles are built
+by `tokn_requests::v2` from the same `ExecutionPlan`; gateway admission and
+original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
-The v2 gateway and injected executor resolve named policies through `from_route`;
+The standard SDK, v2 gateway, and injected executor resolve named policies through `from_route`;
 standard pipelines keep the existing `RetryPolicy::new` and `safe_methods` APIs.
 Both sessions supply error facts and the transport method to `next_delay`:
 

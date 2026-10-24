@@ -88,13 +88,14 @@ impl Fixture {
     let root = tempfile::tempdir().expect("create parity fixture");
     let config_path = root.path().join("config.toml");
     let auth_path = root.path().join("auth.yaml");
-    fs::write(&config_path, "[defaults]\nmode = \"exact\"\n").unwrap();
+    fs::write(&config_path, format!(
+      "schema_version = 2\n[defaults]\nprovider = {{ kind = 'fixed', provider = '{provider}' }}\nmodel = {{ kind = 'qualified', namespace = 'provider' }}\noperation = 'preserve'\nwire_identity = 'none'\n[providers.'{provider}']\ndriver = '{provider}'\nbase_url = '{}'\n", server.base_url()
+    )).unwrap();
     let accounts: Vec<Value> = (0..account_count)
       .map(|index| {
         json!({
           "id": format!("account-{index}"),
           "provider": provider,
-          "base_url": server.base_url(),
           "api_key": format!("key-{index}"),
           "access_token": format!("key-{index}"),
           "access_token_expires_at": 4_102_444_800_i64,

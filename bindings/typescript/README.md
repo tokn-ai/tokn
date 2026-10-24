@@ -1,7 +1,7 @@
 # @tokn-ai/requests
 
 Embedded TypeScript SDK for routing LLM requests through the providers,
-profiles, configuration, and credentials already managed by tokn.
+profiles, v2 configuration, and credentials managed by tokn.
 
 The package is an ESM package for Node.js 22+ and Bun. Its public API is
 TypeScript, while routing and provider execution run in-process through the
@@ -21,6 +21,19 @@ dependency. Supported native platforms are macOS arm64 (addon deployment target
 Bun runtime's own OS requirements also apply. Keep optional dependencies enabled. Other
 architectures and musl-based Linux distributions currently require a source
 build. Consumer installation does not compile Rust or run an install script.
+
+## Configuration
+
+The SDK loads one `config.toml` with `schema_version = 2`; legacy configuration
+is rejected with `ConfigurationError`, and `config.d` fragments are not loaded.
+Set endpoint URLs in `[providers.<id>]` using `base_url`. Accounts in
+`auth.yaml` and `auth.d` refer to that provider ID and supply credentials;
+per-account `base_url` does not choose the SDK's destination. See the
+[Rust SDK guide](../../docs/sdk.md) for v2 configuration examples.
+
+Pass `config_path`, `auth_path`, or `profile` to `Client.create()` to override
+its default sources or profile. Request options can select a different
+configured profile for an individual request.
 
 ## Usage
 

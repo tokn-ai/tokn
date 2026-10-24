@@ -1,8 +1,8 @@
 # tokn-requests Python SDK
 
-The Python package embeds the same Rust routing engine as `tokn-sdk`. It uses
-the existing `config.toml`, `config.d`, `auth.yaml`, and `auth.d` sources and
-does not require a gateway process.
+The Python package embeds the same Rust routing engine as `tokn-sdk`. It loads
+a v2 `config.toml`, with credentials from `auth.yaml` and `auth.d`, and does
+not require a gateway process.
 
 ## Installation
 
@@ -21,6 +21,19 @@ these wheels.
 Other platforms can build the source distribution with a current stable Rust
 toolchain and a C/C++ compiler. Type annotations and native extension stubs
 are included in the installed package.
+
+## Configuration
+
+The SDK loads one configuration document with `schema_version = 2`; legacy
+configuration is rejected with `ConfigurationError`, and `config.d` fragments
+are not loaded. Set endpoint URLs in `[providers.<id>]` using `base_url`.
+Accounts in `auth.yaml` refer to that provider ID and supply credentials;
+per-account `base_url` does not choose the SDK's destination. See the
+[Rust SDK guide](../../docs/sdk.md) for v2 configuration examples.
+
+Pass `config_path`, `auth_path`, or `profile` to `Client` to override its default
+sources or profile. Request options can select a different configured profile
+for an individual request.
 
 ## Friendly generation API
 
@@ -112,10 +125,10 @@ use discovery metadata; sampling compatibility uses the selected model generatio
 Explicit controls unsupported by the selected route fail clearly after routing
 instead of being silently dropped or reinterpreted.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload
+Profiles using a v2 `relay` route preserve the generated Responses payload
 verbatim, so they reject typed `top_k` and reasoning controls that would
-require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
-the provider-neutral control API.
+require post-route lowering. Use a `managed` route for the provider-neutral
+control API.
 
 The snippets below continue using the `client` created above. Snippets after
 the detached-request example also reuse its `request`.
@@ -203,9 +216,6 @@ async with stream:
 
 Raw stream chunks are transport bytes and do not necessarily align with SSE
 event or UTF-8 boundaries.
-
-Pass `config_path`, `auth_path`, or `profile` to `Client` to override the same
-defaults used by the gateway.
 
 ## Preparing a PyPI release
 

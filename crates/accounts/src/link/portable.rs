@@ -620,21 +620,9 @@ mod tests {
   }
 
   #[cfg(feature = "std")]
-  fn gateway(plan: &ExecutionPlan) -> tokn_policy::GatewayPlan {
-    tokn_policy::GatewayPlan::new(
-      BTreeMap::new(),
-      plan.profiles().clone(),
-      plan.routes().clone(),
-      plan.retry_policies().clone(),
-      plan.account_pools().clone(),
-      plan.providers().clone(),
-    )
-  }
-
-  #[cfg(feature = "std")]
   #[test]
   fn native_defaults_match_standard_destinations_for_every_official_provider() {
-    use crate::{link::link_provider_graph, registry::Registry};
+    use crate::{link::link_execution_provider_graph, registry::Registry};
     let plan = plan(
       tokn_core::provider::OFFICIAL_PROVIDER_PRESETS
         .iter()
@@ -643,7 +631,7 @@ mod tests {
       AccountSelector::all(),
     );
     let native = link_provider_metadata(&plan, &[], provider_default_base_url).unwrap();
-    let standard = link_provider_graph(&gateway(&plan), &[], &Registry::builtin()).unwrap();
+    let standard = link_execution_provider_graph(&plan, &[], &Registry::builtin()).unwrap();
     for (id, destination) in native.destinations() {
       let standard_destination = standard.destination(id).unwrap();
       assert_eq!(destination.base_url(), standard_destination.target().base_url(), "{id}");
@@ -655,7 +643,7 @@ mod tests {
   #[test]
   fn standard_materialization_matches_portable_binding_and_pool_metadata() {
     use crate::{
-      link::{link_account_pools, link_provider_graph},
+      link::{link_execution_account_pools, link_execution_provider_graph},
       registry::Registry,
     };
     let plan = plan(
@@ -689,9 +677,8 @@ mod tests {
     accounts[0].base_url = Some("https://ignored.example/v1".into());
     let native = link_provider_metadata(&plan, &accounts, provider_default_base_url).unwrap();
     let native_pools = link_pool_metadata(&plan, &native).unwrap();
-    let gateway = gateway(&plan);
-    let standard = link_provider_graph(&gateway, &accounts, &Registry::builtin()).unwrap();
-    let standard_pools = link_account_pools(&gateway, &standard).unwrap();
+    let standard = link_execution_provider_graph(&plan, &accounts, &Registry::builtin()).unwrap();
+    let standard_pools = link_execution_account_pools(&plan, &standard).unwrap();
     for binding in native.bindings() {
       let runtime = standard
         .binding(binding.provider_id(), binding.key().account_id())
@@ -737,7 +724,7 @@ mod tests {
   #[cfg(feature = "std")]
   #[test]
   fn standard_and_portable_link_errors_preserve_context() {
-    use crate::{link::link_provider_graph, registry::Registry};
+    use crate::{link::link_execution_provider_graph, registry::Registry};
     let registry = Registry::builtin();
     let valid = BTreeMap::from([(provider_id("local"), provider("llama-cpp", None))]);
     let cases = [
@@ -767,7 +754,7 @@ mod tests {
     for (providers, accounts) in cases {
       let plan = plan(providers, AccountSelector::all());
       let native = link_provider_metadata(&plan, &accounts, provider_default_base_url).unwrap_err();
-      let standard = link_provider_graph(&gateway(&plan), &accounts, &registry).unwrap_err();
+      let standard = link_execution_provider_graph(&plan, &accounts, &registry).unwrap_err();
       assert_eq!(native.to_string(), standard.to_string());
     }
   }

@@ -1,6 +1,6 @@
 //! One configured client and request pipeline for standard and embedded applications.
 //!
-//! The default standard platform loads configuration and credentials from disk.
+//! The default standard platform loads v2 configuration and credentials from disk.
 //! [`Injected`] uses the same execution model with application-supplied accounts,
 //! model metadata, HTTP transport, monotonic time and timers.
 

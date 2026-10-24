@@ -5,14 +5,22 @@ mod resources;
 #[cfg(feature = "std")]
 mod service;
 
-#[cfg(feature = "std")]
-use crate::v2::CompiledConfig;
 use crate::v2::{CompileError, RawConfig};
+#[cfg(feature = "std")]
+use crate::v2::{CompiledConfig, CompiledExecutionConfig};
 #[cfg(feature = "std")]
 use std::path::Path;
 use tokn_policy::ExecutionPlan;
 #[cfg(feature = "std")]
 use tokn_policy::GatewayPlan;
+
+#[cfg(feature = "std")]
+pub(super) fn compile_execution_config(raw: &RawConfig) -> Result<CompiledExecutionConfig, CompileError> {
+  Ok(CompiledExecutionConfig::new(
+    compile_execution(raw)?,
+    service::compile_service(&raw.service)?,
+  ))
+}
 
 #[cfg(feature = "std")]
 pub(super) fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig, CompileError> {

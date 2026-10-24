@@ -25,26 +25,19 @@ impl Fixture {
   }
 
   fn with_account(base_url: &str, provider: &str, credentials: &str) -> Self {
-    Self::with_account_and_mode(base_url, provider, credentials, "exact")
-  }
-
-  fn with_account_and_mode(base_url: &str, provider: &str, credentials: &str, mode: &str) -> Self {
     let root = tempfile::tempdir().expect("create SDK fixture directory");
     let config_path = root.path().join("config.toml");
     let auth_path = root.path().join("auth.yaml");
-    let default_provider = matches!(mode, "passthrough" | "switch")
-      .then(|| format!("default_provider_id = \"{provider}\"\n"))
-      .unwrap_or_default();
     fs::write(
       &config_path,
-      format!("[defaults]\nmode = \"{mode}\"\n{default_provider}"),
+      format!(
+        "schema_version = 2\n[defaults]\nprovider = {{ kind = 'fixed', provider = '{provider}' }}\nmodel = {{ kind = 'qualified', namespace = 'provider' }}\nwire_identity = 'none'\n[providers.'{provider}']\ndriver = '{provider}'\nbase_url = '{base_url}'\n"
+      ),
     )
     .expect("write SDK config");
     fs::write(
       &auth_path,
-      format!(
-        "version: 1\naccounts:\n  - id: local\n    provider: {provider}\n    base_url: {base_url}\n{credentials}"
-      ),
+      format!("version: 1\naccounts:\n  - id: local\n    provider: {provider}\n{credentials}"),
     )
     .expect("write SDK credentials");
     Self {
@@ -52,6 +45,53 @@ impl Fixture {
       config_path,
       auth_path,
     }
+  }
+
+  fn relay(base_url: &str, provider: &str, credentials: &str, credential_kind: &str) -> Self {
+    let fixture = Self::with_account(base_url, provider, credentials);
+    fs::write(&fixture.config_path, format!(
+      "schema_version = 2\n[profiles.default]\nroute = 'relay'\nwire_identity = 'none'\n[routes.relay]\nkind = 'relay'\ndestination = {{ kind = 'fixed_provider', provider = '{provider}' }}\ncredentials = {{ kind = '{credential_kind}' }}\nretry = {{ kind = 'never' }}\n[providers.'{provider}']\ndriver = '{provider}'\nbase_url = '{base_url}'\n"
+    )).unwrap();
+    fixture
+  }
+
+  fn profiles(first_url: &str, second_url: &str) -> Self {
+    let fixture = Self::new(first_url);
+    fs::write(
+      &fixture.config_path,
+      format!(
+        r#"
+schema_version = 2
+[profiles.default]
+route = "first"
+wire_identity = "none"
+[profiles.other]
+route = "second"
+wire_identity = "none"
+[routes.first]
+kind = "managed"
+provider = {{ kind = "fixed", provider = "first" }}
+model = {{ kind = "qualified", namespace = "driver" }}
+operation = "translate_compatible"
+retry = {{ kind = "never" }}
+[routes.second]
+kind = "managed"
+provider = {{ kind = "fixed", provider = "second" }}
+model = {{ kind = "qualified", namespace = "driver" }}
+operation = "translate_compatible"
+retry = {{ kind = "never" }}
+[providers.first]
+driver = "llama-cpp"
+base_url = "{first_url}"
+[providers.second]
+driver = "llama-cpp"
+base_url = "{second_url}"
+"#
+      ),
+    )
+    .unwrap();
+    fs::write(&fixture.auth_path, "version: 1\naccounts:\n  - id: first-account\n    provider: first\n  - id: second-account\n    provider: second\n").unwrap();
+    fixture
   }
 
   fn client(&self) -> Client {
@@ -274,9 +314,9 @@ async fn detached_generation_request_round_trips_transforms_and_uses_mock_provid
 }
 
 #[tokio::test]
-async fn typed_generation_controls_reject_verbatim_profile_modes() {
-  for mode in ["passthrough", "switch"] {
-    let fixture = Fixture::with_account_and_mode("http://127.0.0.1:1", "llama-cpp", "", mode);
+async fn typed_generation_controls_reject_relay_routes() {
+  for credentials in ["account_pool", "client"] {
+    let fixture = Fixture::relay("http://127.0.0.1:1", "llama-cpp", "", credentials);
     let client = fixture.client();
 
     let error = client
@@ -285,21 +325,21 @@ async fn typed_generation_controls_reject_verbatim_profile_modes() {
       .top_k(40)
       .send()
       .await
-      .expect_err("verbatim mode should reject typed generation controls");
+      .expect_err("relay route should reject typed generation controls");
 
     assert!(
-      matches!(error, Error::InvalidGenerateRequest { message } if message.contains(mode)),
-      "unexpected error for {mode}"
+      matches!(error, Error::InvalidGenerateRequest { message } if message.contains("relay")),
+      "unexpected error for {credentials} relay"
     );
   }
 }
 
 #[tokio::test]
-async fn max_tokens_is_already_wire_native_in_verbatim_profile_modes() {
+async fn max_tokens_is_already_wire_native_in_relay_routes() {
   let mock = MockLlmServer::start(MockLlmConfig::default()).await;
 
-  for mode in ["passthrough", "switch"] {
-    let fixture = Fixture::with_account_and_mode(mock.base_url(), "openai", "    api_key: test-key\n", mode);
+  for credentials in ["account_pool", "client"] {
+    let fixture = Fixture::relay(mock.base_url(), "openai", "    api_key: test-key\n", credentials);
     let client = fixture.client();
 
     let response = client
@@ -677,15 +717,24 @@ async fn raw_request_and_client_lifecycle_use_explicit_paths() {
     .with_project_id("/tmp/sdk-project")
     .with_initiator("sdk-test")
     .with_header("x-sdk-test", "raw");
-  let error = client
+  let response = client
     .execute(
       tokn_core::provider::Endpoint::ChatCompletions,
       serde_json::to_value(chat_request()).expect("serialize chat request"),
       options,
     )
     .await
+    .expect("explicit default profile should execute");
+  assert_eq!(response.status, 200);
+  let error = client
+    .execute(
+      tokn_sdk::Endpoint::ChatCompletions,
+      serde_json::to_value(chat_request()).unwrap(),
+      RequestOptions::default().with_profile("missing"),
+    )
+    .await
     .expect_err("unknown request profile should fail");
-  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "default"));
+  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "missing"));
 
   mock.shutdown().await;
 }
@@ -726,6 +775,234 @@ fn invalid_default_profile_is_rejected_during_construction() {
     .expect("unknown profile should fail");
 
   assert!(matches!(error, Error::UnknownProfile { profile } if profile == "missing"));
+}
+
+#[test]
+fn legacy_and_missing_schema_are_rejected_instead_of_using_legacy_defaults() {
+  let fixture = Fixture::new("http://127.0.0.1:1");
+  for text in ["[defaults]\nmode = 'exact'\n", "", "schema_version = 1\n"] {
+    fs::write(&fixture.config_path, text).unwrap();
+    let error = Client::builder()
+      .config_path(&fixture.config_path)
+      .auth_path(&fixture.auth_path)
+      .build()
+      .err()
+      .expect("SDK requires explicit v2 config");
+    assert!(matches!(error, Error::LoadConfig { .. }));
+    let mut chain = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(error) = source {
+      chain.push_str(&error.to_string());
+      source = error.source();
+    }
+    assert!(
+      chain.contains("schema_version") || chain.contains("schema version"),
+      "{chain}"
+    );
+  }
+}
+
+#[test]
+fn listener_free_v2_requires_an_existing_default_or_explicit_profile() {
+  let fixture = Fixture::profiles("http://127.0.0.1:1", "http://127.0.0.1:2");
+  let config = fs::read_to_string(&fixture.config_path)
+    .unwrap()
+    .replace("[profiles.default]", "[profiles.named]");
+  fs::write(&fixture.config_path, config).unwrap();
+  let builder = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path);
+  let error = builder
+    .clone()
+    .build()
+    .err()
+    .expect("missing default profile must be explicit");
+  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "default"));
+  builder
+    .profile("named")
+    .build()
+    .expect("listener-free v2 accepts an explicit profile");
+}
+
+#[tokio::test]
+async fn configured_provider_url_overrides_legacy_account_destination() {
+  let configured = MockLlmServer::start(MockLlmConfig::default()).await;
+  let account_destination = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(configured.base_url());
+  fs::write(
+    &fixture.auth_path,
+    format!(
+      "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: {}\n",
+      account_destination.base_url()
+    ),
+  )
+  .unwrap();
+  fixture
+    .client()
+    .chat_completions()
+    .create(&chat_request())
+    .await
+    .unwrap();
+  assert_eq!(configured.requests().len(), 1);
+  assert!(account_destination.requests().is_empty());
+  configured.shutdown().await;
+  account_destination.shutdown().await;
+}
+
+#[tokio::test]
+async fn original_destination_profile_reports_its_sdk_limitation_before_sending() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let mut config = fs::read_to_string(&fixture.config_path).unwrap();
+  config.push_str("\n[profiles.proxy]\nroute = 'original'\n[routes.original]\nkind = 'relay'\ndestination = { kind = 'original' }\ncredentials = { kind = 'client' }\n");
+  fs::write(&fixture.config_path, config).unwrap();
+  let builder = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path);
+  let error = builder
+    .clone()
+    .profile("proxy")
+    .build()
+    .err()
+    .expect("SDK cannot supply an original destination");
+  assert!(matches!(error, Error::BuildEngine { source } if source.to_string().contains("original proxy destination")));
+  let client = builder.build().unwrap();
+  let error = client
+    .chat_completions()
+    .create_with(&chat_request(), RequestOptions::default().with_profile("proxy"))
+    .await
+    .expect_err("request cannot select an original-destination profile");
+  assert!(matches!(error, Error::BuildEngine { source } if source.to_string().contains("original proxy destination")));
+  assert!(mock.requests().is_empty());
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn profile_endpoint_binding_restricts_sdk_operations() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let config = fs::read_to_string(&fixture.config_path).unwrap().replace(
+    "wire_identity = 'none'",
+    "wire_identity = 'none'\nbinding = { endpoints = ['chat_completions'] }",
+  );
+  fs::write(&fixture.config_path, config).unwrap();
+  let client = fixture.client();
+  client
+    .chat_completions()
+    .create(&chat_request())
+    .await
+    .expect("allowed Chat operation executes");
+  let error = client
+    .generate("llama-cpp/mock-model")
+    .prompt("blocked Responses operation")
+    .send()
+    .await
+    .expect_err("generation cannot bypass the profile endpoint restriction");
+  assert!(
+    matches!(error, Error::BuildEngine { source } if source.to_string().contains("does not expose operation 'responses'"))
+  );
+  assert_eq!(mock.requests().len(), 1);
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn builder_and_request_profiles_select_independent_routes_concurrently() {
+  let first = MockLlmServer::start(MockLlmConfig::default()).await;
+  let second = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::profiles(first.base_url(), second.base_url());
+  let client = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .profile("other")
+    .build()
+    .unwrap();
+  let endpoint = client.chat_completions();
+  let request = chat_request();
+  let (builder_default, request_override) = tokio::join!(
+    endpoint.create(&request),
+    endpoint.create_with(&request, RequestOptions::default().with_profile("default")),
+  );
+  builder_default.expect("builder profile selects second provider");
+  request_override.expect("request profile overrides builder profile");
+  assert_eq!(first.requests().len(), 1);
+  assert_eq!(second.requests().len(), 1);
+  let error = endpoint
+    .create_with(&request, RequestOptions::default().with_profile("missing"))
+    .await
+    .expect_err("unknown per-request profile fails before sending");
+  assert!(matches!(error, Error::UnknownProfile { profile } if profile == "missing"));
+  assert_eq!(first.requests().len() + second.requests().len(), 2);
+  first.shutdown().await;
+  second.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejected_reload_keeps_the_last_snapshot_until_valid_replacement() {
+  let first = MockLlmServer::start(MockLlmConfig::default()).await;
+  let second = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(first.base_url());
+  let original = fs::read_to_string(&fixture.config_path).unwrap();
+  let credentials = fs::read_to_string(&fixture.auth_path).unwrap();
+  let client = fixture.client();
+  let mut events = client.subscribe_events();
+  for invalid in [
+    "[defaults]\nmode = 'exact'\n".to_string(),
+    "schema_version = 2\n".to_string(),
+    original.replace("driver = 'llama-cpp'", "driver = 'unknown-driver'"),
+  ] {
+    fs::write(&fixture.config_path, invalid).unwrap();
+    client.reload().expect_err("invalid replacement must fail atomically");
+    client
+      .chat_completions()
+      .create(&chat_request())
+      .await
+      .expect("previous snapshot remains usable");
+  }
+  fs::write(&fixture.config_path, &original).unwrap();
+  fs::write(&fixture.auth_path, "accounts: [broken").unwrap();
+  client
+    .reload()
+    .expect_err("invalid credentials must not replace the snapshot");
+  client.chat_completions().create(&chat_request()).await.unwrap();
+  assert_eq!(first.requests().len(), 4);
+  assert!(second.requests().is_empty());
+
+  fs::write(&fixture.auth_path, credentials).unwrap();
+  fs::write(
+    &fixture.config_path,
+    original.replace(first.base_url(), second.base_url()),
+  )
+  .unwrap();
+  client.reload().expect("valid replacement swaps snapshots");
+  client
+    .chat_completions()
+    .create_with(
+      &chat_request(),
+      RequestOptions::default().with_request_id("after-reload"),
+    )
+    .await
+    .unwrap();
+  assert_eq!(first.requests().len(), 4);
+  assert_eq!(second.requests().len(), 1);
+  tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    loop {
+      let event = events.recv().await.unwrap();
+      if let Event::Requests(event) = event.as_ref() {
+        if event.request_id == "after-reload"
+          && matches!(
+            event.payload,
+            RequestEventPayload::Stage(StageEvent::Completed { success: true, .. })
+          )
+        {
+          break;
+        }
+      }
+    }
+  })
+  .await
+  .expect("existing event subscription survives failed and successful reloads");
+  first.shutdown().await;
+  second.shutdown().await;
 }
 
 #[test]

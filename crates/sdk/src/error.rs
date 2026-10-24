@@ -13,7 +13,7 @@ pub enum Error {
     #[source]
     source: anyhow::Error,
   },
-  #[error("failed to build the provider engine")]
+  #[error("failed to configure the request runtime")]
   BuildEngine {
     #[source]
     source: anyhow::Error,

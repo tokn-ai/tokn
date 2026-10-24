@@ -4,19 +4,21 @@ use smol_str::SmolStr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
-use tokn_config::Config;
+use tokn_config::v2;
 use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
-use tokn_requests::runtime::{ConfiguredRuntime, RequestPolicyRuntime};
-use tokn_requests::{ExecutionRequest, RawInbound, RunConfig};
+use tokn_policy::{ExecutionPlan, ProfileId, RouteKind};
+use tokn_requests::v2::{ApiProfileRuntime, ConfiguredRuntime};
+use tokn_requests::{ExecutionRequest, RawInbound};
 
 use crate::response::RawResponse;
 use crate::{Client, RequestOptions};
 use crate::{Error, Result};
 
 const EVENT_BUS_CAPACITY: usize = 256;
+const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Clone, Debug, Default)]
 pub struct ClientBuilder {
@@ -26,6 +28,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+  /// Load a v2 document. Listeners are optional; legacy config is rejected.
   pub fn config_path(mut self, path: impl Into<PathBuf>) -> Self {
     self.config_path = Some(path.into());
     self
@@ -36,6 +39,8 @@ impl ClientBuilder {
     self
   }
 
+  /// Select the default request profile (otherwise `default`).
+  /// Individual requests can override this with `RequestOptions::profile`.
   pub fn profile(mut self, profile: impl Into<String>) -> Self {
     self.profile = Some(profile.into());
     self
@@ -54,7 +59,8 @@ struct Source {
 
 struct Snapshot {
   state: ConfiguredRuntime,
-  default_profile: Option<String>,
+  plan: ExecutionPlan,
+  default_profile: String,
   config_path: PathBuf,
   auth_path: PathBuf,
 }
@@ -123,27 +129,18 @@ impl StdPlatform {
     mut generation_options: Option<GenerationOptions>,
   ) -> Result<RawResponse> {
     let snapshot = self.snapshot.load_full();
-    let policy = select_policy(&snapshot, options.profile.as_deref())?;
-    let verbatim_mode = match policy.mode {
-      tokn_config::RouteMode::Passthrough => Some("passthrough"),
-      tokn_config::RouteMode::Switch => Some("switch"),
-      _ => None,
-    };
-    if let (Some(mode), Some(generation)) = (verbatim_mode, generation_options.as_ref()) {
+    let profile = select_profile(&snapshot, options.profile.as_deref())?;
+    if let (RouteKind::Relay, Some(generation)) = (profile.route_kind(), generation_options.as_ref()) {
       if generation.top_k.is_some() || generation.reasoning.is_some() {
         return Err(Error::InvalidGenerateRequest {
-          message: format!(
-            "typed top_k and reasoning controls require a managed route; profile mode '{mode}' forwards the generated Responses payload verbatim"
-          ),
+          message: "typed top_k and reasoning controls require a managed route; a relay profile forwards the generated Responses payload verbatim".into(),
         });
       }
       if let Some(max_output_tokens) = generation.max_output_tokens {
         let wire_limit = body.get("max_output_tokens").and_then(Value::as_u64);
         if endpoint != Endpoint::Responses || wire_limit != Some(max_output_tokens) {
           return Err(Error::InvalidGenerateRequest {
-            message: format!(
-              "typed max_output_tokens cannot be lowered in profile mode '{mode}'; the verbatim request must already contain the matching Responses field"
-            ),
+            message: "typed max_output_tokens cannot be lowered in a relay profile; the verbatim request must already contain the matching Responses field".into(),
           });
         }
       }
@@ -153,17 +150,15 @@ impl StdPlatform {
       generation_options = None;
     }
     let raw = raw_request(endpoint, body, &options)?;
-    let mut config = RunConfig::builder().with_agent_id_opt(policy.agent_id.clone());
+    let mut config = profile
+      .run_config(endpoint)
+      .map_err(|source| Error::BuildEngine { source })?;
     if let Some(generation_options) = generation_options {
       config = config.with_generation_options(generation_options);
     }
     let config = config.build();
-    let service = match policy.mode {
-      tokn_config::RouteMode::Passthrough => policy.passthrough_runtime.request_service(),
-      tokn_config::RouteMode::Switch => policy.switch_runtime.request_service(),
-      _ => policy.request_runtime.request_service(),
-    };
-    let response = service
+    let response = profile
+      .request_service()
       .execute(ExecutionRequest::new(raw).with_config(config))
       .await
       .map_err(|source| Error::Request { source })?;
@@ -172,8 +167,17 @@ impl StdPlatform {
 }
 
 fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
-  let (config, config_path) =
-    Config::load(source.config_path.as_deref()).map_err(|source| Error::LoadConfig { source })?;
+  let config_path = match &source.config_path {
+    Some(path) => path.clone(),
+    None => tokn_config::paths::config_path().map_err(|source| Error::LoadConfig { source })?,
+  };
+  let (plan, service) = v2::load_execution_config(&config_path)
+    .map_err(|source| Error::LoadConfig {
+      source: tokn_config::Error::V2 {
+        source: Box::new(source),
+      },
+    })?
+    .into_parts();
   let auth_path = match &source.auth_path {
     Some(path) => path.clone(),
     None => default_auth_path().map_err(|source| Error::LoadCredentials {
@@ -181,46 +185,43 @@ fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
       source,
     })?,
   };
-  let credentials = AuthStore::load(Some(&auth_path), Some(&config_path)).map_err(|source| Error::LoadCredentials {
+  let credentials = AuthStore::load(Some(&auth_path), None).map_err(|source| Error::LoadCredentials {
     path: auth_path.clone(),
     source,
   })?;
-  let state = tokn_requests::runtime::build_configured_runtime(&config, &credentials.accounts, events)
-    .map_err(|source| Error::BuildEngine { source })?;
-  if let Some(profile) = &source.profile {
-    ensure_profile(&state, profile)?;
-  }
-  Ok(Snapshot {
+  let state = ConfiguredRuntime::build(
+    &plan,
+    &credentials.accounts,
+    &service.outbound().to_http_client_options(),
+    events,
+  )
+  .map_err(|source| Error::BuildEngine { source })?;
+  let snapshot = Snapshot {
     state,
-    default_profile: source.profile.clone(),
+    plan,
+    default_profile: source.profile.as_deref().unwrap_or(DEFAULT_PROFILE).to_owned(),
     config_path,
     auth_path,
+  };
+  select_profile(&snapshot, None)?;
+  Ok(snapshot)
+}
+
+fn select_profile<'a>(snapshot: &'a Snapshot, request_profile: Option<&str>) -> Result<&'a ApiProfileRuntime> {
+  let name = request_profile.unwrap_or(&snapshot.default_profile);
+  let id = ProfileId::new(name).map_err(|_| Error::UnknownProfile {
+    profile: name.to_owned(),
+  })?;
+  if snapshot.plan.profile(&id).is_none() {
+    return Err(Error::UnknownProfile {
+      profile: name.to_owned(),
+    });
+  }
+  snapshot.state.profile(&id).ok_or_else(|| Error::BuildEngine {
+    source: anyhow::anyhow!(
+      "SDK profile '{name}' requires an original proxy destination; select a managed or fixed-provider relay profile"
+    ),
   })
-}
-
-fn ensure_profile(state: &ConfiguredRuntime, profile: &str) -> Result<()> {
-  if state.profiles.contains_key(profile) {
-    Ok(())
-  } else {
-    Err(Error::UnknownProfile {
-      profile: profile.to_string(),
-    })
-  }
-}
-
-fn select_policy(snapshot: &Snapshot, request_profile: Option<&str>) -> Result<Arc<RequestPolicyRuntime>> {
-  let profile = request_profile.or(snapshot.default_profile.as_deref());
-  match profile {
-    Some(profile) => snapshot
-      .state
-      .profiles
-      .get(profile)
-      .cloned()
-      .ok_or_else(|| Error::UnknownProfile {
-        profile: profile.to_string(),
-      }),
-    None => Ok(snapshot.state.default_policy.clone()),
-  }
 }
 
 fn raw_request(endpoint: Endpoint, body: Value, options: &RequestOptions) -> Result<RawInbound> {

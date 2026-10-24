@@ -10,9 +10,9 @@ use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokn_policy::{AccountPoolId, AccountSelectionStrategy, GatewayPlan, SessionAffinityPlan};
+use tokn_policy::{AccountPoolId, AccountSelectionStrategy, ExecutionPlan, GatewayPlan, SessionAffinityPlan};
 
-/// Every account pool linked from one compiled gateway plan.
+/// Every account pool linked from one compiled execution plan.
 pub struct LinkedAccountPools {
   pools: BTreeMap<AccountPoolId, Arc<LinkedAccountPool>>,
 }
@@ -146,7 +146,16 @@ pub type PoolLinkResult<T> = std::result::Result<T, PoolLinkError>;
 /// accounts without a viable provider binding are intentionally omitted, but
 /// an explicitly named disabled account is still a valid reference.
 pub fn link_account_pools(plan: &GatewayPlan, providers: &ProviderGraph) -> PoolLinkResult<LinkedAccountPools> {
-  let metadata = link_pool_metadata(plan.execution(), &providers.metadata).map_err(|error| match error {
+  link_execution_account_pools(plan.execution(), providers)
+}
+
+/// Materialize account selectors from execution resources without gateway
+/// hosting. Membership and ordering are identical to [`link_account_pools`].
+pub fn link_execution_account_pools(
+  plan: &ExecutionPlan,
+  providers: &ProviderGraph,
+) -> PoolLinkResult<LinkedAccountPools> {
+  let metadata = link_pool_metadata(plan, &providers.metadata).map_err(|error| match error {
     MetadataPoolError::UnknownAccount { pool, account_id } => PoolLinkError::UnknownAccount { pool, account_id },
   })?;
   let mut pools = BTreeMap::new();

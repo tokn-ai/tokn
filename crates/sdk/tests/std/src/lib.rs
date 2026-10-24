@@ -55,10 +55,12 @@ mod tests {
       let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
       let root = std::env::temp_dir().join(format!("tokn-sdk-std-{}-{unique}", std::process::id()));
       fs::create_dir(&root).expect("create isolated config directory");
-      fs::write(root.join("config.toml"), "[defaults]\nmode = \"exact\"\n").unwrap();
+      fs::write(root.join("config.toml"), format!(
+        "schema_version = 2\n[defaults]\nprovider = {{ kind = 'fixed', provider = 'llama-cpp' }}\nmodel = {{ kind = 'qualified', namespace = 'provider' }}\nwire_identity = 'none'\n[providers.llama-cpp]\ndriver = 'llama-cpp'\nbase_url = 'http://{address}'\n"
+      )).unwrap();
       fs::write(
         root.join("auth.yaml"),
-        format!("version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: http://{address}\n"),
+        "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n",
       )
       .unwrap();
       Self {

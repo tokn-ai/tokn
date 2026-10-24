@@ -624,7 +624,24 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     root = Path(cls.root.name)
     cls.config_path = root / "config.toml"
     cls.auth_path = root / "auth.yaml"
-    cls.config_path.write_text('[defaults]\nmode = "exact"\n')
+    cls.config_path.write_text(
+      "\n".join(
+        [
+          "schema_version = 2",
+          "[defaults]",
+          'provider = { kind = "any" }',
+          'model = { kind = "qualified", namespace = "provider" }',
+          'wire_identity = "none"',
+          '[providers."llama-cpp"]',
+          'driver = "llama-cpp"',
+          f'base_url = "http://127.0.0.1:{cls.server.server_port}"',
+          "[providers.openai]",
+          'driver = "openai"',
+          f'base_url = "http://127.0.0.1:{cls.server.server_port}"',
+          "",
+        ]
+      )
+    )
     cls.auth_path.write_text(
       "\n".join(
         [
@@ -632,10 +649,8 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
           "accounts:",
           "  - id: local-llama",
           "    provider: llama-cpp",
-          f"    base_url: http://127.0.0.1:{cls.server.server_port}",
           "  - id: local-openai",
           "    provider: openai",
-          f"    base_url: http://127.0.0.1:{cls.server.server_port}",
           "    api_key: test-key",
           "",
         ]
@@ -664,6 +679,15 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
   def last_request(self) -> dict[str, Any]:
     self.assertTrue(ProviderHandler.requests)
     return ProviderHandler.requests[-1]
+
+  def test_legacy_config_surfaces_as_configuration_error(self) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+      config_path = Path(directory) / "config.toml"
+      config_path.write_text('[defaults]\nmode = "exact"\n')
+      with self.assertRaises(ConfigurationError):
+        Client(config_path=config_path, auth_path=self.auth_path)
+
+    self.assertFalse(ProviderHandler.requests)
 
   async def test_client_bound_generation_normalizes_response(self) -> None:
     response = await (

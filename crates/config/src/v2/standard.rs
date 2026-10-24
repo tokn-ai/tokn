@@ -62,6 +62,28 @@ pub fn compile(raw: &RawConfig, source: &Path) -> Result<GatewayPlan> {
 
 /// Compile both the routing graph and process-wide service settings.
 pub fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig> {
+  validate_schema_version(raw, source)?;
+
+  compile::compile_config(raw, source).map_err(|source_error| Error::Compile {
+    path: source.to_path_buf(),
+    source: Box::new(source_error),
+  })
+}
+
+/// Compile execution policy and service settings without compiling listeners.
+///
+/// This accepts both listener-free SDK documents and gateway documents. Gateway
+/// admission settings are outside this boundary; all execution references and
+/// service settings still receive the same validation as a gateway config.
+pub fn compile_execution_config(raw: &RawConfig, source: &Path) -> Result<CompiledExecutionConfig> {
+  validate_schema_version(raw, source)?;
+  compile::compile_execution_config(raw).map_err(|source_error| Error::Compile {
+    path: source.to_path_buf(),
+    source: Box::new(source_error),
+  })
+}
+
+fn validate_schema_version(raw: &RawConfig, source: &Path) -> Result<()> {
   if raw.schema_version != SCHEMA_VERSION {
     return Err(Error::UnsupportedSchemaVersion {
       path: source.to_path_buf(),
@@ -69,10 +91,7 @@ pub fn compile_config(raw: &RawConfig, source: &Path) -> Result<CompiledConfig> 
     });
   }
 
-  compile::compile_config(raw, source).map_err(|source_error| Error::Compile {
-    path: source.to_path_buf(),
-    source: Box::new(source_error),
-  })
+  Ok(())
 }
 
 /// Strictly decode and semantically compile a version 2 document.
@@ -97,6 +116,12 @@ pub fn load(path: &Path) -> Result<GatewayPlan> {
 pub fn load_config(path: &Path) -> Result<CompiledConfig> {
   let raw = load_raw(path)?;
   compile_config(&raw, path)
+}
+
+/// Strictly load v2 execution policy and service settings for an in-process client.
+pub fn load_execution_config(path: &Path) -> Result<CompiledExecutionConfig> {
+  let raw = load_raw(path)?;
+  compile_execution_config(&raw, path)
 }
 
 #[cfg(test)]
@@ -133,5 +158,30 @@ mod tests {
     let path = directory.path().join("missing.toml");
     let error = load_raw(&path).unwrap_err();
     assert!(matches!(error, Error::Read { source, .. } if source.kind() == std::io::ErrorKind::NotFound));
+  }
+
+  #[test]
+  fn execution_config_uses_shared_policy_and_service_validation_without_listeners() {
+    let path = Path::new("config.toml");
+    let raw = decode(
+      "schema_version = 2\n[defaults]\n[service.outbound]\nproxy_url = 'http://localhost:8080'\n",
+      path,
+    )
+    .unwrap();
+    let compiled = compile_execution_config(&raw, path).unwrap();
+    assert_eq!(compiled.execution(), &super::super::compile_execution(&raw).unwrap());
+    assert_eq!(
+      compiled.service().outbound().proxy_url(),
+      Some("http://localhost:8080/")
+    );
+    assert!(matches!(compile_config(&raw, path), Err(Error::Compile { .. })));
+
+    let mut invalid = raw;
+    invalid.service.outbound.use_system_proxy = true;
+    assert!(matches!(
+      compile_execution_config(&invalid, path),
+      Err(Error::Compile { source, .. })
+        if matches!(*source, CompileError::InvalidValue { ref location, .. } if location == "service.outbound")
+    ));
   }
 }

@@ -15,7 +15,10 @@ mod models;
 mod raw;
 
 #[cfg(feature = "std")]
-pub use compiled::{CompiledConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan, ServicePlan};
+pub use compiled::{
+  CompiledConfig, CompiledExecutionConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan,
+  ServicePlan,
+};
 pub use cors::RawCors;
 pub use defaults::RawDefaultPolicy;
 pub use error::CompileError;

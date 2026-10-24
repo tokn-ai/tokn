@@ -33,6 +33,17 @@ test("native configuration failures retain their public error type", async () =>
         error.code === "configuration_error" &&
         error.cause instanceof Error,
     );
+    const legacyConfigPath = join(fixtureRoot, "legacy-config.toml");
+    const authPath = join(fixtureRoot, "auth.yaml");
+    await writeFile(legacyConfigPath, '[defaults]\nmode = "exact"\n');
+    await writeFile(authPath, "version: 1\naccounts: []\n");
+    await assert.rejects(
+      Client.create({ config_path: legacyConfigPath, auth_path: authPath }),
+      (error: unknown) =>
+        error instanceof ConfigurationError &&
+        error.code === "configuration_error" &&
+        error.cause instanceof Error,
+    );
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -124,7 +135,20 @@ test("the native client loads configured credentials and completes a provider re
   const fixtureRoot = await mkdtemp(join(tmpdir(), "tokn-typescript-"));
   const configPath = join(fixtureRoot, "config.toml");
   const authPath = join(fixtureRoot, "auth.yaml");
-  await writeFile(configPath, '[defaults]\nmode = "exact"\n');
+  await writeFile(
+    configPath,
+    [
+      "schema_version = 2",
+      "[defaults]",
+      'provider = { kind = "fixed", provider = "llama-cpp" }',
+      'model = { kind = "qualified", namespace = "provider" }',
+      'wire_identity = "none"',
+      '[providers."llama-cpp"]',
+      'driver = "llama-cpp"',
+      `base_url = "http://127.0.0.1:${address.port}"`,
+      "",
+    ].join("\n"),
+  );
   await writeFile(
     authPath,
     [
@@ -132,7 +156,6 @@ test("the native client loads configured credentials and completes a provider re
       "accounts:",
       "  - id: local-llama",
       "    provider: llama-cpp",
-      `    base_url: http://127.0.0.1:${address.port}`,
       "",
     ].join("\n"),
   );

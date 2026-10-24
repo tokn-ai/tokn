@@ -17,6 +17,8 @@ pub mod retry;
 #[cfg(feature = "std")]
 pub mod runtime;
 pub mod send_policy;
+#[cfg(feature = "std")]
+pub mod v2;
 
 #[cfg(feature = "std")]
 pub mod event;
