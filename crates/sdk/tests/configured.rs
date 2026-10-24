@@ -3,8 +3,41 @@ extern crate alloc;
 mod scenarios;
 
 #[test]
+fn typed_event_summaries() {
+  scenarios::typed_event_summaries();
+}
+#[test]
+fn buffered_usage_events() {
+  scenarios::buffered_usage_events();
+}
+#[test]
+fn streaming_usage_events() {
+  scenarios::streaming_usage_events();
+}
+#[test]
+fn typed_event_retry_attribution() {
+  scenarios::typed_event_retry_attribution();
+}
+#[test]
+fn typed_event_failures() {
+  scenarios::typed_event_failures();
+}
+#[test]
+fn event_timestamps_and_local_sink() {
+  scenarios::event_timestamps_and_local_sink();
+}
+
+#[test]
 fn all_native_formats() {
   scenarios::buffered_round_trip();
+}
+#[test]
+fn buffered_content_detection() {
+  scenarios::buffered_content_detection();
+}
+#[test]
+fn buffered_response_limits() {
+  scenarios::buffered_response_limits();
 }
 #[test]
 fn local_streaming() {
@@ -33,6 +66,18 @@ fn response_body_failure_does_not_retry() {
 #[test]
 fn stream_errors_and_borrow_release() {
   scenarios::stream_errors_and_cancellation();
+}
+#[test]
+fn streaming_terminal_lifecycle() {
+  scenarios::streaming_terminal_lifecycle();
+}
+#[test]
+fn streaming_failure_lifecycle() {
+  scenarios::streaming_failure_lifecycle();
+}
+#[test]
+fn streaming_cancellation_lifecycle() {
+  scenarios::streaming_cancellation_lifecycle();
 }
 
 #[test]

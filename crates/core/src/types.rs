@@ -9,6 +9,15 @@
 //! Local values cannot cross threads. Dropping the final shared owner drops
 //! its allocation normally; a nonempty slice retains its entire backing buffer.
 
+/// Shared ownership for portable values. Standard builds retain atomic sharing;
+/// alloc-only builds use local reference counting and cannot cross threads.
+#[cfg(not(feature = "std"))]
+pub use alloc::rc::Rc as Shared;
+/// Shared ownership for portable values. Standard builds retain atomic sharing;
+/// alloc-only builds use local reference counting and cannot cross threads.
+#[cfg(feature = "std")]
+pub use alloc::sync::Arc as Shared;
+
 #[cfg(feature = "std")]
 pub use bytes::Bytes;
 #[cfg(feature = "std")]

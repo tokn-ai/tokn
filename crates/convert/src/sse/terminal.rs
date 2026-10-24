@@ -24,6 +24,12 @@ impl TerminalState {
     if self.completed {
       return Ok(true);
     }
+    if event.is_done() && self.endpoint != Endpoint::ChatCompletions {
+      return Err(ConvertError::sse(format!(
+        "upstream {} stream received [DONE] before its terminal event",
+        self.endpoint.as_str(),
+      )));
+    }
     let json_kind = event
       .json
       .as_ref()

@@ -1,9 +1,9 @@
-//! Closed set of pipeline-observation events emitted by `tokn-requests`'s
-//! `PipelineRunner`.
+//! Closed set of pipeline-observation events emitted by standard and injected
+//! execution in `tokn-requests`.
 //!
 //! These types live in `tokn-core` (rather than `tokn-requests`) so that the
-//! workspace's `tokn_core::event::Event` enum can embed a `Requests(StageEvent)`
-//! variant without inverting the dep graph (requests depends on tokn-core).
+//! workspace's standard `tokn_core::event::Event` enum can embed request events
+//! without inverting the dep graph (requests depends on tokn-core).
 //!
 //! `StageEvent` carries **lossy summaries** of each stage's output rather than
 //! the full stage-output structs. The full structs in `tokn-requests` embed
@@ -19,12 +19,10 @@
 use crate::headers::{HeaderMap, TemplateVars};
 use crate::provider::Endpoint;
 use crate::request_classification::RequestClassification;
+use crate::types::{Bytes, Shared, SmolStr};
 use crate::AgentId;
-use bytes::Bytes;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
-use smol_str::SmolStr;
-use std::sync::Arc;
 
 // Preserve the established event-module path for standard consumers.
 pub use crate::endpoint::RequestEndpoint;
@@ -57,8 +55,8 @@ impl Stage {
   }
 }
 
-impl std::fmt::Display for Stage {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Stage {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
     f.write_str(self.as_str())
   }
 }
@@ -79,7 +77,8 @@ pub struct ExtractedSummary {
   pub headers: HeaderMap,
   pub raw_body: Bytes,
   pub decoded_body: Bytes,
-  pub body_json: Arc<Value>,
+  #[serde(serialize_with = "serialize_shared")]
+  pub body_json: Shared<Value>,
 }
 
 /// Cloneable summary of `tokn_requests::pipeline::stages::Resolved`. Drops
@@ -110,7 +109,8 @@ pub struct BuiltHeadersSummary {
 /// tokn-core free of requests's `utils::codec` types.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConvertedRequestSummary {
-  pub upstream_body: Arc<Value>,
+  #[serde(serialize_with = "serialize_shared")]
+  pub upstream_body: Shared<Value>,
   pub upstream_wire_body: Bytes,
   pub debug_outbound_body: Bytes,
   pub content_encoding: Option<SmolStr>,
@@ -128,22 +128,36 @@ pub struct SentSummary {
   pub stream: bool,
 }
 
-/// Cloneable summary of `tokn_requests::pipeline::stages::ConvertedResponse`.
-/// `Buffered` shares the response's `Arc<Value>` body; `Stream` leaves
-/// `body` as `None` because the live SSE byte stream is single-shot.
+/// Cloneable summary of a converted response. Parsed buffered JSON bodies are
+/// shared. Streams and buffered responses without parsed JSON set `body` to `None`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConvertedResponseSummary {
   pub status: u16,
   pub headers: HeaderMap,
-  /// `Some` for buffered responses; `None` for streaming responses.
-  pub body: Option<Arc<Value>>,
+  /// Parsed buffered JSON, when available. `None` for streams and unparsed
+  /// buffered bodies, such as empty or opaque bytes.
+  #[serde(serialize_with = "serialize_optional_shared")]
+  pub body: Option<Shared<Value>>,
+}
+
+// Serialize the underlying values directly: serde's `rc` feature also enables
+// Arc support, which is unavailable on targets without pointer-width atomics.
+fn serialize_shared<T: Serialize + ?Sized, S: Serializer>(value: &Shared<T>, serializer: S) -> Result<S::Ok, S::Error> {
+  value.as_ref().serialize(serializer)
+}
+
+fn serialize_optional_shared<T: Serialize + ?Sized, S: Serializer>(
+  value: &Option<Shared<T>>,
+  serializer: S,
+) -> Result<S::Ok, S::Error> {
+  value.as_deref().serialize(serializer)
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StageEvent {
-  /// Emitted once at the very start of requests's `PipelineRunner::run`,
-  /// before any stage has produced output.
+  /// Emitted once at the start of each attempt, before any stage has produced
+  /// output. A retry starts another attempt with the same request identifier.
   Started { request_endpoint: RequestEndpoint },
   /// Extract stage completed successfully.
   Extract(ExtractedSummary),
@@ -155,9 +169,9 @@ pub enum StageEvent {
   ConvertRequest(ConvertedRequestSummary),
   /// Send stage completed successfully.
   Send(SentSummary),
-  /// ConvertResponse stage completed successfully. Buffered bodies are
-  /// shared via `Arc<Value>`; streaming bodies are not included on the
-  /// event (the live byte stream is single-shot).
+  /// Response conversion produced a buffered response or a live stream.
+  /// Parsed buffered JSON is shared; a live stream's final outcome is reported
+  /// later by `Completed` after delivery, failure, or cancellation.
   ConvertResponse(ConvertedResponseSummary),
   /// Any stage failure (or deliberate stop). `recoverable` and `stop` are
   /// propagated verbatim from the requests `PipelineError`. Subscribers that
@@ -168,8 +182,10 @@ pub enum StageEvent {
     recoverable: bool,
     stop: bool,
   },
-  /// Emitted once at the end of requests's `PipelineRunner::run`. `success`
-  /// is `true` only when the pipeline produced a `ConvertedResponse`; both
-  /// real failures and deliberate stops set it to `false`.
+  /// Emitted once when an attempt finishes. Buffered attempts finish after
+  /// response conversion; live streams finish after their last output is
+  /// delivered, or on failure or cancellation. `success` is false for failures,
+  /// cancellation, and deliberate stops. `attempts` counts attempts so far,
+  /// including the one that just finished.
   Completed { success: bool, attempts: u32 },
 }

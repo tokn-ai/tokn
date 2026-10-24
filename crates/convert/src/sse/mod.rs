@@ -4,6 +4,7 @@ pub mod decoder;
 pub mod event;
 #[cfg(feature = "std")]
 pub mod pipeline;
+mod processor;
 pub mod responses_emit;
 mod terminal;
 mod transformer;
@@ -17,6 +18,7 @@ pub use decoder::{DecodeError, Decoder, Record};
 pub use event::SseEvent;
 #[cfg(feature = "std")]
 pub use pipeline::{observer_channel, ObserverMsg, ObserverReceiver, ObserverSender, SsePipeline, TapKinds};
+pub use processor::{StreamOutcome, StreamProcessor};
 pub use terminal::TerminalState;
 pub use transformer::EventTransformer;
 pub use translate::EndpointTranslator;

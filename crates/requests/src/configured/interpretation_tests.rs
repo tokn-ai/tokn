@@ -33,8 +33,8 @@ impl Runtime for NoIo {
   }
 }
 
-// Exercise the two actual extraction stages, including fields that do not yet
-// have an injected event payload or a provider-visible effect.
+// Exercise the two actual extraction stages, including metadata that does not
+// have a provider-visible effect.
 async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) -> RequestInterpretation {
   let headers = options.inbound_headers();
   let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
@@ -71,6 +71,7 @@ async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) 
     attempt: 0,
     retry: RetryPolicy::default(),
     terminal: false,
+    stage: Stage::Extract,
   };
   let injected = local.extract().await.unwrap();
   assert_eq!(

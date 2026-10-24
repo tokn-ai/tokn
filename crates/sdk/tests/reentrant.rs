@@ -21,7 +21,8 @@ use tokn_sdk::{
   account::AccountConfig,
   chat_completions::ChatRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, Injected, Lifecycle, RequestOptions, Runtime,
+  Client, EventRuntime, Injected, Lifecycle, RequestEvent, RequestEventPayload, RequestEventSink, RequestOptions,
+  Runtime, StageEvent,
 };
 
 const JSON: &[u8] = br#"{"id":"chat-local","object":"chat.completion","model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]}"#;
@@ -30,6 +31,7 @@ const SSE: &[u8] =
   b"data: {\"id\":\"chat-local\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n";
 
 type LocalClient = Client<Injected<LocalTransport, LocalRuntime>>;
+type TypedClient = Client<Injected<LocalTransport, EventRuntime<LocalRuntime, TypedSink>>>;
 
 #[derive(Default)]
 struct Shared {
@@ -42,7 +44,10 @@ struct Shared {
   sleeping: Cell<bool>,
   resource: RefCell<Weak<Resource>>,
   client: RefCell<Weak<LocalClient>>,
+  typed_client: RefCell<Weak<TypedClient>>,
+  typed_events: RefCell<Vec<RequestEvent>>,
   reenter: Cell<bool>,
+  typed_reenter: Cell<bool>,
   reentry_errors: RefCell<Vec<String>>,
 }
 
@@ -154,6 +159,27 @@ impl Runtime for LocalRuntime {
   }
 }
 
+struct TypedSink(Rc<Shared>);
+impl RequestEventSink for TypedSink {
+  fn emit_request(&mut self, event: RequestEvent) {
+    let completed = matches!(
+      event.payload,
+      RequestEventPayload::Stage(StageEvent::Completed { success: true, .. })
+    );
+    self.0.typed_events.borrow_mut().push(event);
+    if completed && self.0.typed_reenter.replace(false) {
+      let client = self.0.typed_client.borrow().upgrade().expect("client remains alive");
+      let error = ready(
+        client
+          .chat_completions()
+          .create_with(&request(), RequestOptions::default().with_request_id("from-typed-sink")),
+      )
+      .expect_err("a typed sink cannot reenter its borrowed runtime");
+      self.0.reentry_errors.borrow_mut().push(error.to_string());
+    }
+  }
+}
+
 fn client(shared: &Rc<Shared>, replies: impl IntoIterator<Item = &'static [u8]>) -> Rc<LocalClient> {
   client_with_retry(shared, replies, false)
 }
@@ -163,6 +189,16 @@ fn client_with_retry(
   replies: impl IntoIterator<Item = &'static [u8]>,
   retry: bool,
 ) -> Rc<LocalClient> {
+  let client = Rc::new(Client::from_platform(platform(shared, replies, retry)));
+  *shared.client.borrow_mut() = Rc::downgrade(&client);
+  client
+}
+
+fn platform(
+  shared: &Rc<Shared>,
+  replies: impl IntoIterator<Item = &'static [u8]>,
+  retry: bool,
+) -> Injected<LocalTransport, LocalRuntime> {
   let mut raw = json!({
     "schema_version": 2,
     "defaults": {"provider": {"kind":"fixed", "provider":"upstream"}, "wire_identity":"none"},
@@ -185,7 +221,7 @@ fn client_with_retry(
       .unwrap(),
     );
   }
-  let platform = Injected::new(
+  Injected::new(
     plan,
     accounts,
     LocalTransport {
@@ -195,9 +231,14 @@ fn client_with_retry(
     },
     LocalRuntime(shared.clone()),
   )
-  .unwrap();
-  let client = Rc::new(Client::from_platform(platform));
-  *shared.client.borrow_mut() = Rc::downgrade(&client);
+  .unwrap()
+}
+
+fn typed_client(shared: &Rc<Shared>, replies: impl IntoIterator<Item = &'static [u8]>) -> Rc<TypedClient> {
+  let client = Rc::new(Client::from_platform(
+    platform(shared, replies, false).with_event_sink(TypedSink(shared.clone())),
+  ));
+  *shared.typed_client.borrow_mut() = Rc::downgrade(&client);
   client
 }
 
@@ -234,6 +275,74 @@ fn terminal_observer_reentry_returns_busy_without_closing_another_exchange() {
   assert_eq!(state.sent.get(), 2);
   assert_eq!(state.closed.get(), 2);
   assert_eq!(state.released.get(), 2);
+}
+
+#[test]
+fn terminal_typed_sink_reentry_returns_busy_and_keeps_events_once() {
+  let state = Rc::new(Shared::default());
+  let client = typed_client(&state, [SSE, JSON]);
+  state.typed_reenter.set(true);
+  let endpoint = client.chat_completions();
+  let request = request();
+  let mut stream = ready(endpoint.stream(&request)).unwrap();
+  assert!(ready(stream.next_event()).unwrap().is_some());
+  assert!(ready(stream.next_event()).unwrap().unwrap().is_done());
+  assert_eq!(state.reentry_errors.borrow().len(), 1);
+  assert!(state.reentry_errors.borrow()[0].contains("runtime"));
+  assert_eq!(state.sent.get(), 1);
+  assert_eq!(state.closed.get(), 1);
+  assert_eq!(state.released.get(), 1);
+  drop(stream);
+  let completed = state
+    .typed_events
+    .borrow()
+    .iter()
+    .filter(|event| matches!(event.payload, RequestEventPayload::Stage(StageEvent::Completed { .. })))
+    .count();
+  assert_eq!(completed, 1);
+  ready(endpoint.create(&request)).unwrap();
+  assert_eq!(state.sent.get(), 2);
+  assert_eq!(state.closed.get(), 2);
+}
+
+#[test]
+fn cancelled_send_and_read_emit_one_typed_failure() {
+  for pause_send in [true, false] {
+    let state = Rc::new(Shared::default());
+    state.pause_send.set(pause_send);
+    state.pause_read.set(!pause_send);
+    let client = typed_client(&state, [JSON, JSON]);
+    let endpoint = client.chat_completions();
+    let request = request();
+    let mut operation = Box::pin(endpoint.create(&request));
+    assert!(operation
+      .as_mut()
+      .poll(&mut Context::from_waker(Waker::noop()))
+      .is_pending());
+    drop(operation);
+    let events = state.typed_events.borrow();
+    let outcomes: Vec<_> = events
+      .iter()
+      .filter_map(|event| match event.payload {
+        RequestEventPayload::Stage(StageEvent::Completed { success, .. }) => Some(success),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(outcomes, [false]);
+    assert_eq!(
+      events
+        .iter()
+        .filter(|event| matches!(event.payload, RequestEventPayload::Stage(StageEvent::Error { .. })))
+        .count(),
+      1
+    );
+    drop(events);
+    assert_eq!(state.closed.get(), 1);
+    assert_eq!(state.released.get(), 1);
+    state.pause_send.set(false);
+    state.pause_read.set(false);
+    ready(endpoint.create(&request)).unwrap();
+  }
 }
 
 #[test]

@@ -25,7 +25,6 @@ pub mod provider;
 pub mod provider;
 mod provider_values;
 pub mod request_classification;
-#[cfg(feature = "std")]
 pub mod request_event;
 pub mod settings;
 pub mod time;

@@ -33,9 +33,9 @@ pub use response::{ByteStream, RawResponse, ResponseBody, StreamResponse};
 #[cfg(feature = "std")]
 pub use std_client::{ClientBuilder, StdPlatform};
 pub use tokn_config as config;
-pub use tokn_core::{account, settings};
+pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
-pub use tokn_requests::configured::{Injected, Lifecycle, Limits, Runtime};
+pub use tokn_requests::configured::{EventRuntime, Injected, Lifecycle, Limits, Runtime};
 pub use tokn_service::transport;
 
 #[cfg(feature = "std")]
@@ -45,8 +45,9 @@ pub use tokn_core::generation::{
   GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary,
 };
 pub use tokn_core::provider::Endpoint;
-#[cfg(feature = "std")]
-pub use tokn_core::request_event::{RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+pub use tokn_core::request_event::{
+  RecordEvent, RequestEvent, RequestEventPayload, RequestEventSink, Stage, StageEvent,
+};
 pub use tokn_endpoint_chat_completions as chat_completions;
 pub use tokn_endpoint_messages as messages;
 pub use tokn_endpoint_responses as responses;

@@ -15,7 +15,14 @@ use tokn_sdk::{
   messages::MessagesRequest,
   responses::ResponsesRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, Injected, Lifecycle, Limits, RequestOptions, Runtime,
+  Client, Endpoint, Injected, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
+};
+
+#[path = "typed_events.rs"]
+mod typed_events;
+pub use typed_events::{
+  buffered_usage_events, event_timestamps_and_local_sink, streaming_usage_events, typed_event_failures,
+  typed_event_retry_attribution, typed_event_summaries,
 };
 
 const CHAT_JSON: &[u8] = br#"{"id":"chat-test","object":"chat.completion","model":"model","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
@@ -75,8 +82,18 @@ struct MemoryTransport<'a> {
   encoding: &'static str,
   recoverable_errors: bool,
   read_failure_after: Option<usize>,
+  trace: Rc<RefCell<TransportTrace>>,
+}
+#[derive(Default)]
+struct TransportTrace {
+  reads: usize,
+  closed: usize,
 }
 impl<'a> MemoryTransport<'a> {
+  fn with_trace(mut self, trace: Rc<RefCell<TransportTrace>>) -> Self {
+    self.trace = trace;
+    self
+  }
   fn with_encoding(mut self, encoding: &'static str) -> Self {
     self.encoding = encoding;
     self
@@ -103,6 +120,7 @@ impl<'a> MemoryTransport<'a> {
       encoding: "identity",
       recoverable_errors: true,
       read_failure_after: None,
+      trace: Rc::default(),
     }
   }
 }
@@ -134,7 +152,9 @@ impl Transport for MemoryTransport<'_> {
       status: reply.status,
       headers,
     };
-    head.headers.insert("content-type", reply.content_type);
+    if !reply.content_type.is_empty() {
+      head.headers.insert("content-type", reply.content_type);
+    }
     if self.encoding != "identity" {
       head.headers.insert("content-encoding", self.encoding);
       head.headers.insert("content-length", "1");
@@ -142,6 +162,7 @@ impl Transport for MemoryTransport<'_> {
     Ok(head)
   }
   async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+    self.trace.borrow_mut().reads += 1;
     poll_fn(|context| {
       if self.read_failure_after.is_some_and(|limit| self.position >= limit) {
         self.read_failure_after = None;
@@ -166,6 +187,11 @@ impl Transport for MemoryTransport<'_> {
   }
   fn recoverable(&self, _: &Self::Error) -> bool {
     self.recoverable_errors
+  }
+  fn close_response(&mut self) {
+    self.trace.borrow_mut().closed += 1;
+    self.active = &[];
+    self.position = 0;
   }
 }
 
@@ -400,6 +426,152 @@ pub fn cross_format_round_trip() {
     assert!(request.url.ends_with("/chat/completions"));
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["messages"][0]["content"], "hello");
+  }
+}
+
+/// Buffered responses sniff SSE without relying on a correct Content-Type,
+/// while empty bodies remain successful at the untyped execution boundary.
+pub fn buffered_content_detection() {
+  for content_type in ["", "application/json", "text/event-stream; charset=utf-8"] {
+    for endpoint in [tokn_sdk::Endpoint::ChatCompletions, tokn_sdk::Endpoint::Messages] {
+      let sent = RefCell::new(Vec::new());
+      let platform = make_client(
+        &sent,
+        [Reply {
+          status: 200,
+          content_type,
+          bytes: CHAT_SSE,
+        }],
+        "openai",
+      )
+      .into_platform();
+      let response = run(platform.execute(
+        endpoint,
+        serde_json::to_value(messages()).unwrap(),
+        RequestOptions::default(),
+      ))
+      .unwrap();
+      let (_, headers, body) = response.into_json::<Value>().unwrap();
+      assert_eq!(headers.get("content-type").unwrap().as_str(), "application/json");
+      let text = match endpoint {
+        tokn_sdk::Endpoint::ChatCompletions => &body["choices"][0]["message"]["content"],
+        _ => &body["content"][0]["text"],
+      };
+      assert_eq!(text, "héllo 🌍");
+    }
+  }
+  for content_type in ["", "application/json"] {
+    let sent = RefCell::new(Vec::new());
+    let platform = make_client(
+      &sent,
+      [Reply {
+        status: 200,
+        content_type,
+        bytes: &[],
+      }],
+      "openai",
+    )
+    .into_platform();
+    let response = run(platform.execute(
+      tokn_sdk::Endpoint::ChatCompletions,
+      serde_json::to_value(chat()).unwrap(),
+      RequestOptions::default(),
+    ))
+    .unwrap();
+    assert_eq!(response.status, 200);
+    // Empty response bodies are accepted by execution, but have no typed JSON value.
+    assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+  }
+
+  let sent = RefCell::new(Vec::new());
+  let platform = make_client(
+    &sent,
+    [Reply {
+      status: 200,
+      content_type: "text/plain",
+      bytes: b"not JSON or SSE",
+    }],
+    "openai",
+  )
+  .into_platform();
+  let error = run(platform.execute(
+    tokn_sdk::Endpoint::ChatCompletions,
+    serde_json::to_value(chat()).unwrap(),
+    RequestOptions::default(),
+  ))
+  .err()
+  .expect("managed non-JSON bodies must fail normalization");
+  assert_eq!(error.stage, "convert_response");
+}
+
+/// Buffered normalization enforces limits before and after conversion, as well
+/// as the per-event limit when an SSE body arrives without its expected MIME.
+pub fn buffered_response_limits() {
+  const MINIMAL_CHAT: &[u8] = br#"{"choices":[{"message":{"role":"assistant","content":""}}]}"#;
+  for (reply, endpoint, limits, succeeds) in [
+    (
+      Reply::json(CHAT_JSON),
+      tokn_sdk::Endpoint::ChatCompletions,
+      Limits {
+        max_response_bytes: CHAT_JSON.len(),
+        ..Limits::default()
+      },
+      true,
+    ),
+    (
+      Reply::json(CHAT_JSON),
+      tokn_sdk::Endpoint::ChatCompletions,
+      Limits {
+        max_response_bytes: CHAT_JSON.len() - 1,
+        ..Limits::default()
+      },
+      false,
+    ),
+    (
+      Reply::json(MINIMAL_CHAT),
+      tokn_sdk::Endpoint::Messages,
+      Limits::default(),
+      true,
+    ),
+    (
+      Reply::json(MINIMAL_CHAT),
+      tokn_sdk::Endpoint::Messages,
+      Limits {
+        max_response_bytes: MINIMAL_CHAT.len(),
+        ..Limits::default()
+      },
+      false,
+    ),
+    (
+      Reply::json(CHAT_SSE),
+      tokn_sdk::Endpoint::Messages,
+      Limits {
+        max_event_bytes: 16,
+        ..Limits::default()
+      },
+      false,
+    ),
+  ] {
+    let sent = RefCell::new(Vec::new());
+    let platform = make_client(&sent, [reply], "openai")
+      .into_platform()
+      .with_limits(limits);
+    let result = run(platform.execute(
+      endpoint,
+      serde_json::to_value(messages()).unwrap(),
+      RequestOptions::default(),
+    ));
+    match result {
+      Ok(response) => {
+        assert!(succeeds, "response limit must reject the body");
+        response.into_json::<Value>().unwrap();
+      }
+      Err(error) => {
+        assert!(!succeeds, "valid response was rejected: {error}");
+        assert_eq!(error.stage, "convert_response");
+        assert!(error.message.contains("limit"));
+      }
+    }
   }
 }
 
@@ -647,6 +819,24 @@ pub fn response_body_failure_does_not_retry() {
 
 /// EOF and event limits are errors, and dropping a stream releases the borrowed session.
 pub fn stream_errors_and_cancellation() {
+  // Content sniffing is only for buffered normalization. Live streaming still
+  // requires an SSE Content-Type even if its bytes contain a valid SSE stream.
+  for content_type in ["", "application/json"] {
+    let sent = RefCell::new(Vec::new());
+    let client = make_client(
+      &sent,
+      [Reply {
+        status: 200,
+        content_type,
+        bytes: CHAT_SSE,
+      }],
+      "openai",
+    );
+    let error = run(client.chat_completions().stream(&chat()))
+      .err()
+      .expect("live SSE requires its MIME");
+    assert_eq!(error.stage, "convert_response");
+  }
   const TRUNCATED: &[u8] = b"data: {\"choices\":[]}\n\n";
   let sent = RefCell::new(Vec::new());
   let client = make_client(&sent, [Reply::sse(TRUNCATED)], "openai");
@@ -685,6 +875,248 @@ pub fn stream_errors_and_cancellation() {
   drop(events);
   assert!(run(client.chat_completions().create(&request)).is_ok());
   assert_eq!(sent.borrow().len(), 2);
+}
+
+fn stream_request(endpoint: Endpoint) -> Value {
+  let mut request = match endpoint {
+    Endpoint::ChatCompletions => serde_json::to_value(chat()).unwrap(),
+    Endpoint::Responses => serde_json::to_value(responses()).unwrap(),
+    Endpoint::Messages => serde_json::to_value(messages()).unwrap(),
+  };
+  request["stream"] = Value::Bool(true);
+  request
+}
+
+fn assert_completions(runtime: &TestRuntime, expected: &[bool]) {
+  let state = runtime.0.borrow();
+  let completed: Vec<_> = state
+    .events
+    .iter()
+    .filter(|event| event.stage == "completed")
+    .map(|event| event.success.expect("completion includes its outcome"))
+    .collect();
+  assert_eq!(completed, expected);
+}
+
+/// Completion follows delivery of the final event, without another transport
+/// read. The same rules hold when one upstream event expands into many outputs.
+pub fn streaming_terminal_lifecycle() {
+  const CHAT_WITH_USAGE: &[u8] = concat!(
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}\n\n",
+    "data: [DONE]\n\n"
+  )
+  .as_bytes();
+  for (endpoint, driver, bytes) in [
+    (Endpoint::ChatCompletions, "github-copilot", CHAT_WITH_USAGE),
+    (Endpoint::Responses, "github-copilot", RESPONSES_SSE),
+    (Endpoint::Messages, "github-copilot", MESSAGES_SSE),
+    (Endpoint::Responses, "deepseek", CHAT_SSE),
+    (Endpoint::Messages, "openai", CHAT_SSE),
+  ] {
+    let sent = RefCell::new(Vec::new());
+    let runtime = TestRuntime::default();
+    let transport = Rc::new(RefCell::new(TransportTrace::default()));
+    let client = Client::from_platform(
+      Injected::new(
+        plan(driver),
+        vec![account_config("primary", "test-key", "active")],
+        MemoryTransport::new(&sent, [Reply::sse(bytes)])
+          .with_trace(transport.clone())
+          .with_read_failure_after(bytes.len()),
+        runtime.clone(),
+      )
+      .unwrap(),
+    );
+    let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
+      .unwrap()
+      .into_stream()
+      .unwrap();
+    assert_completions(&runtime, &[]);
+    let mut terminal_count = 0;
+    let mut saw_usage_after_finish = false;
+    while let Some(event) = run(events.next_event()).unwrap() {
+      saw_usage_after_finish |= event
+        .json
+        .as_ref()
+        .is_some_and(|value| value["usage"]["total_tokens"] == 3);
+      let terminal = match endpoint {
+        Endpoint::ChatCompletions => event.is_done(),
+        Endpoint::Responses => event
+          .json
+          .as_ref()
+          .is_some_and(|value| value["type"] == "response.completed"),
+        Endpoint::Messages => event.json.as_ref().is_some_and(|value| value["type"] == "message_stop"),
+      };
+      if terminal {
+        terminal_count += 1;
+        assert_completions(&runtime, &[true]);
+      } else {
+        assert_completions(&runtime, &[]);
+      }
+    }
+    assert_eq!(terminal_count, 1);
+    if endpoint == Endpoint::ChatCompletions {
+      assert!(
+        saw_usage_after_finish,
+        "finish_reason must not discard the later usage frame"
+      );
+    }
+    assert!(run(events.next_event()).unwrap().is_none());
+    drop(events);
+    assert_completions(&runtime, &[true]);
+    assert_eq!(transport.borrow().closed, 1);
+    assert!(
+      transport.borrow().reads <= bytes.len(),
+      "terminal stops before the trailing read fault"
+    );
+  }
+}
+
+/// Body failures are terminal, never retried, and release the local session.
+pub fn streaming_failure_lifecycle() {
+  const TRUNCATED_CHAT: &[u8] = b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+  const UNTERMINATED: &[u8] = b"data: [DONE]\n";
+  const ERROR: &[u8] = b"data: {\"error\":{\"message\":\"failed\"}}\n\n";
+  const FAILED: &[u8] = b"event: response.failed\ndata: {\"type\":\"response.failed\"}\n\n";
+  const INCOMPLETE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\"}\n\n";
+  const CANCELLED: &[u8] = b"event: response.cancelled\ndata: {\"type\":\"response.cancelled\"}\n\n";
+  const CONFLICT: &[u8] = b"event: content_block_delta\ndata: {\"type\":\"message_stop\"}\n\n";
+  for (endpoint, driver, bytes, fail_after) in [
+    (Endpoint::ChatCompletions, "openai", TRUNCATED_CHAT, None),
+    (Endpoint::ChatCompletions, "openai", UNTERMINATED, None),
+    (Endpoint::ChatCompletions, "openai", ERROR, None),
+    (Endpoint::Responses, "github-copilot", FAILED, None),
+    (Endpoint::Responses, "github-copilot", INCOMPLETE, None),
+    (Endpoint::Responses, "github-copilot", CANCELLED, None),
+    (Endpoint::Messages, "github-copilot", CONFLICT, None),
+    (Endpoint::Messages, "openai", &b"data: {broken}\n\n"[..], None),
+    (Endpoint::ChatCompletions, "openai", &b"data: \xff\n\n"[..], None),
+    (Endpoint::ChatCompletions, "openai", CHAT_SSE, Some(8)),
+  ] {
+    let sent = RefCell::new(Vec::new());
+    let runtime = TestRuntime::default();
+    let trace = Rc::new(RefCell::new(TransportTrace::default()));
+    let mut transport =
+      MemoryTransport::new(&sent, [Reply::sse(bytes), Reply::json(CHAT_JSON)]).with_trace(trace.clone());
+    transport.read_failure_after = fail_after;
+    let client = Client::from_platform(
+      Injected::new(
+        plan(driver),
+        vec![account_config("primary", "test-key", "active")],
+        transport,
+        runtime.clone(),
+      )
+      .unwrap(),
+    );
+    let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
+      .unwrap()
+      .into_stream()
+      .unwrap();
+    let error = loop {
+      match run(events.next_event()) {
+        Ok(Some(_)) => assert_completions(&runtime, &[]),
+        Ok(None) => panic!("failed stream must surface an error"),
+        Err(error) => break error,
+      }
+    };
+    assert_eq!(error.stage, "stream");
+    assert!(!error.recoverable);
+    assert!(run(events.next_event()).unwrap().is_none());
+    drop(events);
+    assert_completions(&runtime, &[false]);
+    assert_eq!(trace.borrow().closed, 1);
+    assert_eq!(sent.borrow().len(), 1);
+    assert!(runtime.0.borrow().sleeps.is_empty());
+    run(client.chat_completions().create(&chat())).expect("failed stream releases its transport lease");
+    assert_eq!(trace.borrow().closed, 2);
+  }
+}
+
+/// Cancelling one pending pull is resumable. Cancelling or dropping its owning
+/// stream discards pending outputs and reports one failed completion.
+pub fn streaming_cancellation_lifecycle() {
+  for cancel_explicitly in [false, true] {
+    for stop_at in 0..4 {
+      let sent = RefCell::new(Vec::new());
+      let runtime = TestRuntime::default();
+      let trace = Rc::new(RefCell::new(TransportTrace::default()));
+      let (endpoint, bytes) = if stop_at == 2 {
+        (Endpoint::Messages, &b"data: [DONE]\n\n"[..])
+      } else {
+        (Endpoint::ChatCompletions, CHAT_SSE)
+      };
+      let client = Client::from_platform(
+        Injected::new(
+          plan("openai"),
+          vec![account_config("primary", "test-key", "active")],
+          MemoryTransport::new(&sent, [Reply::sse(bytes), Reply::json(CHAT_JSON)]).with_trace(trace.clone()),
+          runtime.clone(),
+        )
+        .unwrap(),
+      );
+      let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
+        .unwrap()
+        .into_stream()
+        .unwrap();
+      match stop_at {
+        0 => {}
+        1 | 2 => {
+          let first = run(events.next_event()).unwrap().unwrap();
+          assert!(!first.is_done());
+          assert!(first.json.is_some_and(|value| value["type"] != "message_stop"));
+        }
+        _ => {
+          let mut pull = pin!(events.next_event());
+          for _ in 0..3 {
+            assert!(pull.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+          }
+        }
+      }
+      assert_completions(&runtime, &[]);
+      if cancel_explicitly {
+        events.cancel();
+        events.cancel();
+        assert!(run(events.next_event()).unwrap().is_none());
+        assert_completions(&runtime, &[false]);
+      }
+      drop(events);
+      assert_completions(&runtime, &[false]);
+      assert_eq!(trace.borrow().closed, 1);
+      run(client.chat_completions().create(&chat())).expect("cancelled stream releases its transport lease");
+      assert_eq!(trace.borrow().closed, 2);
+    }
+  }
+
+  let sent = RefCell::new(Vec::new());
+  let runtime = TestRuntime::default();
+  let trace = Rc::new(RefCell::new(TransportTrace::default()));
+  let client = Client::from_platform(
+    Injected::new(
+      plan("openai"),
+      vec![account_config("primary", "test-key", "active")],
+      MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]).with_trace(trace.clone()),
+      runtime.clone(),
+    )
+    .unwrap(),
+  );
+  let endpoint = client.chat_completions();
+  let request = chat();
+  let mut events = run(endpoint.stream(&request)).unwrap();
+  {
+    let mut pull = pin!(events.next_event());
+    for _ in 0..3 {
+      assert!(pull.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+  }
+  assert_completions(&runtime, &[]);
+  assert_eq!(trace.borrow().closed, 0);
+  let first = run(events.next_event()).unwrap().unwrap();
+  assert_eq!(first.json.unwrap()["choices"][0]["delta"]["content"], "héllo 🌍");
+  while run(events.next_event()).unwrap().is_some() {}
+  drop(events);
+  assert_completions(&runtime, &[true]);
+  assert_eq!(trace.borrow().closed, 1);
 }
 
 /// Provider defaults, per-model operation rules and explicit wire identities
@@ -886,11 +1318,14 @@ pub fn configured_client_relay() {
       Vec::new(),
       MemoryTransport::new(
         &sent,
-        [Reply {
-          status: 503,
-          content_type: "text/plain",
-          bytes: b"opaque upstream failure",
-        }],
+        [
+          Reply {
+            status: 503,
+            content_type: "text/plain",
+            bytes: b"opaque upstream failure",
+          },
+          Reply::sse(CHAT_SSE),
+        ],
       ),
       TestRuntime::default(),
     )
@@ -905,6 +1340,22 @@ pub fn configured_client_relay() {
   assert_eq!(response.status, 503);
   assert_eq!(response.headers.get("content-type").unwrap().as_str(), "text/plain");
   assert_eq!(sent.borrow().len(), 1);
+  assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+
+  // Opaque buffered SSE also bypasses normalization: callers receive its
+  // original media type and cannot decode its wire events as a JSON response.
+  let response = run(client.execute(
+    tokn_sdk::Endpoint::ChatCompletions,
+    json!({"model":"model","stream":false}),
+    RequestOptions::default(),
+  ))
+  .unwrap();
+  assert_eq!(
+    response.headers.get("content-type").unwrap().as_str(),
+    "text/event-stream; charset=utf-8"
+  );
+  assert_eq!(response.into_json::<Value>().unwrap_err().stage, "response");
+  assert_eq!(sent.borrow().len(), 2);
 }
 
 /// Managed status classification matches the standard pipeline: 429 is

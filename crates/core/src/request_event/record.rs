@@ -7,7 +7,7 @@
 //! - records describe transport-adjacent facts the pipeline itself does
 //!   not retain: inbound connection metadata, outbound wire-truth after
 //!   `Provider::patch_headers` auth injection / `Host`+`Content-Length`
-//!   stripping in [`crate::util::http::send`], and parsed usage.
+//!   stripping in `tokn_core::util::http::send`, and parsed usage.
 //!
 //! Persistence uses records to populate connection, usage, outbound,
 //! and fully-converted response body columns; intent values still flow through the per-stage
@@ -22,11 +22,10 @@
 //!
 //! [`RequestEventPayload::Record`]: super::RequestEventPayload::Record
 
-use crate::db::Usage;
 use crate::headers::HeaderMap;
-use bytes::Bytes;
+use crate::types::{Bytes, SmolStr};
+use crate::usage::Usage;
 use serde::Serialize;
-use smol_str::SmolStr;
 
 /// A local rejection returned before the request pipeline takes ownership.
 ///
@@ -59,7 +58,7 @@ pub struct IngressRejection {
 /// subscribers can write each piece as soon as it is known: inbound connection
 /// facts, outbound request bytes, response status and headers, accumulated
 /// bodies, and parsed usage. Providers emit outbound captures through
-/// [`OutboundCapture`](crate::provider::OutboundCapture).
+/// `tokn_core::provider::OutboundCapture` in standard builds.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RecordEvent {
@@ -99,9 +98,9 @@ pub enum RecordEvent {
   /// responses or after streaming accumulation finishes. Streaming paths may
   /// carry a partial body plus the stream termination error.
   UpstreamBody { body: Bytes, error: Option<SmolStr> },
-  /// Materialized client-facing response body after any endpoint translation.
-  /// For buffered responses the `StageEvent::ConvertResponse` summary already
-  /// carries the JSON body, so this record is emitted only for streaming paths.
+  /// Materialized client-facing response bytes after any endpoint translation.
+  /// Standard recording emits buffered bytes or the accumulated streaming body;
+  /// these bytes can also represent empty or opaque non-JSON responses.
   ConvertedBody { body: Bytes, error: Option<SmolStr> },
   /// Parsed token usage attributed to the request. Added now so callers and
   /// persistence can converge on a stable shape before every execution path

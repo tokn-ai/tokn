@@ -8,6 +8,7 @@ pub mod provider {
   pub use tokn_core::Endpoint;
 }
 
+pub mod buffered;
 pub mod chat;
 pub mod error;
 pub mod ir;
@@ -48,9 +49,13 @@ pub fn convert_response(from: Endpoint, to: Endpoint, body: &Value) -> Result<Va
     Endpoint::Responses => value::responses::response_from_value(body)?,
     Endpoint::Messages => value::messages::response_from_value(body)?,
   };
-  match to {
-    Endpoint::ChatCompletions => value::chat::response_to_value(&resp),
-    Endpoint::Responses => value::responses::response_to_value(&resp),
-    Endpoint::Messages => value::messages::response_to_value(&resp),
+  render_response(to, &resp)
+}
+
+fn render_response(endpoint: Endpoint, response: &ir::IrResponse) -> Result<Value> {
+  match endpoint {
+    Endpoint::ChatCompletions => value::chat::response_to_value(response),
+    Endpoint::Responses => value::responses::response_to_value(response),
+    Endpoint::Messages => value::messages::response_to_value(response),
   }
 }

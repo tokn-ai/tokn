@@ -18,13 +18,16 @@ use crate::pipeline::error::{PipelineError, RequestsError};
 use crate::utils::codec::ContentEncodingKind;
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use serde_json::Value;
 use smol_str::SmolStr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokn_accounts::AccountHandle;
+use tokn_convert::sse::StreamOutcome;
 use tokn_core::provider::{Endpoint, ProviderRequestKind};
 use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{RequestEndpoint, Stage, StageEvent};
@@ -41,6 +44,7 @@ pub(crate) struct AccumHelper {
 struct AccumInner {
   tx: mpsc::UnboundedSender<AccumMsg>,
   finished: AtomicBool,
+  outcome: std::sync::Mutex<Option<StreamOutcome>>,
 }
 
 pub(crate) enum AccumMsg {
@@ -48,7 +52,10 @@ pub(crate) enum AccumMsg {
   Converted(Bytes),
   UpstreamError(SmolStr),
   ConvertedError(SmolStr),
-  Finish,
+  OpaqueEndpoint(RequestEndpoint),
+  Finish(StreamOutcome),
+  FinishBuffered,
+  Abandon,
 }
 
 impl AccumHelper {
@@ -57,7 +64,6 @@ impl AccumHelper {
     let attempt = ctx.attempt;
     let attempts = attempt + 1;
     let request_endpoint = ctx.request_endpoint.as_str().to_string();
-    let completion_endpoint = ctx.request_endpoint.clone();
     let events = ctx.events.clone();
     let guard = ctx.events.begin_finalizer();
     let (tx, mut rx) = mpsc::unbounded_channel::<AccumMsg>();
@@ -73,12 +79,13 @@ impl AccumHelper {
       let mut converted_error = None;
       let mut bytes_streamed: u64 = 0;
       let mut chunks: u64 = 0;
+      let mut completion_endpoint = None;
 
       let mut tick = interval(Duration::from_millis(500));
       tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
       tick.tick().await;
 
-      loop {
+      let outcome = loop {
         tokio::select! {
           msg = rx.recv() => {
             match msg {
@@ -90,7 +97,14 @@ impl AccumHelper {
               }
               Some(AccumMsg::UpstreamError(err)) => upstream_error = Some(err),
               Some(AccumMsg::ConvertedError(err)) => converted_error = Some(err),
-              Some(AccumMsg::Finish) | None => break,
+              Some(AccumMsg::OpaqueEndpoint(endpoint)) => completion_endpoint = Some(endpoint),
+              Some(AccumMsg::Finish(outcome)) => break Some(outcome),
+              Some(AccumMsg::FinishBuffered) => break None,
+              Some(AccumMsg::Abandon) => {
+                guard.finish();
+                return;
+              }
+              None => break Some(StreamOutcome::Cancelled),
             }
           }
           _ = tick.tick() => {
@@ -105,12 +119,19 @@ impl AccumHelper {
             });
           }
         }
-      }
+      };
 
       let stream_error = upstream_error
         .clone()
         .or_else(|| converted_error.clone())
-        .or_else(|| stream_terminal_error(&completion_endpoint, &upstream));
+        .or_else(|| match outcome {
+          Some(StreamOutcome::Complete) => completion_endpoint
+            .as_ref()
+            .and_then(|endpoint| stream_terminal_error(endpoint, &upstream)),
+          Some(StreamOutcome::Failed) => Some(SmolStr::new_static("stream failed")),
+          Some(StreamOutcome::Cancelled) => Some(SmolStr::new_static("stream cancelled before completion")),
+          None => None,
+        });
 
       events.emit(tokn_core::event::Event::Requests(
         tokn_core::request_event::RequestEvent {
@@ -125,6 +146,12 @@ impl AccumHelper {
           ),
         },
       ));
+      if outcome.is_none() {
+        // A custom stage buffered the stream. The runner records its converted
+        // response and completion, while this recorder still owns upstream bytes.
+        guard.finish();
+        return;
+      }
       events.emit(tokn_core::event::Event::Requests(
         tokn_core::request_event::RequestEvent {
           request_id: request_id.clone(),
@@ -172,6 +199,7 @@ impl AccumHelper {
       inner: Arc::new(AccumInner {
         tx,
         finished: AtomicBool::new(false),
+        outcome: std::sync::Mutex::new(None),
       }),
     }
   }
@@ -206,6 +234,36 @@ impl AccumHelper {
     }
   }
 
+  fn completion(&self) -> StreamCompletion {
+    let inner = self.inner.clone();
+    Box::new(move |outcome| *inner.outcome.lock().expect("stream outcome lock") = Some(outcome))
+  }
+
+  fn validate_opaque(&self, endpoint: RequestEndpoint) {
+    // Transparent relays retain their best-effort protocol telemetry. Managed
+    // streams already validate incrementally in the shared stream processor.
+    let _ = self.inner.tx.send(AccumMsg::OpaqueEndpoint(endpoint));
+  }
+
+  fn finish_if_terminal(&self) {
+    if self.inner.outcome.lock().expect("stream outcome lock").is_some() {
+      self.finish();
+    }
+  }
+
+  fn abandon(&self) {
+    // The runner owns completion until a streaming response is returned.
+    if !self.inner.finished.swap(true, Ordering::AcqRel) {
+      let _ = self.inner.tx.send(AccumMsg::Abandon);
+    }
+  }
+
+  fn finish_buffered(&self) {
+    if !self.inner.finished.swap(true, Ordering::AcqRel) {
+      let _ = self.inner.tx.send(AccumMsg::FinishBuffered);
+    }
+  }
+
   pub(crate) fn finish(&self) {
     self.inner.finish();
   }
@@ -215,7 +273,12 @@ impl AccumInner {
   fn finish(&self) {
     if !self.finished.swap(true, Ordering::AcqRel) {
       tracing::debug!("upstream stream ended");
-      let _ = self.tx.send(AccumMsg::Finish);
+      let outcome = self
+        .outcome
+        .lock()
+        .expect("stream outcome lock")
+        .unwrap_or(StreamOutcome::Cancelled);
+      let _ = self.tx.send(AccumMsg::Finish(outcome));
     }
   }
 }
@@ -223,6 +286,96 @@ impl AccumInner {
 impl Drop for AccumInner {
   fn drop(&mut self) {
     self.finish();
+  }
+}
+
+/// Receives exactly one outcome after stream delivery, failure, or cancellation.
+pub type StreamCompletion = Box<dyn FnOnce(StreamOutcome) + Send>;
+
+/// Compatibility adapter for stages that expose only a transport stream.
+struct ObservedStream {
+  body: Option<futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>>,
+  completion: Option<StreamCompletion>,
+}
+
+impl ObservedStream {
+  fn complete(&mut self, outcome: StreamOutcome) {
+    self.body.take();
+    if let Some(completion) = self.completion.take() {
+      completion(outcome);
+    }
+  }
+}
+
+impl Stream for ObservedStream {
+  type Item = std::io::Result<Bytes>;
+
+  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    let Some(body) = self.body.as_mut() else {
+      return Poll::Ready(None);
+    };
+    let result = body.as_mut().poll_next(cx);
+    match &result {
+      Poll::Ready(Some(Err(_))) => self.complete(StreamOutcome::Failed),
+      Poll::Ready(None) => self.complete(StreamOutcome::Complete),
+      _ => {}
+    }
+    result
+  }
+}
+
+impl Drop for ObservedStream {
+  fn drop(&mut self) {
+    self.complete(StreamOutcome::Cancelled);
+  }
+}
+
+/// Record the returned chunk before finalizing the outcome reported by its
+/// producer. In particular, a terminal chunk must be present in the saved body.
+struct RecordedStream {
+  body: Option<futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>>,
+  accum: AccumHelper,
+}
+
+/// Until a response is returned, the runner owns failure/cancellation reporting.
+struct StreamSetupGuard(Option<AccumHelper>);
+
+impl Drop for StreamSetupGuard {
+  fn drop(&mut self) {
+    if let Some(accum) = &self.0 {
+      accum.abandon();
+    }
+  }
+}
+
+impl Stream for RecordedStream {
+  type Item = std::io::Result<Bytes>;
+
+  fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    let Some(body) = self.body.as_mut() else {
+      return Poll::Ready(None);
+    };
+    let result = body.as_mut().poll_next(cx);
+    match &result {
+      Poll::Ready(Some(item)) => {
+        self.accum.note_converted(item);
+        self.accum.finish_if_terminal();
+      }
+      Poll::Ready(None) => {
+        self.body.take();
+        self.accum.finish();
+      }
+      Poll::Pending => {}
+    }
+    result
+  }
+}
+
+impl Drop for RecordedStream {
+  fn drop(&mut self) {
+    // Drop the producer first so it reports cancellation if output remains.
+    self.body.take();
+    self.accum.finish();
   }
 }
 
@@ -701,6 +854,32 @@ pub trait ConvertResponseStage: Send + Sync {
     body: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
   ) -> Result<ConvertedResponse, PipelineError>;
 
+  /// Observe delivery of a stream's final output, failure, or cancellation.
+  /// Managed implementations can report protocol completion before transport
+  /// EOF; the default preserves custom stages with transport-only completion.
+  async fn convert_stream_observed(
+    &self,
+    ctx: &PipelineCtx,
+    status: u16,
+    headers: HeaderMap,
+    upstream_endpoint: Option<Endpoint>,
+    body: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+    completion: StreamCompletion,
+  ) -> Result<ConvertedResponse, PipelineError> {
+    let mut converted = self
+      .convert_stream(ctx, status, headers, upstream_endpoint, body)
+      .await?;
+    if let ConvertedBody::Stream { body } = converted.body {
+      converted.body = ConvertedBody::Stream {
+        body: Box::pin(ObservedStream {
+          body: Some(body),
+          completion: Some(completion),
+        }),
+      };
+    }
+    Ok(converted)
+  }
+
   fn is_sse_response(&self, _ctx: &PipelineCtx, sent: &SentResponse) -> bool {
     sent.stream
   }
@@ -716,6 +895,7 @@ pub trait ConvertResponseStage: Send + Sync {
     } = sent;
     if is_sse {
       let accum = AccumHelper::spawn(ctx, SmolStr::default());
+      let mut setup = StreamSetupGuard(Some(accum.clone()));
       let accum_upstream = accum.clone();
       let body = response
         .bytes_stream()
@@ -723,30 +903,30 @@ pub trait ConvertResponseStage: Send + Sync {
         .inspect(move |item| accum_upstream.note_upstream(item))
         .boxed();
       let converted = self
-        .convert_stream(ctx, status, headers, upstream_endpoint, body)
+        .convert_stream_observed(ctx, status, headers, upstream_endpoint, body, accum.completion())
         .await?;
+      if converted.kind == ConvertedResponseKind::Opaque {
+        accum.validate_opaque(
+          upstream_endpoint
+            .map(Into::into)
+            .unwrap_or_else(|| ctx.request_endpoint.clone()),
+        );
+      }
       if let ConvertedBody::Stream { body } = converted.body {
+        setup.0.take();
         return Ok(ConvertedResponse {
           status: converted.status,
           headers: converted.headers,
           kind: converted.kind,
           body: ConvertedBody::Stream {
-            body: stream::unfold((body, accum), |(mut body, accum)| async move {
-              match body.next().await {
-                Some(item) => {
-                  accum.note_converted(&item);
-                  Some((item, (body, accum)))
-                }
-                None => {
-                  accum.finish();
-                  None
-                }
-              }
-            })
-            .boxed(),
+            body: Box::pin(RecordedStream {
+              body: Some(body),
+              accum,
+            }),
           },
         });
       }
+      accum.finish_buffered();
       return Ok(converted);
     }
     let raw = response.bytes().await.map_err(|e| {
@@ -825,6 +1005,7 @@ mod tests {
       std::io::ErrorKind::UnexpectedEof,
       "upstream TLS stream ended",
     )));
+    accum.completion()(StreamOutcome::Complete);
     accum.finish();
 
     let request_events = receive_until_completed(&mut receiver).await;
@@ -847,16 +1028,18 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn missing_terminal_event_emits_failed_completion() {
+  async fn opaque_missing_terminal_event_emits_failed_completion() {
     let events = Arc::new(crate::event::EventBus::new(32));
     let mut receiver = events.subscribe();
     let ctx = PipelineCtx::new("req-stream-incomplete", Endpoint::Responses.into(), events);
     let accum = AccumHelper::spawn(&ctx, SmolStr::new("gpt-test"));
+    accum.validate_opaque(Endpoint::Responses.into());
     let partial = Bytes::from_static(
       b"event: response.compaction.compacting\ndata: {\"type\":\"response.compaction.compacting\"}\n\n",
     );
     accum.note_upstream(&Ok(partial.clone()));
     accum.note_converted(&Ok(partial));
+    accum.completion()(StreamOutcome::Complete);
     accum.finish();
 
     let request_events = receive_until_completed(&mut receiver).await;
@@ -884,6 +1067,7 @@ mod tests {
     let terminal = Bytes::from_static(b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n");
     accum.note_upstream(&Ok(terminal.clone()));
     accum.note_converted(&Ok(terminal));
+    accum.completion()(StreamOutcome::Complete);
     accum.finish();
 
     let request_events = receive_until_completed(&mut receiver).await;
@@ -896,6 +1080,178 @@ mod tests {
         RequestEventPayload::Stage(StageEvent::Completed { success: true, .. })
       )
     }));
+  }
+
+  #[tokio::test]
+  async fn stream_construction_failure_leaves_completion_to_runner() {
+    let events = Arc::new(crate::event::EventBus::new(32));
+    let mut receiver = events.subscribe();
+    let ctx = PipelineCtx::new("req-stream-setup", Endpoint::ChatCompletions.into(), events.clone());
+    let sent = SentResponse {
+      status: 200,
+      headers: HeaderMap::new(),
+      stream: true,
+      upstream_endpoint: None,
+      response: reqwest::Response::from(http::Response::new("data: [DONE]\n\n")),
+    };
+    let error = crate::stages::convert_response::DefaultConvertResponse::new()
+      .convert_response(&ctx, sent)
+      .await
+      .unwrap_err();
+    assert!(matches!(error.inner(), RequestsError::MissingUpstreamEndpoint { .. }));
+    let _ = assert_no_recorder_completion(&events, &mut receiver).await;
+  }
+
+  #[tokio::test]
+  async fn cancelling_stream_construction_leaves_completion_to_runner() {
+    struct PendingConversion;
+
+    #[async_trait]
+    impl ConvertResponseStage for PendingConversion {
+      async fn convert_buffered(
+        &self,
+        _: &PipelineCtx,
+        _: u16,
+        _: HeaderMap,
+        _: Option<Endpoint>,
+        _: Bytes,
+      ) -> Result<ConvertedResponse, PipelineError> {
+        unreachable!("fixture only requests streaming conversion")
+      }
+
+      async fn convert_stream(
+        &self,
+        _: &PipelineCtx,
+        _: u16,
+        _: HeaderMap,
+        _: Option<Endpoint>,
+        _: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+      ) -> Result<ConvertedResponse, PipelineError> {
+        core::future::pending().await
+      }
+    }
+
+    let events = Arc::new(crate::event::EventBus::new(32));
+    let mut receiver = events.subscribe();
+    let ctx = PipelineCtx::new(
+      "req-stream-setup-cancel",
+      Endpoint::ChatCompletions.into(),
+      events.clone(),
+    );
+    let sent = SentResponse {
+      status: 200,
+      headers: HeaderMap::new(),
+      stream: true,
+      upstream_endpoint: Some(Endpoint::ChatCompletions),
+      response: reqwest::Response::from(http::Response::new("data: [DONE]\n\n")),
+    };
+    let mut conversion = Box::pin(PendingConversion.convert_response(&ctx, sent));
+    assert!(futures_util::poll!(&mut conversion).is_pending());
+    drop(conversion);
+    let _ = assert_no_recorder_completion(&events, &mut receiver).await;
+  }
+
+  #[tokio::test]
+  async fn custom_buffered_stream_preserves_upstream_record_without_duplicate_completion() {
+    struct BufferingConversion;
+
+    #[async_trait]
+    impl ConvertResponseStage for BufferingConversion {
+      async fn convert_buffered(
+        &self,
+        _: &PipelineCtx,
+        _: u16,
+        _: HeaderMap,
+        _: Option<Endpoint>,
+        _: Bytes,
+      ) -> Result<ConvertedResponse, PipelineError> {
+        unreachable!("fixture requests streaming conversion")
+      }
+
+      async fn convert_stream(
+        &self,
+        _: &PipelineCtx,
+        status: u16,
+        headers: HeaderMap,
+        _: Option<Endpoint>,
+        mut body: futures_util::stream::BoxStream<'static, std::io::Result<Bytes>>,
+      ) -> Result<ConvertedResponse, PipelineError> {
+        while let Some(chunk) = body.next().await {
+          chunk.expect("fixture upstream body");
+        }
+        Ok(ConvertedResponse {
+          status,
+          headers,
+          kind: ConvertedResponseKind::Managed,
+          body: ConvertedBody::Buffered {
+            body_json: None,
+            body_bytes: Bytes::from_static(br#"{"content":"buffered"}"#),
+          },
+        })
+      }
+    }
+
+    let events = Arc::new(crate::event::EventBus::new(32));
+    let mut receiver = events.subscribe();
+    let ctx = PipelineCtx::new("req-custom-buffered", Endpoint::ChatCompletions.into(), events.clone());
+    let upstream = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n";
+    let sent = SentResponse {
+      status: 200,
+      headers: HeaderMap::new(),
+      stream: true,
+      upstream_endpoint: Some(Endpoint::ChatCompletions),
+      response: reqwest::Response::from(http::Response::new(upstream)),
+    };
+    let converted = BufferingConversion.convert_response(&ctx, sent).await.unwrap();
+    let ConvertedBody::Buffered { body_bytes, .. } = converted.body else {
+      panic!("custom conversion should return a buffered response");
+    };
+    assert_eq!(body_bytes.as_ref(), br#"{"content":"buffered"}"#);
+
+    let recorded = assert_no_recorder_completion(&events, &mut receiver).await;
+    assert_eq!(recorded.len(), 1, "runner owns converted-body and completion records");
+    assert!(matches!(
+      &recorded[0].payload,
+      RequestEventPayload::Record(tokn_core::request_event::RecordEvent::UpstreamBody { body, error })
+        if body.as_ref() == upstream.as_bytes() && error.is_none()
+    ));
+  }
+
+  async fn assert_no_recorder_completion(
+    events: &crate::event::EventBus,
+    receiver: &mut tokio::sync::broadcast::Receiver<Arc<CoreEvent>>,
+  ) -> Vec<RequestEvent> {
+    // Drain the finalizer barrier and preserve records, proving that the
+    // recorder leaves completion to the runner when no live stream is returned.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+      let mut recorded = Vec::new();
+      let shutdown = events.shutdown();
+      tokio::pin!(shutdown);
+      loop {
+        tokio::select! {
+          () = &mut shutdown => break recorded,
+          event = receiver.recv() => {
+            match event.unwrap().as_ref() {
+              CoreEvent::Shutdown(sender) => {
+                if let Some(sender) = sender.lock().unwrap().take() {
+                  let _ = sender.send(());
+                }
+              }
+              CoreEvent::Requests(event) => {
+                assert!(!matches!(
+                  event.payload,
+                  RequestEventPayload::Stage(StageEvent::Completed { .. })
+                ));
+                recorded.push(event.clone());
+              }
+              _ => {}
+            }
+          }
+        }
+      }
+    })
+    .await
+    .expect("stream construction must release its finalizer")
   }
 
   async fn receive_until_completed(
