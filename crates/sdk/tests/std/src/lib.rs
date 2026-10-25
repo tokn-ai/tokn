@@ -21,7 +21,9 @@ mod tests {
   };
 
   use serde_json::{json, Value};
-  use tokn_sdk::{chat_completions::ChatRequest, Client, Error, Event, RequestEventPayload, RequestOptions, StageEvent, StdPlatform};
+  use tokn_sdk::{
+    chat_completions::ChatRequest, Client, Error, Event, RequestEventPayload, RequestOptions, StageEvent, StdPlatform,
+  };
 
   fn assert_send_sync<T: Send + Sync>() {}
 
@@ -138,7 +140,9 @@ mod tests {
       if requests.is_empty() {
         if let Some((received, release)) = &gate {
           received.send(()).map_err(io::Error::other)?;
-          release.recv_timeout(Duration::from_secs(10)).map_err(io::Error::other)?;
+          release
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(io::Error::other)?;
         }
       }
       if request["model"] == "test-retry" && requests.is_empty() {
@@ -534,7 +538,8 @@ mod tests {
         "wire_identity": "none"
       },
       "providers": {"llama-cpp": {"driver": "llama-cpp", "base_url": fixture.base_url}}
-    })).unwrap();
+    }))
+    .unwrap();
     let rules = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
     let account = serde_json::from_value(json!({"id": "memory", "provider": "llama-cpp"})).unwrap();
     let client = Client::new(rules, vec![account], StdPlatform::new().unwrap()).unwrap();
@@ -544,18 +549,24 @@ mod tests {
     // In-memory construction must not retain or depend on the fixture files.
     fs::remove_file(fixture.root.join("config.toml")).unwrap();
     fs::remove_file(fixture.root.join("auth.yaml")).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
     runtime.block_on(async {
       tokio::time::timeout(Duration::from_secs(10), async {
         let request: ChatRequest = serde_json::from_value(json!({
           "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
-        })).unwrap();
+        }))
+        .unwrap();
         let endpoint = client.chat_completions();
         assert_send(endpoint.create(&request)).await.unwrap();
         let stream = assert_send(endpoint.stream(&request)).await.unwrap();
         let bytes = assert_send(stream.bytes()).await.unwrap();
         assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
-      }).await.expect("in-memory standard requests complete");
+      })
+      .await
+      .expect("in-memory standard requests complete");
     });
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
@@ -566,28 +577,43 @@ mod tests {
   fn an_unread_stream_keeps_its_snapshot_when_reload_publishes_new_accounts() {
     let mut original = Fixture::start_with_requests(1);
     let mut replacement = Fixture::start_with_requests(1);
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
     runtime.block_on(async {
       tokio::time::timeout(Duration::from_secs(10), async {
         let client = original.client();
         let mut events = client.subscribe_events();
         let request: ChatRequest = serde_json::from_value(json!({
           "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
-        })).unwrap();
+        }))
+        .unwrap();
         let endpoint = client.chat_completions();
-        let stream = assert_send(endpoint.stream_with(
-          &request, RequestOptions::default().with_request_id("before-reload")
-        )).await.unwrap();
+        let stream =
+          assert_send(endpoint.stream_with(&request, RequestOptions::default().with_request_id("before-reload")))
+            .await
+            .unwrap();
         let config_path = original.root.join("config.toml");
-        let config = fs::read_to_string(&config_path).unwrap().replace(&original.base_url, &replacement.base_url);
+        let config = fs::read_to_string(&config_path)
+          .unwrap()
+          .replace(&original.base_url, &replacement.base_url);
         fs::write(&config_path, config).unwrap();
-        fs::write(original.root.join("auth.yaml"),
-          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n"
-        ).unwrap();
-        client.reload().expect("publish replacement state while a response owns the original");
-        endpoint.create_with(&request, RequestOptions::default().with_request_id("after-reload"))
-          .await.expect("the new request uses replacement state independently");
-        let bytes = assert_send(stream.bytes()).await.expect("the original stream completes after reload");
+        fs::write(
+          original.root.join("auth.yaml"),
+          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n",
+        )
+        .unwrap();
+        client
+          .reload()
+          .expect("publish replacement state while a response owns the original");
+        endpoint
+          .create_with(&request, RequestOptions::default().with_request_id("after-reload"))
+          .await
+          .expect("the new request uses replacement state independently");
+        let bytes = assert_send(stream.bytes())
+          .await
+          .expect("the original stream completes after reload");
         assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
         let mut accounts = Vec::new();
         let mut outcomes = Vec::new();
@@ -604,9 +630,20 @@ mod tests {
             }
           }
         }
-        assert_eq!(accounts, [("before-reload".into(), "local".into()), ("after-reload".into(), "replacement".into())]);
-        assert_eq!(outcomes, [("after-reload".into(), true, 1), ("before-reload".into(), true, 1)]);
-      }).await.expect("reload with an active stream completes");
+        assert_eq!(
+          accounts,
+          [
+            ("before-reload".into(), "local".into()),
+            ("after-reload".into(), "replacement".into())
+          ]
+        );
+        assert_eq!(
+          outcomes,
+          [("after-reload".into(), true, 1), ("before-reload".into(), true, 1)]
+        );
+      })
+      .await
+      .expect("reload with an active stream completes");
     });
     assert_eq!(original.requests().len(), 1);
     assert_eq!(replacement.requests().len(), 1);
@@ -620,15 +657,21 @@ mod tests {
     let mut replacement = Fixture::start_with_requests(1);
     let config_path = original.root.join("config.toml");
     let config = fs::read_to_string(&config_path).unwrap().replace(
-      "[defaults]", "[defaults]\nretry = { kind = 'recoverable', policy = 'retry' }"
+      "[defaults]",
+      "[defaults]\nretry = { kind = 'recoverable', policy = 'retry' }",
     );
-    fs::write(&config_path,
-      format!("{config}\n[retry_policies.retry]\nmax_retries = 1\ninitial_backoff_ms = 1\n")
-    ).unwrap();
+    fs::write(
+      &config_path,
+      format!("{config}\n[retry_policies.retry]\nmax_retries = 1\ninitial_backoff_ms = 1\n"),
+    )
+    .unwrap();
     fs::write(original.root.join("auth.yaml"),
       "version: 1\naccounts:\n  - id: primary\n    provider: llama-cpp\n  - id: backup\n    provider: llama-cpp\n    tier: fallback\n"
     ).unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
     runtime.block_on(async {
       tokio::time::timeout(Duration::from_secs(10), async {
         let client = Arc::new(original.client());
@@ -637,39 +680,52 @@ mod tests {
         let request = tokio::spawn(async move {
           let body: ChatRequest = serde_json::from_value(json!({
             "model": "llama-cpp/test-retry", "messages": [{"role": "user", "content": "hello"}]
-          })).unwrap();
-          active.chat_completions().create_with(&body,
-            RequestOptions::default().with_request_id("snapshot-pending")
-          ).await
+          }))
+          .unwrap();
+          active
+            .chat_completions()
+            .create_with(&body, RequestOptions::default().with_request_id("snapshot-pending"))
+            .await
         });
         // The upstream has received the first attempt but cannot respond yet.
         while received_rx.try_recv().is_err() {
           tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let replacement_config = fs::read_to_string(&config_path).unwrap()
+        let replacement_config = fs::read_to_string(&config_path)
+          .unwrap()
           .replace(&original.base_url, &replacement.base_url)
           .replace(
             "retry = { kind = 'recoverable', policy = 'retry' }",
             "retry = { kind = 'never' }",
           );
         fs::write(&config_path, replacement_config).unwrap();
-        fs::write(original.root.join("auth.yaml"),
-          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n"
-        ).unwrap();
+        fs::write(
+          original.root.join("auth.yaml"),
+          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n",
+        )
+        .unwrap();
         client.reload().expect("publish new rules, accounts, and HTTP pool");
         let new_body: ChatRequest = serde_json::from_value(json!({
           "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
-        })).unwrap();
-        client.chat_completions().create_with(&new_body,
-          RequestOptions::default().with_request_id("snapshot-new")
-        ).await.expect("new sessions use the replacement snapshot");
+        }))
+        .unwrap();
+        client
+          .chat_completions()
+          .create_with(&new_body, RequestOptions::default().with_request_id("snapshot-new"))
+          .await
+          .expect("new sessions use the replacement snapshot");
         release_tx.send(()).unwrap();
-        request.await.unwrap().expect("the original rules still permit a retry on the old fallback account");
+        request
+          .await
+          .unwrap()
+          .expect("the original rules still permit a retry on the old fallback account");
         let mut accounts = Vec::new();
         let mut outcomes = Vec::new();
         while let Ok(event) = events.try_recv() {
           if let Event::Requests(event) = event.as_ref() {
-            if event.request_id != "snapshot-pending" { continue; }
+            if event.request_id != "snapshot-pending" {
+              continue;
+            }
             match &event.payload {
               RequestEventPayload::Stage(StageEvent::Resolve(summary)) => {
                 accounts.push((event.attempt, summary.account_id.to_string()));
@@ -683,7 +739,9 @@ mod tests {
         }
         assert_eq!(accounts, [(0, "primary".into()), (1, "backup".into())]);
         assert_eq!(outcomes, [(0, false, 1), (1, true, 2)]);
-      }).await.expect("pending request and reload complete");
+      })
+      .await
+      .expect("pending request and reload complete");
     });
     let requests = original.requests();
     assert_eq!(requests.len(), 2);
