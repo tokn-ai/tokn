@@ -118,12 +118,12 @@ pub use crate::session::Lifecycle;
 /// Configuration and request state belong to the client that acquires these
 /// services. A streaming response retains the transport lease until completion
 /// or cancellation. Neither transport nor runtime needs to be `Send`.
-pub struct Injected<T, R> {
+pub struct Adapter<T, R> {
   transport: RefCell<T>,
   runtime: RefCell<R>,
 }
 
-impl<T: Transport, R: Runtime> Injected<T, R> {
+impl<T: Transport, R: Runtime> Adapter<T, R> {
   pub fn new(transport: T, runtime: R) -> Self {
     Self {
       transport: RefCell::new(transport),
@@ -132,8 +132,8 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
   }
 
   /// Attach event delivery without changing transport or timing services.
-  pub fn with_event_sink<S: RequestEventSink>(self, sink: S) -> Injected<T, EventRuntime<R, S>> {
-    Injected {
+  pub fn with_event_sink<S: RequestEventSink>(self, sink: S) -> Adapter<T, EventRuntime<R, S>> {
+    Adapter {
       transport: self.transport,
       runtime: RefCell::new(EventRuntime::new(self.runtime.into_inner(), sink)),
     }

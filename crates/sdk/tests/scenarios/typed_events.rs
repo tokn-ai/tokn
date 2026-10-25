@@ -30,11 +30,11 @@ fn recorded_client<'a>(
   replies: impl IntoIterator<Item = Reply>,
   driver: &str,
   events: &'a RefCell<Vec<RequestEvent>>,
-) -> Client<Injected<MemoryTransport<'a>, EventRuntime<TestRuntime, impl RequestEventSink + 'a>>> {
+) -> Client<Adapter<MemoryTransport<'a>, EventRuntime<TestRuntime, impl RequestEventSink + 'a>>> {
   Client::new(
     plan(driver),
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(MemoryTransport::new(requests, replies), TestRuntime::default())
+    Adapter::new(MemoryTransport::new(requests, replies), TestRuntime::default())
       .with_event_sink(move |event| events.borrow_mut().push(event)),
   )
   .unwrap()
@@ -270,7 +270,7 @@ pub fn buffered_usage_events() {
     let client = Client::new(
       tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
       Vec::new(),
-      Injected::new(
+      Adapter::new(
         MemoryTransport::new(
           &sent,
           [Reply {
@@ -412,7 +412,7 @@ pub fn typed_event_retry_attribution() {
       account_config("primary", "primary-key", "active"),
       account_config("backup", "backup-key", "fallback"),
     ],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(
         &sent,
         [
@@ -553,7 +553,7 @@ pub fn event_timestamps_and_local_sink() {
     let client = Client::new(
       plan("openai"),
       vec![account_config("primary", "test-key", "active")],
-      Injected::new(MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]), Clock(expected)).with_event_sink(
+      Adapter::new(MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]), Clock(expected)).with_event_sink(
         move |event| {
           observed.set(observed.get() + 1);
           events_ref.borrow_mut().push(event);

@@ -22,7 +22,7 @@ use tokn_service::transport::Transport;
 /// Only a test harness; production orchestration belongs to tokn-sdk::Client.
 pub struct BorrowedSession<T, R> {
   state: Shared<ExecutionState>,
-  services: configured::Injected<T, R>,
+  services: configured::Adapter<T, R>,
   request_sequence: Cell<u64>,
 }
 
@@ -52,7 +52,7 @@ impl<T: Transport, R: Runtime> BorrowedSession<T, R> {
       .collect();
     Ok(Self {
       state: Shared::new(ExecutionState::with_models(rules, accounts, models)?),
-      services: configured::Injected::new(transport, runtime),
+      services: configured::Adapter::new(transport, runtime),
       request_sequence: Cell::new(0),
     })
   }

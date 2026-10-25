@@ -16,7 +16,7 @@ use tokn_requests::v2::{prepare_execution, HttpClients};
 
 use crate::client::Snapshot;
 use crate::response::RawResponse;
-use crate::{Client, ConfigWarning, Platform, RequestOptions, ResponseAdapter, Services};
+use crate::{Client, ConfigWarning, PlatformFactory, RequestOptions, ResponseAdapter, Services};
 use crate::{Error, Result};
 
 const EVENT_BUS_CAPACITY: usize = 256;
@@ -113,7 +113,7 @@ impl StdPlatform {
   }
 }
 
-impl Platform for StdPlatform {
+impl PlatformFactory for StdPlatform {
   type Pool = HttpClients;
   type Exchange<'a> = ReqwestExchange;
   type Clock<'a> = TokioRuntime;

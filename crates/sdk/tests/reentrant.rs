@@ -1,4 +1,4 @@
-//! Injected exchanges must release driver resources on cancellation and reject
+//! Adapter exchanges must release driver resources on cancellation and reject
 //! synchronous observer reentry without panicking or closing a newer response.
 
 use std::{
@@ -21,7 +21,7 @@ use tokn_sdk::{
   account::AccountConfig,
   chat_completions::ChatRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, EventRuntime, Injected, Lifecycle, RequestEvent, RequestEventPayload, RequestEventSink, RequestOptions,
+  Adapter, Client, EventRuntime, Lifecycle, RequestEvent, RequestEventPayload, RequestEventSink, RequestOptions,
   Runtime, StageEvent,
 };
 
@@ -30,8 +30,8 @@ const RETRY_ERROR: &[u8] = br#"{"error":{"message":"retry"}}"#;
 const SSE: &[u8] =
   b"data: {\"id\":\"chat-local\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n";
 
-type LocalClient = Client<Injected<LocalTransport, LocalRuntime>>;
-type TypedClient = Client<Injected<LocalTransport, EventRuntime<LocalRuntime, TypedSink>>>;
+type LocalClient = Client<Adapter<LocalTransport, LocalRuntime>>;
+type TypedClient = Client<Adapter<LocalTransport, EventRuntime<LocalRuntime, TypedSink>>>;
 
 #[derive(Default)]
 struct Shared {
@@ -224,8 +224,8 @@ fn configuration(retry: bool) -> (tokn_sdk::policy::ExecutionRules, Vec<AccountC
 fn platform(
   shared: &Rc<Shared>,
   replies: impl IntoIterator<Item = &'static [u8]>,
-) -> Injected<LocalTransport, LocalRuntime> {
-  Injected::new(
+) -> Adapter<LocalTransport, LocalRuntime> {
+  Adapter::new(
     LocalTransport {
       shared: shared.clone(),
       replies: replies.into_iter().collect(),

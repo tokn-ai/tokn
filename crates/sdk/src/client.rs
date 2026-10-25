@@ -44,12 +44,12 @@ pub struct Services<T, C, E> {
 
 /// The exchange, clock, and events produced by one service factory acquisition.
 pub type PlatformServices<'a, P> =
-  Services<<P as Platform>::Exchange<'a>, <P as Platform>::Clock<'a>, <P as Platform>::Events<'a>>;
+  Services<<P as PlatformFactory>::Exchange<'a>, <P as PlatformFactory>::Clock<'a>, <P as PlatformFactory>::Events<'a>>;
 
 /// A factory for transport, time, and event services. It neither owns execution
 /// state nor interprets requests. Pool handles are snapshotted with client state;
 /// an acquired exchange must not borrow those handles from the snapshot.
-pub trait Platform {
+pub trait PlatformFactory {
   type Pool;
   type Exchange<'a>: Transport
   where
@@ -68,7 +68,7 @@ pub trait Platform {
 /// Synchronous presentation of the shared session's result. This compatibility
 /// boundary preserves standard owned byte streams and local borrowed SSE streams
 /// without requiring local adapters or futures to be `Send`.
-pub trait ResponseAdapter: Platform {
+pub trait ResponseAdapter: PlatformFactory {
   type Error;
   type Stream<'a>
   where
@@ -162,7 +162,7 @@ impl Sequence {
 
 /// Configured execution state and one shared request orchestration path.
 #[cfg(feature = "std")]
-pub struct Client<P: Platform = crate::StdPlatform> {
+pub struct Client<P: PlatformFactory = crate::StdPlatform> {
   pub(crate) platform: P,
   pub(crate) snapshot: SnapshotCell<P::Pool>,
   limits: Limits,
@@ -170,14 +170,14 @@ pub struct Client<P: Platform = crate::StdPlatform> {
   pub(crate) source: Option<crate::std_client::Source>,
 }
 #[cfg(not(feature = "std"))]
-pub struct Client<P: Platform> {
+pub struct Client<P: PlatformFactory> {
   pub(crate) platform: P,
   pub(crate) snapshot: SnapshotCell<P::Pool>,
   limits: Limits,
   request_sequence: Sequence,
 }
 
-impl<P: Platform> Client<P> {
+impl<P: PlatformFactory> Client<P> {
   pub(crate) fn from_snapshot(platform: P, snapshot: Snapshot<P::Pool>) -> Self {
     Self {
       platform,
@@ -397,7 +397,7 @@ impl<P: ResponseAdapter> Client<P> {
   }
 }
 
-impl<T: Transport, R: tokn_requests::configured::Runtime> Platform for tokn_requests::configured::Injected<T, R> {
+impl<T: Transport, R: tokn_requests::configured::Runtime> PlatformFactory for tokn_requests::configured::Adapter<T, R> {
   type Pool = ();
   type Exchange<'a>
     = tokn_requests::configured::BorrowedTransport<'a, T>
@@ -425,9 +425,7 @@ impl<T: Transport, R: tokn_requests::configured::Runtime> Platform for tokn_requ
   }
 }
 
-impl<T: Transport, R: tokn_requests::configured::Runtime> ResponseAdapter
-  for tokn_requests::configured::Injected<T, R>
-{
+impl<T: Transport, R: tokn_requests::configured::Runtime> ResponseAdapter for tokn_requests::configured::Adapter<T, R> {
   type Error = session::Error;
   type Response<'a>
     = tokn_requests::configured::Response<'a, T, R>

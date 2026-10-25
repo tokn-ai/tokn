@@ -202,10 +202,10 @@ when an exact endpoint wire shape is required.
 `Client<P>` owns the active configuration and `ExecutionState` snapshot: execution
 rules, accounts, credential caches, account pools, and model metadata. The client
 creates a `tokn_requests::session::Session<T, C, E>` for each request using that
-snapshot. The platform `P` supplies external services: a per-request transport
-exchange `T`, clock/timer `C`, and event sink `E`. Platforms do not load routing
-rules or execute requests. `Platform::Pool` represents client-level transport
-handles; `Platform::Exchange<'a>` is the distinct owned or borrowed exchange
+snapshot. The adapter `P` supplies external services: a per-request transport
+exchange `T`, clock/timer `C`, and event sink `E`. Adapters do not load routing
+rules or execute requests. `PlatformFactory::Pool` represents client-level transport
+handles; `PlatformFactory::Exchange<'a>` is the distinct owned or borrowed exchange
 acquired for a request. `Services` bundles that exchange, clock, and event sink.
 `ResponseAdapter` only presents the shared session result as the existing owned
 std response or local borrowed response. It performs no request orchestration.
@@ -215,7 +215,7 @@ The SDK does not depend on the HTTP gateway crate.
 Client<P>
   ├─ active snapshot → ExecutionState
   │    └─ rules, accounts, credentials, pools, model metadata
-  └─ platform services → acquire exchange + clock + events
+  └─ adapter services → acquire exchange + clock + events
 
 Client::execute → capture snapshot → Session<exchange, clock, events>
 ```
@@ -223,20 +223,22 @@ Client::execute → capture snapshot → Session<exchange, clock, events>
 A transport factory or connection pool belongs to the client-level services;
 the exchange returned by it belongs to one session and then its response.
 `StdPlatform` returns independent owned HTTP exchanges backed by shared connection
-pools, allowing concurrent requests and streams. `Injected` leases one borrowed
+pools, allowing concurrent requests and streams. `Adapter` leases one borrowed
 application transport until its response completes or is cancelled; another
 request returns busy while the lease is active. Neither ownership model changes
 routing or provider policy.
+Custom service factories implement `PlatformFactory`; the borrowed service
+wrapper previously named `Injected` is now `Adapter`.
 
 Configuration input and adapter selection are independent. Compile an in-memory
 `config::v2::RawConfig` with `config::v2::compile_execution`, then supply the same
 rules and `account::AccountConfig` values to either adapter:
 
 ```rust
-use tokn_sdk::{Client, Injected};
+use tokn_sdk::{Adapter, Client};
 
 let rules = tokn_sdk::config::v2::compile_execution(&raw_config)?;
-let services = Injected::new(transport, runtime);
+let services = Adapter::new(transport, runtime);
 let client = Client::new(rules, accounts, services)?;
 let response = client.chat_completions().create(&request).await?;
 ```
@@ -263,7 +265,7 @@ In-flight requests retain their original state and exchanges; failed reloads
 leave the active snapshot unchanged. Event subscriptions survive reloads.
 Legacy normalization stays in the standard configuration-loading boundary.
 
-Disable default features to use `no_std + alloc`. `Injected::new(transport,
+Disable default features to use `no_std + alloc`. `Adapter::new(transport,
 runtime)` contains services only; rules, accounts, model inventories, and
 response limits belong to client construction. No listener, configuration file,
 credential file, or gateway process is required. The implicit profile is always
@@ -284,11 +286,11 @@ Managed request interpretation has one implementation in
 The session uses the normalized session identity for account affinity and the
 normalized stream/initiator for provider context. Codex compaction priority and
 routing-header policy apply through the same provider preparation on both SDK
-platforms. Gateway original-destination proxy admission remains separate from
+adapters. Gateway original-destination proxy admission remains separate from
 SDK execution.
 
-The standard SDK, v2 gateway, and injected executor share provider/account linking and route
-selection in `tokn-accounts`:
+The SDK with standard or custom adapters and the v2 gateway share
+provider/account linking and route selection in `tokn-accounts`:
 
 - `link::portable` validates provider destinations, account identities, and pool
   membership from the same `ExecutionRules`. Disabled accounts remain valid pool
@@ -297,8 +299,8 @@ selection in `tokn-accounts`:
   capability evidence, operation fallback, provider scores, and access filtering.
   Both adapters pass only the selected pool's bindings to this algorithm.
 - `PoolState` owns round-robin, cooldown, fallback tiers, and session affinity.
-  Standard execution locks its pool for each state transaction; injected execution
-  borrows local state and uses the supplied monotonic clock.
+  The shared state locks each transaction under std and borrows it locally under
+  `no_std`, using the selected adapter's monotonic clock.
 
 Native provider transformations and credential policy are shared. Model
 discovery and cache refresh happen outside request execution; routing parity
@@ -309,15 +311,16 @@ client. Gateway API profiles use the same `ExecutionRules` and session; gateway
 admission and original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
-The standard SDK, v2 gateway, and injected executor resolve named policies through `from_route`;
-standard pipelines keep the existing `RetryPolicy::new` and `safe_methods` APIs.
+The SDK with standard or custom adapters and the v2 gateway resolve named
+policies through `from_route`; standard pipelines keep the existing
+`RetryPolicy::new` and `safe_methods` APIs.
 The shared session supplies error facts and the transport method to `next_delay`:
 
 - Only recoverable send failures can replay; deliberate stops and later response
   or stream failures do not replay a request.
 - The retry limit counts additional attempts. Backoff doubles from the configured
   initial delay; a zero delay skips the timer.
-- Safe-method policies allow only GET, HEAD, OPTIONS, and TRACE. Injected LLM API
+- Safe-method policies allow only GET, HEAD, OPTIONS, and TRACE. SDK LLM API
   calls use POST, so account relays require an explicit buffered policy to replay.
 - The shared driver resolves an account again for every retry. Account cooldown
   still applies to recoverable send failures even when retries are disabled.
@@ -351,16 +354,16 @@ Managed buffered responses share `tokn_convert::buffered::convert_response`:
 - Invalid JSON, incomplete SSE, and conversion errors fail the response stage
   without retrying the request or changing account feedback.
 
-Injected buffered execution now follows these standard behaviors, including
+Custom adapters use these same buffered response behaviors, including
 content-based SSE detection when an upstream omits or mislabels its MIME type.
-Its decoded input, converted output, and individual SSE records remain bounded
+Their decoded input, converted output, and individual SSE records remain bounded
 by `Limits`. Opaque buffered relays preserve their bytes without normalization.
 Opaque relays follow the upstream content type: `text/event-stream` produces a
 live byte stream even when the request's `stream` field is false.
 Accumulated SSE receives `application/json`; other buffered responses retain
-their upstream content type in the converter and injected adapter. The HTTP
+their upstream content type in the converter and custom adapter. The HTTP
 gateway sets its managed response content type when constructing the HTTP reply.
-Live injected streams still require `text/event-stream`.
+Live managed streams require `text/event-stream` with either adapter.
 
 Managed live streams share `tokn_convert::sse::StreamProcessor` for terminal
 validation, transformation, queued output, and completion:
@@ -373,7 +376,7 @@ validation, transformation, queued output, and completion:
 - Upstream failure events, malformed translated payloads, framing errors, and
   transport errors fail once. Dropping or cancelling a response with output still
   pending reports cancellation instead of success. Neither case retries the request.
-- Dropping an injected `next_event` future leaves its response resumable; dropping
+- Dropping a borrowed stream's `next_event` future leaves its response resumable; dropping
   the response itself releases the exchange and cancels it.
 
 The standard recorder consumes the processor's outcome for managed streams,
@@ -382,9 +385,9 @@ relays still forward original bytes and retain best-effort protocol telemetry.
 Generic `SsePipeline::from_stream` retains transport-EOF completion unless a
 known upstream endpoint is supplied with `with_endpoint`.
 
-The std and injected SDK paths use the same session implementation and share
-provider preparation, buffered response normalization, stream processing, and
-pool feedback. Platform services supply transport I/O, time, and event delivery;
+The SDK with standard and custom adapters uses the same session implementation
+and shares provider preparation, buffered response normalization, stream
+processing, and pool feedback. Adapter services supply transport I/O, time, and event delivery;
 the response owns the exchange and completion state until delivery, failure, or
 cancellation. Gateway original-destination and legacy compatibility wiring
 remain outside this SDK session contract.
@@ -413,12 +416,12 @@ credential-file loading, and persistence remain outside the session.
 
 Request events use the same `RequestEvent`, `StageEvent`, `RecordEvent`, and
 `usage::Usage` types in both builds. Attach a `RequestEventSink` or a local
-`FnMut(RequestEvent)` callback to the injected platform:
+`FnMut(RequestEvent)` callback to the custom adapter:
 
 ```rust
-use tokn_sdk::{Client, Injected, RequestEvent, RequestEventPayload, RecordEvent};
+use tokn_sdk::{Adapter, Client, RequestEvent, RequestEventPayload, RecordEvent};
 
-let services = Injected::new(transport, runtime)
+let services = Adapter::new(transport, runtime)
   .with_event_sink(|event: RequestEvent| {
     if let RequestEventPayload::Record(RecordEvent::Usage(usage)) = event.payload {
       // Store or forward this observation using application-owned services.
@@ -446,8 +449,8 @@ are constructed only when a typed sink is installed. Installing a sink opts
 into body/header copies and upstream/converted body records. Each live-stream
 recording is capped at `Limits.max_response_bytes`; reaching that recording cap
 does not stop delivery, and the corresponding record reports truncation.
-Injected ingress summaries serialize the supplied JSON value because this
-adapter has no original HTTP wire body or agent-detection context.
+SDK ingress summaries serialize the supplied JSON value because the SDK
+has no original HTTP wire body or agent-detection context.
 
 Usage observations preserve the existing parser's zero, partial, and repeated
 figures; they are snapshots, not additive token deltas. Managed buffered JSON
@@ -456,7 +459,7 @@ before translation. Opaque buffered responses use a best-effort JSON parse.
 Both adapters receive the same transport/body capture records. The standard
 event bus retains Tokio delivery and persistence subscribers. No database or file I/O is introduced into the alloc-only path.
 
-The injected platform supports managed profiles and fixed-provider relays,
+The custom adapter supports managed profiles and fixed-provider relays,
 including caller-supplied credentials. Origin-based proxy routing remains a
 gateway concern. A response stream retains a
 borrow of its HTTP session until completion, cancellation, or drop; another
@@ -465,7 +468,7 @@ borrowed only for short transactions and is not held over network awaits.
 Model identifiers can be supplied through `Client::with_models` for family
 and capability-based routing. `Client::with_model_metadata` accepts
 `ModelInventory` values with endpoint and reasoning capabilities alongside rules,
-accounts, and platform services. This gives embedded applications the same model
+accounts, and adapter services. This gives embedded applications the same model
 evidence as std discovery. `Client::with_limits` applies `Limits` to buffered
 responses and SSE records.
 The friendly generation builder and gateway relay/proxy adapters currently
@@ -476,9 +479,10 @@ time. Standard builds re-export the original upstream types; embedded builds
 use local static/inline/`Rc` storage. The local backend supports single-threaded,
 non-atomic targets and is intentionally neither `Send` nor `Sync`.
 
-`crates/sdk/tests/interpretation_parity.rs` constructs real standard and injected
-clients from the same in-memory rules and accounts, using controlled upstream responses: stream mode, initiator headers,
-session aliases, option precedence, and account affinity. Extraction-stage
+`crates/sdk/tests/interpretation_parity.rs` constructs clients with standard and
+custom adapters from the same in-memory rules and accounts, using controlled
+upstream responses: stream mode, initiator headers, session aliases, option
+precedence, and account affinity. Extraction-stage
 comparisons also cover request purpose across all three APIs and missing-model
 behavior. These checks establish interpretation parity, not full stage parity.
 `crates/requests/tests/injected_event_parity.rs` compares usage and terminal

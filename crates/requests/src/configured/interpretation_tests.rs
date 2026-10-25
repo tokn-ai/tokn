@@ -66,7 +66,7 @@ async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) 
   .unwrap();
   let plan = tokn_config::v2::compile_execution(&raw).unwrap();
   let state = Shared::new(ExecutionState::new(plan, Vec::new()).unwrap());
-  let platform = Injected::new(NoIo, NoIo);
+  let platform = Adapter::new(NoIo, NoIo);
   let (transport, clock, events) = platform.acquire().unwrap();
   let mut input = RequestInput::new(endpoint, body, headers, "parity".into());
   input.profile = options.profile;

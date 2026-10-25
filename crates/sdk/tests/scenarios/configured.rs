@@ -15,7 +15,7 @@ use tokn_sdk::{
   messages::MessagesRequest,
   responses::ResponsesRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, Endpoint, Injected, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
+  Adapter, Client, Endpoint, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
 };
 
 #[path = "typed_events.rs"]
@@ -239,7 +239,7 @@ impl Runtime for TestRuntime {
   }
 }
 
-type TestClient<'a> = Client<Injected<MemoryTransport<'a>, TestRuntime>>;
+type TestClient<'a> = Client<Adapter<MemoryTransport<'a>, TestRuntime>>;
 fn plan(driver: &str) -> tokn_sdk::policy::ExecutionRules {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
@@ -272,7 +272,7 @@ fn make_client<'a>(
   Client::new(
     plan(driver),
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(MemoryTransport::new(requests, replies), TestRuntime::default()),
+    Adapter::new(MemoryTransport::new(requests, replies), TestRuntime::default()),
   )
   .unwrap()
 }
@@ -319,7 +319,7 @@ pub fn explicit_profiles_do_not_imply_default() {
   let client = Client::new(
     plan,
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
       TestRuntime::default(),
     ),
@@ -374,7 +374,7 @@ pub fn copilot_refresh_uses_injected_transport_and_reuses_credentials() {
     let client = Client::new(
       plan("github-copilot"),
       vec![account],
-      Injected::new(
+      Adapter::new(
         MemoryTransport::new(&sent, replies).with_methods(methods),
         TestRuntime::default(),
       ),
@@ -439,7 +439,7 @@ pub fn recoverable_refresh_failure_reselects_accounts() {
   let client = Client::new(
     retry_plan_for(1, 2, "github-copilot"),
     accounts.into(),
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(
         &sent,
         [
@@ -786,7 +786,7 @@ pub fn retry_fallback_affinity() {
       account_config("primary", "primary-key", "active"),
       account_config("backup", "backup-key", "fallback"),
     ],
-    Injected::new(MemoryTransport::new(&sent, replies), runtime),
+    Adapter::new(MemoryTransport::new(&sent, replies), runtime),
   )
   .unwrap();
   let options = RequestOptions::default()
@@ -837,7 +837,7 @@ pub fn retry_schedule_and_exhaustion() {
         account_config("secondary", "secondary-key", "active"),
         account_config("backup", "backup-key", "fallback"),
       ],
-      Injected::new(MemoryTransport::new(&sent, replies), runtime),
+      Adapter::new(MemoryTransport::new(&sent, replies), runtime),
     )
     .unwrap();
     let error = run(
@@ -908,7 +908,7 @@ pub fn transport_failure_account_feedback() {
         account_config("primary", "primary-key", "active"),
         account_config("backup", "backup-key", "fallback"),
       ],
-      Injected::new(
+      Adapter::new(
         MemoryTransport::new(
           &sent,
           [
@@ -973,7 +973,7 @@ pub fn response_body_failure_does_not_retry() {
         account_config("primary", "primary-key", "active"),
         account_config("secondary", "secondary-key", "active"),
       ],
-      Injected::new(transport, runtime),
+      Adapter::new(transport, runtime),
     )
     .unwrap();
     let options = RequestOptions::default().with_session_id("body-failure-session");
@@ -1034,7 +1034,7 @@ pub fn stream_errors_and_cancellation() {
   let bounded = Client::new(
     plan("openai"),
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]),
       TestRuntime::default(),
     ),
@@ -1103,7 +1103,7 @@ pub fn streaming_terminal_lifecycle() {
     let client = Client::new(
       plan(driver),
       vec![account_config("primary", "test-key", "active")],
-      Injected::new(
+      Adapter::new(
         MemoryTransport::new(&sent, [Reply::sse(bytes)])
           .with_trace(transport.clone())
           .with_read_failure_after(bytes.len()),
@@ -1186,7 +1186,7 @@ pub fn streaming_failure_lifecycle() {
     let client = Client::new(
       plan(driver),
       vec![account_config("primary", "test-key", "active")],
-      Injected::new(transport, runtime.clone()),
+      Adapter::new(transport, runtime.clone()),
     )
     .unwrap();
     let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
@@ -1229,7 +1229,7 @@ pub fn streaming_cancellation_lifecycle() {
       let client = Client::new(
         plan("openai"),
         vec![account_config("primary", "test-key", "active")],
-        Injected::new(
+        Adapter::new(
           MemoryTransport::new(&sent, [Reply::sse(bytes), Reply::json(CHAT_JSON)]).with_trace(trace.clone()),
           runtime.clone(),
         ),
@@ -1274,7 +1274,7 @@ pub fn streaming_cancellation_lifecycle() {
   let client = Client::new(
     plan("openai"),
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]).with_trace(trace.clone()),
       runtime.clone(),
     ),
@@ -1315,7 +1315,7 @@ pub fn configured_provider_policies() {
   let client = Client::new(
     plan,
     vec![account],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(RESPONSES_JSON)]),
       TestRuntime::default(),
     ),
@@ -1353,7 +1353,7 @@ pub fn configured_provider_policies() {
   let client = Client::new(
     plan,
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
       TestRuntime::default(),
     ),
@@ -1401,7 +1401,7 @@ pub fn configured_relay_policies() {
         account_config("primary", "primary-key", "active"),
         account_config("backup", "backup-key", "fallback"),
       ],
-      Injected::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
     )
     .unwrap();
     let body = json!({"model":"namespace/unchanged-model","messages":[{"role":"user","content":"hello"}],"reasoning":{"effort":"high"},"stream":false,"vendor_field":{"preserve":true}});
@@ -1450,7 +1450,7 @@ pub fn configured_client_relay() {
     let client = Client::new(
       plan,
       Vec::new(),
-      Injected::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
     )
     .unwrap();
     let body = json!({"model":"namespace/unchanged","messages":[{"role":"user","content":"hello"}],"vendor_field":{"untouched":true},"stream":false});
@@ -1489,7 +1489,7 @@ pub fn configured_client_relay() {
   let client = Client::new(
     tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
     Vec::new(),
-    Injected::new(
+    Adapter::new(
       MemoryTransport::new(
         &sent,
         [
@@ -1556,7 +1556,7 @@ pub fn configured_status_policy() {
         account_config("primary", "primary-key", "active"),
         account_config("backup", "backup-key", "fallback"),
       ],
-      Injected::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
     )
     .unwrap();
     let first = run(client.chat_completions().create(&chat()));
@@ -1581,7 +1581,7 @@ pub fn configured_transport_encoding() {
   let client = Client::new(
     plan("openai"),
     vec![account_config("primary", "test-key", "active")],
-    Injected::new(transport, TestRuntime::default()),
+    Adapter::new(transport, TestRuntime::default()),
   )
   .unwrap();
   let response = run(client.chat_completions().create(&chat())).unwrap();

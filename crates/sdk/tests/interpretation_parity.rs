@@ -10,11 +10,11 @@
 use serde_json::{json, Value};
 use std::{cell::RefCell, convert::Infallible, rc::Rc, time::Duration};
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
-use tokn_requests::configured::ResponseBody as InjectedBody;
+use tokn_requests::configured::ResponseBody as BorrowedBody;
 use tokn_sdk::{
   account::AccountConfig,
   transport::{Request, ResponseHead, Transport},
-  Client, Endpoint, Injected, RequestOptions, ResponseBody, Runtime, StdPlatform,
+  Adapter, Client, Endpoint, RequestOptions, ResponseBody, Runtime, StdPlatform,
 };
 
 struct CaptureTransport {
@@ -66,7 +66,7 @@ impl Runtime for TestRuntime {
 struct Fixture {
   server: MockLlmServer,
   standard: Client,
-  injected: Client<Injected<CaptureTransport, TestRuntime>>,
+  injected: Client<Adapter<CaptureTransport, TestRuntime>>,
   requests: Rc<RefCell<Vec<Request>>>,
   provider: &'static str,
 }
@@ -126,7 +126,7 @@ impl Fixture {
     let injected = Client::new(
       plan,
       accounts,
-      Injected::new(
+      Adapter::new(
         CaptureTransport {
           requests: requests.clone(),
           reply,
@@ -180,8 +180,8 @@ impl Fixture {
       .await
       .expect("execute injected request");
     assert_eq!(injected.status, 200);
-    let injected_streaming = matches!(injected.body, InjectedBody::Stream(_));
-    if let InjectedBody::Stream(mut stream) = injected.body {
+    let injected_streaming = matches!(injected.body, BorrowedBody::Stream(_));
+    if let BorrowedBody::Stream(mut stream) = injected.body {
       while stream.next_event().await.expect("consume injected SSE").is_some() {}
     }
     let standard = self.server.last_request().expect("standard upstream request");
