@@ -1,7 +1,7 @@
 # Embedded SDKs
 
 With their default features, the SDKs execute requests in-process using the
-standard configuration, credentials, account pool, routing, conversion, retry,
+v2 configuration, credentials, account pool, routing, conversion, retry,
 and provider runtime. They do not require a gateway process.
 Rust also supports configured requests with caller-supplied networking in
 `no_std + alloc` environments.
@@ -10,8 +10,8 @@ Rust also supports configured requests with caller-supplied networking in
 
 The `tokn-sdk` crate is the stable façade. It provides:
 
-- default and explicit `config.toml` / `auth.yaml` loading, including
-  `config.d` and `auth.d`;
+- default and explicit v2 `config.toml` / `auth.yaml` loading, including `auth.d`
+  credential fragments;
 - atomic `reload()` of configuration and credentials;
 - default and per-request profile selection;
 - a provider-neutral generation builder with friendly text, reasoning, tool
@@ -21,6 +21,37 @@ The `tokn-sdk` crate is the stable façade. It provides:
 - typed clients for Responses, Chat Completions, and Messages;
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
+
+The standard client requires `schema_version = 2`. Legacy config files and
+legacy `config.d` overlays are no longer SDK inputs. A missing config file is
+an error. Provider destinations belong in v2 configuration; account files
+supply credentials. A minimal SDK config needs no listener:
+
+```toml
+schema_version = 2
+
+[defaults]
+provider = { kind = "fixed", provider = "openai" }
+model = { kind = "qualified", namespace = "provider" }
+
+[providers.openai]
+driver = "openai"
+base_url = "https://api.openai.com"
+```
+
+With an OpenAI account in `auth.yaml`, select a model such as `openai/gpt-5`.
+`Client::builder()` selects profile `default`, created by `[defaults]` or an
+explicit `[profiles.default]`. Use `.profile("name")` for another default;
+`RequestOptions.profile` overrides it for an individual request. Unknown
+profiles fail explicitly, including a missing `default` profile at build time.
+
+The SDK accepts gateway v2 documents too, but only builds their request runtime.
+It does not start listeners, persistence, or proxy certificate management.
+Managed routes and fixed-provider relays are available; original-destination
+proxy routes require gateway context. `service.outbound` configures SDK HTTP
+clients. A failed `reload()` preserves the previous configuration and credentials;
+successful reloads keep event subscriptions valid and let in-flight requests
+finish with their original snapshot.
 
 The client-bound builder is the shortest path for a one-off request:
 
@@ -111,13 +142,13 @@ Unsupported explicit controls fail clearly after routing rather than being
 silently dropped or reinterpreted. Raw endpoint clients remain the escape
 hatch for an exact provider wire shape.
 
-`passthrough` and `switch` profiles preserve the generated Responses payload,
+V2 relay profiles preserve the generated Responses payload,
 except detected compaction requests sent to Codex always use
 `service_tier: "priority"`, overriding any incoming tier. Their outgoing
 `x-codex-routing-hint` also uses the outgoing model and `tier=priority`,
 preserving unrelated routing directives. These profiles
 reject typed `top_k` and reasoning controls that would
-require post-route lowering. Use an `exact`, `route`, or `fuzzy` profile for
+require post-route lowering. Use a managed route for
 the provider-neutral control API.
 
 Build a request without a client when it needs to be serialized, transformed,
@@ -147,17 +178,28 @@ when an exact endpoint wire shape is required.
 
 ### Shared standard and embedded execution
 
-`Client<P>` delegates execution to its platform. Both platforms use the shared
-stage driver and managed request interpretation in `tokn-requests`. The default
-`StdPlatform` loads configuration and credentials from disk and preserves
-reloads, lifecycle subscriptions, and concurrent requests. The SDK does not
-depend on the HTTP gateway crate.
+`Client<P>` delegates configuration and service ownership to its platform. Both
+SDK platforms execute through one `tokn-requests` session, `Session<T, C, E>`:
+transport exchange `T`, clock/timer `C`, and event sink `E` supply the platform
+services. Interpretation, profile and route selection, provider preparation,
+credential refresh, retry decisions, and response processing belong to the
+shared session. The SDK does not depend on the HTTP gateway crate.
+
+The default `StdPlatform` loads configuration and credentials from disk and
+preserves reloads, lifecycle subscriptions, and concurrent requests. Each std
+request owns an independent exchange backed by the shared HTTP connection pool;
+keeping one streaming response alive does not block another request. Injected
+execution borrows an application's exchange until its response completes or is
+cancelled. These ownership adapters do not choose routing or provider policy.
 
 Disable default features to use `no_std + alloc`. Compile the same in-memory
 `config::v2::RawConfig` with `config::v2::compile_execution`, then create a
 platform using `Injected::new(plan, accounts, transport, runtime)` and pass it
 to `Client::from_platform`. Accounts use the shared `account::AccountConfig`.
 No listener, configuration file, credential file, or gateway process is required.
+The implicit profile is always `default`; a configuration with only named
+profiles requires `RequestOptions::with_profile`. The injected client checks
+this when executing a request, since an explicit profile can be supplied there.
 
 ```rust
 use tokn_sdk::{Client, Injected};
@@ -178,13 +220,13 @@ Managed request interpretation has one implementation in
 - Session/project identity, explicit and inferred initiator, request purpose,
   and route hints are normalized before routing and provider conversion.
 
-The injected executor uses the normalized session for account affinity and the
-normalized stream/initiator for provider context. Request-purpose classification
-is portable metadata; this does not yet port standard Codex compaction priority
-or routing-header policy. Standard passthrough keeps its distinct typed metadata
-peek, header-only initiator, and original body bytes.
+The session uses the normalized session identity for account affinity and the
+normalized stream/initiator for provider context. Codex compaction priority and
+routing-header policy apply through the same provider preparation on both SDK
+platforms. Gateway original-destination proxy admission remains separate from
+SDK execution.
 
-The v2 gateway and injected executor share provider/account linking and route
+The standard SDK, v2 gateway, and injected executor share provider/account linking and route
 selection in `tokn-accounts`:
 
 - `link::portable` validates provider destinations, account identities, and pool
@@ -197,16 +239,18 @@ selection in `tokn-accounts`:
   Standard execution locks its pool for each state transaction; injected execution
   borrows local state and uses the supplied monotonic clock.
 
-Standard provider objects, refreshable model caches, and injected native driver
-capabilities remain platform adapters. Routing parity depends on equivalent
-plans, accounts, capability inventories, and pool state. The injected executor
-accepts v2 configuration only. The default standard SDK still loads legacy
-configuration and retains its older routing behavior; legacy routing is not available in `no_std`.
+Native provider transformations and credential policy are shared. Model
+discovery and cache refresh happen outside request execution; routing parity
+depends on equivalent plans, accounts, capability inventories, and pool state.
+Both SDK platforms
+accept v2 configuration only. Standard SDK and gateway API profiles are built
+by `tokn_requests::v2` from the same `ExecutionPlan`; gateway admission and
+original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
-The v2 gateway and injected executor resolve named policies through `from_route`;
+The standard SDK, v2 gateway, and injected executor resolve named policies through `from_route`;
 standard pipelines keep the existing `RetryPolicy::new` and `safe_methods` APIs.
-Both sessions supply error facts and the transport method to `next_delay`:
+The shared session supplies error facts and the transport method to `next_delay`:
 
 - Only recoverable send failures can replay; deliberate stops and later response
   or stream failures do not replay a request.
@@ -232,8 +276,8 @@ Forwarding an HTTP error does not itself trigger replay. A recoverable send
 error cools the selected v2 account even if retries are disabled or exhausted.
 Successful send feedback commits session affinity before response decoding or
 stream consumption; a later body failure does not replay or cool that account.
-The standard adapter locks pool state and logs mutation errors; the injected
-adapter borrows local state and returns mutation errors to its caller.
+Shared execution state uses brief synchronized transactions under std and local
+interior mutability under `no_std`. No state guard spans transport I/O.
 
 Managed buffered responses share `tokn_convert::buffered::convert_response`:
 
@@ -250,6 +294,8 @@ Injected buffered execution now follows these standard behaviors, including
 content-based SSE detection when an upstream omits or mislabels its MIME type.
 Its decoded input, converted output, and individual SSE records remain bounded
 by `Limits`. Opaque buffered relays preserve their bytes without normalization.
+Opaque relays follow the upstream content type: `text/event-stream` produces a
+live byte stream even when the request's `stream` field is false.
 Accumulated SSE receives `application/json`; other buffered responses retain
 their upstream content type in the converter and injected adapter. The HTTP
 gateway sets its managed response content type when constructing the HTTP reply.
@@ -275,20 +321,22 @@ relays still forward original bytes and retain best-effort protocol telemetry.
 Generic `SsePipeline::from_stream` retains transport-EOF completion unless a
 known upstream endpoint is supplied with `with_endpoint`.
 
-The standard and injected sessions still implement their stages separately.
-They reuse provider preparation helpers, buffered response normalization, and
-stream processing. Transport I/O, error-body capture, live stream ownership, and
-event delivery remain platform adapters. Send decisions are shared; applying
-pool feedback uses each adapter's existing state access.
+The std and injected SDK paths use the same session implementation and share
+provider preparation, buffered response normalization, stream processing, and
+pool feedback. Platform services supply transport I/O, time, and event delivery;
+the response owns the exchange and completion state until delivery, failure, or
+cancellation. Gateway original-destination and legacy compatibility wiring
+remain outside this SDK session contract.
 `tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
-Further unification belongs in these existing crates, with platform services for
-transport, time, credentials, state access, and event delivery. There is no
-separate direct client or engine crate.
+The implementation stays in the existing crates; there is no separate direct
+client or engine crate.
 
 Implement `transport::Transport` on the application's HTTP/TLS session:
 
 - `send` starts an exchange and returns its status and headers;
-- `read` reads decoded HTTP entity bytes, returning zero at EOF;
+- `read` reads HTTP entity bytes, returning zero at EOF; managed responses are
+  decoded, while an opaque exchange may preserve encoding and report that through
+  `response_is_decoded`;
 - `accept_encoding` advertises the adapter’s supported content decoders and
   defaults to `identity`;
 - `recoverable` classifies errors that can be replayed;
@@ -297,8 +345,10 @@ Implement `transport::Transport` on the application's HTTP/TLS session:
 Implement `Runtime` for monotonic time, wall-clock timestamps, asynchronous
 sleep, and optional event delivery. Networking, TLS validation, an
 allocator, and an async executor are supplied by firmware. Explicit API keys
-and access tokens are supplied in memory; desktop login and refresh adapters
-remain standard features.
+and access tokens are supplied in memory. Copilot accounts with a refresh
+credential exchange it through the supplied transport when their cached token
+needs renewal; the shared state reuses the replacement token. Interactive login,
+credential-file loading, and persistence remain outside the session.
 
 Request events use the same `RequestEvent`, `StageEvent`, `RecordEvent`, and
 `usage::Usage` types in both builds. Attach a `RequestEventSink` or a local
@@ -330,7 +380,9 @@ Completed's `attempts` is one-based. Stream completion follows the shared
 terminal rules above. Cancellation and response failures emit Error followed
 by Completed with `success: false`. Summary payloads and usage observations
 are constructed only when a typed sink is installed. Installing a sink opts
-into body/header copies for summaries; live response bodies are not retained.
+into body/header copies and upstream/converted body records. Each live-stream
+recording is capped at `Limits.max_response_bytes`; reaching that recording cap
+does not stop delivery, and the corresponding record reports truncation.
 Injected ingress summaries serialize the supplied JSON value because this
 adapter has no original HTTP wire body or agent-detection context.
 
@@ -338,9 +390,8 @@ Usage observations preserve the existing parser's zero, partial, and repeated
 figures; they are snapshots, not additive token deltas. Managed buffered JSON
 is observed before conversion, buffered SSE after rendering, and live SSE
 before translation. Opaque buffered responses use a best-effort JSON parse.
-The standard event bus implements the sink interface and retains its existing
-Tokio delivery, additional transport/body capture records, and persistence
-subscribers. No database or file I/O is introduced into the alloc-only path.
+Both adapters receive the same transport/body capture records. The standard
+event bus retains Tokio delivery and persistence subscribers. No database or file I/O is introduced into the alloc-only path.
 
 The injected platform supports managed profiles and fixed-provider relays,
 including caller-supplied credentials. Origin-based proxy routing remains a
@@ -348,8 +399,11 @@ gateway concern. A response stream retains a
 borrow of its HTTP session until completion, cancellation, or drop; another
 call using that session returns an error while it is busy. Selection state is
 borrowed only for short transactions and is not held over network awaits.
-Model metadata can be supplied through `Injected::with_models` for family and
-capability-based routing. `Limits` bounds buffered responses and SSE records.
+Model identifiers can be supplied through `Injected::with_models` for family
+and capability-based routing. `Injected::with_model_metadata` accepts
+`ModelInventory` values with endpoint and reasoning capabilities, so embedded
+applications can provide the same evidence as std discovery. `Limits` bounds
+buffered responses and SSE records.
 The friendly generation builder and gateway relay/proxy adapters currently
 remain standard-only.
 

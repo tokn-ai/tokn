@@ -59,8 +59,21 @@ let client: Awaited<ReturnType<typeof Client.create>> | undefined;
 try {
   const configPath = join(fixture, "config.toml");
   const authPath = join(fixture, "auth.yaml");
-  await writeFile(configPath, '[defaults]\nmode = "exact"\n');
-  await writeFile(authPath, `version: 1\naccounts:\n  - id: local-llama\n    provider: llama-cpp\n    base_url: http://127.0.0.1:${address.port}\n`);
+  await writeFile(
+    configPath,
+    [
+      "schema_version = 2",
+      "[defaults]",
+      'provider = { kind = "fixed", provider = "llama-cpp" }',
+      'model = { kind = "qualified", namespace = "provider" }',
+      'wire_identity = "none"',
+      '[providers."llama-cpp"]',
+      'driver = "llama-cpp"',
+      `base_url = "http://127.0.0.1:${address.port}"`,
+      "",
+    ].join("\n"),
+  );
+  await writeFile(authPath, "version: 1\naccounts:\n  - id: local-llama\n    provider: llama-cpp\n");
   client = await Client.create({ config_path: configPath, auth_path: authPath });
   const response = await client.generate("llama-cpp/mock-model").prompt("Hello").send();
   assert.equal(response.text, "installed native answer");

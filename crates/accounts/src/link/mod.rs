@@ -11,11 +11,13 @@ pub use portable::{ProviderBindingKey, ProviderUrlSource};
 
 #[cfg(feature = "std")]
 pub use pools::{
-  link_account_pools, LinkedAccountPool, LinkedAccountPools, LinkedPoolAccount, PoolLinkError, PoolLinkResult,
+  link_account_pools, link_execution_account_pools, LinkedAccountPool, LinkedAccountPools, LinkedPoolAccount,
+  PoolLinkError, PoolLinkResult,
 };
 #[cfg(feature = "std")]
 pub use provider_graph::{
-  link_provider_graph, LinkError, LinkResult, LinkedAccount, ProviderBinding, ProviderDestination, ProviderGraph,
+  link_execution_provider_graph, link_provider_graph, LinkError, LinkResult, LinkedAccount, ProviderBinding,
+  ProviderDestination, ProviderGraph,
 };
 #[cfg(feature = "std")]
 pub use selection::{

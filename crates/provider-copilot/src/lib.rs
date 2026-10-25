@@ -5,6 +5,7 @@
 #[macro_use]
 extern crate alloc;
 
+pub mod config;
 pub mod native;
 
 #[cfg(feature = "std")]

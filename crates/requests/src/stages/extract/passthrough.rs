@@ -23,21 +23,8 @@ use crate::pipeline::error::PipelineError;
 use crate::pipeline::stages::{ExtractStage, Extracted, RawInbound};
 use crate::utils::codec::request_content_encoding;
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::Value;
-use smol_str::SmolStr;
 use std::sync::Arc;
-use tokn_core::request_classification::classify_request;
-
-/// Preserve the original all-or-nothing metadata peek: an invalid type in
-/// either field makes both peeked fields unavailable.
-#[derive(Debug, Default, Deserialize)]
-struct ModelPeek {
-  #[serde(default)]
-  model: Option<SmolStr>,
-  #[serde(default)]
-  stream: Option<bool>,
-}
 
 pub struct PassthroughExtract;
 
@@ -53,12 +40,6 @@ impl ExtractStage for PassthroughExtract {
       request_id: _,
     } = raw;
 
-    // Preserve typed-peek behavior, including rejection of duplicate keys
-    // and invalid field types. Classification parses independently so it
-    // cannot change routing metadata or the original forwarded bytes.
-    let peek = serde_json::from_slice::<ModelPeek>(&decoded_body).unwrap_or_default();
-    let inspected_body = serde_json::from_slice::<Value>(&decoded_body).unwrap_or(Value::Null);
-
     let RequestInterpretation {
       model,
       stream,
@@ -67,9 +48,8 @@ impl ExtractStage for PassthroughExtract {
       initiator,
       header_initiator,
       route_mode_hint,
-      ..
-    } = RequestInterpretation::from_headers(&headers).with_body_metadata(peek.model.as_deref(), peek.stream);
-    let request_classification = classify_request(&ctx.request_endpoint, &inspected_body);
+      request_classification,
+    } = RequestInterpretation::from_wire(&ctx.request_endpoint, &headers, &decoded_body);
 
     let content_encoding = request_content_encoding(&headers).ok().flatten();
 

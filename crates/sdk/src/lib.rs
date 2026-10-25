@@ -1,6 +1,6 @@
 //! One configured client and request pipeline for standard and embedded applications.
 //!
-//! The default standard platform loads configuration and credentials from disk.
+//! The default standard platform loads v2 configuration and credentials from disk.
 //! [`Injected`] uses the same execution model with application-supplied accounts,
 //! model metadata, HTTP transport, monotonic time and timers.
 
@@ -36,6 +36,7 @@ pub use tokn_config as config;
 pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
 pub use tokn_requests::configured::{EventRuntime, Injected, Lifecycle, Limits, Runtime};
+pub use tokn_requests::session::{ModelCapabilities, ModelInventory};
 pub use tokn_service::transport;
 
 #[cfg(feature = "std")]

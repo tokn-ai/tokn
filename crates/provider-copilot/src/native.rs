@@ -1,7 +1,7 @@
 //! Pure native request preparation. Transport, credential refresh, and timing
 //! belong to the caller's platform services.
 
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use serde_json::Value;
 use tokn_core::{
   provider::{prepare_request_with_policy, validate_credential, PrepareError, PreparedRequest},
@@ -74,6 +74,72 @@ pub fn prepare_with_policy(
 }
 
 pub const COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
+pub const COPILOT_TOKEN_EXCHANGE_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+
+/// Cache policy used by both standard and injected credential acquisition.
+pub fn api_token_valid_at(expires_at: i64, now: i64) -> bool {
+  expires_at.saturating_sub(300) > now
+}
+
+/// Fields required to replace a cached Copilot API token.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CopilotTokenResponse {
+  pub token: String,
+  pub expires_at: i64,
+  #[serde(default)]
+  pub refresh_in: Option<i64>,
+}
+
+/// Headers for exchanging the long-lived GitHub credential.
+pub fn token_exchange_headers(github_token: &str, identity: &crate::config::CopilotHeaders) -> HeaderMap {
+  use tokn_headers::keys::{EDITOR_PLUGIN_VERSION, EDITOR_VERSION, USER_AGENT};
+  let mut headers = HeaderMap::new();
+  headers.insert(
+    &AUTHORIZATION,
+    HeaderValue::from_string(format!("token {github_token}")),
+  );
+  headers.insert(&ACCEPT, HeaderValue::from_static("application/json"));
+  headers.insert(&USER_AGENT, HeaderValue::from_string(identity.user_agent.clone()));
+  headers.insert(
+    &EDITOR_VERSION,
+    HeaderValue::from_string(identity.editor_version.clone()),
+  );
+  headers.insert(
+    &EDITOR_PLUGIN_VERSION,
+    HeaderValue::from_string(identity.editor_plugin_version.clone()),
+  );
+  headers
+}
+
+/// Resolve billing initiator using the same precedence on every platform.
+pub fn resolve_initiator(
+  endpoint: Endpoint,
+  body: &Value,
+  inbound: &HeaderMap,
+  fallback: &str,
+  mode: crate::config::InitiatorMode,
+) -> String {
+  if let Some(value) = inbound.get("x-initiator") {
+    let value = value.as_str().trim().to_ascii_lowercase();
+    if value == "user" || value == "agent" {
+      return value;
+    }
+  }
+  match mode {
+    crate::config::InitiatorMode::AlwaysUser => "user".into(),
+    crate::config::InitiatorMode::AlwaysAgent => "agent".into(),
+    crate::config::InitiatorMode::Auto => {
+      if fallback == "user" || fallback == "agent" {
+        return fallback.into();
+      }
+      let classified = match endpoint {
+        Endpoint::Responses => tokn_core::util::initiator::classify_initiator_responses(body),
+        _ => tokn_core::util::initiator::classify_initiator(body),
+      };
+      classified.unwrap_or("user").into()
+    }
+  }
+}
 
 /// Per-model operation availability used by the shared route resolver.
 pub fn supports_model_endpoint(model: &str, endpoint: Endpoint, base_url: &str) -> bool {

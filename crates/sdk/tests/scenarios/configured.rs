@@ -81,6 +81,7 @@ struct MemoryTransport<'a> {
   local: Rc<()>,
   encoding: &'static str,
   recoverable_errors: bool,
+  expected_methods: VecDeque<&'static str>,
   read_failure_after: Option<usize>,
   trace: Rc<RefCell<TransportTrace>>,
 }
@@ -109,6 +110,11 @@ impl<'a> MemoryTransport<'a> {
     self
   }
 
+  fn with_methods(mut self, methods: impl IntoIterator<Item = &'static str>) -> Self {
+    self.expected_methods = methods.into_iter().collect();
+    self
+  }
+
   fn new(requests: &'a RefCell<Vec<Request>>, replies: impl IntoIterator<Item = Reply>) -> Self {
     Self {
       requests,
@@ -119,6 +125,7 @@ impl<'a> MemoryTransport<'a> {
       local: Rc::new(()),
       encoding: "identity",
       recoverable_errors: true,
+      expected_methods: VecDeque::new(),
       read_failure_after: None,
       trace: Rc::default(),
     }
@@ -134,7 +141,7 @@ impl core::fmt::Display for MemoryError {
 impl Transport for MemoryTransport<'_> {
   type Error = MemoryError;
   async fn send(&mut self, request: Request) -> Result<ResponseHead, Self::Error> {
-    assert_eq!(request.method, "POST");
+    assert_eq!(request.method, self.expected_methods.pop_front().unwrap_or("POST"));
     self.requests.borrow_mut().push(request);
     let reply = self
       .replies
@@ -243,11 +250,14 @@ fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
   tokn_sdk::config::v2::compile_execution(&raw).unwrap()
 }
 fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionPlan {
+  retry_plan_for(max_retries, initial_backoff_ms, "openai")
+}
+fn retry_plan_for(max_retries: u32, initial_backoff_ms: u64, driver: &str) -> tokn_sdk::policy::ExecutionPlan {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
     "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},
     "retry_policies":{"retry":{"max_retries":max_retries,"initial_backoff_ms":initial_backoff_ms}},
-    "providers":{"upstream":{"driver":"openai","base_url":"https://example.com/v1"}}
+    "providers":{"upstream":{"driver":driver,"base_url":"https://example.com/v1"}}
   })).unwrap();
   tokn_sdk::config::v2::compile_execution(&raw).unwrap()
 }
@@ -289,6 +299,195 @@ fn run<F: Future>(future: F) -> F::Output {
     }
   }
   panic!("fixture exceeded its pending-poll budget");
+}
+
+/// An unrelated named profile must never become the implicit default merely
+/// because it is first in the config's map.
+pub fn explicit_profiles_do_not_imply_default() {
+  let raw = serde_json::from_value(json!({
+    "schema_version": 2,
+    "profiles": {"named": {"route": "managed", "wire_identity": "none"}},
+    "routes": {"managed": {
+      "kind": "managed",
+      "provider": {"kind": "fixed", "provider": "upstream"},
+      "model": {"kind": "qualified", "namespace": "provider"},
+      "operation": "preserve",
+      "retry": {"kind": "never"}
+    }},
+    "providers": {"upstream": {"driver": "openai", "base_url": "https://example.com/v1"}}
+  }))
+  .unwrap();
+  let plan = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
+  let sent = RefCell::new(Vec::new());
+  let client = Client::from_platform(
+    Injected::new(
+      plan,
+      vec![account_config("primary", "test-key", "active")],
+      MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
+      TestRuntime::default(),
+    )
+    .unwrap(),
+  );
+  let body = json!({"model": "upstream/model", "messages": [{"role": "user", "content": "hello"}]});
+  for (options, expected_profile) in [
+    (RequestOptions::default(), "default"),
+    (RequestOptions::default().with_profile("missing"), "missing"),
+  ] {
+    let error = match run(client.execute(Endpoint::ChatCompletions, body.clone(), options)) {
+      Err(error) => error,
+      Ok(_) => panic!("an absent profile must fail before transport I/O"),
+    };
+    assert!(error.message.contains(expected_profile), "{error}");
+    assert!(sent.borrow().is_empty());
+  }
+  let response = run(client.execute(
+    Endpoint::ChatCompletions,
+    body,
+    RequestOptions::default().with_profile("named"),
+  ))
+  .expect("an explicit existing profile is valid without a default profile");
+  assert_eq!(response.status, 200);
+  assert_eq!(sent.borrow().len(), 1);
+}
+
+/// Credential refresh is part of shared request preparation. The transport sees
+/// both exchanges, and a successful refresh is reused by later requests.
+pub fn copilot_refresh_uses_injected_transport_and_reuses_credentials() {
+  const TOKEN: &[u8] = br#"{"token":"refreshed-api-token","expires_at":1700003600}"#;
+  for fail_first_refresh in [false, true] {
+    let sent = RefCell::new(Vec::new());
+    let account = serde_json::from_value(json!({
+      "id": "primary",
+      "provider": "upstream",
+      "access_token": "expired-api-token",
+      "access_token_expires_at": 1_699_999_999_i64,
+      "refresh_token": "github-credential",
+      "refresh_url": "https://credentials.example/token",
+      "settings": {"editor_version": "test-editor/1"}
+    }))
+    .unwrap();
+    let mut replies = Vec::new();
+    let mut methods = Vec::new();
+    if fail_first_refresh {
+      replies.push(Reply::json(b"invalid-token-response"));
+      methods.push("GET");
+    }
+    replies.extend([Reply::json(TOKEN), Reply::json(CHAT_JSON), Reply::json(CHAT_JSON)]);
+    methods.extend(["GET", "POST", "POST"]);
+    let client = Client::from_platform(
+      Injected::new(
+        plan("github-copilot"),
+        vec![account],
+        MemoryTransport::new(&sent, replies).with_methods(methods),
+        TestRuntime::default(),
+      )
+      .unwrap(),
+    );
+    if fail_first_refresh {
+      assert!(run(client.chat_completions().create(&chat())).is_err());
+      assert_eq!(
+        sent.borrow().len(),
+        1,
+        "invalid refreshed credentials must not reach LLM send"
+      );
+    }
+    for _ in 0..2 {
+      let response =
+        run(client.chat_completions().create(&chat())).expect("valid refresh and later cached credential both execute");
+      assert_eq!(response.data.id.as_deref(), Some("chat-test"));
+    }
+    let requests = sent.borrow();
+    let refresh_count = 1 + usize::from(fail_first_refresh);
+    assert_eq!(requests.len(), refresh_count + 2);
+    for request in &requests[..refresh_count] {
+      assert_eq!(request.method, "GET");
+      assert_eq!(request.url, "https://credentials.example/token");
+      assert!(request.body.is_empty());
+      assert_eq!(
+        request.headers.get("authorization").unwrap().as_str(),
+        "token github-credential"
+      );
+      assert_eq!(request.headers.get("editor-version").unwrap().as_str(), "test-editor/1");
+    }
+    for request in &requests[refresh_count..] {
+      assert_eq!(request.method, "POST");
+      assert_eq!(request.url, "https://example.com/v1/chat/completions");
+      assert_eq!(
+        request.headers.get("authorization").unwrap().as_str(),
+        "Bearer refreshed-api-token"
+      );
+    }
+  }
+}
+
+/// A recoverable credential exchange failure is a send failure: cool down the
+/// account, retry the full request, and refresh the newly selected account.
+pub fn recoverable_refresh_failure_reselects_accounts() {
+  let sent = RefCell::new(Vec::new());
+  let accounts = [
+    ("primary", "active", "github-primary"),
+    ("backup", "fallback", "github-backup"),
+  ]
+  .map(|(id, tier, refresh)| {
+    serde_json::from_value(json!({
+      "id": id, "tier": tier, "provider": "upstream",
+      "access_token": "expired-api-token",
+      "access_token_expires_at": 1_699_999_999_i64,
+      "refresh_token": refresh,
+      "refresh_url": "https://credentials.example/token"
+    }))
+    .unwrap()
+  });
+  let runtime = TestRuntime::default();
+  let client = Client::from_platform(
+    Injected::new(
+      retry_plan_for(1, 2, "github-copilot"),
+      accounts.into(),
+      MemoryTransport::new(
+        &sent,
+        [
+          Reply {
+            status: 503,
+            content_type: "application/json",
+            bytes: br#"{"error":"try another account"}"#,
+          },
+          Reply::json(br#"{"token":"fallback-api-token","expires_at":1700003600}"#),
+          Reply::json(CHAT_JSON),
+        ],
+      )
+      .with_methods(["GET", "GET", "POST"]),
+      runtime.clone(),
+    )
+    .unwrap(),
+  );
+  let response = run(
+    client
+      .chat_completions()
+      .create_with(&chat(), RequestOptions::default().with_request_id("refresh-retry")),
+  )
+  .expect("recoverable refresh failure retries the full send with another account");
+  assert_eq!(response.data.id.as_deref(), Some("chat-test"));
+  let requests = sent.borrow();
+  assert_eq!(requests.len(), 3);
+  for (request, expected) in requests.iter().zip([
+    "token github-primary",
+    "token github-backup",
+    "Bearer fallback-api-token",
+  ]) {
+    assert_eq!(request.headers.get("authorization").unwrap().as_str(), expected);
+  }
+  let state = runtime.0.borrow();
+  assert_eq!(state.sleeps, [Duration::from_millis(2)]);
+  let completed: Vec<_> = state
+    .events
+    .iter()
+    .filter(|event| event.stage == "completed")
+    .map(|event| (event.request_id.as_str(), event.attempt, event.success))
+    .collect();
+  assert_eq!(
+    completed,
+    [("refresh-retry", 0, Some(false)), ("refresh-retry", 1, Some(true))]
+  );
 }
 
 /// All three native API formats use the configured Client and shared provider preparation.

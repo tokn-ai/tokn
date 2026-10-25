@@ -1,10 +1,11 @@
 //! Shared request execution for standard and embedded Tokn applications.
 //!
-//! [`driver`] owns the six-stage sequence and retry control flow. The standard
-//! dynamic profiles and configured injected sessions adapt their platform services
-//! to that driver; routing, selection, provider preparation, and conversion remain
-//! in their domain crates. Standard-only modules retain Tower, HTTP gateway,
-//! recording, and custom stage adapters.
+//! [`session::Session`] implements configured v2 execution for both standard
+//! and injected clients. Its host supplies transport, timing, and event delivery;
+//! [`driver`] owns the common six-stage sequence and retry control flow. Routing,
+//! selection, provider preparation, and conversion remain in their domain crates.
+//! Standard-only modules adapt Tower and gateway traffic and retain the explicit
+//! dynamic-profile compatibility API.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -13,10 +14,14 @@ extern crate alloc;
 pub mod configured;
 pub mod driver;
 pub mod interpretation;
+pub mod preparation;
 pub mod retry;
 #[cfg(feature = "std")]
 pub mod runtime;
 pub mod send_policy;
+pub mod session;
+#[cfg(feature = "std")]
+pub mod v2;
 
 #[cfg(feature = "std")]
 pub mod event;

@@ -20,13 +20,12 @@
 use crate::pipeline::ctx::PipelineCtx;
 use crate::pipeline::error::PipelineError;
 use crate::pipeline::stages::{BuildHeadersStage, BuiltHeaders, Extracted, Resolved};
+use crate::preparation::identity_headers;
 use async_trait::async_trait;
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use tokn_core::AgentId;
 use tokn_headers::inbound::build_template_vars;
-use tokn_headers::registry::build_wire_identity_headers;
-use tokn_headers::{keys, HeaderValue};
 
 /// Default BuildHeaders stage. See module docs for the resolution
 /// algorithm.
@@ -88,11 +87,12 @@ impl BuildHeadersStage for DefaultBuildHeaders {
     let mut vars = build_template_vars(inbound);
     let agent_id = self.effective_agent_id(extracted, resolved);
 
-    let mut headers = build_wire_identity_headers(resolved.provider_id.as_str(), agent_id.as_str(), &vars, inbound);
-    vars.request_id.get_or_insert_with(|| ctx.request_id.to_string().into());
-    headers.insert(
-      &keys::X_REQUEST_ID,
-      HeaderValue::from_string(ctx.request_id.to_string()),
+    let headers = identity_headers(
+      resolved.provider_id.as_str(),
+      Some(&agent_id),
+      &mut vars,
+      inbound,
+      ctx.request_id.as_str(),
     );
 
     Ok(BuiltHeaders {

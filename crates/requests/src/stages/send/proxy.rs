@@ -283,11 +283,11 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
   use super::*;
   use crate::event::{EventBus, EventPayload, RecordEvent};
+  use crate::header_policy::BODY_DIGEST_HEADERS;
   use crate::pipeline::config::RunConfig;
   use crate::pipeline::stages::ResolveStage;
   use crate::pipeline::stages::{BuiltHeaders, ConvertedRequest, Extracted, Resolved, ResolvedRoute};
   use crate::stages::resolve::proxy::ProxyResolve;
-  use crate::stages::send::BODY_DIGEST_HEADERS;
   use crate::test_support::{mock_handle_with_provider, MockProvider};
   use crate::utils::codec::{decode_body_bytes, encode_body_bytes, ContentEncodingKind};
   use bytes::Bytes;

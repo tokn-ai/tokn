@@ -8,15 +8,31 @@ mod scenarios;
 pub use scenarios::{
   buffered_content_detection, buffered_response_limits, buffered_round_trip, buffered_usage_events,
   configured_client_relay, configured_provider_policies, configured_relay_policies, configured_status_policy,
-  configured_transport_encoding, cross_format_round_trip, event_timestamps_and_local_sink,
-  response_body_failure_does_not_retry, retry_fallback_affinity, retry_schedule_and_exhaustion,
-  stream_errors_and_cancellation, streaming_cancellation_lifecycle, streaming_failure_lifecycle, streaming_round_trip,
-  streaming_terminal_lifecycle, streaming_usage_events, transport_failure_account_feedback, typed_event_failures,
-  typed_event_retry_attribution, typed_event_summaries,
+  configured_transport_encoding, copilot_refresh_uses_injected_transport_and_reuses_credentials,
+  cross_format_round_trip, event_timestamps_and_local_sink, explicit_profiles_do_not_imply_default,
+  recoverable_refresh_failure_reselects_accounts, response_body_failure_does_not_retry, retry_fallback_affinity,
+  retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_cancellation_lifecycle,
+  streaming_failure_lifecycle, streaming_round_trip, streaming_terminal_lifecycle, streaming_usage_events,
+  transport_failure_account_feedback, typed_event_failures, typed_event_retry_attribution, typed_event_summaries,
 };
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn recoverable_refresh_failure_reselects_accounts() {
+    super::recoverable_refresh_failure_reselects_accounts();
+  }
+
+  #[test]
+  fn copilot_refresh_uses_injected_transport_and_reuses_credentials() {
+    super::copilot_refresh_uses_injected_transport_and_reuses_credentials();
+  }
+
+  #[test]
+  fn explicit_profiles_do_not_imply_default() {
+    super::explicit_profiles_do_not_imply_default();
+  }
+
   #[test]
   fn typed_event_summaries() {
     super::typed_event_summaries();
