@@ -10,8 +10,8 @@ Rust also supports configured requests with caller-supplied networking in
 
 The `tokn-sdk` crate is the stable façade. It provides:
 
-- default and explicit v2 `config.toml` / `auth.yaml` loading, including `auth.d`
-  credential fragments;
+- default and explicit legacy or v2 `config.toml` loading, with `auth.yaml`
+  and `auth.d` credential fragments;
 - atomic `reload()` of configuration and credentials;
 - default and per-request profile selection;
 - a provider-neutral generation builder with friendly text, reasoning, tool
@@ -22,10 +22,12 @@ The `tokn-sdk` crate is the stable façade. It provides:
 - a raw JSON request escape hatch;
 - buffered typed responses and live byte streams.
 
-The standard client requires `schema_version = 2`. Legacy config files and
-legacy `config.d` overlays are no longer SDK inputs. A missing config file is
-an error. Provider destinations belong in v2 configuration; account files
-supply credentials. A minimal SDK config needs no listener:
+The standard client accepts native v2 documents with `schema_version = 2`
+and legacy documents with no schema marker. Legacy configuration and its sorted
+`config.d` overlays are projected into v2 in memory, then enter the same compiler
+and request runtime as native v2 input.
+A missing config file, malformed schema marker, or unsupported schema version
+is an error. A minimal native v2 config needs no listener:
 
 ```toml
 schema_version = 2
@@ -52,6 +54,25 @@ proxy routes require gateway context. `service.outbound` configures SDK HTTP
 clients. A failed `reload()` preserves the previous configuration and credentials;
 successful reloads keep event subscriptions valid and let in-flight requests
 finish with their original snapshot.
+
+Legacy loading does not migrate or rewrite configuration or credentials. It
+loads accounts from `auth.yaml` and `auth.d`, then adds inline legacy accounts
+whose IDs are absent from that store. Store accounts take precedence when an
+inline account has the same ID. Account-level destinations are promoted to v2
+provider destinations; conflicting destinations within a provider are rejected.
+Native v2 input uses `[providers.<id>].base_url`, while account files supply
+credentials and do not override that destination.
+
+Projection follows v2 routing and selection semantics. Unsupported legacy
+recipes fail during loading. Inspect `client.config_warnings()` for behavior
+changes, promoted account destinations, and renamed profile resources. Builder
+and request profile options accept original legacy names. Generated resource
+IDs are also accepted unless an original name shadows them; original names
+take precedence in a projected legacy snapshot. Legacy API/proxy listener
+settings are outside SDK execution; the client neither compiles nor starts those
+listeners. A successful reload
+replaces warnings with the new snapshot, including an empty list for native
+v2 input; a failed reload preserves the previous warnings and runtime.
 
 The client-bound builder is the shortest path for a one-off request:
 
@@ -242,10 +263,10 @@ selection in `tokn-accounts`:
 Native provider transformations and credential policy are shared. Model
 discovery and cache refresh happen outside request execution; routing parity
 depends on matching execution rules, accounts, capability inventories, and pool state.
-Both SDK platforms
-accept v2 configuration only. Standard SDK and gateway API profiles are built
-by `tokn_requests::v2` from the same `ExecutionRules`; gateway admission and
-original-destination proxy wiring remain in `tokn-router`.
+The injected platform accepts in-memory v2 configuration; legacy filesystem
+loading and projection belong to `StdPlatform`. Standard SDK and gateway API
+profiles are built by `tokn_requests::v2` from the same `ExecutionRules`;
+gateway admission and original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
 The standard SDK, v2 gateway, and injected executor resolve named policies through `from_route`;

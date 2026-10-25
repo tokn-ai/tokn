@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,12 +33,12 @@ test("native configuration failures retain their public error type", async () =>
         error.code === "configuration_error" &&
         error.cause instanceof Error,
     );
-    const legacyConfigPath = join(fixtureRoot, "legacy-config.toml");
+    const invalidConfigPath = join(fixtureRoot, "invalid-config.toml");
     const authPath = join(fixtureRoot, "auth.yaml");
-    await writeFile(legacyConfigPath, '[defaults]\nmode = "exact"\n');
+    await writeFile(invalidConfigPath, "schema_version = 3\n");
     await writeFile(authPath, "version: 1\naccounts: []\n");
     await assert.rejects(
-      Client.create({ config_path: legacyConfigPath, auth_path: authPath }),
+      Client.create({ config_path: invalidConfigPath, auth_path: authPath }),
       (error: unknown) =>
         error instanceof ConfigurationError &&
         error.code === "configuration_error" &&
@@ -221,6 +221,29 @@ test("the native client loads configured credentials and completes a provider re
     }
     assert.equal(requests.length, 3);
     assert.equal(requests[2]?.body["stream"], true);
+
+    const legacyConfig = '[server]\nhost = "sdk.private.example"\n[defaults]\nmode = "exact"\n';
+    const legacyAuth = [
+      "version: 1",
+      "accounts:",
+      "  - id: local-llama",
+      "    provider: llama-cpp",
+      `    base_url: http://127.0.0.1:${address.port}`,
+      "",
+    ].join("\n");
+    await writeFile(configPath, legacyConfig);
+    await writeFile(authPath, legacyAuth);
+    const legacyClient = await Client.create({ config_path: configPath, auth_path: authPath });
+    try {
+      const legacyResponse = await legacyClient.generate("llama-cpp/mock-model").prompt("legacy input").send();
+      assert.equal(legacyResponse.text, "native answer");
+      assert.equal(requests.length, 4);
+      assert.equal(requests[3]?.body["model"], "mock-model");
+      assert.equal(await readFile(configPath, "utf8"), legacyConfig);
+      assert.equal(await readFile(authPath, "utf8"), legacyAuth);
+    } finally {
+      await legacyClient.close();
+    }
   } finally {
     await client?.close();
     await new Promise<void>((resolve, reject) => {

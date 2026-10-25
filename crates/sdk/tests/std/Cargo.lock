@@ -2216,6 +2216,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-router-legacy-config"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "directories",
+ "reqwest",
+ "serde",
+ "serde_yaml",
+ "thiserror",
+ "tokn-core",
+ "tokn-router-config",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "tokn-sdk"
 version = "0.2.4"
 dependencies = [
@@ -2239,6 +2255,7 @@ dependencies = [
  "tokn-policy",
  "tokn-requests",
  "tokn-router-config",
+ "tokn-router-legacy-config",
  "tokn-service",
 ]
 

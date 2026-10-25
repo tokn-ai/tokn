@@ -7,11 +7,11 @@ use tokn_policy::{ExecutionRules, GatewayPlan};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledExecutionConfig {
   execution: ExecutionRules,
-  service: ServicePlan,
+  service: ServiceSettings,
 }
 
 impl CompiledExecutionConfig {
-  pub(super) fn new(execution: ExecutionRules, service: ServicePlan) -> Self {
+  pub(super) fn new(execution: ExecutionRules, service: ServiceSettings) -> Self {
     Self { execution, service }
   }
 
@@ -19,11 +19,11 @@ impl CompiledExecutionConfig {
     &self.execution
   }
 
-  pub fn service(&self) -> &ServicePlan {
+  pub fn service(&self) -> &ServiceSettings {
     &self.service
   }
 
-  pub fn into_parts(self) -> (ExecutionRules, ServicePlan) {
+  pub fn into_parts(self) -> (ExecutionRules, ServiceSettings) {
     (self.execution, self.service)
   }
 }
@@ -32,11 +32,11 @@ impl CompiledExecutionConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledConfig {
   gateway: GatewayPlan,
-  service: ServicePlan,
+  service: ServiceSettings,
 }
 
 impl CompiledConfig {
-  pub(super) fn new(gateway: GatewayPlan, service: ServicePlan) -> Self {
+  pub(super) fn new(gateway: GatewayPlan, service: ServiceSettings) -> Self {
     Self { gateway, service }
   }
 
@@ -44,18 +44,18 @@ impl CompiledConfig {
     &self.gateway
   }
 
-  pub fn service(&self) -> &ServicePlan {
+  pub fn service(&self) -> &ServiceSettings {
     &self.service
   }
 
-  pub fn into_parts(self) -> (GatewayPlan, ServicePlan) {
+  pub fn into_parts(self) -> (GatewayPlan, ServiceSettings) {
     (self.gateway, self.service)
   }
 }
 
 /// Process-wide serving settings independent of the routing graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ServicePlan {
+pub struct ServiceSettings {
   logging: crate::LoggingConfig,
   outbound: OutboundPlan,
   request_limits: RequestLimitsPlan,
@@ -63,7 +63,7 @@ pub struct ServicePlan {
   models: super::ModelRefreshPlan,
 }
 
-impl ServicePlan {
+impl ServiceSettings {
   pub(super) fn new(
     logging: crate::LoggingConfig,
     outbound: OutboundPlan,

@@ -1,11 +1,11 @@
 use crate::v2::{
   CompileError, OutboundPlan, PersistencePlan, RawOutbound, RawPersistence, RawRequestLimits, RawService,
-  RequestLimitsPlan, ServicePlan,
+  RequestLimitsPlan, ServiceSettings,
 };
 use std::collections::BTreeSet;
 
-pub(super) fn compile_service(raw: &RawService) -> Result<ServicePlan, CompileError> {
-  Ok(ServicePlan::new(
+pub(super) fn compile_service(raw: &RawService) -> Result<ServiceSettings, CompileError> {
+  Ok(ServiceSettings::new(
     (&raw.logging).into(),
     compile_outbound(&raw.outbound)?,
     compile_request_limits(&raw.request_limits)?,

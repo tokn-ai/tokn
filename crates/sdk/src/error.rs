@@ -7,6 +7,12 @@ pub enum Error {
     #[source]
     source: tokn_config::Error,
   },
+  #[error("failed to project legacy configuration from {path}")]
+  ProjectConfig {
+    path: PathBuf,
+    #[source]
+    source: Box<tokn_router_legacy_config::v2::V2ProjectionError>,
+  },
   #[error("failed to load credentials from {path}")]
   LoadCredentials {
     path: PathBuf,

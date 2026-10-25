@@ -18,15 +18,19 @@ pub(super) struct EffectivePolicy {
   pub(super) model_families: Vec<ModelFamily>,
 }
 
-pub(super) fn base_warnings(legacy: &Config) -> Vec<V2ProjectionWarning> {
-  let mut warnings = vec![
-    V2ProjectionWarning::BehaviorChange(V2BehaviorChange::RequestModeOverrides),
-    V2ProjectionWarning::BehaviorChange(V2BehaviorChange::HttpRejectionBehavior),
-  ];
+pub(super) fn base_warnings(legacy: &Config, api_bindings: bool) -> Vec<V2ProjectionWarning> {
+  let mut warnings = vec![V2ProjectionWarning::BehaviorChange(
+    V2BehaviorChange::RequestModeOverrides,
+  )];
+  if api_bindings {
+    warnings.push(V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::HttpRejectionBehavior,
+    ));
+  }
   if !legacy.agents.is_empty() {
     warnings.push(V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AgentBindings));
   }
-  if !legacy.profiles.is_empty() {
+  if api_bindings && !legacy.profiles.is_empty() {
     warnings.push(V2ProjectionWarning::BehaviorChange(
       V2BehaviorChange::PercentDecodedProfileAliases,
     ));
@@ -274,7 +278,7 @@ mod tests {
     legacy.profiles.insert("work".into(), ProfileConfig::default());
     legacy.pool.strategy = "random".into();
 
-    let warnings = base_warnings(&legacy);
+    let warnings = base_warnings(&legacy, true);
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(V2BehaviorChange::AgentBindings)));
     assert!(warnings.contains(&V2ProjectionWarning::BehaviorChange(
       V2BehaviorChange::PercentDecodedProfileAliases

@@ -17,7 +17,7 @@ mod raw;
 #[cfg(feature = "std")]
 pub use compiled::{
   CompiledConfig, CompiledExecutionConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan,
-  ServicePlan,
+  ServiceSettings,
 };
 pub use cors::RawCors;
 pub use defaults::RawDefaultPolicy;

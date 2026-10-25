@@ -36,6 +36,7 @@ mod tests {
 
   struct Fixture {
     root: PathBuf,
+    base_url: String,
     stopped: Arc<AtomicBool>,
     server: Option<JoinHandle<io::Result<Vec<Value>>>>,
   }
@@ -65,6 +66,7 @@ mod tests {
       .unwrap();
       Self {
         root,
+        base_url: format!("http://{address}"),
         stopped,
         server: Some(server),
       }
@@ -249,6 +251,57 @@ mod tests {
       .await
       .expect("SDK calls completed before timeout");
     });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], "test-model");
+    assert_eq!(requests[0]["stream"], false);
+    assert_eq!(requests[1]["model"], "test-model");
+    assert_eq!(requests[1]["stream"], true);
+  }
+
+  #[test]
+  fn default_consumer_loads_legacy_config_without_migrating_source_files() {
+    let mut fixture = Fixture::start();
+    let config = "[server]\nhost = 'sdk.private.example'\n[defaults]\nmode = 'exact'\n";
+    let auth = format!(
+      "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: {}\n",
+      fixture.base_url
+    );
+    fs::write(fixture.root.join("config.toml"), config).unwrap();
+    fs::write(fixture.root.join("auth.yaml"), &auth).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build runtime");
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        assert!(!client.config_warnings().is_empty());
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model",
+          "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        client
+          .chat_completions()
+          .create(&request)
+          .await
+          .expect("legacy buffered call");
+        let response = client
+          .chat_completions()
+          .stream(&request)
+          .await
+          .expect("legacy streaming call");
+        let bytes = response.bytes().await.expect("legacy stream completes");
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
+        client.reload().expect("legacy configuration remains reloadable");
+      })
+      .await
+      .expect("legacy SDK calls completed before timeout");
+    });
+    assert_eq!(fs::read_to_string(fixture.root.join("config.toml")).unwrap(), config);
+    assert_eq!(fs::read_to_string(fixture.root.join("auth.yaml")).unwrap(), auth);
+    assert!(!fixture.root.join("config.toml.bak").exists());
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["model"], "test-model");

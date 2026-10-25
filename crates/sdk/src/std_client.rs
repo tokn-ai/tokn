@@ -1,10 +1,11 @@
 use arc_swap::ArcSwap;
 use serde_json::Value;
 use smol_str::SmolStr;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
-use tokn_config::v2;
+use tokn_config::{v2, ExecutionConfigInput};
 use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
@@ -14,7 +15,7 @@ use tokn_requests::v2::{ApiProfileRuntime, ConfiguredRuntime};
 use tokn_requests::{ExecutionRequest, RawInbound};
 
 use crate::response::RawResponse;
-use crate::{Client, RequestOptions};
+use crate::{Client, ConfigWarning, RequestOptions};
 use crate::{Error, Result};
 
 const EVENT_BUS_CAPACITY: usize = 256;
@@ -28,7 +29,8 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-  /// Load a v2 document. Listeners are optional; legacy config is rejected.
+  /// Load native v2 or legacy configuration. Legacy input is projected in memory
+  /// before using the same v2 compiler and runtime; listeners are not started.
   pub fn config_path(mut self, path: impl Into<PathBuf>) -> Self {
     self.config_path = Some(path.into());
     self
@@ -61,6 +63,8 @@ struct Snapshot {
   state: ConfiguredRuntime,
   plan: ExecutionRules,
   default_profile: String,
+  profile_aliases: BTreeMap<String, String>,
+  config_warnings: Vec<ConfigWarning>,
   config_path: PathBuf,
   auth_path: PathBuf,
 }
@@ -106,6 +110,11 @@ impl StdPlatform {
 
   pub fn auth_path(&self) -> PathBuf {
     self.snapshot.load().auth_path.clone()
+  }
+
+  /// Conversion diagnostics belonging to the active configuration snapshot.
+  pub fn config_warnings(&self) -> Vec<ConfigWarning> {
+    self.snapshot.load().config_warnings.clone()
   }
 
   pub(crate) async fn execute_generation(
@@ -171,13 +180,7 @@ fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
     Some(path) => path.clone(),
     None => tokn_config::paths::config_path().map_err(|source| Error::LoadConfig { source })?,
   };
-  let (plan, service) = v2::load_execution_config(&config_path)
-    .map_err(|source| Error::LoadConfig {
-      source: tokn_config::Error::V2 {
-        source: Box::new(source),
-      },
-    })?
-    .into_parts();
+  let input = tokn_config::load_execution_input(&config_path).map_err(|source| Error::LoadConfig { source })?;
   let auth_path = match &source.auth_path {
     Some(path) => path.clone(),
     None => default_auth_path().map_err(|source| Error::LoadCredentials {
@@ -189,19 +192,58 @@ fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
     path: auth_path.clone(),
     source,
   })?;
-  let state = ConfiguredRuntime::build(
-    &plan,
-    &credentials.accounts,
-    &service.outbound().to_http_client_options(),
-    events,
-  )
-  .map_err(|source| Error::BuildEngine { source })?;
+  let (raw, accounts, config_warnings) = match input {
+    ExecutionConfigInput::V2(raw) => (raw, credentials.accounts, Vec::new()),
+    ExecutionConfigInput::Legacy {
+      loaded,
+      inline_accounts,
+    } => {
+      // Current auth sources own duplicate ids. Legacy-only accounts remain
+      // usable in memory without migrating or rewriting either credential file.
+      let mut accounts = credentials.accounts;
+      let auth_ids: BTreeSet<_> = accounts.iter().map(|account| account.id.clone()).collect();
+      accounts.extend(
+        inline_accounts
+          .into_iter()
+          .filter(|account| !auth_ids.contains(&account.id)),
+      );
+      tokn_router_legacy_config::v2::project_v2_execution_config(&loaded.config, &accounts)
+        .map_err(|source| Error::ProjectConfig {
+          path: config_path.clone(),
+          source: Box::new(source),
+        })?
+        .into_parts()
+    }
+  };
+  let (plan, service) = v2::compile_execution_config(&raw, &config_path)
+    .map_err(|source| Error::LoadConfig {
+      source: tokn_config::Error::V2 {
+        source: Box::new(source),
+      },
+    })?
+    .into_parts();
+  let profile_aliases: BTreeMap<String, String> = config_warnings
+    .iter()
+    .filter_map(|warning| match warning {
+      ConfigWarning::ProfileResourceRenamed { profile, resource_id } => Some((profile.clone(), resource_id.clone())),
+      _ => None,
+    })
+    .collect();
+  let state = ConfiguredRuntime::build(&plan, &accounts, &service.outbound().to_http_client_options(), events)
+    .map_err(|source| Error::BuildEngine { source })?;
+  let default_profile = source
+    .profile
+    .as_deref()
+    .map(|name| profile_aliases.get(name).map(String::as_str).unwrap_or(name).to_owned())
+    .unwrap_or_else(|| DEFAULT_PROFILE.to_owned());
   let snapshot = Snapshot {
     state,
     plan,
-    default_profile: source.profile.as_deref().unwrap_or(DEFAULT_PROFILE).to_owned(),
+    default_profile,
     config_path,
     auth_path,
+    profile_aliases,
+    config_warnings,
   };
   select_profile(&snapshot, None)?;
   Ok(snapshot)
@@ -209,14 +251,20 @@ fn load_snapshot(source: &Source, events: Arc<EventBus>) -> Result<Snapshot> {
 
 fn select_profile<'a>(snapshot: &'a Snapshot, request_profile: Option<&str>) -> Result<&'a ApiProfileRuntime> {
   let name = request_profile.unwrap_or(&snapshot.default_profile);
-  let id = ProfileId::new(name).map_err(|_| Error::UnknownProfile {
-    profile: name.to_owned(),
-  })?;
-  if snapshot.plan.profile(&id).is_none() {
-    return Err(Error::UnknownProfile {
+  // An explicit legacy name selects its original policy even if its
+  // spelling collides with another profile's generated resource id. The
+  // implicit default is already canonicalized at snapshot construction.
+  let canonical = if request_profile.is_some() {
+    snapshot.profile_aliases.get(name).map(String::as_str).unwrap_or(name)
+  } else {
+    name
+  };
+  let id = ProfileId::new(canonical)
+    .ok()
+    .filter(|id| snapshot.plan.profile(id).is_some())
+    .ok_or_else(|| Error::UnknownProfile {
       profile: name.to_owned(),
-    });
-  }
+    })?;
   snapshot.state.profile(&id).ok_or_else(|| Error::BuildEngine {
     source: anyhow::anyhow!(
       "SDK profile '{name}' requires an original proxy destination; select a managed or fixed-provider relay profile"
@@ -269,6 +317,11 @@ impl Client<StdPlatform> {
   }
   pub fn auth_path(&self) -> PathBuf {
     self.platform.auth_path()
+  }
+  /// Warnings from normalizing the active legacy configuration into v2.
+  /// Failed reloads preserve the previous snapshot and its diagnostics.
+  pub fn config_warnings(&self) -> Vec<ConfigWarning> {
+    self.platform.config_warnings()
   }
   pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Arc<Event>> {
     self.platform.subscribe_events()

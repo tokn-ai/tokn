@@ -814,12 +814,18 @@ pub fn build_runtime_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<RuntimeStates> {
-  build_runtime_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+  build_runtime_states_with_service(
+    plan,
+    tokn_config::v2::ServiceSettings::default(),
+    accounts,
+    access,
+    events,
+  )
 }
 
 pub fn build_runtime_states_with_service(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -830,7 +836,7 @@ pub fn build_runtime_states_with_service(
 /// Build execution-only workers without reading or generating interception CA keys.
 pub fn build_worker_runtime_states(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -840,7 +846,7 @@ pub fn build_worker_runtime_states(
 
 fn build_runtime_states_inner(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -901,12 +907,18 @@ pub fn build_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  build_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+  build_states_with_service(
+    plan,
+    tokn_config::v2::ServiceSettings::default(),
+    accounts,
+    access,
+    events,
+  )
 }
 
 pub fn build_states_with_service(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -923,12 +935,18 @@ pub fn build_dry_run_states(
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> anyhow::Result<Vec<AppState>> {
-  build_dry_run_states_with_service(plan, tokn_config::v2::ServicePlan::default(), accounts, access, events)
+  build_dry_run_states_with_service(
+    plan,
+    tokn_config::v2::ServiceSettings::default(),
+    accounts,
+    access,
+    events,
+  )
 }
 
 pub fn build_dry_run_states_with_service(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -938,7 +956,7 @@ pub fn build_dry_run_states_with_service(
 
 fn build_api_states(
   plan: GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,

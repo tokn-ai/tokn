@@ -65,6 +65,55 @@ impl V2Projection {
   }
 }
 
+/// An in-memory legacy projection for the shared client configuration path.
+///
+/// HTTP listeners, proxy admission, and profile paths are deliberately absent.
+/// The caller compiles `raw_config` with `tokn_config::v2::compile_execution_config`
+/// before linking its runtime resources.
+#[derive(Clone, Debug)]
+pub struct V2ExecutionProjection {
+  raw_config: RawConfig,
+  accounts: Vec<AccountConfig>,
+  warnings: Vec<V2ProjectionWarning>,
+}
+
+impl V2ExecutionProjection {
+  pub fn raw_config(&self) -> &RawConfig {
+    &self.raw_config
+  }
+
+  /// Ephemeral account copies with enabled account destinations promoted to
+  /// provider definitions, using the same normalization as gateway projection.
+  pub fn accounts(&self) -> &[AccountConfig] {
+    &self.accounts
+  }
+
+  pub fn warnings(&self) -> &[V2ProjectionWarning] {
+    &self.warnings
+  }
+
+  pub fn into_parts(self) -> (RawConfig, Vec<AccountConfig>, Vec<V2ProjectionWarning>) {
+    (self.raw_config, self.accounts, self.warnings)
+  }
+}
+
+/// Project effective merged legacy configuration for an in-process client.
+///
+/// This performs no I/O and does not mutate configuration or accounts. It
+/// projects execution resources and service settings only; legacy server and
+/// proxy listener settings do not apply to a client. Compile the returned raw
+/// document with `tokn_config::v2::compile_execution_config` to validate all
+/// shared policy and service settings before runtime activation.
+pub fn project_v2_execution_config(
+  legacy: &Config,
+  accounts: &[AccountConfig],
+) -> Result<V2ExecutionProjection, V2ProjectionError> {
+  legacy
+    .validate_execution_input()
+    .map_err(|source| V2ProjectionError::InvalidLegacyConfig { source })?;
+  project_resources(legacy, accounts, &V2ProjectionOptions::default(), false).map(|(projection, _, _)| projection)
+}
+
 /// Project an effective merged v1 configuration into an in-memory v2 graph.
 ///
 /// This function performs no I/O. It does not modify the legacy config,
@@ -80,7 +129,62 @@ pub fn project_v2_config(
     .validate()
     .map_err(|source| V2ProjectionError::InvalidLegacyConfig { source })?;
 
-  let mut warnings = base_warnings(legacy);
+  let (projection, default_policy, mut ids) = project_resources(legacy, accounts, &options, true)?;
+  let (mut raw_config, projected_accounts, mut warnings) = projection.into_parts();
+  let api_bind = api_bind(legacy, options.allow_insecure_public_listener)?;
+  if !api_bind.ip().is_loopback() {
+    warnings.push(V2ProjectionWarning::RemoteApiBindAllowed { bind: api_bind });
+  }
+  raw_config.listeners.insert(
+    API_LISTENER_ID.to_string(),
+    RawListener::LlmApi {
+      bind: api_bind.to_string(),
+      cors: (&legacy.server.cors).into(),
+      client_auth: if legacy.api_key.enabled {
+        RawClientAuth::LocalKeys
+      } else {
+        RawClientAuth::None
+      },
+      allow_insecure_public: options.allow_insecure_public_listener,
+    },
+  );
+  if let Some(proxy_options) = options.forward_proxy.as_ref() {
+    let account_index = index_accounts(accounts)?;
+    let proxy = project_forward_proxy(
+      legacy,
+      proxy_options,
+      &default_policy,
+      &account_index,
+      &mut ids,
+      options.allow_insecure_public_listener,
+    )?;
+    raw_config
+      .listeners
+      .insert(FORWARD_PROXY_LISTENER_ID.to_string(), proxy.listener);
+    raw_config.profiles.extend(proxy.profiles);
+    raw_config.routes.extend(proxy.routes);
+    raw_config.bindings.extend(proxy.bindings);
+    raw_config.connect_rules.extend(proxy.connect_rules);
+    warnings.extend(proxy.warnings);
+  }
+  let compiled_config = tokn_config::v2::compile_config(&raw_config, Path::new(GENERATED_SOURCE))
+    .map_err(|source| V2ProjectionError::InvalidGeneratedConfig { source })?;
+
+  Ok(V2Projection {
+    raw_config,
+    compiled_config,
+    accounts: projected_accounts,
+    warnings,
+  })
+}
+
+fn project_resources(
+  legacy: &Config,
+  accounts: &[AccountConfig],
+  options: &V2ProjectionOptions,
+  api_bindings: bool,
+) -> Result<(V2ExecutionProjection, EffectivePolicy, IdentifierAllocator), V2ProjectionError> {
+  let mut warnings = base_warnings(legacy, api_bindings);
   let policies = effective_policies(legacy, &mut warnings)?;
   let default_policy = policies
     .first()
@@ -90,17 +194,10 @@ pub fn project_v2_config(
     return Err(V2ProjectionError::NoAccounts);
   }
   let account_index = index_accounts(accounts)?;
-  let (projected_accounts, providers) = project_accounts_and_providers(accounts, &options, &mut warnings)?;
-  let api_bind = api_bind(legacy, options.allow_insecure_public_listener)?;
-  if !api_bind.ip().is_loopback() {
-    warnings.push(V2ProjectionWarning::RemoteApiBindAllowed { bind: api_bind });
-  }
-
+  let (projected_accounts, providers) = project_accounts_and_providers(accounts, options, &mut warnings)?;
   let mut ids = IdentifierAllocator::with_reserved(DEFAULT_POLICY_ID);
   let mut profiles = BTreeMap::new();
   let mut routes = BTreeMap::new();
-  let mut bindings = Vec::new();
-  let mut connect_rules = Vec::new();
 
   for policy in policies {
     let resource_id = match policy.legacy_profile.as_deref() {
@@ -118,14 +215,22 @@ pub fn project_v2_config(
     };
     let pool = raw_pool_for_policy(legacy, &policy, &account_index)?;
     let route = route_recipe(&policy, raw_providers_for_policy(&policy)?)?;
-    let path = match policy.legacy_profile.as_deref() {
-      Some(profile) => profile_path(profile)?,
-      None => "/v1/".to_string(),
-    };
-    let default_path = if resource_id == DEFAULT_POLICY_ID {
-      "/v1/".to_string()
+    let binding = if api_bindings {
+      let path = match policy.legacy_profile.as_deref() {
+        Some(profile) => profile_path(profile)?,
+        None => "/v1/".to_string(),
+      };
+      let default_path = if resource_id == DEFAULT_POLICY_ID {
+        "/v1/".to_string()
+      } else {
+        format!("/{resource_id}/v1/")
+      };
+      (path != default_path).then(|| RawProfileBinding {
+        path: Some(path.trim_end_matches('/').to_string()),
+        endpoints: None,
+      })
     } else {
-      format!("/{resource_id}/v1/")
+      None
     };
     profiles.insert(
       resource_id.clone(),
@@ -133,43 +238,10 @@ pub fn project_v2_config(
         route: resource_id.clone(),
         wire_identity: wire_identity(&policy),
         account_pool: Some(pool),
-        binding: (path != default_path).then(|| RawProfileBinding {
-          path: Some(path.trim_end_matches('/').to_string()),
-          endpoints: None,
-        }),
+        binding,
       },
     );
     routes.insert(resource_id.clone(), route);
-  }
-
-  let mut listeners = BTreeMap::from([(
-    API_LISTENER_ID.to_string(),
-    RawListener::LlmApi {
-      bind: api_bind.to_string(),
-      cors: (&legacy.server.cors).into(),
-      client_auth: if legacy.api_key.enabled {
-        RawClientAuth::LocalKeys
-      } else {
-        RawClientAuth::None
-      },
-      allow_insecure_public: options.allow_insecure_public_listener,
-    },
-  )]);
-  if let Some(proxy_options) = options.forward_proxy.as_ref() {
-    let proxy = project_forward_proxy(
-      legacy,
-      proxy_options,
-      &default_policy,
-      &account_index,
-      &mut ids,
-      options.allow_insecure_public_listener,
-    )?;
-    listeners.insert(FORWARD_PROXY_LISTENER_ID.to_string(), proxy.listener);
-    profiles.extend(proxy.profiles);
-    routes.extend(proxy.routes);
-    bindings.extend(proxy.bindings);
-    connect_rules.extend(proxy.connect_rules);
-    warnings.extend(proxy.warnings);
   }
 
   let raw_config = RawConfig {
@@ -194,9 +266,9 @@ pub fn project_v2_config(
         ..RawPersistence::default()
       },
     },
-    listeners,
-    bindings,
-    connect_rules,
+    listeners: BTreeMap::new(),
+    bindings: Vec::new(),
+    connect_rules: Vec::new(),
     profiles,
     routes,
     retry_policies: BTreeMap::from([(
@@ -209,15 +281,16 @@ pub fn project_v2_config(
     model_scores: legacy.model_scores.clone(),
     providers,
   };
-  let compiled_config = tokn_config::v2::compile_config(&raw_config, Path::new(GENERATED_SOURCE))
-    .map_err(|source| V2ProjectionError::InvalidGeneratedConfig { source })?;
 
-  Ok(V2Projection {
-    raw_config,
-    compiled_config,
-    accounts: projected_accounts,
-    warnings,
-  })
+  Ok((
+    V2ExecutionProjection {
+      raw_config,
+      accounts: projected_accounts,
+      warnings,
+    },
+    default_policy,
+    ids,
+  ))
 }
 
 struct ProjectedForwardProxy {
@@ -586,6 +659,136 @@ mod tests {
       }),
       ..V2ProjectionOptions::default()
     }
+  }
+
+  #[test]
+  fn execution_projection_ignores_listener_and_http_profile_path_settings() {
+    let mut legacy = Config::default();
+    legacy.server.host = "localhost".into();
+    legacy.server.cors.enabled = true;
+    legacy.proxy_mode.host = "0.0.0.0".into();
+    legacy.proxy_mode.intercept_hosts = vec!["https://not-a-host.example/path".into()];
+    legacy.profiles.insert("..".into(), ProfileConfig::default());
+    let accounts = [account("primary", "openai", None)];
+
+    let projection = project_v2_execution_config(&legacy, &accounts).unwrap();
+    let raw = projection.raw_config();
+    let compiled = tokn_config::v2::compile_execution_config(raw, Path::new("client.toml")).unwrap();
+
+    assert!(raw.listeners.is_empty());
+    assert!(raw.bindings.is_empty());
+    assert!(raw.connect_rules.is_empty());
+    assert!(raw.profiles.values().all(|profile| profile.binding.is_none()));
+    assert!(compiled.execution().profiles().contains_key("profile"));
+    assert!(projection
+      .warnings()
+      .contains(&V2ProjectionWarning::ProfileResourceRenamed {
+        profile: "..".into(),
+        resource_id: "profile".into(),
+      }));
+    assert!(!projection.warnings().contains(&V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::HttpRejectionBehavior
+    )));
+    assert!(!projection.warnings().contains(&V2ProjectionWarning::BehaviorChange(
+      V2BehaviorChange::PercentDecodedProfileAliases
+    )));
+    assert!(matches!(
+      project_v2_config(&legacy, &accounts, V2ProjectionOptions::default()),
+      Err(V2ProjectionError::InvalidLegacyConfig { .. })
+    ));
+  }
+
+  #[test]
+  fn execution_projection_preserves_shared_resources_service_and_account_normalization() {
+    let mut legacy = Config::default();
+    legacy.defaults.agent_id = Some(tokn_config::AgentId::CodexCli);
+    legacy.defaults.providers = Some(vec!["openai".into()]);
+    legacy.profiles.insert(
+      "team blue".into(),
+      ProfileConfig {
+        mode: Some(RouteMode::Exact),
+        ..Default::default()
+      },
+    );
+    legacy.pool.failure_cooldown_secs = 12;
+    legacy.db.enabled = false;
+    legacy.proxy.url = Some("http://proxy.example:8080".into());
+    legacy.proxy.no_proxy = vec!["localhost".into()];
+    let active = account("primary", "openai", Some("https://gateway.example/v1"));
+    let mut disabled = account("dormant", "openai", Some("https://dormant.example/v1"));
+    disabled.enabled = false;
+    let accounts = [active, disabled];
+
+    let execution = project_v2_execution_config(&legacy, &accounts).unwrap();
+    let gateway = project_v2_config(&legacy, &accounts, V2ProjectionOptions::default()).unwrap();
+    let mut expected = gateway.raw_config().clone();
+    expected.listeners.clear();
+    for profile in expected.profiles.values_mut() {
+      profile.binding = None;
+    }
+    assert_eq!(execution.raw_config(), &expected);
+    let compiled = tokn_config::v2::compile_execution_config(execution.raw_config(), Path::new("client.toml")).unwrap();
+    assert_eq!(compiled.service(), gateway.compiled_config().service());
+    assert!(execution.accounts()[0].base_url.is_none());
+    assert_eq!(execution.accounts()[0].api_key.as_ref().unwrap().expose(), "test-key");
+    assert_eq!(execution.accounts()[1].base_url, accounts[1].base_url);
+    assert_eq!(accounts[0].base_url.as_deref(), Some("https://gateway.example/v1"));
+    assert!(execution
+      .warnings()
+      .contains(&V2ProjectionWarning::AccountBaseUrlPromoted {
+        provider: "openai".into(),
+        accounts: vec!["primary".into()],
+        base_url: "https://gateway.example/v1/".into(),
+      }));
+    let (raw, normalized, warnings) = execution.into_parts();
+    assert_eq!(raw, expected);
+    assert_eq!(normalized.len(), 2);
+    assert!(!warnings.is_empty());
+  }
+
+  #[test]
+  fn execution_projection_preserves_policy_errors_and_default_destination_safety() {
+    let accounts = [account("primary", "openai", None)];
+    let mut legacy = Config::default();
+    legacy.defaults.mode = RouteMode::Passthrough;
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &accounts),
+      Err(V2ProjectionError::UnsupportedRouteMode { .. })
+    ));
+    legacy.defaults.mode = RouteMode::Route;
+    legacy.defaults.accounts = Some(vec!["missing".into()]);
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &accounts),
+      Err(V2ProjectionError::UnknownPolicyAccount { .. })
+    ));
+    legacy.defaults.accounts = None;
+    let remote = [account("remote", "openai", Some("http://upstream.example/v1"))];
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &remote),
+      Err(V2ProjectionError::InsecureProviderRequiresOptIn { .. })
+    ));
+
+    legacy.defaults.mode = RouteMode::Fuzzy;
+    legacy.model_families = vec![ModelFamily {
+      name: "smart".into(),
+      members: Vec::new(),
+    }];
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &accounts),
+      Err(V2ProjectionError::InvalidLegacyConfig { .. })
+    ));
+    // Validate malformed families even when the selected route does not use them.
+    legacy.defaults.mode = RouteMode::Route;
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &accounts),
+      Err(V2ProjectionError::InvalidLegacyConfig { .. })
+    ));
+    legacy.model_families.clear();
+    legacy.proxy.url = Some("ftp://proxy.example".into());
+    assert!(matches!(
+      project_v2_execution_config(&legacy, &accounts),
+      Err(V2ProjectionError::InvalidLegacyConfig { .. })
+    ));
   }
 
   #[test]

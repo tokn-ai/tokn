@@ -451,9 +451,10 @@ fn value_error(error: impl std::fmt::Display) -> PyErr {
 fn sdk_error(error: SdkError) -> PyErr {
   let message = error_chain(&error);
   match error {
-    SdkError::LoadConfig { .. } | SdkError::BuildEngine { .. } | SdkError::UnknownProfile { .. } => {
-      ConfigurationError::new_err(message)
-    }
+    SdkError::LoadConfig { .. }
+    | SdkError::ProjectConfig { .. }
+    | SdkError::BuildEngine { .. }
+    | SdkError::UnknownProfile { .. } => ConfigurationError::new_err(message),
     SdkError::LoadCredentials { .. } => AuthenticationError::new_err(message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }
