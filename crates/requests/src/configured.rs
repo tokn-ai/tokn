@@ -1,29 +1,23 @@
-//! In-memory configuration and borrowed adapters for the shared request session.
+//! Borrowed transport, timing, and event adapters for the shared request session.
 //!
 //! The application owns transport and runtime services. All interpretation,
 //! routing, provider policy, retries, and response lifecycle run in `session`.
 
-use crate::session::{self, ExecutionState, ModelCapabilities, ModelInventory, RequestInput};
+use crate::session;
 use alloc::{
-  collections::{BTreeMap, BTreeSet},
-  format,
   string::{String, ToString},
   vec::Vec,
 };
 use core::{
-  cell::{Cell, RefCell, RefMut},
+  cell::{RefCell, RefMut},
   time::Duration,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tokn_core::{
-  account::AccountConfig,
   headers::{HeaderMap, HeaderName, HeaderValue},
   request_event::{RequestEvent, RequestEventSink},
-  types::{Bytes, Shared, SmolStr},
-  Endpoint,
+  types::Bytes,
 };
-use tokn_policy::{ExecutionRules, ProviderId, RelayDestination, RoutePlan};
 use tokn_service::transport::{EncodeError, Request, ResponseHead, Transport};
 
 mod events;
@@ -119,97 +113,37 @@ pub trait Runtime {
 
 pub use crate::session::Lifecycle;
 
-/// An in-memory client with one exclusive, application-owned HTTP exchange.
+/// Application-supplied services with one exclusive, borrowed HTTP exchange.
 ///
-/// A streaming response retains the transport lease. State transactions are
-/// shared with standard execution and never retain a lock across I/O.
+/// Configuration and request state belong to the client that acquires these
+/// services. A streaming response retains the transport lease until completion
+/// or cancellation. Neither transport nor runtime needs to be `Send`.
 pub struct Injected<T, R> {
-  state: Shared<ExecutionState>,
   transport: RefCell<T>,
   runtime: RefCell<R>,
-  limits: Limits,
-  request_sequence: Cell<u64>,
 }
 
 impl<T: Transport, R: Runtime> Injected<T, R> {
-  pub fn new(plan: ExecutionRules, accounts: Vec<AccountConfig>, transport: T, runtime: R) -> Result<Self, Error> {
-    Self::with_models(plan, accounts, BTreeMap::new(), transport, runtime)
-  }
-
-  pub fn with_models(
-    plan: ExecutionRules,
-    accounts: Vec<AccountConfig>,
-    models: BTreeMap<ProviderId, BTreeSet<SmolStr>>,
-    transport: T,
-    runtime: R,
-  ) -> Result<Self, Error> {
-    let models = models
-      .into_iter()
-      .map(|(provider, models)| {
-        (
-          provider,
-          models
-            .into_iter()
-            .map(|model| (model, ModelCapabilities::default()))
-            .collect(),
-        )
-      })
-      .collect();
-    Self::with_model_metadata(plan, accounts, models, transport, runtime)
-  }
-
-  /// Supply the same model evidence used by standard catalogue/discovery clients.
-  pub fn with_model_metadata(
-    plan: ExecutionRules,
-    accounts: Vec<AccountConfig>,
-    models: BTreeMap<ProviderId, ModelInventory>,
-    transport: T,
-    runtime: R,
-  ) -> Result<Self, Error> {
-    if plan.profiles().is_empty() {
-      return Err(Error::new("config", "no execution profiles configured"));
-    }
-    for (id, profile) in plan.profiles() {
-      if matches!(plan.route(profile.route()), Some(RoutePlan::Relay(relay))
-        if !matches!(relay.destination(), RelayDestination::FixedProvider(_)))
-      {
-        return Err(Error::new(
-          "config",
-          format!("profile '{id}' requires original-destination proxy context"),
-        ));
-      }
-    }
-    Ok(Self {
-      state: Shared::new(ExecutionState::with_models(plan, accounts, models)?),
+  pub fn new(transport: T, runtime: R) -> Self {
+    Self {
       transport: RefCell::new(transport),
       runtime: RefCell::new(runtime),
-      limits: Limits::default(),
-      request_sequence: Cell::new(0),
-    })
-  }
-
-  pub fn with_limits(mut self, limits: Limits) -> Self {
-    self.limits = limits;
-    self
+    }
   }
 
   /// Attach event delivery without changing transport or timing services.
   pub fn with_event_sink<S: RequestEventSink>(self, sink: S) -> Injected<T, EventRuntime<R, S>> {
     Injected {
-      state: self.state,
       transport: self.transport,
       runtime: RefCell::new(EventRuntime::new(self.runtime.into_inner(), sink)),
-      limits: self.limits,
-      request_sequence: self.request_sequence,
     }
   }
 
-  pub async fn execute(
-    &self,
-    endpoint: Endpoint,
-    body: Value,
-    options: RequestOptions,
-  ) -> Result<Response<'_, T, R>, Error> {
+  /// Acquire one exchange and its timing/event adapters.
+  ///
+  /// The returned exchange owns the exclusive transport lease. No routing or
+  /// mutable execution-state borrow is retained by these services.
+  pub fn acquire(&self) -> Result<BorrowedServices<'_, T, R>, Error> {
     let transport = self
       .transport
       .try_borrow_mut()
@@ -222,27 +156,18 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
         .try_borrow_mut()
         .map_err(|_| Error::new("runtime", "runtime services are busy delivering a callback"))?,
     );
-    let request_id = options.request_id.clone().unwrap_or_else(|| {
-      let sequence = self.request_sequence.get();
-      self.request_sequence.set(sequence.wrapping_add(1));
-      format!("req-{}-{sequence}", self.runtime.borrow().now().as_nanos())
-    });
-    let mut input = RequestInput::new(endpoint, body, options.inbound_headers(), request_id);
-    input.profile = options.profile;
-    session::Session::new(
-      self.state.clone(),
-      input,
+    Ok((
       BorrowedTransport(transport),
       LocalClock(&self.runtime),
       LocalEvents(&self.runtime),
-    )
-    .with_limits(self.limits)
-    .run()
-    .await
+    ))
   }
 }
 
-/// Standard and injected callers receive the same response and stream objects.
+/// An exclusive borrowed exchange with the corresponding clock and event adapters.
+pub type BorrowedServices<'a, T, R> = (BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>);
+
+/// Shared-session response using borrowed application services.
 pub type Response<'a, T, R> = session::Response<BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>>;
 pub type ResponseBody<'a, T, R> =
   session::ResponseBody<BorrowedTransport<'a, T>, LocalClock<'a, R>, LocalEvents<'a, R>>;
@@ -293,10 +218,6 @@ impl<R: Runtime> session::Clock for LocalClock<'_, R> {
   #[allow(
     clippy::await_holding_refcell_ref,
     reason = "the application's timer is exclusive; the transport lease rejects concurrent execution and cancellation releases the borrow"
-  )]
-  #[allow(
-    clippy::await_holding_refcell_ref,
-    reason = "the exclusive injected runtime lease is retained across sleep and released on cancellation"
   )]
   async fn sleep(&mut self, duration: Duration) {
     self.0.borrow_mut().sleep(duration).await;

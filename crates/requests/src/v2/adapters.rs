@@ -332,10 +332,6 @@ pub(super) fn request_service(
       );
       input.raw_body = inbound.raw_body;
       input.decoded_body = inbound.decoded_body;
-      input.content_encoding = input
-        .headers
-        .get("content-encoding")
-        .map(|value| value.as_str().to_string());
       input.profile = Some(profile.to_string());
       input.generation_options = config.generation_options().cloned();
       input.allowed_providers = allowed_providers(&config)?;
@@ -400,7 +396,10 @@ fn allowed_providers(
     })
 }
 
-fn refresh_models(state: &crate::session::ExecutionState, bindings: &[Arc<tokn_accounts::link::ProviderBinding>]) {
+pub(super) fn refresh_models(
+  state: &crate::session::ExecutionState,
+  bindings: &[Arc<tokn_accounts::link::ProviderBinding>],
+) {
   use crate::session::{ModelCapabilities, ModelInventory};
   use std::collections::BTreeSet;
   for binding in bindings {
@@ -441,7 +440,8 @@ fn refresh_models(state: &crate::session::ExecutionState, bindings: &[Arc<tokn_a
   }
 }
 
-fn pipeline_error(error: crate::session::Error, endpoint: tokn_core::Endpoint) -> crate::PipelineError {
+/// Preserve the standard request error taxonomy when presenting session errors.
+pub fn pipeline_error(error: crate::session::Error, endpoint: tokn_core::Endpoint) -> crate::PipelineError {
   use crate::pipeline::error::RequestsError;
   use crate::session::ErrorKind;
   use crate::Stage;
@@ -457,6 +457,9 @@ fn pipeline_error(error: crate::session::Error, endpoint: tokn_core::Endpoint) -
     return crate::PipelineError::stop(stage);
   }
   let source = match error.kind {
+    ErrorKind::UnknownProfile { profile } => RequestsError::InvalidRouteRequest {
+      message: format!("unknown SDK profile '{profile}'").into(),
+    },
     ErrorKind::ProviderAccessDenied => RequestsError::ProviderAccessDenied,
     ErrorKind::NoAccount { model } => RequestsError::NoAccount { endpoint, model },
     ErrorKind::InvalidRoute => RequestsError::InvalidRouteRequest { message: error.message },
@@ -477,7 +480,8 @@ fn pipeline_error(error: crate::session::Error, endpoint: tokn_core::Endpoint) -
   }
 }
 
-fn into_standard_response(
+/// Present an owned standard session response through the standard byte stream API.
+pub fn into_standard_response(
   response: crate::session::Response<ReqwestExchange, TokioRuntime, StandardEvents>,
 ) -> crate::pipeline::stages::ConvertedResponse {
   use crate::pipeline::stages::{ConvertedBody, ConvertedResponse, ConvertedResponseKind};

@@ -81,12 +81,20 @@ impl PyClient {
     self.inner.reload().map_err(sdk_error)
   }
 
-  fn config_path(&self) -> String {
-    self.inner.config_path().to_string_lossy().into_owned()
+  fn config_path(&self) -> PyResult<String> {
+    self
+      .inner
+      .config_path()
+      .map(|path| path.to_string_lossy().into_owned())
+      .ok_or_else(|| sdk_error(SdkError::ReloadUnavailable))
   }
 
-  fn auth_path(&self) -> String {
-    self.inner.auth_path().to_string_lossy().into_owned()
+  fn auth_path(&self) -> PyResult<String> {
+    self
+      .inner
+      .auth_path()
+      .map(|path| path.to_string_lossy().into_owned())
+      .ok_or_else(|| sdk_error(SdkError::ReloadUnavailable))
   }
 
   fn subscribe_events(&self) -> NativeRequestEventStream {
@@ -454,7 +462,8 @@ fn sdk_error(error: SdkError) -> PyErr {
     SdkError::LoadConfig { .. }
     | SdkError::ProjectConfig { .. }
     | SdkError::BuildEngine { .. }
-    | SdkError::UnknownProfile { .. } => ConfigurationError::new_err(message),
+    | SdkError::UnknownProfile { .. }
+    | SdkError::ReloadUnavailable => ConfigurationError::new_err(message),
     SdkError::LoadCredentials { .. } => AuthenticationError::new_err(message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }

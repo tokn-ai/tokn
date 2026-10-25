@@ -71,3 +71,7 @@ required-features = ["std"]
 [[example]]
 name = "chat"
 required-features = ["std"]
+
+[[example]]
+name = "in_memory"
+required-features = ["std"]

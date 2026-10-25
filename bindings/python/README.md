@@ -27,7 +27,10 @@ are included in the installed package.
 The SDK accepts v2 `config.toml` documents with `schema_version = 2` and
 legacy documents with no schema marker. Legacy input includes sorted `config.d`
 fragments and is projected into v2 in memory before using the shared request
-runtime. Unsupported conversions, malformed input, and
+runtime. The Rust client owns each configuration/state snapshot and creates
+request sessions; its standard adapters supply HTTP, timing, and events.
+Successful reloads publish a new snapshot while active requests and streams
+retain their original state. Unsupported conversions, malformed input, and
 missing config files raise `ConfigurationError`; loading does not migrate or
 rewrite source files.
 

@@ -31,16 +31,13 @@ fn recorded_client<'a>(
   driver: &str,
   events: &'a RefCell<Vec<RequestEvent>>,
 ) -> Client<Injected<MemoryTransport<'a>, EventRuntime<TestRuntime, impl RequestEventSink + 'a>>> {
-  Client::from_platform(
-    Injected::new(
-      plan(driver),
-      vec![account_config("primary", "test-key", "active")],
-      MemoryTransport::new(requests, replies),
-      TestRuntime::default(),
-    )
-    .unwrap()
-    .with_event_sink(move |event| events.borrow_mut().push(event)),
+  Client::new(
+    plan(driver),
+    vec![account_config("primary", "test-key", "active")],
+    Injected::new(MemoryTransport::new(requests, replies), TestRuntime::default())
+      .with_event_sink(move |event| events.borrow_mut().push(event)),
   )
+  .unwrap()
 }
 
 fn request_body(endpoint: Endpoint) -> Value {
@@ -270,10 +267,10 @@ pub fn buffered_usage_events() {
     })).unwrap();
     let sent = RefCell::new(Vec::new());
     let events = RefCell::new(Vec::new());
-    let client = Client::from_platform(
+    let client = Client::new(
+      tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
+      Vec::new(),
       Injected::new(
-        tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
-        Vec::new(),
         MemoryTransport::new(
           &sent,
           [Reply {
@@ -284,9 +281,9 @@ pub fn buffered_usage_events() {
         ),
         TestRuntime::default(),
       )
-      .unwrap()
       .with_event_sink(|event| events.borrow_mut().push(event)),
-    );
+    )
+    .unwrap();
     let response = run(client.execute(
       Endpoint::ChatCompletions,
       request_body(Endpoint::ChatCompletions),
@@ -409,13 +406,13 @@ pub fn typed_event_retry_attribution() {
   let sent = RefCell::new(Vec::new());
   let events = RefCell::new(Vec::new());
   let runtime = TestRuntime::default();
-  let client = Client::from_platform(
+  let client = Client::new(
+    retry_plan(1, 2),
+    vec![
+      account_config("primary", "primary-key", "active"),
+      account_config("backup", "backup-key", "fallback"),
+    ],
     Injected::new(
-      retry_plan(1, 2),
-      vec![
-        account_config("primary", "primary-key", "active"),
-        account_config("backup", "backup-key", "fallback"),
-      ],
       MemoryTransport::new(
         &sent,
         [
@@ -429,9 +426,9 @@ pub fn typed_event_retry_attribution() {
       ),
       runtime.clone(),
     )
-    .unwrap()
     .with_event_sink(|event| events.borrow_mut().push(event)),
-  );
+  )
+  .unwrap();
   run(
     client
       .chat_completions()
@@ -553,19 +550,17 @@ pub fn event_timestamps_and_local_sink() {
     let events_ref = &events;
     let local = Rc::new(core::cell::Cell::new(0));
     let observed = local.clone();
-    let client = Client::from_platform(
-      Injected::new(
-        plan("openai"),
-        vec![account_config("primary", "test-key", "active")],
-        MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
-        Clock(expected),
-      )
-      .unwrap()
-      .with_event_sink(move |event| {
-        observed.set(observed.get() + 1);
-        events_ref.borrow_mut().push(event);
-      }),
-    );
+    let client = Client::new(
+      plan("openai"),
+      vec![account_config("primary", "test-key", "active")],
+      Injected::new(MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]), Clock(expected)).with_event_sink(
+        move |event| {
+          observed.set(observed.get() + 1);
+          events_ref.borrow_mut().push(event);
+        },
+      ),
+    )
+    .unwrap();
     run(client.chat_completions().create(&chat())).unwrap();
     let events = events.borrow();
     assert_eq!(local.get(), events.len());

@@ -199,37 +199,77 @@ when an exact endpoint wire shape is required.
 
 ### Shared standard and embedded execution
 
-`Client<P>` delegates configuration and service ownership to its platform. Both
-SDK platforms execute through one `tokn-requests` session, `Session<T, C, E>`:
-transport exchange `T`, clock/timer `C`, and event sink `E` supply the platform
-services. Interpretation, profile and route selection, provider preparation,
-credential refresh, retry decisions, and response processing belong to the
-shared session. The SDK does not depend on the HTTP gateway crate.
+`Client<P>` owns the active configuration and `ExecutionState` snapshot: execution
+rules, accounts, credential caches, account pools, and model metadata. The client
+creates a `tokn_requests::session::Session<T, C, E>` for each request using that
+snapshot. The platform `P` supplies external services: a per-request transport
+exchange `T`, clock/timer `C`, and event sink `E`. Platforms do not load routing
+rules or execute requests. `Platform::Pool` represents client-level transport
+handles; `Platform::Exchange<'a>` is the distinct owned or borrowed exchange
+acquired for a request. `Services` bundles that exchange, clock, and event sink.
+`ResponseAdapter` only presents the shared session result as the existing owned
+std response or local borrowed response. It performs no request orchestration.
+The SDK does not depend on the HTTP gateway crate.
 
-The default `StdPlatform` loads configuration and credentials from disk and
-preserves reloads, lifecycle subscriptions, and concurrent requests. Each std
-request owns an independent exchange backed by the shared HTTP connection pool;
-keeping one streaming response alive does not block another request. Injected
-execution borrows an application's exchange until its response completes or is
-cancelled. These ownership adapters do not choose routing or provider policy.
+```text
+Client<P>
+  ├─ active snapshot → ExecutionState
+  │    └─ rules, accounts, credentials, pools, model metadata
+  └─ platform services → acquire exchange + clock + events
 
-Disable default features to use `no_std + alloc`. Compile the same in-memory
-`config::v2::RawConfig` with `config::v2::compile_execution`, then create a
-platform using `Injected::new(plan, accounts, transport, runtime)` and pass it
-to `Client::from_platform`. Accounts use the shared `account::AccountConfig`.
-No listener, configuration file, credential file, or gateway process is required.
-The implicit profile is always `default`; a configuration with only named
-profiles requires `RequestOptions::with_profile`. The injected client checks
-this when executing a request, since an explicit profile can be supplied there.
+Client::execute → capture snapshot → Session<exchange, clock, events>
+```
+
+A transport factory or connection pool belongs to the client-level services;
+the exchange returned by it belongs to one session and then its response.
+`StdPlatform` returns independent owned HTTP exchanges backed by shared connection
+pools, allowing concurrent requests and streams. `Injected` leases one borrowed
+application transport until its response completes or is cancelled; another
+request returns busy while the lease is active. Neither ownership model changes
+routing or provider policy.
+
+Configuration input and adapter selection are independent. Compile an in-memory
+`config::v2::RawConfig` with `config::v2::compile_execution`, then supply the same
+rules and `account::AccountConfig` values to either adapter:
 
 ```rust
 use tokn_sdk::{Client, Injected};
 
-let plan = tokn_sdk::config::v2::compile_execution(&raw_config)?;
-let platform = Injected::new(plan, accounts, transport, runtime)?;
-let client = Client::from_platform(platform);
+let rules = tokn_sdk::config::v2::compile_execution(&raw_config)?;
+let services = Injected::new(transport, runtime);
+let client = Client::new(rules, accounts, services)?;
 let response = client.chat_completions().create(&request).await?;
 ```
+
+With the standard feature, the same constructor accepts the standard services
+without reading files:
+
+```rust
+use tokn_sdk::{Client, StdPlatform};
+
+let client = Client::new(rules, accounts, StdPlatform::new()?)?;
+```
+
+`Client::new` uses the same caller-provided model evidence with standard and
+custom services; it does not import a host catalogue implicitly. Use
+`Client::with_model_metadata` to supply endpoint/reasoning capabilities or
+`Client::with_models` to supply model identifiers. The file builder additionally
+prepares catalogue/live model caches before constructing the state snapshot.
+
+`Client::builder()` remains a standard convenience for preparing configuration
+and credentials from files and constructing this same client. The client owns
+its reload source and atomically publishes successful replacement snapshots.
+In-flight requests retain their original state and exchanges; failed reloads
+leave the active snapshot unchanged. Event subscriptions survive reloads.
+Legacy normalization stays in the standard configuration-loading boundary.
+
+Disable default features to use `no_std + alloc`. `Injected::new(transport,
+runtime)` contains services only; rules, accounts, model inventories, and
+response limits belong to client construction. No listener, configuration file,
+credential file, or gateway process is required. The implicit profile is always
+`default`; a configuration with only named profiles requires
+`RequestOptions::with_profile`. The in-memory client checks this when executing
+a request, allowing an explicit profile to be supplied there.
 
 Managed request interpretation has one implementation in
 `tokn_requests::interpretation::RequestInterpretation`:
@@ -263,10 +303,10 @@ selection in `tokn-accounts`:
 Native provider transformations and credential policy are shared. Model
 discovery and cache refresh happen outside request execution; routing parity
 depends on matching execution rules, accounts, capability inventories, and pool state.
-The injected platform accepts in-memory v2 configuration; legacy filesystem
-loading and projection belong to `StdPlatform`. Standard SDK and gateway API
-profiles are built by `tokn_requests::v2` from the same `ExecutionRules`;
-gateway admission and original-destination proxy wiring remain in `tokn-router`.
+The SDK accepts in-memory v2 rules with either standard or custom services.
+Filesystem loading and legacy projection prepare input before constructing the
+client. Gateway API profiles use the same `ExecutionRules` and session; gateway
+admission and original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
 The standard SDK, v2 gateway, and injected executor resolve named policies through `from_route`;
@@ -376,15 +416,16 @@ Request events use the same `RequestEvent`, `StageEvent`, `RecordEvent`, and
 `FnMut(RequestEvent)` callback to the injected platform:
 
 ```rust
-use tokn_sdk::{Injected, RequestEvent, RequestEventPayload, RecordEvent};
+use tokn_sdk::{Client, Injected, RequestEvent, RequestEventPayload, RecordEvent};
 
-let platform = Injected::new(plan, accounts, transport, runtime)?
+let services = Injected::new(transport, runtime)
   .with_event_sink(|event: RequestEvent| {
     if let RequestEventPayload::Record(RecordEvent::Usage(usage)) = event.payload {
       // Store or forward this observation using application-owned services.
       observe_usage(event.request_id, event.attempt, usage);
     }
   });
+let client = Client::new(rules, accounts, services)?;
 ```
 
 The sink may borrow local state and does not require `Send` or `'static`.
@@ -395,7 +436,8 @@ for existing lifecycle observers and is called alongside the typed sink.
 `Runtime::unix_millis` supplies event timestamps, defaulting to `unix_seconds`
 converted to milliseconds when the application does not override it.
 
-The injected adapter emits stage summaries, errors, completion, and usage.
+The shared session emits stage summaries, errors, completion, and usage through
+the selected event services.
 Each attempt has its own Started/Completed pair; `attempt` is zero-based and
 Completed's `attempts` is one-based. Stream completion follows the shared
 terminal rules above. Cancellation and response failures emit Error followed
@@ -420,11 +462,12 @@ gateway concern. A response stream retains a
 borrow of its HTTP session until completion, cancellation, or drop; another
 call using that session returns an error while it is busy. Selection state is
 borrowed only for short transactions and is not held over network awaits.
-Model identifiers can be supplied through `Injected::with_models` for family
-and capability-based routing. `Injected::with_model_metadata` accepts
-`ModelInventory` values with endpoint and reasoning capabilities, so embedded
-applications can provide the same evidence as std discovery. `Limits` bounds
-buffered responses and SSE records.
+Model identifiers can be supplied through `Client::with_models` for family
+and capability-based routing. `Client::with_model_metadata` accepts
+`ModelInventory` values with endpoint and reasoning capabilities alongside rules,
+accounts, and platform services. This gives embedded applications the same model
+evidence as std discovery. `Client::with_limits` applies `Limits` to buffered
+responses and SSE records.
 The friendly generation builder and gateway relay/proxy adapters currently
 remain standard-only.
 
@@ -433,8 +476,8 @@ time. Standard builds re-export the original upstream types; embedded builds
 use local static/inline/`Rc` storage. The local backend supports single-threaded,
 non-atomic targets and is intentionally neither `Send` nor `Sync`.
 
-`crates/sdk/tests/interpretation_parity.rs` compares real standard and injected
-clients using controlled upstream responses: stream mode, initiator headers,
+`crates/sdk/tests/interpretation_parity.rs` constructs real standard and injected
+clients from the same in-memory rules and accounts, using controlled upstream responses: stream mode, initiator headers,
 session aliases, option precedence, and account affinity. Extraction-stage
 comparisons also cover request purpose across all three APIs and missing-model
 behavior. These checks establish interpretation parity, not full stage parity.

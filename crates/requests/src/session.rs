@@ -56,6 +56,7 @@ pub trait Clock {
 #[derive(Debug)]
 pub enum ErrorKind {
   Other,
+  UnknownProfile { profile: SmolStr },
   InvalidRoute,
   NoAccount { model: SmolStr },
   ProviderAccessDenied,
@@ -203,6 +204,10 @@ pub struct ExecutionState {
   pools: BTreeMap<AccountPoolId, Pool>,
 }
 impl ExecutionState {
+  pub fn rules(&self) -> &ExecutionRules {
+    &self.plan
+  }
+
   pub fn new(plan: ExecutionRules, accounts: Vec<AccountConfig>) -> Result<Self, Error> {
     Self::with_models(plan, accounts, BTreeMap::new())
   }
@@ -389,6 +394,7 @@ pub struct RequestInput {
 impl RequestInput {
   pub fn new(endpoint: Endpoint, body: Value, headers: HeaderMap, request_id: String) -> Self {
     let raw_body = Bytes::from(serde_json::to_vec(&body).expect("JSON serializes"));
+    let content_encoding = headers.get("content-encoding").map(|value| value.as_str().to_string());
     Self {
       endpoint,
       body,
@@ -399,7 +405,7 @@ impl RequestInput {
       profile: None,
       generation_options: None,
       allowed_providers: None,
-      content_encoding: None,
+      content_encoding,
       method: "POST",
       dry_run: false,
     }
@@ -673,7 +679,10 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
         .iter()
         .any(|operation| operation.as_str() == self.input.endpoint.as_str())
     }) {
-      return Err(Error::new("resolve", "profile does not expose this operation"));
+      return Err(Error::new(
+        "resolve",
+        format!("profile does not expose operation '{}'", self.input.endpoint.as_str()),
+      ));
     }
     self.retry = RetryPolicy::from_route(&self.state.plan, route).map_err(|error| Error::new("resolve", error))?;
     if let RoutePlan::Relay(relay) = route {

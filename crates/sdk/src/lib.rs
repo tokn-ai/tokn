@@ -1,9 +1,10 @@
 //! One configured client and request pipeline for standard and embedded applications.
 //!
-//! The standard platform loads configuration and credentials from disk, normalizing
-//! legacy input into v2 before constructing the shared runtime.
-//! [`Injected`] uses the same execution model with application-supplied accounts,
-//! model metadata, HTTP transport, monotonic time and timers.
+//! [`Client`] owns execution configuration and state and creates shared request
+//! sessions. Standard and custom platforms supply HTTP exchanges, time, and events.
+//! The standard builder prepares configuration and credentials from disk, including
+//! legacy normalization; [`Client::new`] accepts in-memory rules and accounts with
+//! either standard or local [`Injected`] services.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -20,7 +21,9 @@ mod response;
 #[cfg(feature = "std")]
 mod std_client;
 
-pub use client::{BufferedResponse, Client, Platform, PlatformResponse, RequestOptions};
+pub use client::{
+  BufferedResponse, Client, Platform, PlatformResponse, PlatformServices, RequestOptions, ResponseAdapter, Services,
+};
 pub use endpoint::{ChatCompletions, Messages, Responses};
 #[cfg(feature = "std")]
 pub use error::{Error, Result};
@@ -37,6 +40,7 @@ pub use tokn_config as config;
 pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
 pub use tokn_requests::configured::{EventRuntime, Injected, Lifecycle, Limits, Runtime};
+pub use tokn_requests::session;
 pub use tokn_requests::session::{ModelCapabilities, ModelInventory};
 pub use tokn_service::transport;
 

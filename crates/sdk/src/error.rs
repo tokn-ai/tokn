@@ -26,6 +26,8 @@ pub enum Error {
   },
   #[error("unknown SDK profile '{profile}'")]
   UnknownProfile { profile: String },
+  #[error("this SDK client was constructed in memory and has no configuration files to reload")]
+  ReloadUnavailable,
   #[error("failed to serialize request")]
   SerializeRequest {
     #[source]

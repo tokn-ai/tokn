@@ -112,6 +112,44 @@ fn chat_request() -> ChatRequest {
 }
 
 #[tokio::test]
+async fn content_encoding_survives_model_rewriting_as_actual_compressed_wire_bytes() {
+  use tokn_requests::utils::codec::{decode_body_bytes, ContentEncodingKind};
+
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = fixture.client();
+  for (encoding, kind, magic) in [
+    ("gzip", ContentEncodingKind::Gzip, &[0x1f, 0x8b][..]),
+    ("zstd", ContentEncodingKind::Zstd, &[0x28, 0xb5, 0x2f, 0xfd][..]),
+  ] {
+    client
+      .chat_completions()
+      .create_with(
+        &chat_request(),
+        RequestOptions::default().with_header("content-encoding", encoding),
+      )
+      .await
+      .expect("execute a configured request with a compressed rewritten body");
+
+    let request = mock.last_request().expect("capture the actual HTTP request");
+    assert_eq!(request.header("content-encoding"), Some(encoding));
+    assert!(
+      request.body.starts_with(magic),
+      "{encoding} must match the actual wire body"
+    );
+    let decoded = decode_body_bytes(request.body, Some(kind)).expect("upstream can decode the advertised encoding");
+    let body: serde_json::Value = serde_json::from_slice(&decoded).expect("decoded request is valid JSON");
+    assert_eq!(
+      body["model"], "mock-model",
+      "routing rewrites the qualified SDK selector"
+    );
+    assert_eq!(body["messages"][0]["content"], "hello");
+    assert_eq!(body["stream"], false);
+  }
+  mock.shutdown().await;
+}
+
+#[tokio::test]
 async fn lifecycle_subscription_survives_reload_and_serializes_request_events() {
   let mock = MockLlmServer::start(MockLlmConfig::default()).await;
   let fixture = Fixture::new(mock.base_url());
@@ -789,8 +827,8 @@ async fn raw_request_and_client_lifecycle_use_explicit_paths() {
   let fixture = Fixture::new(mock.base_url());
   let client = fixture.client();
 
-  assert_eq!(client.config_path(), fixture.config_path);
-  assert_eq!(client.auth_path(), fixture.auth_path);
+  assert_eq!(client.config_path(), Some(fixture.config_path));
+  assert_eq!(client.auth_path(), Some(fixture.auth_path));
   client.reload().expect("reload SDK client");
   let _ = client.responses();
   let _ = client.messages();
@@ -1212,7 +1250,7 @@ async fn profile_endpoint_binding_restricts_sdk_operations() {
     .await
     .expect_err("generation cannot bypass the profile endpoint restriction");
   assert!(
-    matches!(error, Error::BuildEngine { source } if source.to_string().contains("does not expose operation 'responses'"))
+    matches!(error, Error::Request { source } if format!("{source:#}").contains("does not expose operation 'responses'"))
   );
   assert_eq!(mock.requests().len(), 1);
   mock.shutdown().await;

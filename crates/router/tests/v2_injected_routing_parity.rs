@@ -25,9 +25,13 @@ use tokn_access::AccessStore;
 use tokn_config::v2::{compile, compile_execution, RawConfig};
 use tokn_core::{account::AccountConfig, event::EventBus, types::SmolStr, Endpoint};
 use tokn_policy::ProviderId;
-use tokn_requests::configured::{Injected, RequestOptions, Runtime};
+use tokn_requests::configured::{RequestOptions, Runtime};
 use tokn_service::transport::{Request, ResponseHead, Transport};
 use tower::ServiceExt;
+
+#[path = "../../requests/tests/support/injected.rs"]
+mod injected_fixture;
+use injected_fixture::BorrowedSession;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Observation {
@@ -195,7 +199,7 @@ impl<'a> Expected<'a> {
 
 struct Fixture {
   app: Router,
-  injected: Injected<CaptureTransport, TestRuntime>,
+  injected: BorrowedSession<CaptureTransport, TestRuntime>,
   standard_capture: Arc<Mutex<Capture>>,
   injected_capture: Rc<RefCell<Capture>>,
   sleeps: Rc<RefCell<Vec<Duration>>>,
@@ -249,7 +253,7 @@ impl Fixture {
     ]);
     let injected_capture = Rc::new(RefCell::new(Capture::new(statuses)));
     let sleeps = Rc::default();
-    let injected = Injected::with_models(
+    let injected = BorrowedSession::with_models(
       execution,
       accounts,
       models,
