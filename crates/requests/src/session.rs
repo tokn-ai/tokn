@@ -31,7 +31,7 @@ use tokn_core::{
   Endpoint,
 };
 use tokn_policy::{
-  AccountPoolId, DriverId, ExecutionPlan, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
+  AccountPoolId, DriverId, ExecutionRules, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
@@ -197,17 +197,17 @@ impl CandidateBinding for Binding {
 
 /// Linked v2 resources and transactionally shared mutable account state.
 pub struct ExecutionState {
-  plan: ExecutionPlan,
+  plan: ExecutionRules,
   destinations: BTreeMap<ProviderId, DestinationMetadata>,
   bindings: Vec<Binding>,
   pools: BTreeMap<AccountPoolId, Pool>,
 }
 impl ExecutionState {
-  pub fn new(plan: ExecutionPlan, accounts: Vec<AccountConfig>) -> Result<Self, Error> {
+  pub fn new(plan: ExecutionRules, accounts: Vec<AccountConfig>) -> Result<Self, Error> {
     Self::with_models(plan, accounts, BTreeMap::new())
   }
   pub fn with_models(
-    plan: ExecutionPlan,
+    plan: ExecutionRules,
     accounts: Vec<AccountConfig>,
     models: BTreeMap<ProviderId, ModelInventory>,
   ) -> Result<Self, Error> {

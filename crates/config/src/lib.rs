@@ -1,4 +1,4 @@
-//! Configuration models and shared execution-plan compilation.
+//! Configuration models and compilation of shared execution rules.
 //!
 //! File loading and gateway service settings are available with `std`.
 #![cfg_attr(not(feature = "std"), no_std)]

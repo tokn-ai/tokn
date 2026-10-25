@@ -15,7 +15,7 @@ use tokn_accounts::{
 };
 use tokn_core::{account::AccountConfig, event::EventBus, util::http::HttpClientOptions, AgentId, Endpoint};
 use tokn_policy::{
-  CredentialPolicy, ExecutionPlan, ProfileId, RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
+  CredentialPolicy, ExecutionRules, ProfileId, RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
 };
 
 use crate::{session::ExecutionState, RequestService, RetryPolicy, RunConfig, RunConfigBuilder};
@@ -50,7 +50,7 @@ pub struct ConfiguredRuntime {
 
 impl ConfiguredRuntime {
   pub fn build(
-    plan: &ExecutionPlan,
+    plan: &ExecutionRules,
     accounts: &[AccountConfig],
     outbound: &HttpClientOptions,
     events: Arc<EventBus>,
@@ -159,7 +159,7 @@ impl ApiProfileRuntime {
 /// relay profiles require gateway proxy context and therefore return `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_profile(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   id: &ProfileId,
   providers: &ProviderGraph,
   http: &HttpClients,

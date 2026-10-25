@@ -240,7 +240,7 @@ impl Runtime for TestRuntime {
 }
 
 type TestClient<'a> = Client<Injected<MemoryTransport<'a>, TestRuntime>>;
-fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
+fn plan(driver: &str) -> tokn_sdk::policy::ExecutionRules {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
     "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none"},
@@ -249,10 +249,10 @@ fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
   .unwrap();
   tokn_sdk::config::v2::compile_execution(&raw).unwrap()
 }
-fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionPlan {
+fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionRules {
   retry_plan_for(max_retries, initial_backoff_ms, "openai")
 }
-fn retry_plan_for(max_retries: u32, initial_backoff_ms: u64, driver: &str) -> tokn_sdk::policy::ExecutionPlan {
+fn retry_plan_for(max_retries: u32, initial_backoff_ms: u64, driver: &str) -> tokn_sdk::policy::ExecutionRules {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
     "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},

@@ -1014,7 +1014,7 @@ fn build_profile_runtimes(
   // Runtime-only profile checks apply to profiles admitted by this gateway.
   // Provider and pool resources remain complete, matching their existing
   // global linking/validation and preserving shared proxy/API pool state.
-  let execution_plan = tokn_policy::ExecutionPlan::new(
+  let execution_rules = tokn_policy::ExecutionRules::new(
     plan
       .profiles()
       .iter()
@@ -1026,7 +1026,7 @@ fn build_profile_runtimes(
     plan.execution().account_pools().clone(),
     plan.execution().providers().clone(),
   );
-  let execution = tokn_requests::session::ExecutionState::new(execution_plan, accounts.to_vec())?;
+  let execution = tokn_requests::session::ExecutionState::new(execution_rules, accounts.to_vec())?;
   execution.use_standard_pools(&pools);
   let execution = Arc::new(execution);
 

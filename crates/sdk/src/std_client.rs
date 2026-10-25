@@ -9,7 +9,7 @@ use tokn_core::event::{Event, EventBus};
 use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::RequestEndpoint;
-use tokn_policy::{ExecutionPlan, ProfileId, RouteKind};
+use tokn_policy::{ExecutionRules, ProfileId, RouteKind};
 use tokn_requests::v2::{ApiProfileRuntime, ConfiguredRuntime};
 use tokn_requests::{ExecutionRequest, RawInbound};
 
@@ -59,7 +59,7 @@ struct Source {
 
 struct Snapshot {
   state: ConfiguredRuntime,
-  plan: ExecutionPlan,
+  plan: ExecutionRules,
   default_profile: String,
   config_path: PathBuf,
   auth_path: PathBuf,

@@ -45,7 +45,7 @@ pub use standard::*;
 
 /// Compile the in-memory configuration into the same execution policy used by
 /// the gateway, without requiring listeners, filesystem paths, or a network runtime.
-pub fn compile_execution(raw: &RawConfig) -> core::result::Result<tokn_policy::ExecutionPlan, CompileError> {
+pub fn compile_execution(raw: &RawConfig) -> core::result::Result<tokn_policy::ExecutionRules, CompileError> {
   if raw.schema_version != SCHEMA_VERSION {
     return Err(CompileError::InvalidValue {
       location: "schema_version".into(),

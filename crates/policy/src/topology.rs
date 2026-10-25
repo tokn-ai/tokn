@@ -23,9 +23,9 @@ use tokn_core::types::SmolStr;
 /// No admission cap is imposed unless the forward-proxy policy supplies one.
 pub const DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES: usize = usize::MAX;
 
-/// Validated execution resources independent of gateway hosting.
+/// Reusable execution rules and resource definitions independent of gateway hosting.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ExecutionPlan {
+pub struct ExecutionRules {
   profiles: BTreeMap<ProfileId, ProfilePlan>,
   routes: BTreeMap<RouteId, RoutePlan>,
   retry_policies: BTreeMap<RetryPolicyId, RetryPolicyPlan>,
@@ -33,7 +33,7 @@ pub struct ExecutionPlan {
   providers: BTreeMap<ProviderId, ProviderPlan>,
 }
 
-impl ExecutionPlan {
+impl ExecutionRules {
   pub fn new(
     profiles: BTreeMap<ProfileId, ProfilePlan>,
     routes: BTreeMap<RouteId, RoutePlan>,
@@ -86,7 +86,7 @@ impl ExecutionPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayPlan {
   listeners: BTreeMap<ListenerId, ListenerPlan>,
-  execution: ExecutionPlan,
+  execution: ExecutionRules,
 }
 
 #[cfg(feature = "std")]
@@ -101,7 +101,7 @@ impl GatewayPlan {
   ) -> Self {
     Self {
       listeners,
-      execution: ExecutionPlan::new(profiles, routes, retry_policies, account_pools, providers),
+      execution: ExecutionRules::new(profiles, routes, retry_policies, account_pools, providers),
     }
   }
   pub fn listeners(&self) -> &BTreeMap<ListenerId, ListenerPlan> {
@@ -110,10 +110,10 @@ impl GatewayPlan {
   pub fn listener(&self, id: &ListenerId) -> Option<&ListenerPlan> {
     self.listeners.get(id)
   }
-  pub fn execution(&self) -> &ExecutionPlan {
+  pub fn execution(&self) -> &ExecutionRules {
     &self.execution
   }
-  pub fn into_execution(self) -> ExecutionPlan {
+  pub fn into_execution(self) -> ExecutionRules {
     self.execution
   }
   pub fn profiles(&self) -> &BTreeMap<ProfileId, ProfilePlan> {

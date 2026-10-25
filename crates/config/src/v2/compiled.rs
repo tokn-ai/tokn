@@ -1,21 +1,21 @@
 use std::path::PathBuf;
-use tokn_policy::{ExecutionPlan, GatewayPlan};
+use tokn_policy::{ExecutionRules, GatewayPlan};
 
 /// Version 2 execution policy and service settings without gateway admission.
 ///
 /// SDKs use this form without requiring or initializing listeners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledExecutionConfig {
-  execution: ExecutionPlan,
+  execution: ExecutionRules,
   service: ServicePlan,
 }
 
 impl CompiledExecutionConfig {
-  pub(super) fn new(execution: ExecutionPlan, service: ServicePlan) -> Self {
+  pub(super) fn new(execution: ExecutionRules, service: ServicePlan) -> Self {
     Self { execution, service }
   }
 
-  pub fn execution(&self) -> &ExecutionPlan {
+  pub fn execution(&self) -> &ExecutionRules {
     &self.execution
   }
 
@@ -23,7 +23,7 @@ impl CompiledExecutionConfig {
     &self.service
   }
 
-  pub fn into_parts(self) -> (ExecutionPlan, ServicePlan) {
+  pub fn into_parts(self) -> (ExecutionRules, ServicePlan) {
     (self.execution, self.service)
   }
 }

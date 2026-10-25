@@ -23,7 +23,7 @@ use tokn_core::{
   types::{Bytes, Shared, SmolStr},
   Endpoint,
 };
-use tokn_policy::{ExecutionPlan, ProviderId, RelayDestination, RoutePlan};
+use tokn_policy::{ExecutionRules, ProviderId, RelayDestination, RoutePlan};
 use tokn_service::transport::{EncodeError, Request, ResponseHead, Transport};
 
 mod events;
@@ -132,12 +132,12 @@ pub struct Injected<T, R> {
 }
 
 impl<T: Transport, R: Runtime> Injected<T, R> {
-  pub fn new(plan: ExecutionPlan, accounts: Vec<AccountConfig>, transport: T, runtime: R) -> Result<Self, Error> {
+  pub fn new(plan: ExecutionRules, accounts: Vec<AccountConfig>, transport: T, runtime: R) -> Result<Self, Error> {
     Self::with_models(plan, accounts, BTreeMap::new(), transport, runtime)
   }
 
   pub fn with_models(
-    plan: ExecutionPlan,
+    plan: ExecutionRules,
     accounts: Vec<AccountConfig>,
     models: BTreeMap<ProviderId, BTreeSet<SmolStr>>,
     transport: T,
@@ -160,7 +160,7 @@ impl<T: Transport, R: Runtime> Injected<T, R> {
 
   /// Supply the same model evidence used by standard catalogue/discovery clients.
   pub fn with_model_metadata(
-    plan: ExecutionPlan,
+    plan: ExecutionRules,
     accounts: Vec<AccountConfig>,
     models: BTreeMap<ProviderId, ModelInventory>,
     transport: T,

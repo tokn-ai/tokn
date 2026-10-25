@@ -230,7 +230,7 @@ The standard SDK, v2 gateway, and injected executor share provider/account linki
 selection in `tokn-accounts`:
 
 - `link::portable` validates provider destinations, account identities, and pool
-  membership from the same `ExecutionPlan`. Disabled accounts remain valid pool
+  membership from the same `ExecutionRules`. Disabled accounts remain valid pool
   references but cannot be selected; provider URLs are owned by v2 configuration.
 - `selection::select_route` handles provider/driver qualification, model families,
   capability evidence, operation fallback, provider scores, and access filtering.
@@ -241,10 +241,10 @@ selection in `tokn-accounts`:
 
 Native provider transformations and credential policy are shared. Model
 discovery and cache refresh happen outside request execution; routing parity
-depends on equivalent plans, accounts, capability inventories, and pool state.
+depends on matching execution rules, accounts, capability inventories, and pool state.
 Both SDK platforms
 accept v2 configuration only. Standard SDK and gateway API profiles are built
-by `tokn_requests::v2` from the same `ExecutionPlan`; gateway admission and
+by `tokn_requests::v2` from the same `ExecutionRules`; gateway admission and
 original-destination proxy wiring remain in `tokn-router`.
 
 Retry configuration and replay decisions share `tokn_requests::retry::RetryPolicy`.
@@ -327,7 +327,7 @@ pool feedback. Platform services supply transport I/O, time, and event delivery;
 the response owns the exchange and completion state until delivery, failure, or
 cancellation. Gateway original-destination and legacy compatibility wiring
 remain outside this SDK session contract.
-`tokn-policy` owns execution-plan data and `tokn-convert` owns protocol conversion.
+`tokn-policy` owns execution rules and `tokn-convert` owns protocol conversion.
 The implementation stays in the existing crates; there is no separate direct
 client or engine crate.
 

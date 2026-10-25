@@ -10,7 +10,7 @@ use crate::v2::{CompileError, RawConfig};
 use crate::v2::{CompiledConfig, CompiledExecutionConfig};
 #[cfg(feature = "std")]
 use std::path::Path;
-use tokn_policy::ExecutionPlan;
+use tokn_policy::ExecutionRules;
 #[cfg(feature = "std")]
 use tokn_policy::GatewayPlan;
 
@@ -56,7 +56,7 @@ fn compile_gateway(raw: &RawConfig, source: &Path) -> Result<GatewayPlan, Compil
 }
 
 /// Compile shared resources without requiring a gateway listener or source path.
-pub(super) fn compile_execution(raw: &RawConfig) -> Result<ExecutionPlan, CompileError> {
+pub(super) fn compile_execution(raw: &RawConfig) -> Result<ExecutionRules, CompileError> {
   let expanded = super::defaults::expand(raw)?;
   let resources = resources::compile_resources(&expanded).map_err(|error| {
     if raw.defaults.is_some() {
@@ -65,7 +65,7 @@ pub(super) fn compile_execution(raw: &RawConfig) -> Result<ExecutionPlan, Compil
       error
     }
   })?;
-  Ok(ExecutionPlan::new(
+  Ok(ExecutionRules::new(
     resources.profiles,
     resources.routes,
     resources.retry_policies,

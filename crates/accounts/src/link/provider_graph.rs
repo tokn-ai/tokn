@@ -15,7 +15,7 @@ use tokn_auth::descriptor::ProviderDescriptor;
 use tokn_core::account::AccountConfig;
 use tokn_core::provider::{Endpoint, Error as ProviderError, Provider, ProviderTarget};
 use tokn_core::upstream_url::InvalidUpstreamUrl;
-use tokn_policy::{DriverId, ExecutionPlan, GatewayPlan, ProviderId};
+use tokn_policy::{DriverId, ExecutionRules, GatewayPlan, ProviderId};
 
 /// Linked metadata for one configured provider destination.
 ///
@@ -284,7 +284,7 @@ pub fn link_provider_graph(
 /// Like [`link_provider_graph`], configured provider destinations take
 /// precedence over account-level base URLs. No listeners are required.
 pub fn link_execution_provider_graph(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   accounts: &[AccountConfig],
   registry: &Registry,
 ) -> LinkResult<ProviderGraph> {

@@ -16,7 +16,7 @@ use tokn_core::{
   types::SmolStr,
   upstream_url::{CanonicalUpstreamUrl, CleartextHttpPolicy, InvalidUpstreamUrl},
 };
-use tokn_policy::{AccountPoolId, AccountSelectionStrategy, DriverId, ExecutionPlan, ProviderId, SessionAffinityPlan};
+use tokn_policy::{AccountPoolId, AccountSelectionStrategy, DriverId, ExecutionRules, ProviderId, SessionAffinityPlan};
 
 /// The source of a provider URL selected during linking.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,7 +235,7 @@ impl core::error::Error for MetadataLinkError {
 /// when a URL is explicitly configured, so unknown drivers cannot pass linking.
 /// Legacy account URLs are intentionally ignored: the provider owns its URL.
 pub fn link_provider_metadata(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   accounts: &[AccountConfig],
   resolve_default: impl Fn(&ProviderId, &DriverId) -> Option<&'static str>,
 ) -> Result<ProviderMetadataGraph, MetadataLinkError> {
@@ -397,7 +397,7 @@ impl core::error::Error for MetadataPoolError {}
 /// Intersect pool selectors over linked accounts. Explicitly named disabled or
 /// otherwise unbound accounts are valid references, but never become members.
 pub fn link_pool_metadata(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   providers: &ProviderMetadataGraph,
 ) -> Result<BTreeMap<AccountPoolId, PoolMetadata>, MetadataPoolError> {
   let mut pools = BTreeMap::new();
@@ -475,8 +475,8 @@ mod tests {
     )
   }
 
-  fn plan(providers: BTreeMap<ProviderId, ProviderPlan>, selector: AccountSelector) -> ExecutionPlan {
-    ExecutionPlan::new(
+  fn plan(providers: BTreeMap<ProviderId, ProviderPlan>, selector: AccountSelector) -> ExecutionRules {
+    ExecutionRules::new(
       BTreeMap::new(),
       BTreeMap::new(),
       BTreeMap::new(),
