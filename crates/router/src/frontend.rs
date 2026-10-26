@@ -32,7 +32,7 @@ impl Frontend {
   /// Link transport policy only: no provider pipelines, credentials, or request databases.
   pub fn new(
     plan: GatewayPlan,
-    service: tokn_config::v2::ServicePlan,
+    service: tokn_config::v2::ServiceSettings,
     access: Arc<AccessStore>,
     dispatcher: Arc<dyn RequestDispatcher>,
   ) -> anyhow::Result<Self> {
@@ -42,7 +42,7 @@ impl Frontend {
   /// Persist only requests rejected here; dispatched requests belong to their worker.
   pub fn new_with_events(
     plan: GatewayPlan,
-    service: tokn_config::v2::ServicePlan,
+    service: tokn_config::v2::ServiceSettings,
     access: Arc<AccessStore>,
     dispatcher: Arc<dyn RequestDispatcher>,
     events: Arc<EventBus>,

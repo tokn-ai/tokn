@@ -3,8 +3,9 @@
 //! This module deliberately owns no filesystem behavior. It neither reads nor
 //! writes config or auth files, and it does not change runtime schema
 //! selection. A caller supplies the already-merged legacy config and a slice of
-//! account configurations, then receives a compiled v2 plan plus ephemeral
-//! account copies.
+//! account configurations, then receives v2 configuration plus ephemeral
+//! account copies. Gateway projection also compiles listener admission; client
+//! projection uses the shared execution-only compiler after normalization.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -16,7 +17,7 @@ mod analysis;
 mod compose;
 mod resources;
 
-pub use compose::{project_v2_config, V2Projection};
+pub use compose::{project_v2_config, project_v2_execution_config, V2ExecutionProjection, V2Projection};
 
 /// Explicit choices that can relax a safety check during projection.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

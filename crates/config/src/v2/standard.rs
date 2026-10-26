@@ -12,6 +12,10 @@ pub fn decode(contents: &str, source: &Path) -> Result<RawConfig> {
     path: source.to_path_buf(),
     source: source_error,
   })?;
+  decode_document(document, source)
+}
+
+pub(crate) fn decode_document(document: toml::Value, source: &Path) -> Result<RawConfig> {
   match crate::schema::detect_toml(&document) {
     Ok(ConfigSchema::V2) => {}
     Ok(ConfigSchema::Legacy) => {

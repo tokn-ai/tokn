@@ -3413,6 +3413,7 @@ dependencies = [
  "tokn-policy",
  "tokn-requests",
  "tokn-router-config",
+ "tokn-router-legacy-config",
  "tokn-service",
 ]
 

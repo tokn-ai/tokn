@@ -5,7 +5,7 @@
 //! the shared driver owns replay ordering and the platform supplies the timer.
 
 use core::{fmt, time::Duration};
-use tokn_policy::{ExecutionPlan, ManagedRetry, RelayRetry, RetryPolicyId, RoutePlan};
+use tokn_policy::{ExecutionRules, ManagedRetry, RelayRetry, RetryPolicyId, RoutePlan};
 
 /// Bounded replay of recoverable send failures.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -32,7 +32,7 @@ pub struct RetryFailure {
   pub stop: bool,
 }
 
-/// A route references a retry policy absent from its execution plan.
+/// A route references a retry policy absent from its execution rules.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissingRetryPolicy {
   policy_id: RetryPolicyId,
@@ -72,7 +72,7 @@ impl RetryPolicy {
   }
 
   /// Resolve the retry choice and named policy for a v2 route.
-  pub fn from_route(plan: &ExecutionPlan, route: &RoutePlan) -> Result<Self, MissingRetryPolicy> {
+  pub fn from_route(plan: &ExecutionRules, route: &RoutePlan) -> Result<Self, MissingRetryPolicy> {
     let (policy_id, replay_safety) = match route {
       RoutePlan::Managed(route) => match route.retry() {
         ManagedRetry::Never => return Ok(Self::default()),
@@ -228,7 +228,7 @@ mod tests {
   #[test]
   fn route_resolution_preserves_replay_safety_and_named_limits() {
     let id = RetryPolicyId::new("failover").unwrap();
-    let plan = ExecutionPlan::new(
+    let plan = ExecutionRules::new(
       BTreeMap::new(),
       BTreeMap::new(),
       BTreeMap::from([(id.clone(), RetryPolicyPlan::new(2, Duration::from_millis(17)))]),
@@ -257,7 +257,7 @@ mod tests {
 
   #[test]
   fn never_routes_need_no_named_policy() {
-    let plan = ExecutionPlan::default();
+    let plan = ExecutionRules::default();
     for route in [managed(ManagedRetry::Never), relay(RelayRetry::Never)] {
       let policy = RetryPolicy::from_route(&plan, &route).unwrap();
       assert_eq!(policy.next_delay(0, RECOVERABLE_SEND, Some("GET")), None);
@@ -272,7 +272,7 @@ mod tests {
       relay(RelayRetry::SafeMethods(id.clone())),
       relay(RelayRetry::Buffered(id.clone())),
     ] {
-      let error = RetryPolicy::from_route(&ExecutionPlan::default(), &route).unwrap_err();
+      let error = RetryPolicy::from_route(&ExecutionRules::default(), &route).unwrap_err();
       assert_eq!(error.policy_id(), &id);
       assert_eq!(error.to_string(), "route references missing retry policy 'missing'");
     }

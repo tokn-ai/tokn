@@ -1,20 +1,20 @@
-//! Exercise request interpretation through both public SDK execution paths.
+//! Exercise the same in-memory configuration through both public SDK adapters.
 //!
 //! The standard client sends HTTP to the fixture server; the injected client
 //! receives the same upstream reply through a local transport. Assertions use
 //! externally visible response modes, provider headers, and account affinity.
+//! Neither client loads configuration or credentials from files.
 
 #![cfg(feature = "std")]
 
 use serde_json::{json, Value};
-use std::{cell::RefCell, convert::Infallible, fs, rc::Rc, time::Duration};
-use tempfile::TempDir;
+use std::{cell::RefCell, convert::Infallible, rc::Rc, time::Duration};
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
-use tokn_requests::configured::ResponseBody as InjectedBody;
+use tokn_requests::configured::ResponseBody as BorrowedBody;
 use tokn_sdk::{
   account::AccountConfig,
   transport::{Request, ResponseHead, Transport},
-  Client, Endpoint, Injected, RequestOptions, ResponseBody, Runtime,
+  Adapter, Client, Endpoint, RequestOptions, ResponseBody, Runtime, StdPlatform,
 };
 
 struct CaptureTransport {
@@ -64,10 +64,9 @@ impl Runtime for TestRuntime {
 }
 
 struct Fixture {
-  _root: TempDir,
   server: MockLlmServer,
   standard: Client,
-  injected: Client<Injected<CaptureTransport, TestRuntime>>,
+  injected: Client<Adapter<CaptureTransport, TestRuntime>>,
   requests: Rc<RefCell<Vec<Request>>>,
   provider: &'static str,
 }
@@ -89,12 +88,6 @@ impl Fixture {
   async fn new(provider: &'static str, account_count: usize, route: MockRoute) -> Self {
     let reply = route.response.clone();
     let server = MockLlmServer::start(MockLlmConfig::default().with_route(route)).await;
-    let root = tempfile::tempdir().expect("create parity fixture");
-    let config_path = root.path().join("config.toml");
-    let auth_path = root.path().join("auth.yaml");
-    fs::write(&config_path, format!(
-      "schema_version = 2\n[defaults]\nprovider = {{ kind = 'fixed', provider = '{provider}' }}\nmodel = {{ kind = 'qualified', namespace = 'provider' }}\noperation = 'preserve'\nwire_identity = 'none'\n[providers.'{provider}']\ndriver = '{provider}'\nbase_url = '{}'\n", server.base_url()
-    )).unwrap();
     let accounts: Vec<Value> = (0..account_count)
       .map(|index| {
         json!({
@@ -107,17 +100,6 @@ impl Fixture {
         })
       })
       .collect();
-    // JSON is also valid YAML, keeping credentials identical in both fixtures.
-    fs::write(
-      &auth_path,
-      serde_json::to_vec(&json!({"version": 1, "accounts": accounts})).unwrap(),
-    )
-    .unwrap();
-    let standard = Client::builder()
-      .config_path(&config_path)
-      .auth_path(&auth_path)
-      .build()
-      .expect("build standard client");
     let raw = serde_json::from_value(json!({
       "schema_version": 2,
       "defaults": {
@@ -134,22 +116,27 @@ impl Fixture {
       .into_iter()
       .map(|account| serde_json::from_value(account).unwrap())
       .collect();
+    let standard = Client::new(
+      plan.clone(),
+      accounts.clone(),
+      StdPlatform::new().expect("build standard transport services"),
+    )
+    .expect("build standard client from the same in-memory configuration");
     let requests = Rc::new(RefCell::new(Vec::new()));
-    let injected = Client::from_platform(
-      Injected::new(
-        plan,
-        accounts,
+    let injected = Client::new(
+      plan,
+      accounts,
+      Adapter::new(
         CaptureTransport {
           requests: requests.clone(),
           reply,
           position: 0,
         },
         TestRuntime,
-      )
-      .unwrap(),
-    );
+      ),
+    )
+    .unwrap();
     Self {
-      _root: root,
       server,
       standard,
       injected,
@@ -193,8 +180,8 @@ impl Fixture {
       .await
       .expect("execute injected request");
     assert_eq!(injected.status, 200);
-    let injected_streaming = matches!(injected.body, InjectedBody::Stream(_));
-    if let InjectedBody::Stream(mut stream) = injected.body {
+    let injected_streaming = matches!(injected.body, BorrowedBody::Stream(_));
+    if let BorrowedBody::Stream(mut stream) = injected.body {
       while stream.next_event().await.expect("consume injected SSE").is_some() {}
     }
     let standard = self.server.last_request().expect("standard upstream request");

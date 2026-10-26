@@ -20,7 +20,7 @@ use tokn_accounts::selection::{
 use tokn_accounts::selection::{provider_allowed, select_route, RouteSelection, SelectionRequest};
 use tokn_accounts::AccountHandle;
 use tokn_core::provider::Endpoint;
-use tokn_policy::{ExecutionPlan, ProfileId, ProviderId, RelayDestination, RoutePlan};
+use tokn_policy::{ExecutionRules, ProfileId, ProviderId, RelayDestination, RoutePlan};
 #[cfg(test)]
 use tokn_policy::{GatewayPlan, ManagedRoute, OperationPolicy, QualificationNamespace, RouteId};
 
@@ -92,7 +92,7 @@ pub struct V2AccountSelector {
 
 impl V2AccountSelector {
   pub fn new(
-    plan: &ExecutionPlan,
+    plan: &ExecutionRules,
     profile_id: &ProfileId,
     pools: &AccountPoolRuntimes,
   ) -> anyhow::Result<(Self, Arc<SelectionState>)> {

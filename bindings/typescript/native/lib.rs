@@ -162,13 +162,23 @@ impl Drop for NativeClient {
 #[napi]
 impl NativeClient {
   #[napi(getter)]
-  pub fn config_path(&self) -> String {
-    self.state.client.config_path().to_string_lossy().into_owned()
+  pub fn config_path(&self) -> Result<String> {
+    self
+      .state
+      .client
+      .config_path()
+      .map(|path| path.to_string_lossy().into_owned())
+      .ok_or_else(|| sdk_error(tokn_sdk::Error::ReloadUnavailable))
   }
 
   #[napi(getter)]
-  pub fn auth_path(&self) -> String {
-    self.state.client.auth_path().to_string_lossy().into_owned()
+  pub fn auth_path(&self) -> Result<String> {
+    self
+      .state
+      .client
+      .auth_path()
+      .map(|path| path.to_string_lossy().into_owned())
+      .ok_or_else(|| sdk_error(tokn_sdk::Error::ReloadUnavailable))
   }
 
   #[napi]

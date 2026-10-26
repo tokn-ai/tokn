@@ -12,7 +12,8 @@ mod tests {
     net::{TcpListener, TcpStream},
     path::PathBuf,
     sync::{
-      atomic::{AtomicBool, Ordering},
+      atomic::{AtomicBool, AtomicU64, Ordering},
+      mpsc::{self, Receiver, Sender},
       Arc,
     },
     thread::{self, JoinHandle},
@@ -20,7 +21,9 @@ mod tests {
   };
 
   use serde_json::{json, Value};
-  use tokn_sdk::{chat_completions::ChatRequest, Client, Event, RequestEventPayload, RequestOptions, StageEvent};
+  use tokn_sdk::{
+    chat_completions::ChatRequest, Client, Error, Event, RequestEventPayload, RequestOptions, StageEvent, StdPlatform,
+  };
 
   fn assert_send_sync<T: Send + Sync>() {}
 
@@ -36,6 +39,7 @@ mod tests {
 
   struct Fixture {
     root: PathBuf,
+    base_url: String,
     stopped: Arc<AtomicBool>,
     server: Option<JoinHandle<io::Result<Vec<Value>>>>,
   }
@@ -46,14 +50,20 @@ mod tests {
     }
 
     fn start_with_requests(expected_requests: usize) -> Self {
+      Self::start_with_gate(expected_requests, None)
+    }
+
+    fn start_with_gate(expected_requests: usize, gate: Option<(Sender<()>, Receiver<()>)>) -> Self {
       let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback server");
       listener.set_nonblocking(true).expect("nonblocking listener");
       let address = listener.local_addr().unwrap();
       let stopped = Arc::new(AtomicBool::new(false));
       let stop = stopped.clone();
-      let server = thread::spawn(move || serve(listener, &stop, expected_requests));
+      let server = thread::spawn(move || serve(listener, &stop, expected_requests, gate));
       let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-      let root = std::env::temp_dir().join(format!("tokn-sdk-std-{}-{unique}", std::process::id()));
+      static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+      let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+      let root = std::env::temp_dir().join(format!("tokn-sdk-std-{}-{unique}-{sequence}", std::process::id()));
       fs::create_dir(&root).expect("create isolated config directory");
       fs::write(root.join("config.toml"), format!(
         "schema_version = 2\n[defaults]\nprovider = {{ kind = 'fixed', provider = 'llama-cpp' }}\nmodel = {{ kind = 'qualified', namespace = 'provider' }}\nwire_identity = 'none'\n[providers.llama-cpp]\ndriver = 'llama-cpp'\nbase_url = 'http://{address}'\n"
@@ -65,6 +75,7 @@ mod tests {
       .unwrap();
       Self {
         root,
+        base_url: format!("http://{address}"),
         stopped,
         server: Some(server),
       }
@@ -99,7 +110,12 @@ mod tests {
     }
   }
 
-  fn serve(listener: TcpListener, stopped: &AtomicBool, expected_requests: usize) -> io::Result<Vec<Value>> {
+  fn serve(
+    listener: TcpListener,
+    stopped: &AtomicBool,
+    expected_requests: usize,
+    gate: Option<(Sender<()>, Receiver<()>)>,
+  ) -> io::Result<Vec<Value>> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut requests = Vec::new();
     while requests.len() < expected_requests {
@@ -121,6 +137,14 @@ mod tests {
       socket.set_read_timeout(Some(Duration::from_secs(5)))?;
       socket.set_write_timeout(Some(Duration::from_secs(5)))?;
       let request = read_request(&mut socket)?;
+      if requests.is_empty() {
+        if let Some((received, release)) = &gate {
+          received.send(()).map_err(io::Error::other)?;
+          release
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(io::Error::other)?;
+        }
+      }
       if request["model"] == "test-retry" && requests.is_empty() {
         let body = r#"{"error":{"message":"retry on another account"}}"#;
         write!(
@@ -209,8 +233,8 @@ mod tests {
     runtime.block_on(async {
       tokio::time::timeout(Duration::from_secs(10), async {
         let client = fixture.client();
-        assert_eq!(client.config_path(), fixture.root.join("config.toml"));
-        assert_eq!(client.auth_path(), fixture.root.join("auth.yaml"));
+        assert_eq!(client.config_path(), Some(fixture.root.join("config.toml")));
+        assert_eq!(client.auth_path(), Some(fixture.root.join("auth.yaml")));
         client.reload().expect("reload explicit config");
         let request: ChatRequest = serde_json::from_value(json!({
           "model": "llama-cpp/test-model",
@@ -249,6 +273,57 @@ mod tests {
       .await
       .expect("SDK calls completed before timeout");
     });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["model"], "test-model");
+    assert_eq!(requests[0]["stream"], false);
+    assert_eq!(requests[1]["model"], "test-model");
+    assert_eq!(requests[1]["stream"], true);
+  }
+
+  #[test]
+  fn default_consumer_loads_legacy_config_without_migrating_source_files() {
+    let mut fixture = Fixture::start();
+    let config = "[server]\nhost = 'sdk.private.example'\n[defaults]\nmode = 'exact'\n";
+    let auth = format!(
+      "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: {}\n",
+      fixture.base_url
+    );
+    fs::write(fixture.root.join("config.toml"), config).unwrap();
+    fs::write(fixture.root.join("auth.yaml"), &auth).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build runtime");
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        assert!(!client.config_warnings().is_empty());
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model",
+          "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        client
+          .chat_completions()
+          .create(&request)
+          .await
+          .expect("legacy buffered call");
+        let response = client
+          .chat_completions()
+          .stream(&request)
+          .await
+          .expect("legacy streaming call");
+        let bytes = response.bytes().await.expect("legacy stream completes");
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
+        client.reload().expect("legacy configuration remains reloadable");
+      })
+      .await
+      .expect("legacy SDK calls completed before timeout");
+    });
+    assert_eq!(fs::read_to_string(fixture.root.join("config.toml")).unwrap(), config);
+    assert_eq!(fs::read_to_string(fixture.root.join("auth.yaml")).unwrap(), auth);
+    assert!(!fixture.root.join("config.toml.bak").exists());
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["model"], "test-model");
@@ -450,5 +525,227 @@ mod tests {
     let requests = fixture.requests();
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0], requests[1]);
+  }
+
+  #[test]
+  fn standard_services_accept_in_memory_configuration_without_reload_sources() {
+    let mut fixture = Fixture::start_with_requests(2);
+    let raw = serde_json::from_value(json!({
+      "schema_version": 2,
+      "defaults": {
+        "provider": {"kind": "fixed", "provider": "llama-cpp"},
+        "model": {"kind": "qualified", "namespace": "provider"},
+        "wire_identity": "none"
+      },
+      "providers": {"llama-cpp": {"driver": "llama-cpp", "base_url": fixture.base_url}}
+    }))
+    .unwrap();
+    let rules = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
+    let account = serde_json::from_value(json!({"id": "memory", "provider": "llama-cpp"})).unwrap();
+    let client = Client::new(rules, vec![account], StdPlatform::new().unwrap()).unwrap();
+    assert_eq!(client.config_path(), None);
+    assert_eq!(client.auth_path(), None);
+    assert!(matches!(client.reload(), Err(Error::ReloadUnavailable)));
+    // In-memory construction must not retain or depend on the fixture files.
+    fs::remove_file(fixture.root.join("config.toml")).unwrap();
+    fs::remove_file(fixture.root.join("auth.yaml")).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let endpoint = client.chat_completions();
+        assert_send(endpoint.create(&request)).await.unwrap();
+        let stream = assert_send(endpoint.stream(&request)).await.unwrap();
+        let bytes = assert_send(stream.bytes()).await.unwrap();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
+      })
+      .await
+      .expect("in-memory standard requests complete");
+    });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| request["model"] == "test-model"));
+  }
+
+  #[test]
+  fn an_unread_stream_keeps_its_snapshot_when_reload_publishes_new_accounts() {
+    let mut original = Fixture::start_with_requests(1);
+    let mut replacement = Fixture::start_with_requests(1);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = original.client();
+        let mut events = client.subscribe_events();
+        let request: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let endpoint = client.chat_completions();
+        let stream =
+          assert_send(endpoint.stream_with(&request, RequestOptions::default().with_request_id("before-reload")))
+            .await
+            .unwrap();
+        let config_path = original.root.join("config.toml");
+        let config = fs::read_to_string(&config_path)
+          .unwrap()
+          .replace(&original.base_url, &replacement.base_url);
+        fs::write(&config_path, config).unwrap();
+        fs::write(
+          original.root.join("auth.yaml"),
+          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n",
+        )
+        .unwrap();
+        client
+          .reload()
+          .expect("publish replacement state while a response owns the original");
+        endpoint
+          .create_with(&request, RequestOptions::default().with_request_id("after-reload"))
+          .await
+          .expect("the new request uses replacement state independently");
+        let bytes = assert_send(stream.bytes())
+          .await
+          .expect("the original stream completes after reload");
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("data: [DONE]"));
+        let mut accounts = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+          if let Event::Requests(event) = event.as_ref() {
+            match &event.payload {
+              RequestEventPayload::Stage(StageEvent::Resolve(summary)) => {
+                accounts.push((event.request_id.to_string(), summary.account_id.to_string()));
+              }
+              RequestEventPayload::Stage(StageEvent::Completed { success, attempts }) => {
+                outcomes.push((event.request_id.to_string(), *success, *attempts));
+              }
+              _ => {}
+            }
+          }
+        }
+        assert_eq!(
+          accounts,
+          [
+            ("before-reload".into(), "local".into()),
+            ("after-reload".into(), "replacement".into())
+          ]
+        );
+        assert_eq!(
+          outcomes,
+          [("after-reload".into(), true, 1), ("before-reload".into(), true, 1)]
+        );
+      })
+      .await
+      .expect("reload with an active stream completes");
+    });
+    assert_eq!(original.requests().len(), 1);
+    assert_eq!(replacement.requests().len(), 1);
+  }
+
+  #[test]
+  fn a_pending_request_retries_with_its_original_rules_and_accounts_after_reload() {
+    let (received_tx, received_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut original = Fixture::start_with_gate(2, Some((received_tx, release_rx)));
+    let mut replacement = Fixture::start_with_requests(1);
+    let config_path = original.root.join("config.toml");
+    let config = fs::read_to_string(&config_path).unwrap().replace(
+      "[defaults]",
+      "[defaults]\nretry = { kind = 'recoverable', policy = 'retry' }",
+    );
+    fs::write(
+      &config_path,
+      format!("{config}\n[retry_policies.retry]\nmax_retries = 1\ninitial_backoff_ms = 1\n"),
+    )
+    .unwrap();
+    fs::write(original.root.join("auth.yaml"),
+      "version: 1\naccounts:\n  - id: primary\n    provider: llama-cpp\n  - id: backup\n    provider: llama-cpp\n    tier: fallback\n"
+    ).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = Arc::new(original.client());
+        let mut events = client.subscribe_events();
+        let active = client.clone();
+        let request = tokio::spawn(async move {
+          let body: ChatRequest = serde_json::from_value(json!({
+            "model": "llama-cpp/test-retry", "messages": [{"role": "user", "content": "hello"}]
+          }))
+          .unwrap();
+          active
+            .chat_completions()
+            .create_with(&body, RequestOptions::default().with_request_id("snapshot-pending"))
+            .await
+        });
+        // The upstream has received the first attempt but cannot respond yet.
+        while received_rx.try_recv().is_err() {
+          tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let replacement_config = fs::read_to_string(&config_path)
+          .unwrap()
+          .replace(&original.base_url, &replacement.base_url)
+          .replace(
+            "retry = { kind = 'recoverable', policy = 'retry' }",
+            "retry = { kind = 'never' }",
+          );
+        fs::write(&config_path, replacement_config).unwrap();
+        fs::write(
+          original.root.join("auth.yaml"),
+          "version: 1\naccounts:\n  - id: replacement\n    provider: llama-cpp\n",
+        )
+        .unwrap();
+        client.reload().expect("publish new rules, accounts, and HTTP pool");
+        let new_body: ChatRequest = serde_json::from_value(json!({
+          "model": "llama-cpp/test-model", "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        client
+          .chat_completions()
+          .create_with(&new_body, RequestOptions::default().with_request_id("snapshot-new"))
+          .await
+          .expect("new sessions use the replacement snapshot");
+        release_tx.send(()).unwrap();
+        request
+          .await
+          .unwrap()
+          .expect("the original rules still permit a retry on the old fallback account");
+        let mut accounts = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Ok(event) = events.try_recv() {
+          if let Event::Requests(event) = event.as_ref() {
+            if event.request_id != "snapshot-pending" {
+              continue;
+            }
+            match &event.payload {
+              RequestEventPayload::Stage(StageEvent::Resolve(summary)) => {
+                accounts.push((event.attempt, summary.account_id.to_string()));
+              }
+              RequestEventPayload::Stage(StageEvent::Completed { success, attempts }) => {
+                outcomes.push((event.attempt, *success, *attempts));
+              }
+              _ => {}
+            }
+          }
+        }
+        assert_eq!(accounts, [(0, "primary".into()), (1, "backup".into())]);
+        assert_eq!(outcomes, [(0, false, 1), (1, true, 2)]);
+      })
+      .await
+      .expect("pending request and reload complete");
+    });
+    let requests = original.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(replacement.requests().len(), 1);
   }
 }

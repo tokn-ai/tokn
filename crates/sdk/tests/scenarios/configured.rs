@@ -15,7 +15,7 @@ use tokn_sdk::{
   messages::MessagesRequest,
   responses::ResponsesRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, Endpoint, Injected, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
+  Adapter, Client, Endpoint, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
 };
 
 #[path = "typed_events.rs"]
@@ -239,8 +239,8 @@ impl Runtime for TestRuntime {
   }
 }
 
-type TestClient<'a> = Client<Injected<MemoryTransport<'a>, TestRuntime>>;
-fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
+type TestClient<'a> = Client<Adapter<MemoryTransport<'a>, TestRuntime>>;
+fn plan(driver: &str) -> tokn_sdk::policy::ExecutionRules {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
     "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none"},
@@ -249,10 +249,10 @@ fn plan(driver: &str) -> tokn_sdk::policy::ExecutionPlan {
   .unwrap();
   tokn_sdk::config::v2::compile_execution(&raw).unwrap()
 }
-fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionPlan {
+fn retry_plan(max_retries: u32, initial_backoff_ms: u64) -> tokn_sdk::policy::ExecutionRules {
   retry_plan_for(max_retries, initial_backoff_ms, "openai")
 }
-fn retry_plan_for(max_retries: u32, initial_backoff_ms: u64, driver: &str) -> tokn_sdk::policy::ExecutionPlan {
+fn retry_plan_for(max_retries: u32, initial_backoff_ms: u64, driver: &str) -> tokn_sdk::policy::ExecutionRules {
   let raw = serde_json::from_value(json!({
     "schema_version":2,
     "defaults":{"provider":{"kind":"fixed","provider":"upstream"},"wire_identity":"none","retry":{"kind":"recoverable","policy":"retry"}},
@@ -269,15 +269,12 @@ fn make_client<'a>(
   replies: impl IntoIterator<Item = Reply>,
   driver: &str,
 ) -> TestClient<'a> {
-  Client::from_platform(
-    Injected::new(
-      plan(driver),
-      vec![account_config("primary", "test-key", "active")],
-      MemoryTransport::new(requests, replies),
-      TestRuntime::default(),
-    )
-    .unwrap(),
+  Client::new(
+    plan(driver),
+    vec![account_config("primary", "test-key", "active")],
+    Adapter::new(MemoryTransport::new(requests, replies), TestRuntime::default()),
   )
+  .unwrap()
 }
 fn chat() -> ChatRequest {
   serde_json::from_value(json!({"model":"model","messages":[{"role":"user","content":"hello"}]})).unwrap()
@@ -319,15 +316,15 @@ pub fn explicit_profiles_do_not_imply_default() {
   .unwrap();
   let plan = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
   let sent = RefCell::new(Vec::new());
-  let client = Client::from_platform(
-    Injected::new(
-      plan,
-      vec![account_config("primary", "test-key", "active")],
+  let client = Client::new(
+    plan,
+    vec![account_config("primary", "test-key", "active")],
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
       TestRuntime::default(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   let body = json!({"model": "upstream/model", "messages": [{"role": "user", "content": "hello"}]});
   for (options, expected_profile) in [
     (RequestOptions::default(), "default"),
@@ -374,15 +371,15 @@ pub fn copilot_refresh_uses_injected_transport_and_reuses_credentials() {
     }
     replies.extend([Reply::json(TOKEN), Reply::json(CHAT_JSON), Reply::json(CHAT_JSON)]);
     methods.extend(["GET", "POST", "POST"]);
-    let client = Client::from_platform(
-      Injected::new(
-        plan("github-copilot"),
-        vec![account],
+    let client = Client::new(
+      plan("github-copilot"),
+      vec![account],
+      Adapter::new(
         MemoryTransport::new(&sent, replies).with_methods(methods),
         TestRuntime::default(),
-      )
-      .unwrap(),
-    );
+      ),
+    )
+    .unwrap();
     if fail_first_refresh {
       assert!(run(client.chat_completions().create(&chat())).is_err());
       assert_eq!(
@@ -439,10 +436,10 @@ pub fn recoverable_refresh_failure_reselects_accounts() {
     .unwrap()
   });
   let runtime = TestRuntime::default();
-  let client = Client::from_platform(
-    Injected::new(
-      retry_plan_for(1, 2, "github-copilot"),
-      accounts.into(),
+  let client = Client::new(
+    retry_plan_for(1, 2, "github-copilot"),
+    accounts.into(),
+    Adapter::new(
       MemoryTransport::new(
         &sent,
         [
@@ -457,9 +454,9 @@ pub fn recoverable_refresh_failure_reselects_accounts() {
       )
       .with_methods(["GET", "GET", "POST"]),
       runtime.clone(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   let response = run(
     client
       .chat_completions()
@@ -634,7 +631,7 @@ pub fn buffered_content_detection() {
   for content_type in ["", "application/json", "text/event-stream; charset=utf-8"] {
     for endpoint in [tokn_sdk::Endpoint::ChatCompletions, tokn_sdk::Endpoint::Messages] {
       let sent = RefCell::new(Vec::new());
-      let platform = make_client(
+      let client = make_client(
         &sent,
         [Reply {
           status: 200,
@@ -642,9 +639,8 @@ pub fn buffered_content_detection() {
           bytes: CHAT_SSE,
         }],
         "openai",
-      )
-      .into_platform();
-      let response = run(platform.execute(
+      );
+      let response = run(client.execute(
         endpoint,
         serde_json::to_value(messages()).unwrap(),
         RequestOptions::default(),
@@ -661,7 +657,7 @@ pub fn buffered_content_detection() {
   }
   for content_type in ["", "application/json"] {
     let sent = RefCell::new(Vec::new());
-    let platform = make_client(
+    let client = make_client(
       &sent,
       [Reply {
         status: 200,
@@ -669,9 +665,8 @@ pub fn buffered_content_detection() {
         bytes: &[],
       }],
       "openai",
-    )
-    .into_platform();
-    let response = run(platform.execute(
+    );
+    let response = run(client.execute(
       tokn_sdk::Endpoint::ChatCompletions,
       serde_json::to_value(chat()).unwrap(),
       RequestOptions::default(),
@@ -683,7 +678,7 @@ pub fn buffered_content_detection() {
   }
 
   let sent = RefCell::new(Vec::new());
-  let platform = make_client(
+  let client = make_client(
     &sent,
     [Reply {
       status: 200,
@@ -691,9 +686,8 @@ pub fn buffered_content_detection() {
       bytes: b"not JSON or SSE",
     }],
     "openai",
-  )
-  .into_platform();
-  let error = run(platform.execute(
+  );
+  let error = run(client.execute(
     tokn_sdk::Endpoint::ChatCompletions,
     serde_json::to_value(chat()).unwrap(),
     RequestOptions::default(),
@@ -752,10 +746,8 @@ pub fn buffered_response_limits() {
     ),
   ] {
     let sent = RefCell::new(Vec::new());
-    let platform = make_client(&sent, [reply], "openai")
-      .into_platform()
-      .with_limits(limits);
-    let result = run(platform.execute(
+    let client = make_client(&sent, [reply], "openai").with_limits(limits);
+    let result = run(client.execute(
       endpoint,
       serde_json::to_value(messages()).unwrap(),
       RequestOptions::default(),
@@ -788,18 +780,15 @@ pub fn retry_fallback_affinity() {
     Reply::json(CHAT_JSON),
     Reply::json(CHAT_JSON),
   ];
-  let client = Client::from_platform(
-    Injected::new(
-      retry_plan(1, 2),
-      vec![
-        account_config("primary", "primary-key", "active"),
-        account_config("backup", "backup-key", "fallback"),
-      ],
-      MemoryTransport::new(&sent, replies),
-      runtime,
-    )
-    .unwrap(),
-  );
+  let client = Client::new(
+    retry_plan(1, 2),
+    vec![
+      account_config("primary", "primary-key", "active"),
+      account_config("backup", "backup-key", "fallback"),
+    ],
+    Adapter::new(MemoryTransport::new(&sent, replies), runtime),
+  )
+  .unwrap();
   let options = RequestOptions::default()
     .with_request_id("retry-request")
     .with_session_id("session");
@@ -841,19 +830,16 @@ pub fn retry_schedule_and_exhaustion() {
       content_type: "application/json",
       bytes: br#"{"error":{"message":"retry exhausted"}}"#,
     });
-    let client = Client::from_platform(
-      Injected::new(
-        retry_plan(2, initial_backoff_ms),
-        vec![
-          account_config("primary", "primary-key", "active"),
-          account_config("secondary", "secondary-key", "active"),
-          account_config("backup", "backup-key", "fallback"),
-        ],
-        MemoryTransport::new(&sent, replies),
-        runtime,
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      retry_plan(2, initial_backoff_ms),
+      vec![
+        account_config("primary", "primary-key", "active"),
+        account_config("secondary", "secondary-key", "active"),
+        account_config("backup", "backup-key", "fallback"),
+      ],
+      Adapter::new(MemoryTransport::new(&sent, replies), runtime),
+    )
+    .unwrap();
     let error = run(
       client
         .chat_completions()
@@ -916,13 +902,13 @@ pub fn transport_failure_account_feedback() {
     let runtime = TestRuntime::default();
     let trace = runtime.clone();
     let plan = retry_budget.map_or_else(|| plan("openai"), |max_retries| retry_plan(max_retries, 2));
-    let client = Client::from_platform(
-      Injected::new(
-        plan,
-        vec![
-          account_config("primary", "primary-key", "active"),
-          account_config("backup", "backup-key", "fallback"),
-        ],
+    let client = Client::new(
+      plan,
+      vec![
+        account_config("primary", "primary-key", "active"),
+        account_config("backup", "backup-key", "fallback"),
+      ],
+      Adapter::new(
         MemoryTransport::new(
           &sent,
           [
@@ -936,9 +922,9 @@ pub fn transport_failure_account_feedback() {
         )
         .with_recoverable_errors(recoverable),
         runtime,
-      )
-      .unwrap(),
-    );
+      ),
+    )
+    .unwrap();
     let error = run(client.chat_completions().create(&chat())).unwrap_err();
     assert_eq!(error.stage, "send");
     assert_eq!(error.recoverable, recoverable);
@@ -981,18 +967,15 @@ pub fn response_body_failure_does_not_retry() {
     if read_failure {
       transport = transport.with_read_failure_after(1);
     }
-    let client = Client::from_platform(
-      Injected::new(
-        retry_plan(2, 2),
-        vec![
-          account_config("primary", "primary-key", "active"),
-          account_config("secondary", "secondary-key", "active"),
-        ],
-        transport,
-        runtime,
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      retry_plan(2, 2),
+      vec![
+        account_config("primary", "primary-key", "active"),
+        account_config("secondary", "secondary-key", "active"),
+      ],
+      Adapter::new(transport, runtime),
+    )
+    .unwrap();
     let options = RequestOptions::default().with_session_id("body-failure-session");
     let error = run(client.chat_completions().create_with(&chat(), options.clone())).unwrap_err();
     assert_eq!(error.stage, "convert_response");
@@ -1048,18 +1031,19 @@ pub fn stream_errors_and_cancellation() {
   drop(events);
 
   let sent = RefCell::new(Vec::new());
-  let platform = Injected::new(
+  let bounded = Client::new(
     plan("openai"),
     vec![account_config("primary", "test-key", "active")],
-    MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]),
-    TestRuntime::default(),
+    Adapter::new(
+      MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]),
+      TestRuntime::default(),
+    ),
   )
   .unwrap()
   .with_limits(Limits {
     max_event_bytes: 16,
     ..Limits::default()
   });
-  let bounded = Client::from_platform(platform);
   let endpoint = bounded.chat_completions();
   let mut events = run(endpoint.stream(&request)).unwrap();
   assert!(run(events.next_event()).is_err());
@@ -1116,17 +1100,17 @@ pub fn streaming_terminal_lifecycle() {
     let sent = RefCell::new(Vec::new());
     let runtime = TestRuntime::default();
     let transport = Rc::new(RefCell::new(TransportTrace::default()));
-    let client = Client::from_platform(
-      Injected::new(
-        plan(driver),
-        vec![account_config("primary", "test-key", "active")],
+    let client = Client::new(
+      plan(driver),
+      vec![account_config("primary", "test-key", "active")],
+      Adapter::new(
         MemoryTransport::new(&sent, [Reply::sse(bytes)])
           .with_trace(transport.clone())
           .with_read_failure_after(bytes.len()),
         runtime.clone(),
-      )
-      .unwrap(),
-    );
+      ),
+    )
+    .unwrap();
     let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
       .unwrap()
       .into_stream()
@@ -1199,15 +1183,12 @@ pub fn streaming_failure_lifecycle() {
     let mut transport =
       MemoryTransport::new(&sent, [Reply::sse(bytes), Reply::json(CHAT_JSON)]).with_trace(trace.clone());
     transport.read_failure_after = fail_after;
-    let client = Client::from_platform(
-      Injected::new(
-        plan(driver),
-        vec![account_config("primary", "test-key", "active")],
-        transport,
-        runtime.clone(),
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      plan(driver),
+      vec![account_config("primary", "test-key", "active")],
+      Adapter::new(transport, runtime.clone()),
+    )
+    .unwrap();
     let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
       .unwrap()
       .into_stream()
@@ -1245,15 +1226,15 @@ pub fn streaming_cancellation_lifecycle() {
       } else {
         (Endpoint::ChatCompletions, CHAT_SSE)
       };
-      let client = Client::from_platform(
-        Injected::new(
-          plan("openai"),
-          vec![account_config("primary", "test-key", "active")],
+      let client = Client::new(
+        plan("openai"),
+        vec![account_config("primary", "test-key", "active")],
+        Adapter::new(
           MemoryTransport::new(&sent, [Reply::sse(bytes), Reply::json(CHAT_JSON)]).with_trace(trace.clone()),
           runtime.clone(),
-        )
-        .unwrap(),
-      );
+        ),
+      )
+      .unwrap();
       let mut events = run(client.execute(endpoint, stream_request(endpoint), RequestOptions::default()))
         .unwrap()
         .into_stream()
@@ -1290,15 +1271,15 @@ pub fn streaming_cancellation_lifecycle() {
   let sent = RefCell::new(Vec::new());
   let runtime = TestRuntime::default();
   let trace = Rc::new(RefCell::new(TransportTrace::default()));
-  let client = Client::from_platform(
-    Injected::new(
-      plan("openai"),
-      vec![account_config("primary", "test-key", "active")],
+  let client = Client::new(
+    plan("openai"),
+    vec![account_config("primary", "test-key", "active")],
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::sse(CHAT_SSE)]).with_trace(trace.clone()),
       runtime.clone(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   let endpoint = client.chat_completions();
   let request = chat();
   let mut events = run(endpoint.stream(&request)).unwrap();
@@ -1331,15 +1312,15 @@ pub fn configured_provider_policies() {
   account.provider = "github-copilot".into();
   account.base_url = Some("https://wrong-account-destination.example/v1".into());
   let sent = RefCell::new(Vec::new());
-  let client = Client::from_platform(
-    Injected::new(
-      plan,
-      vec![account],
+  let client = Client::new(
+    plan,
+    vec![account],
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(RESPONSES_JSON)]),
       TestRuntime::default(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   let request =
     serde_json::from_value(json!({"model":"gpt-5","messages":[{"role":"user","content":"hello"}]})).unwrap();
   let response = run(client.chat_completions().create(&request)).unwrap();
@@ -1369,15 +1350,15 @@ pub fn configured_provider_policies() {
   .unwrap();
   let plan = tokn_sdk::config::v2::compile_execution(&raw).unwrap();
   let sent = RefCell::new(Vec::new());
-  let client = Client::from_platform(
-    Injected::new(
-      plan,
-      vec![account_config("primary", "test-key", "active")],
+  let client = Client::new(
+    plan,
+    vec![account_config("primary", "test-key", "active")],
+    Adapter::new(
       MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]),
       TestRuntime::default(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   run(client.chat_completions().create(&chat())).unwrap();
   assert!(sent.borrow()[0]
     .headers
@@ -1414,18 +1395,15 @@ pub fn configured_relay_policies() {
       },
       Reply::json(CHAT_JSON),
     ];
-    let client = Client::from_platform(
-      Injected::new(
-        plan,
-        vec![
-          account_config("primary", "primary-key", "active"),
-          account_config("backup", "backup-key", "fallback"),
-        ],
-        MemoryTransport::new(&sent, replies),
-        TestRuntime::default(),
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      plan,
+      vec![
+        account_config("primary", "primary-key", "active"),
+        account_config("backup", "backup-key", "fallback"),
+      ],
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+    )
+    .unwrap();
     let body = json!({"model":"namespace/unchanged-model","messages":[{"role":"user","content":"hello"}],"reasoning":{"effort":"high"},"stream":false,"vendor_field":{"preserve":true}});
     let response = run(client.execute(
       tokn_sdk::Endpoint::ChatCompletions,
@@ -1469,15 +1447,12 @@ pub fn configured_client_relay() {
       },
       Reply::json(CHAT_JSON),
     ];
-    let client = Client::from_platform(
-      Injected::new(
-        plan,
-        Vec::new(),
-        MemoryTransport::new(&sent, replies),
-        TestRuntime::default(),
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      plan,
+      Vec::new(),
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+    )
+    .unwrap();
     let body = json!({"model":"namespace/unchanged","messages":[{"role":"user","content":"hello"}],"vendor_field":{"untouched":true},"stream":false});
     let options = RequestOptions::default()
       .with_header("Authorization", "Bearer caller-token")
@@ -1511,10 +1486,10 @@ pub fn configured_client_relay() {
     "providers":{"upstream":{"driver":"openai","base_url":"https://example.com/v1"}}
   })).unwrap();
   let sent = RefCell::new(Vec::new());
-  let client = Client::from_platform(
-    Injected::new(
-      tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
-      Vec::new(),
+  let client = Client::new(
+    tokn_sdk::config::v2::compile_execution(&raw).unwrap(),
+    Vec::new(),
+    Adapter::new(
       MemoryTransport::new(
         &sent,
         [
@@ -1527,9 +1502,9 @@ pub fn configured_client_relay() {
         ],
       ),
       TestRuntime::default(),
-    )
-    .unwrap(),
-  );
+    ),
+  )
+  .unwrap();
   let response = run(client.execute(
     tokn_sdk::Endpoint::ChatCompletions,
     json!({"model":"model","stream":false}),
@@ -1575,18 +1550,15 @@ pub fn configured_status_policy() {
       Reply::json(CHAT_JSON),
       Reply::json(CHAT_JSON),
     ];
-    let client = Client::from_platform(
-      Injected::new(
-        retry_plan(1, 1),
-        vec![
-          account_config("primary", "primary-key", "active"),
-          account_config("backup", "backup-key", "fallback"),
-        ],
-        MemoryTransport::new(&sent, replies),
-        TestRuntime::default(),
-      )
-      .unwrap(),
-    );
+    let client = Client::new(
+      retry_plan(1, 1),
+      vec![
+        account_config("primary", "primary-key", "active"),
+        account_config("backup", "backup-key", "fallback"),
+      ],
+      Adapter::new(MemoryTransport::new(&sent, replies), TestRuntime::default()),
+    )
+    .unwrap();
     let first = run(client.chat_completions().create(&chat()));
     assert_eq!(first.is_ok(), status != 429);
     assert_eq!(sent.borrow().len(), expected_sends);
@@ -1606,15 +1578,12 @@ pub fn configured_status_policy() {
 pub fn configured_transport_encoding() {
   let sent = RefCell::new(Vec::new());
   let transport = MemoryTransport::new(&sent, [Reply::json(CHAT_JSON)]).with_encoding("gzip");
-  let client = Client::from_platform(
-    Injected::new(
-      plan("openai"),
-      vec![account_config("primary", "test-key", "active")],
-      transport,
-      TestRuntime::default(),
-    )
-    .unwrap(),
-  );
+  let client = Client::new(
+    plan("openai"),
+    vec![account_config("primary", "test-key", "active")],
+    Adapter::new(transport, TestRuntime::default()),
+  )
+  .unwrap();
   let response = run(client.chat_completions().create(&chat())).unwrap();
   assert!(!response.headers.contains_key("content-encoding"));
   assert!(!response.headers.contains_key("content-length"));

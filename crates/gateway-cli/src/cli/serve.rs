@@ -314,7 +314,7 @@ where
 fn install_admin_reloader(
   live: &tokn_router::v2::LiveRuntime,
   source: RuntimeSource,
-  initial_service: tokn_config::v2::ServicePlan,
+  initial_service: tokn_config::v2::ServiceSettings,
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
 ) -> Result<()> {
@@ -368,11 +368,11 @@ fn install_admin_reloader(
 }
 
 fn ensure_service_reload_compatible(
-  current: &tokn_config::v2::ServicePlan,
-  replacement: &tokn_config::v2::ServicePlan,
+  current: &tokn_config::v2::ServiceSettings,
+  replacement: &tokn_config::v2::ServiceSettings,
 ) -> std::result::Result<(), tokn_router::v2::ReloadError> {
   // These fields are restart-only, so every accepted generation still matches
-  // the process-start service plan used as this comparison baseline.
+  // the process-start service settings used as this comparison baseline.
   let changed = if current.outbound() != replacement.outbound() {
     "outbound transport settings changed"
   } else if current.request_limits() != replacement.request_limits() {
@@ -398,7 +398,7 @@ fn model_refresh_changes_require_restart() {
   )
   .unwrap();
   assert!(matches!(
-    ensure_service_reload_compatible(&tokn_config::v2::ServicePlan::default(), replacement.service()),
+    ensure_service_reload_compatible(&tokn_config::v2::ServiceSettings::default(), replacement.service()),
     Err(tokn_router::v2::ReloadError::RestartRequired(message)) if message == "model refresh settings changed"
   ));
 }
@@ -406,7 +406,7 @@ fn model_refresh_changes_require_restart() {
 #[cfg(test)]
 async fn serve_v2_plan(
   plan: tokn_policy::GatewayPlan,
-  service: tokn_config::v2::ServicePlan,
+  service: tokn_config::v2::ServiceSettings,
   accounts: &[tokn_core::account::AccountConfig],
   access: Arc<tokn_access::AccessStore>,
   events: Arc<EventBus>,
@@ -575,7 +575,7 @@ client_auth = "none"
     let (stop, stopped) = watch::channel(false);
     let server = tokio::spawn(serve_v2_plan(
       plan,
-      tokn_config::v2::ServicePlan::default(),
+      tokn_config::v2::ServiceSettings::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),
@@ -1297,7 +1297,7 @@ client_auth = "none"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(serve_v2_plan(
       plan,
-      tokn_config::v2::ServicePlan::default(),
+      tokn_config::v2::ServiceSettings::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),
@@ -1334,7 +1334,7 @@ client_auth = "none"
 
     let error = serve_v2_plan(
       plan,
-      tokn_config::v2::ServicePlan::default(),
+      tokn_config::v2::ServiceSettings::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),
@@ -1369,7 +1369,7 @@ default_connect = "reject"
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = tokio::spawn(serve_v2_plan(
       plan,
-      tokn_config::v2::ServicePlan::default(),
+      tokn_config::v2::ServiceSettings::default(),
       &[],
       Arc::new(tokn_access::AccessStore::disabled()),
       Arc::new(EventBus::noop()),

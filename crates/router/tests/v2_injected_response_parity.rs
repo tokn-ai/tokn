@@ -20,9 +20,13 @@ use std::{
 use tokn_access::AccessStore;
 use tokn_config::v2::{compile, compile_execution, RawConfig};
 use tokn_core::{account::AccountConfig, event::EventBus, Endpoint};
-use tokn_requests::configured::{Injected, RequestOptions, ResponseBody, Runtime};
+use tokn_requests::configured::{RequestOptions, ResponseBody, Runtime};
 use tokn_service::transport::{Request, ResponseHead, Transport};
 use tower::ServiceExt;
+
+#[path = "../../requests/tests/support/injected.rs"]
+mod injected_fixture;
+use injected_fixture::BorrowedSession;
 
 const ENDPOINTS: [Endpoint; 3] = [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages];
 const TEXT: &str = "héllo 🌍";
@@ -125,7 +129,7 @@ enum Mode {
 struct Fixture {
   mode: Mode,
   app: Router,
-  injected: Injected<MemoryTransport, TestRuntime>,
+  injected: BorrowedSession<MemoryTransport, TestRuntime>,
   standard: Arc<Upstream>,
   injected_paths: Rc<RefCell<Vec<String>>>,
   server: tokio::task::JoinHandle<()>,
@@ -189,7 +193,7 @@ impl Fixture {
     .pop()
     .unwrap();
     let injected_paths = Rc::default();
-    let injected = Injected::new(
+    let injected = BorrowedSession::new(
       compile_execution(&raw).unwrap(),
       accounts,
       MemoryTransport {

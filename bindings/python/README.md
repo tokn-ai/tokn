@@ -1,7 +1,7 @@
 # tokn-requests Python SDK
 
 The Python package embeds the same Rust routing engine as `tokn-sdk`. It loads
-a v2 `config.toml`, with credentials from `auth.yaml` and `auth.d`, and does
+legacy or v2 `config.toml`, with credentials from `auth.yaml` and `auth.d`, and does
 not require a gateway process.
 
 ## Installation
@@ -24,12 +24,22 @@ are included in the installed package.
 
 ## Configuration
 
-The SDK loads one configuration document with `schema_version = 2`; legacy
-configuration is rejected with `ConfigurationError`, and `config.d` fragments
-are not loaded. Set endpoint URLs in `[providers.<id>]` using `base_url`.
-Accounts in `auth.yaml` refer to that provider ID and supply credentials;
-per-account `base_url` does not choose the SDK's destination. See the
-[Rust SDK guide](../../docs/sdk.md) for v2 configuration examples.
+The SDK accepts v2 `config.toml` documents with `schema_version = 2` and
+legacy documents with no schema marker. Legacy input includes sorted `config.d`
+fragments and is projected into v2 in memory before using the shared request
+runtime. The Rust client owns each configuration/state snapshot and creates
+request sessions; its standard adapters supply HTTP, timing, and events.
+Successful reloads publish a new snapshot while active requests and streams
+retain their original state. Unsupported conversions, malformed input, and
+missing config files raise `ConfigurationError`; loading does not migrate or
+rewrite source files.
+
+For native v2, set endpoint URLs in `[providers.<id>].base_url`; accounts in
+`auth.yaml` and `auth.d` supply credentials without overriding that destination.
+For legacy input, account-level destinations are promoted to provider settings,
+and accounts in the auth store take precedence over inline accounts with the
+same ID. Projection uses v2 routing semantics. See the
+[Rust SDK guide](../../docs/sdk.md) for configuration and conversion details.
 
 Pass `config_path`, `auth_path`, or `profile` to `Client` to override its default
 sources or profile. Request options can select a different configured profile

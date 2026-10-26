@@ -19,6 +19,7 @@ std = [
   "dep:futures-util",
   "dep:smol_str",
   "dep:tokio",
+  "dep:tokn-router-legacy-config",
   "tokn-auth/std",
   "tokn-config/std",
   "tokn-convert/std",
@@ -57,6 +58,7 @@ tokn-headers.workspace = true
 tokn-requests.workspace = true
 tokn-service.workspace = true
 tokn-policy.workspace = true
+tokn-router-legacy-config = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -68,4 +70,8 @@ required-features = ["std"]
 
 [[example]]
 name = "chat"
+required-features = ["std"]
+
+[[example]]
+name = "in_memory"
 required-features = ["std"]

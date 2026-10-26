@@ -1,4 +1,4 @@
-//! Injected exchanges must release driver resources on cancellation and reject
+//! Adapter exchanges must release driver resources on cancellation and reject
 //! synchronous observer reentry without panicking or closing a newer response.
 
 use std::{
@@ -21,7 +21,7 @@ use tokn_sdk::{
   account::AccountConfig,
   chat_completions::ChatRequest,
   transport::{Request, ResponseHead, Transport},
-  Client, EventRuntime, Injected, Lifecycle, RequestEvent, RequestEventPayload, RequestEventSink, RequestOptions,
+  Adapter, Client, EventRuntime, Lifecycle, RequestEvent, RequestEventPayload, RequestEventSink, RequestOptions,
   Runtime, StageEvent,
 };
 
@@ -30,8 +30,8 @@ const RETRY_ERROR: &[u8] = br#"{"error":{"message":"retry"}}"#;
 const SSE: &[u8] =
   b"data: {\"id\":\"chat-local\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n";
 
-type LocalClient = Client<Injected<LocalTransport, LocalRuntime>>;
-type TypedClient = Client<Injected<LocalTransport, EventRuntime<LocalRuntime, TypedSink>>>;
+type LocalClient = Client<Adapter<LocalTransport, LocalRuntime>>;
+type TypedClient = Client<Adapter<LocalTransport, EventRuntime<LocalRuntime, TypedSink>>>;
 
 #[derive(Default)]
 struct Shared {
@@ -189,16 +189,13 @@ fn client_with_retry(
   replies: impl IntoIterator<Item = &'static [u8]>,
   retry: bool,
 ) -> Rc<LocalClient> {
-  let client = Rc::new(Client::from_platform(platform(shared, replies, retry)));
+  let (rules, accounts) = configuration(retry);
+  let client = Rc::new(Client::new(rules, accounts, platform(shared, replies)).unwrap());
   *shared.client.borrow_mut() = Rc::downgrade(&client);
   client
 }
 
-fn platform(
-  shared: &Rc<Shared>,
-  replies: impl IntoIterator<Item = &'static [u8]>,
-  retry: bool,
-) -> Injected<LocalTransport, LocalRuntime> {
+fn configuration(retry: bool) -> (tokn_sdk::policy::ExecutionRules, Vec<AccountConfig>) {
   let mut raw = json!({
     "schema_version": 2,
     "defaults": {"provider": {"kind":"fixed", "provider":"upstream"}, "wire_identity":"none"},
@@ -221,9 +218,14 @@ fn platform(
       .unwrap(),
     );
   }
-  Injected::new(
-    plan,
-    accounts,
+  (plan, accounts)
+}
+
+fn platform(
+  shared: &Rc<Shared>,
+  replies: impl IntoIterator<Item = &'static [u8]>,
+) -> Adapter<LocalTransport, LocalRuntime> {
+  Adapter::new(
     LocalTransport {
       shared: shared.clone(),
       replies: replies.into_iter().collect(),
@@ -231,13 +233,18 @@ fn platform(
     },
     LocalRuntime(shared.clone()),
   )
-  .unwrap()
 }
 
 fn typed_client(shared: &Rc<Shared>, replies: impl IntoIterator<Item = &'static [u8]>) -> Rc<TypedClient> {
-  let client = Rc::new(Client::from_platform(
-    platform(shared, replies, false).with_event_sink(TypedSink(shared.clone())),
-  ));
+  let (rules, accounts) = configuration(false);
+  let client = Rc::new(
+    Client::new(
+      rules,
+      accounts,
+      platform(shared, replies).with_event_sink(TypedSink(shared.clone())),
+    )
+    .unwrap(),
+  );
   *shared.typed_client.borrow_mut() = Rc::downgrade(&client);
   client
 }

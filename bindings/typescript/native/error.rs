@@ -36,9 +36,11 @@ pub(crate) fn api_status_error(message: String, status: u16, body: String) -> Na
 pub(crate) fn sdk_error(error: SdkError) -> NapiError {
   let message = error_chain(&error);
   match error {
-    SdkError::LoadConfig { .. } | SdkError::BuildEngine { .. } | SdkError::UnknownProfile { .. } => {
-      native_error(CONFIGURATION_ERROR, message)
-    }
+    SdkError::LoadConfig { .. }
+    | SdkError::ProjectConfig { .. }
+    | SdkError::BuildEngine { .. }
+    | SdkError::UnknownProfile { .. }
+    | SdkError::ReloadUnavailable => native_error(CONFIGURATION_ERROR, message),
     SdkError::LoadCredentials { .. } => native_error(AUTHENTICATION_ERROR, message),
     SdkError::InvalidGenerateRequest { .. }
     | SdkError::BuildGenerateRequest { .. }

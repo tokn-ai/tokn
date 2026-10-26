@@ -14,12 +14,16 @@ use tokn_core::{
   Endpoint,
 };
 use tokn_requests::{
-  configured::{Injected, RequestOptions, ResponseBody, Runtime},
+  configured::{RequestOptions, ResponseBody, Runtime},
   stage_traits::{ConvertResponseStage, ConvertedBody, SentResponse},
   stages::DefaultConvertResponse,
   PipelineCtx,
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
+
+#[path = "support/injected.rs"]
+mod injected_fixture;
+use injected_fixture::BorrowedSession;
 
 const ENDPOINTS: [Endpoint; 3] = [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages];
 const REQUEST_ID: &str = "event-parity";
@@ -163,7 +167,7 @@ async fn injected(from: Endpoint, to: Endpoint, reply: Reply, mode: ReadMode) ->
   .unwrap();
   let events = Rc::new(RefCell::new(Vec::new()));
   let sink = events.clone();
-  let platform = Injected::new(
+  let platform = BorrowedSession::new(
     tokn_config::v2::compile_execution(&raw).unwrap(),
     vec![account],
     MemoryTransport { reply, position: 0 },

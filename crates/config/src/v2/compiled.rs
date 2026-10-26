@@ -1,29 +1,29 @@
 use std::path::PathBuf;
-use tokn_policy::{ExecutionPlan, GatewayPlan};
+use tokn_policy::{ExecutionRules, GatewayPlan};
 
 /// Version 2 execution policy and service settings without gateway admission.
 ///
 /// SDKs use this form without requiring or initializing listeners.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledExecutionConfig {
-  execution: ExecutionPlan,
-  service: ServicePlan,
+  execution: ExecutionRules,
+  service: ServiceSettings,
 }
 
 impl CompiledExecutionConfig {
-  pub(super) fn new(execution: ExecutionPlan, service: ServicePlan) -> Self {
+  pub(super) fn new(execution: ExecutionRules, service: ServiceSettings) -> Self {
     Self { execution, service }
   }
 
-  pub fn execution(&self) -> &ExecutionPlan {
+  pub fn execution(&self) -> &ExecutionRules {
     &self.execution
   }
 
-  pub fn service(&self) -> &ServicePlan {
+  pub fn service(&self) -> &ServiceSettings {
     &self.service
   }
 
-  pub fn into_parts(self) -> (ExecutionPlan, ServicePlan) {
+  pub fn into_parts(self) -> (ExecutionRules, ServiceSettings) {
     (self.execution, self.service)
   }
 }
@@ -32,11 +32,11 @@ impl CompiledExecutionConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledConfig {
   gateway: GatewayPlan,
-  service: ServicePlan,
+  service: ServiceSettings,
 }
 
 impl CompiledConfig {
-  pub(super) fn new(gateway: GatewayPlan, service: ServicePlan) -> Self {
+  pub(super) fn new(gateway: GatewayPlan, service: ServiceSettings) -> Self {
     Self { gateway, service }
   }
 
@@ -44,18 +44,18 @@ impl CompiledConfig {
     &self.gateway
   }
 
-  pub fn service(&self) -> &ServicePlan {
+  pub fn service(&self) -> &ServiceSettings {
     &self.service
   }
 
-  pub fn into_parts(self) -> (GatewayPlan, ServicePlan) {
+  pub fn into_parts(self) -> (GatewayPlan, ServiceSettings) {
     (self.gateway, self.service)
   }
 }
 
 /// Process-wide serving settings independent of the routing graph.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ServicePlan {
+pub struct ServiceSettings {
   logging: crate::LoggingConfig,
   outbound: OutboundPlan,
   request_limits: RequestLimitsPlan,
@@ -63,7 +63,7 @@ pub struct ServicePlan {
   models: super::ModelRefreshPlan,
 }
 
-impl ServicePlan {
+impl ServiceSettings {
   pub(super) fn new(
     logging: crate::LoggingConfig,
     outbound: OutboundPlan,

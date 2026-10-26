@@ -31,7 +31,7 @@ use tokn_core::{
   Endpoint,
 };
 use tokn_policy::{
-  AccountPoolId, DriverId, ExecutionPlan, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
+  AccountPoolId, DriverId, ExecutionRules, ProviderId, RelayCredentials, RelayDestination, RoutePlan, WireIdentity,
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
@@ -56,6 +56,7 @@ pub trait Clock {
 #[derive(Debug)]
 pub enum ErrorKind {
   Other,
+  UnknownProfile { profile: SmolStr },
   InvalidRoute,
   NoAccount { model: SmolStr },
   ProviderAccessDenied,
@@ -197,17 +198,21 @@ impl CandidateBinding for Binding {
 
 /// Linked v2 resources and transactionally shared mutable account state.
 pub struct ExecutionState {
-  plan: ExecutionPlan,
+  plan: ExecutionRules,
   destinations: BTreeMap<ProviderId, DestinationMetadata>,
   bindings: Vec<Binding>,
   pools: BTreeMap<AccountPoolId, Pool>,
 }
 impl ExecutionState {
-  pub fn new(plan: ExecutionPlan, accounts: Vec<AccountConfig>) -> Result<Self, Error> {
+  pub fn rules(&self) -> &ExecutionRules {
+    &self.plan
+  }
+
+  pub fn new(plan: ExecutionRules, accounts: Vec<AccountConfig>) -> Result<Self, Error> {
     Self::with_models(plan, accounts, BTreeMap::new())
   }
   pub fn with_models(
-    plan: ExecutionPlan,
+    plan: ExecutionRules,
     accounts: Vec<AccountConfig>,
     models: BTreeMap<ProviderId, ModelInventory>,
   ) -> Result<Self, Error> {
@@ -389,6 +394,7 @@ pub struct RequestInput {
 impl RequestInput {
   pub fn new(endpoint: Endpoint, body: Value, headers: HeaderMap, request_id: String) -> Self {
     let raw_body = Bytes::from(serde_json::to_vec(&body).expect("JSON serializes"));
+    let content_encoding = headers.get("content-encoding").map(|value| value.as_str().to_string());
     Self {
       endpoint,
       body,
@@ -399,7 +405,7 @@ impl RequestInput {
       profile: None,
       generation_options: None,
       allowed_providers: None,
-      content_encoding: None,
+      content_encoding,
       method: "POST",
       dry_run: false,
     }
@@ -673,7 +679,10 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
         .iter()
         .any(|operation| operation.as_str() == self.input.endpoint.as_str())
     }) {
-      return Err(Error::new("resolve", "profile does not expose this operation"));
+      return Err(Error::new(
+        "resolve",
+        format!("profile does not expose operation '{}'", self.input.endpoint.as_str()),
+      ));
     }
     self.retry = RetryPolicy::from_route(&self.state.plan, route).map_err(|error| Error::new("resolve", error))?;
     if let RoutePlan::Relay(relay) = route {

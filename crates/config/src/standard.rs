@@ -330,6 +330,20 @@ pub struct LoadedConfig {
   pub sources: ConfigSources,
 }
 
+/// Decoded configuration input for the shared execution compiler.
+///
+/// Gateway admission settings are not validated at this boundary. Legacy
+/// inputs include their sorted overlays and must be projected to version 2;
+/// native version 2 inputs use the execution compiler directly.
+#[derive(Debug, Clone)]
+pub enum ExecutionConfigInput {
+  Legacy {
+    loaded: LoadedConfig,
+    inline_accounts: Vec<AccountConfig>,
+  },
+  V2(v2::RawConfig),
+}
+
 /// A validated configuration loaded through the common schema dispatcher.
 ///
 /// Callers that only need effective settings should use this type instead of
@@ -935,37 +949,18 @@ impl Config {
   /// from the matching `config.d` directory.
   pub fn load_with_sources(explicit: Option<&Path>) -> Result<LoadedConfig> {
     let path = resolve_config_path(explicit)?;
-    let mut cfg = load_primary_config(&path)?;
-    let fragment_dir = paths::config_fragment_dir(&path);
-    let fragments = load_fragment_paths(&fragment_dir)?;
-    let sources = ConfigSources {
-      root: path.clone(),
-      fragment_dir,
-      fragments,
-    };
-    let mut fragment_profile_owners = BTreeMap::new();
-    for fragment_path in &sources.fragments {
-      let fragment = load_config_fragment(fragment_path)?;
-      apply_config_fragment(&mut cfg, fragment_path, fragment, &mut fragment_profile_owners)?;
-    }
-    cfg.validate()?;
-    tracing::debug!(path = %path.display(), fragments = sources.fragments.len(), "config loaded");
-    Ok(LoadedConfig { config: cfg, sources })
+    let cfg = load_primary_config(&path)?;
+    let loaded = load_config_overlays(&path, cfg)?;
+    loaded.config.validate()?;
+    tracing::debug!(path = %path.display(), fragments = loaded.sources.fragments.len(), "config loaded");
+    Ok(loaded)
   }
 
   pub fn validate(&self) -> Result<()> {
     self.server.cors.validate()?;
     self.proxy.validate()?;
     self.proxy_mode.validate()?;
-    validate_model_families(&self.model_families)?;
-    validate_model_scores(&self.model_scores)?;
-    validate_model_families(&self.defaults.model_families)?;
-    validate_provider_id(
-      "defaults.default_provider_id",
-      self.defaults.default_provider_id.as_deref(),
-    )?;
-    validate_providers("defaults.providers", self.defaults.providers.as_deref())?;
-    validate_account_ids("defaults.accounts", self.defaults.accounts.as_deref())?;
+    self.validate_execution_defaults()?;
     for (name, agent) in &self.agents {
       validate_profile_name(name)?;
       if let Some(profile) = agent.profile.as_deref() {
@@ -1013,16 +1008,35 @@ impl Config {
     }
     for (name, profile) in &self.profiles {
       validate_profile_name(name)?;
-      if let Some(model_families) = profile.model_families.as_deref() {
-        validate_model_families(model_families)?;
-      }
-      validate_provider_id(
-        &format!("profiles.{name}.default_provider_id"),
-        profile.default_provider_id.as_deref(),
-      )?;
-      validate_providers(&format!("profiles.{name}.providers"), profile.providers.as_deref())?;
-      validate_account_ids(&format!("profiles.{name}.accounts"), profile.accounts.as_deref())?;
+      validate_execution_profile(name, profile)?;
     }
+    Ok(())
+  }
+
+  /// Validate legacy policy and outbound settings for in-process execution.
+  ///
+  /// Listener admission, agent bindings, and HTTP profile-path syntax are
+  /// outside this boundary. Projection and the shared version 2 compiler
+  /// additionally validate whether these policies can be represented.
+  pub fn validate_execution_input(&self) -> Result<()> {
+    self.proxy.validate()?;
+    self.validate_execution_defaults()?;
+    for (name, profile) in &self.profiles {
+      validate_execution_profile(name, profile)?;
+    }
+    Ok(())
+  }
+
+  fn validate_execution_defaults(&self) -> Result<()> {
+    validate_model_families(&self.model_families)?;
+    validate_model_scores(&self.model_scores)?;
+    validate_model_families(&self.defaults.model_families)?;
+    validate_provider_id(
+      "defaults.default_provider_id",
+      self.defaults.default_provider_id.as_deref(),
+    )?;
+    validate_providers("defaults.providers", self.defaults.providers.as_deref())?;
+    validate_account_ids("defaults.accounts", self.defaults.accounts.as_deref())?;
     Ok(())
   }
 
@@ -1214,7 +1228,11 @@ pub fn detect_config_schema(path: &Path) -> Result<ConfigSchema> {
     path: path.to_path_buf(),
     source,
   })?;
-  match schema::detect_toml(&document) {
+  classify_config_document(&document, path)
+}
+
+fn classify_config_document(document: &toml::Value, path: &Path) -> Result<ConfigSchema> {
+  match schema::detect_toml(document) {
     Ok(schema) => Ok(schema),
     Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
       path: path.to_path_buf(),
@@ -1223,6 +1241,49 @@ pub fn detect_config_schema(path: &Path) -> Result<ConfigSchema> {
       path: path.to_path_buf(),
       found,
     }),
+  }
+}
+
+/// Read configuration for an in-process client without validating listeners.
+///
+/// The primary file must exist. Legacy documents use the same sorted overlays
+/// and ownership rules as [`Config::load_with_sources`]. Legacy execution policy
+/// and outbound settings are validated before projection; listener admission
+/// remains outside this boundary. Inline accounts and legacy policy come from
+/// the same primary document read. Native version 2 documents are strictly
+/// decoded without compiling gateway admission.
+/// No config or credential files are modified.
+pub fn load_execution_input(path: &Path) -> Result<ExecutionConfigInput> {
+  let raw = std::fs::read_to_string(path).context(error::ReadSnafu {
+    path: path.to_path_buf(),
+  })?;
+  let document: toml::Value = toml::from_str(&raw).context(error::ParseSnafu {
+    path: path.to_path_buf(),
+  })?;
+  match classify_config_document(&document, path)? {
+    ConfigSchema::Legacy => {
+      let inline_accounts = document
+        .get("accounts")
+        .cloned()
+        .map(toml::Value::try_into)
+        .transpose()
+        .context(error::ParseSnafu {
+          path: path.to_path_buf(),
+        })?
+        .unwrap_or_default();
+      let config = decode_primary_config(document, path)?;
+      let loaded = load_config_overlays(path, config)?;
+      loaded.config.validate_execution_input()?;
+      Ok(ExecutionConfigInput::Legacy {
+        loaded,
+        inline_accounts,
+      })
+    }
+    ConfigSchema::V2 => v2::decode_document(document, path)
+      .map(ExecutionConfigInput::V2)
+      .map_err(|source| Error::V2 {
+        source: Box::new(source),
+      }),
   }
 }
 
@@ -1289,6 +1350,12 @@ fn load_primary_config(path: &Path) -> Result<Config> {
   let document: toml::Value = toml::from_str(&raw).context(error::ParseSnafu {
     path: path.to_path_buf(),
   })?;
+  let config = decode_primary_config(document, path)?;
+  config.validate()?;
+  Ok(config)
+}
+
+fn decode_primary_config(document: toml::Value, path: &Path) -> Result<Config> {
   require_legacy_schema(schema::detect_toml(&document), path)?;
   let raw_cfg: ConfigRaw = document.try_into().context(error::ParseSnafu {
     path: path.to_path_buf(),
@@ -1298,8 +1365,23 @@ fn load_primary_config(path: &Path) -> Result<Config> {
       "top-level [copilot] config is ignored by the new account schema; move values under [accounts.settings]"
     );
   }
-  raw_cfg.config.validate()?;
   Ok(raw_cfg.config)
+}
+
+fn load_config_overlays(path: &Path, mut config: Config) -> Result<LoadedConfig> {
+  let fragment_dir = paths::config_fragment_dir(path);
+  let fragments = load_fragment_paths(&fragment_dir)?;
+  let sources = ConfigSources {
+    root: path.to_path_buf(),
+    fragment_dir,
+    fragments,
+  };
+  let mut fragment_profile_owners = BTreeMap::new();
+  for fragment_path in &sources.fragments {
+    let fragment = load_config_fragment(fragment_path)?;
+    apply_config_fragment(&mut config, fragment_path, fragment, &mut fragment_profile_owners)?;
+  }
+  Ok(LoadedConfig { config, sources })
 }
 
 fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerError>, path: &Path) -> Result<()> {
@@ -1544,6 +1626,19 @@ fn validate_account_common(account: &AccountConfig) -> Result<()> {
       return error::InvalidHeaderNameSnafu { name: name.clone() }.fail();
     }
   }
+  Ok(())
+}
+
+fn validate_execution_profile(name: &str, profile: &ProfileConfig) -> Result<()> {
+  if let Some(model_families) = profile.model_families.as_deref() {
+    validate_model_families(model_families)?;
+  }
+  validate_provider_id(
+    &format!("profiles.{name}.default_provider_id"),
+    profile.default_provider_id.as_deref(),
+  )?;
+  validate_providers(&format!("profiles.{name}.providers"), profile.providers.as_deref())?;
+  validate_account_ids(&format!("profiles.{name}.accounts"), profile.accounts.as_deref())?;
   Ok(())
 }
 
@@ -1822,6 +1917,168 @@ mod tests {
       detect_config_schema(&path),
       Err(Error::UnsupportedSchemaVersion { path: rejected, found: 3 }) if rejected == path
     ));
+  }
+
+  #[test]
+  fn execution_input_requires_a_primary_file_and_strict_schema_markers() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    assert!(matches!(
+      load_execution_input(&path),
+      Err(Error::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound
+    ));
+    // The gateway keeps its historical default configuration on a missing file.
+    assert!(load_config(Some(&path)).is_ok());
+
+    std::fs::write(&path, "schema_version = [").unwrap();
+    assert!(matches!(load_execution_input(&path), Err(Error::Parse { .. })));
+    std::fs::write(&path, "schema_version = \"2\"\n").unwrap();
+    assert!(matches!(
+      load_execution_input(&path),
+      Err(Error::InvalidSchemaVersion { .. })
+    ));
+    for marker in [-1, 1, 3] {
+      std::fs::write(&path, format!("schema_version = {marker}\n")).unwrap();
+      assert!(matches!(
+        load_execution_input(&path),
+        Err(Error::UnsupportedSchemaVersion { found, .. }) if found == marker
+      ));
+    }
+  }
+
+  #[test]
+  fn execution_input_decodes_listener_free_v2_without_gateway_compilation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, "schema_version = 2\n[defaults]\n").unwrap();
+    let ExecutionConfigInput::V2(raw) = load_execution_input(&path).unwrap() else {
+      panic!("expected a native version 2 document");
+    };
+    assert!(v2::compile_execution_config(&raw, &path).is_ok());
+    assert!(load_config(Some(&path)).is_err());
+
+    std::fs::write(
+      &path,
+      "schema_version = 2\n[defaults]\n[listeners.ignored]\nkind = 'llm_api'\nbind = 'listener.invalid:0'\nclient_auth = 'none'\n[listeners.ignored.cors]\nenabled = true\n",
+    )
+    .unwrap();
+    let ExecutionConfigInput::V2(raw) = load_execution_input(&path).unwrap() else {
+      panic!("expected a native version 2 document");
+    };
+    assert!(v2::compile_execution_config(&raw, &path).is_ok());
+    assert!(load_config(Some(&path)).is_err());
+
+    std::fs::write(&path, "schema_version = 2\nunknown_setting = true\n").unwrap();
+    assert!(matches!(load_execution_input(&path), Err(Error::V2 { .. })));
+  }
+
+  #[test]
+  fn execution_input_uses_sorted_legacy_overlays_and_existing_ownership_rules() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("work.toml");
+    let root = "[model_scores.'gpt-*']\nopenai = 1\n[profiles.work]\nagent_id = 'opencode'\nmode = 'route'\n";
+    std::fs::write(&path, root).unwrap();
+    let fragment_dir = paths::config_fragment_dir(&path);
+    std::fs::create_dir(&fragment_dir).unwrap();
+    // Create in reverse lexical order; loading order controls score precedence.
+    let last = fragment_dir.join("z-last.toml");
+    let first = fragment_dir.join("a-first.toml");
+    let agent = fragment_dir.join("opencode.toml");
+    std::fs::write(&last, "[model_scores.'gpt-*']\nopenai = 3\n").unwrap();
+    std::fs::write(&first, "[model_scores.'gpt-*']\nopenai = 2\ndeepseek = 4\n").unwrap();
+    std::fs::write(&agent, "[profiles.work]\nagent_id = 'opencode'\nmode = 'exact'\n").unwrap();
+
+    let ExecutionConfigInput::Legacy { loaded, .. } = load_execution_input(&path).unwrap() else {
+      panic!("expected an effective legacy document");
+    };
+    assert_eq!(loaded.sources.root, path);
+    assert_eq!(loaded.sources.fragments, vec![first, agent.clone(), last]);
+    assert_eq!(loaded.config.model_scores["gpt-*"]["openai"], 3);
+    assert_eq!(loaded.config.model_scores["gpt-*"]["deepseek"], 4);
+    assert_eq!(loaded.config.profiles["work"].mode, Some(RouteMode::Exact));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), root);
+
+    std::fs::write(&agent, "[profiles.work]\nagent_id = 'codex-cli'\n").unwrap();
+    assert!(load_execution_input(&path).is_err());
+  }
+
+  #[test]
+  fn execution_input_owns_legacy_policy_and_inline_credentials_from_one_primary_read() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(
+      &path,
+      "[defaults]\nmode = 'exact'\naccounts = ['inline']\n[[accounts]]\nid = 'inline'\nprovider = 'openai'\napi_key = 'inline-key'\nbase_url = 'https://upstream.example/v1'\n",
+    )
+    .unwrap();
+    let ExecutionConfigInput::Legacy {
+      loaded,
+      inline_accounts,
+    } = load_execution_input(&path).unwrap()
+    else {
+      panic!("expected legacy policy and inline credentials");
+    };
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(loaded.config.defaults.mode, RouteMode::Exact);
+    assert_eq!(loaded.config.defaults.accounts.as_deref().unwrap(), ["inline"]);
+    assert_eq!(inline_accounts.len(), 1);
+    assert_eq!(inline_accounts[0].id, "inline");
+    assert_eq!(inline_accounts[0].api_key.as_ref().unwrap().expose(), "inline-key");
+    assert_eq!(
+      inline_accounts[0].base_url.as_deref(),
+      Some("https://upstream.example/v1")
+    );
+
+    std::fs::write(&path, "accounts = 'not an account array'\n").unwrap();
+    assert!(matches!(
+      load_execution_input(&path),
+      Err(Error::Parse { path: rejected, .. }) if rejected == path
+    ));
+    // Gateway configuration loading still leaves legacy credential parsing to
+    // its explicit migration adapter.
+    assert!(Config::load_with_sources(Some(&path)).is_ok());
+  }
+
+  #[test]
+  fn execution_input_omits_legacy_gateway_admission_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    for gateway_setting in [
+      "[server.cors]\nenabled = true\n",
+      "[proxy_mode]\nintercept_hosts = ['invalid host']\n",
+      "[profiles.'team/blue']\nmode = 'exact'\n",
+      "[agents.ignored]\nprovider = 'openai'\n",
+    ] {
+      let contents = format!("[server]\nhost = 'listener.invalid'\n{gateway_setting}");
+      std::fs::write(&path, contents).unwrap();
+      let ExecutionConfigInput::Legacy { loaded, .. } = load_execution_input(&path).unwrap() else {
+        panic!("expected a legacy execution input");
+      };
+      assert_eq!(loaded.config.server.host, "listener.invalid");
+      assert!(Config::load_with_sources(Some(&path)).is_err());
+    }
+  }
+
+  #[test]
+  fn execution_input_retains_legacy_policy_and_outbound_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    for invalid_setting in [
+      "[proxy]\nurl = 'ftp://localhost'\n",
+      "[[model_families]]\nname = 'unused'\nmembers = []\n",
+      "[model_scores.'gpt*oops']\nopenai = 1\n",
+      "[defaults]\ndefault_provider_id = ' '\n",
+      "[defaults]\nproviders = [' ']\n",
+      "[defaults]\naccounts = [' ']\n",
+      "[[defaults.model_families]]\nname = 'unused'\nmembers = []\n",
+      "[profiles.unused]\ndefault_provider_id = ' ' \n",
+      "[profiles.unused]\nproviders = [' ']\n",
+      "[profiles.unused]\naccounts = [' ']\n",
+      "[[profiles.unused.model_families]]\nname = 'unused'\nmembers = []\n",
+    ] {
+      std::fs::write(&path, invalid_setting).unwrap();
+      assert!(load_execution_input(&path).is_err(), "accepted {invalid_setting:?}");
+    }
   }
 
   #[test]

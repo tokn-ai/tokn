@@ -1,4 +1,4 @@
-use crate::{BufferedResponse, Client, Platform, PlatformResponse, RequestOptions};
+use crate::{BufferedResponse, Client, PlatformResponse, RequestOptions, ResponseAdapter};
 use tokn_core::provider::Endpoint;
 use tokn_endpoint_chat_completions::{ChatRequest, ChatResponse};
 use tokn_endpoint_messages::{MessagesRequest, MessagesResponse};
@@ -12,15 +12,15 @@ macro_rules! endpoint_client {
     $endpoint:expr
   ) => {
     #[cfg(feature = "std")]
-    pub struct $name<'client, P: Platform = crate::StdPlatform> {
+    pub struct $name<'client, P: ResponseAdapter = crate::StdPlatform> {
       client: &'client Client<P>,
     }
     #[cfg(not(feature = "std"))]
-    pub struct $name<'client, P: Platform> {
+    pub struct $name<'client, P: ResponseAdapter> {
       client: &'client Client<P>,
     }
 
-    impl<'client, P: Platform> $name<'client, P> {
+    impl<'client, P: ResponseAdapter> $name<'client, P> {
       pub(crate) fn new(client: &'client Client<P>) -> Self {
         Self { client }
       }

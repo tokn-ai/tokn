@@ -1,6 +1,6 @@
 //! Standard execution of compiled v2 profiles, independent of gateway listeners.
 
-mod adapters;
+pub mod adapters;
 pub mod selection;
 
 use anyhow::Context;
@@ -15,7 +15,7 @@ use tokn_accounts::{
 };
 use tokn_core::{account::AccountConfig, event::EventBus, util::http::HttpClientOptions, AgentId, Endpoint};
 use tokn_policy::{
-  CredentialPolicy, ExecutionPlan, ProfileId, RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
+  CredentialPolicy, ExecutionRules, ProfileId, RelayCredentials, RelayDestination, RouteKind, RoutePlan, WireIdentity,
 };
 
 use crate::{session::ExecutionState, RequestService, RetryPolicy, RunConfig, RunConfigBuilder};
@@ -28,9 +28,63 @@ pub enum BuildMode {
 }
 
 /// The HTTP clients used by standard managed and opaque execution.
+#[derive(Clone)]
 pub struct HttpClients {
   pub managed: reqwest::Client,
   pub opaque: reqwest::Client,
+}
+
+/// Provider model caches belonging to one immutable execution configuration.
+///
+/// This is runtime metadata, separate from the HTTP, clock, and event adapters.
+/// Refreshing it only copies current model capabilities into the shared state;
+/// no lock is retained while a request is executing.
+pub struct StandardMetadata {
+  bindings: Arc<[Arc<tokn_accounts::link::ProviderBinding>]>,
+}
+
+impl StandardMetadata {
+  fn new(providers: &ProviderGraph) -> Self {
+    Self {
+      bindings: providers.bindings().cloned().collect(),
+    }
+  }
+
+  pub fn refresh(&self, execution: &ExecutionState) {
+    adapters::refresh_models(execution, &self.bindings);
+  }
+}
+
+/// Standard provider linking and mutable account state for a shared session.
+/// HTTP clients and per-request exchanges are deliberately constructed separately.
+pub struct PreparedExecution {
+  execution: Arc<ExecutionState>,
+  metadata: StandardMetadata,
+  providers: ProviderGraph,
+}
+
+impl PreparedExecution {
+  pub fn into_parts(self) -> (Arc<ExecutionState>, StandardMetadata) {
+    (self.execution, self.metadata)
+  }
+}
+
+/// Prepare the same account and model state used by standard gateway sessions.
+/// The caller owns the resulting snapshot and starts sessions with its adapters.
+pub fn prepare_execution(plan: &ExecutionRules, accounts: &[AccountConfig]) -> anyhow::Result<PreparedExecution> {
+  let providers = link_execution_provider_graph(plan, accounts, &Registry::builtin())?;
+  let linked_pools = link_execution_account_pools(plan, &providers)?;
+  let pools = build_account_pool_runtimes(&linked_pools);
+  let execution = ExecutionState::new(plan.clone(), accounts.to_vec())?;
+  execution.use_standard_pools(&pools);
+  let execution = Arc::new(execution);
+  let metadata = StandardMetadata::new(&providers);
+  metadata.refresh(&execution);
+  Ok(PreparedExecution {
+    execution,
+    metadata,
+    providers,
+  })
 }
 
 impl HttpClients {
@@ -50,26 +104,21 @@ pub struct ConfiguredRuntime {
 
 impl ConfiguredRuntime {
   pub fn build(
-    plan: &ExecutionPlan,
+    plan: &ExecutionRules,
     accounts: &[AccountConfig],
     outbound: &HttpClientOptions,
     events: Arc<EventBus>,
   ) -> anyhow::Result<Self> {
-    let providers = link_execution_provider_graph(plan, accounts, &Registry::builtin())?;
-    let linked_pools = link_execution_account_pools(plan, &providers)?;
-    let pools = build_account_pool_runtimes(&linked_pools);
+    let prepared = prepare_execution(plan, accounts)?;
     let http = HttpClients::build(outbound)?;
-    let execution = ExecutionState::new(plan.clone(), accounts.to_vec())?;
-    execution.use_standard_pools(&pools);
-    let execution = Arc::new(execution);
     let mut profiles = BTreeMap::new();
     for id in plan.profiles().keys() {
       if let Some(profile) = build_api_profile(
         plan,
         id,
-        &providers,
+        &prepared.providers,
         &http,
-        execution.clone(),
+        prepared.execution.clone(),
         events.clone(),
         BuildMode::Full,
       )? {
@@ -159,7 +208,7 @@ impl ApiProfileRuntime {
 /// relay profiles require gateway proxy context and therefore return `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_api_profile(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   id: &ProfileId,
   providers: &ProviderGraph,
   http: &HttpClients,

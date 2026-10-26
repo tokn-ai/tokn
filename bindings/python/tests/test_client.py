@@ -680,12 +680,39 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     self.assertTrue(ProviderHandler.requests)
     return ProviderHandler.requests[-1]
 
-  def test_legacy_config_surfaces_as_configuration_error(self) -> None:
+  async def test_legacy_config_uses_shared_runtime_without_migrating_files(self) -> None:
     with tempfile.TemporaryDirectory() as directory:
       config_path = Path(directory) / "config.toml"
-      config_path.write_text('[defaults]\nmode = "exact"\n')
-      with self.assertRaises(ConfigurationError):
-        Client(config_path=config_path, auth_path=self.auth_path)
+      auth_path = Path(directory) / "auth.yaml"
+      config = '[server]\nhost = "sdk.private.example"\n[defaults]\nmode = "exact"\n'
+      auth = (
+        "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n"
+        f"    base_url: http://127.0.0.1:{self.server.server_port}\n"
+      )
+      config_path.write_text(config)
+      auth_path.write_text(auth)
+      client = Client(config_path=config_path, auth_path=auth_path)
+      response = await client.chat.completions.create(
+        {
+          "model": "llama-cpp/mock-model",
+          "messages": [{"role": "user", "content": "legacy request"}],
+        }
+      )
+      self.assertEqual(response.status, 200)
+      self.assertEqual(response.data["id"], "chatcmpl-python")
+      self.assertEqual(self.last_request()["body"]["model"], "mock-model")
+      client.reload()
+      self.assertEqual(config_path.read_text(), config)
+      self.assertEqual(auth_path.read_text(), auth)
+      self.assertFalse(config_path.with_suffix(".toml.bak").exists())
+
+  def test_unsupported_config_surfaces_as_configuration_error(self) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+      config_path = Path(directory) / "config.toml"
+      for config in ["schema_version = 3\n", '[defaults]\nmode = "passthrough"\n']:
+        config_path.write_text(config)
+        with self.assertRaises(ConfigurationError):
+          Client(config_path=config_path, auth_path=self.auth_path)
 
     self.assertFalse(ProviderHandler.requests)
 

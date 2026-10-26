@@ -1,10 +1,15 @@
 use super::*;
 use crate::interpretation::RequestInterpretation;
+use crate::session::{ExecutionState, RequestInput};
 use crate::{driver::Session, stage_traits::ExtractStage, stages::DefaultExtract, EventBus, PipelineCtx, RawInbound};
 use core::convert::Infallible;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tokn_core::request_classification::{RequestClassificationSource, RequestPurpose};
+use tokn_core::{
+  types::{Bytes, Shared},
+  Endpoint,
+};
 
 struct NoIo;
 
@@ -60,16 +65,12 @@ async fn extract_both(endpoint: Endpoint, body: Value, options: RequestOptions) 
   }))
   .unwrap();
   let plan = tokn_config::v2::compile_execution(&raw).unwrap();
-  let platform = Injected::new(plan, Vec::new(), NoIo, NoIo).unwrap();
+  let state = Shared::new(ExecutionState::new(plan, Vec::new()).unwrap());
+  let platform = Adapter::new(NoIo, NoIo);
+  let (transport, clock, events) = platform.acquire().unwrap();
   let mut input = RequestInput::new(endpoint, body, headers, "parity".into());
   input.profile = options.profile;
-  let mut local = crate::session::Session::new(
-    platform.state.clone(),
-    input,
-    NoIo,
-    LocalClock(&platform.runtime),
-    LocalEvents(&platform.runtime),
-  );
+  let mut local = crate::session::Session::new(state, input, transport, clock, events);
   let injected = local.extract().await.unwrap();
   assert_eq!(
     injected,

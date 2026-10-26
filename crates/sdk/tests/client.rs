@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use tokn_mock_server::{MockEndpoint, MockLlmConfig, MockLlmServer, MockResponse, MockRoute};
 use tokn_sdk::chat_completions::{ChatRequest, ChatResponse};
 use tokn_sdk::{
-  Client, Error, Event, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary,
+  Client, ConfigWarning, Error, Event, GenerateEvent, GenerateRequest, Message, ReasoningEffort, ReasoningSummary,
   RequestEventPayload, RequestOptions, StageEvent, Tool, ToolCall, ToolChoice,
 };
 
@@ -109,6 +109,44 @@ fn chat_request() -> ChatRequest {
     "messages": [{"role": "user", "content": "hello"}]
   }))
   .expect("deserialize chat request fixture")
+}
+
+#[tokio::test]
+async fn content_encoding_survives_model_rewriting_as_actual_compressed_wire_bytes() {
+  use tokn_requests::utils::codec::{decode_body_bytes, ContentEncodingKind};
+
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(mock.base_url());
+  let client = fixture.client();
+  for (encoding, kind, magic) in [
+    ("gzip", ContentEncodingKind::Gzip, &[0x1f, 0x8b][..]),
+    ("zstd", ContentEncodingKind::Zstd, &[0x28, 0xb5, 0x2f, 0xfd][..]),
+  ] {
+    client
+      .chat_completions()
+      .create_with(
+        &chat_request(),
+        RequestOptions::default().with_header("content-encoding", encoding),
+      )
+      .await
+      .expect("execute a configured request with a compressed rewritten body");
+
+    let request = mock.last_request().expect("capture the actual HTTP request");
+    assert_eq!(request.header("content-encoding"), Some(encoding));
+    assert!(
+      request.body.starts_with(magic),
+      "{encoding} must match the actual wire body"
+    );
+    let decoded = decode_body_bytes(request.body, Some(kind)).expect("upstream can decode the advertised encoding");
+    let body: serde_json::Value = serde_json::from_slice(&decoded).expect("decoded request is valid JSON");
+    assert_eq!(
+      body["model"], "mock-model",
+      "routing rewrites the qualified SDK selector"
+    );
+    assert_eq!(body["messages"][0]["content"], "hello");
+    assert_eq!(body["stream"], false);
+  }
+  mock.shutdown().await;
 }
 
 #[tokio::test]
@@ -789,8 +827,8 @@ async fn raw_request_and_client_lifecycle_use_explicit_paths() {
   let fixture = Fixture::new(mock.base_url());
   let client = fixture.client();
 
-  assert_eq!(client.config_path(), fixture.config_path);
-  assert_eq!(client.auth_path(), fixture.auth_path);
+  assert_eq!(client.config_path(), Some(fixture.config_path));
+  assert_eq!(client.auth_path(), Some(fixture.auth_path));
   client.reload().expect("reload SDK client");
   let _ = client.responses();
   let _ = client.messages();
@@ -863,28 +901,256 @@ fn invalid_default_profile_is_rejected_during_construction() {
 }
 
 #[test]
-fn legacy_and_missing_schema_are_rejected_instead_of_using_legacy_defaults() {
+fn malformed_and_unsupported_schema_are_rejected_without_legacy_fallback() {
   let fixture = Fixture::new("http://127.0.0.1:1");
-  for text in ["[defaults]\nmode = 'exact'\n", "", "schema_version = 1\n"] {
+  for text in [
+    "schema_version = '2'\n",
+    "schema_version = 1\n",
+    "schema_version = 3\n",
+    "schema_version = 2.0\n",
+    "schema_version = 2\n[defaults]\nprovider = { kind = ",
+  ] {
     fs::write(&fixture.config_path, text).unwrap();
     let error = Client::builder()
       .config_path(&fixture.config_path)
       .auth_path(&fixture.auth_path)
       .build()
       .err()
-      .expect("SDK requires explicit v2 config");
-    assert!(matches!(error, Error::LoadConfig { .. }));
-    let mut chain = error.to_string();
-    let mut source = std::error::Error::source(&error);
-    while let Some(error) = source {
-      chain.push_str(&error.to_string());
-      source = error.source();
-    }
-    assert!(
-      chain.contains("schema_version") || chain.contains("schema version"),
-      "{chain}"
+      .expect("invalid schema must not fall back to legacy defaults");
+    assert!(matches!(error, Error::LoadConfig { .. }), "{error}");
+    assert_eq!(fs::read_to_string(&fixture.config_path).unwrap(), text);
+  }
+}
+
+#[test]
+fn missing_config_is_an_error_instead_of_an_implicit_legacy_config() {
+  let fixture = Fixture::new("http://127.0.0.1:1");
+  fs::remove_file(&fixture.config_path).unwrap();
+  let error = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .build()
+    .err()
+    .expect("a missing SDK config file must be explicit");
+  assert!(matches!(error, Error::LoadConfig { .. }));
+  assert!(!fixture.config_path.exists());
+}
+
+#[test]
+fn legacy_listener_settings_do_not_block_the_sdk() {
+  let fixture = Fixture::openai("http://127.0.0.1:1");
+  fs::write(
+    &fixture.auth_path,
+    "version: 1\naccounts:\n  - id: local\n    provider: openai\n    api_key: test-key\n    base_url: http://127.0.0.1:1\n",
+  )
+  .unwrap();
+  for host in ["router.private.example", "0.0.0.0"] {
+    fs::write(
+      &fixture.config_path,
+      format!("[server]\nhost = '{host}'\n[defaults]\nmode = 'exact'\n"),
+    )
+    .unwrap();
+    fixture.client();
+  }
+}
+
+#[tokio::test]
+async fn legacy_overlays_and_account_destination_use_the_shared_v2_request_path() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let legacy = Fixture::openai(mock.base_url());
+  let config = "[server]\nhost = 'router.private.example'\n[defaults]\nmode = 'exact'\n";
+  let auth = format!(
+    "version: 1\naccounts:\n  - id: local\n    provider: openai\n    api_key: test-key\n    base_url: {}\n",
+    mock.base_url()
+  );
+  fs::write(&legacy.config_path, config).unwrap();
+  fs::write(&legacy.auth_path, &auth).unwrap();
+  let fragments = legacy.config_path.parent().unwrap().join("config.d");
+  fs::create_dir(&fragments).unwrap();
+  let fragment = fragments.join("opencode.toml");
+  let overlay = "[profiles.'Team Blue']\nagent_id = 'opencode'\nmode = 'exact'\naccounts = ['local']\n";
+  fs::write(&fragment, overlay).unwrap();
+  let client = legacy.client();
+  assert!(client.config_warnings().iter().any(|warning| matches!(
+    warning,
+    ConfigWarning::ProfileResourceRenamed { profile, resource_id }
+      if profile == "Team Blue" && resource_id == "team-blue"
+  )));
+  assert!(client.config_warnings().iter().any(|warning| matches!(
+    warning,
+    ConfigWarning::AccountBaseUrlPromoted { provider, accounts, .. }
+      if provider == "openai" && accounts == &["local"]
+  )));
+  let request: ChatRequest = serde_json::from_value(json!({
+    "model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hello"}]
+  }))
+  .unwrap();
+  for profile in ["default", "Team Blue", "team-blue"] {
+    client
+      .chat_completions()
+      .create_with(&request, RequestOptions::default().with_profile(profile))
+      .await
+      .expect("projected profiles accept their original or canonical names");
+  }
+  let native = Fixture::openai(mock.base_url());
+  let native_client = native.client();
+  assert!(native_client.config_warnings().is_empty());
+  native_client
+    .chat_completions()
+    .create(&request)
+    .await
+    .expect("native v2 executes the equivalent managed request");
+  let requests = mock.requests();
+  assert_eq!(requests.len(), 4);
+  let expected: serde_json::Value = serde_json::from_slice(&requests[3].body).unwrap();
+  assert_eq!(expected["model"], "gpt-4o");
+  for captured in &requests {
+    assert_eq!(captured.path, "/chat/completions");
+    assert_eq!(captured.header("authorization"), Some("Bearer test-key"));
+    assert_eq!(
+      serde_json::from_slice::<serde_json::Value>(&captured.body).unwrap(),
+      expected
     );
   }
+  assert_eq!(fs::read_to_string(&legacy.config_path).unwrap(), config);
+  assert_eq!(fs::read_to_string(&legacy.auth_path).unwrap(), auth);
+  assert_eq!(fs::read_to_string(&fragment).unwrap(), overlay);
+  assert!(!legacy.config_path.with_extension("toml.bak").exists());
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn original_legacy_profile_names_win_over_generated_resource_id_collisions() {
+  let first = MockLlmServer::start(MockLlmConfig::default()).await;
+  let second = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::openai(first.base_url());
+  fs::write(
+    &fixture.config_path,
+    r#"[defaults]
+mode = "exact"
+[profiles."Team Blue"]
+mode = "switch"
+default_provider_id = "openai"
+providers = ["openai"]
+accounts = ["first"]
+[profiles.team-blue]
+mode = "switch"
+default_provider_id = "llama-cpp"
+providers = ["llama-cpp"]
+accounts = ["second"]
+"#,
+  )
+  .unwrap();
+  fs::write(
+    &fixture.auth_path,
+    format!(
+      "version: 1\naccounts:\n  - id: first\n    provider: openai\n    api_key: first-key\n    base_url: {}\n  - id: second\n    provider: llama-cpp\n    base_url: {}\n",
+      first.base_url(), second.base_url()
+    ),
+  )
+  .unwrap();
+  let client = Client::builder()
+    .config_path(&fixture.config_path)
+    .auth_path(&fixture.auth_path)
+    .profile("team-blue")
+    .build()
+    .expect("builder profile names resolve against the original legacy names");
+  let request: ChatRequest = serde_json::from_value(json!({
+    "model": "gpt-4o", "messages": [{"role": "user", "content": "hello"}]
+  }))
+  .unwrap();
+  client.chat_completions().create(&request).await.unwrap();
+  client
+    .chat_completions()
+    .create_with(&request, RequestOptions::default().with_profile("Team Blue"))
+    .await
+    .expect("the original spaced name selects its own route");
+  client
+    .chat_completions()
+    .create_with(&request, RequestOptions::default().with_profile("team-blue-2"))
+    .await
+    .expect("a generated resource ID remains usable when no original name shadows it");
+  assert_eq!(first.requests().len(), 1);
+  assert_eq!(second.requests().len(), 2);
+  first.shutdown().await;
+  second.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_inline_credentials_are_read_only_and_auth_store_ids_take_precedence() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::openai(mock.base_url());
+  let config = format!(
+    "[defaults]\nmode = 'exact'\naccounts = ['local']\n[profiles.inline]\naccounts = ['inline-only']\n[profiles.shard]\naccounts = ['shard']\n[[accounts]]\nid = 'shard'\nprovider = 'openai'\napi_key = 'stale-shard-key'\nbase_url = 'http://127.0.0.1:1'\n[[accounts]]\nid = 'local'\nprovider = 'openai'\napi_key = 'stale-inline-key'\nbase_url = 'http://127.0.0.1:1'\n[[accounts]]\nid = 'inline-only'\nprovider = 'openai'\napi_key = 'inline-key'\nbase_url = '{}'\n",
+    mock.base_url()
+  );
+  let auth = format!(
+    "version: 1\naccounts:\n  - id: local\n    provider: openai\n    api_key: auth-key\n    base_url: {}\n",
+    mock.base_url()
+  );
+  fs::write(&fixture.config_path, &config).unwrap();
+  fs::write(&fixture.auth_path, &auth).unwrap();
+  let shard_dir = fixture.auth_path.parent().unwrap().join("auth.d");
+  fs::create_dir(&shard_dir).unwrap();
+  let shard_path = shard_dir.join("opencode.yaml");
+  let shard = format!(
+    "version: 1\naccounts:\n  - id: shard\n    provider: openai\n    api_key: shard-key\n    base_url: {}\n",
+    mock.base_url()
+  );
+  fs::write(&shard_path, &shard).unwrap();
+  let client = fixture.client();
+  let request: ChatRequest = serde_json::from_value(json!({
+    "model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hello"}]
+  }))
+  .unwrap();
+  for (profile, credential) in [
+    ("default", "Bearer auth-key"),
+    ("inline", "Bearer inline-key"),
+    ("shard", "Bearer shard-key"),
+  ] {
+    client
+      .chat_completions()
+      .create_with(&request, RequestOptions::default().with_profile(profile))
+      .await
+      .expect("read-only account normalization keeps the selected account");
+    assert_eq!(mock.last_request().unwrap().header("authorization"), Some(credential));
+  }
+  client.reload().unwrap();
+  assert_eq!(fs::read_to_string(&fixture.config_path).unwrap(), config);
+  assert_eq!(fs::read_to_string(&fixture.auth_path).unwrap(), auth);
+  assert_eq!(fs::read_to_string(&shard_path).unwrap(), shard);
+  mock.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_inline_credentials_do_not_create_an_auth_store() {
+  let mock = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::openai(mock.base_url());
+  let config = format!(
+    "[defaults]\nmode = 'exact'\n[[accounts]]\nid = 'inline'\nprovider = 'openai'\napi_key = 'inline-key'\nbase_url = '{}'\n",
+    mock.base_url()
+  );
+  fs::write(&fixture.config_path, &config).unwrap();
+  fs::remove_file(&fixture.auth_path).unwrap();
+  fixture
+    .client()
+    .chat_completions()
+    .create(
+      &serde_json::from_value(json!({
+        "model": "openai/gpt-4o", "messages": [{"role": "user", "content": "hello"}]
+      }))
+      .unwrap(),
+    )
+    .await
+    .expect("inline-only legacy config works without writing auth.yaml");
+  assert_eq!(
+    mock.last_request().unwrap().header("authorization"),
+    Some("Bearer inline-key")
+  );
+  assert_eq!(fs::read_to_string(&fixture.config_path).unwrap(), config);
+  assert!(!fixture.auth_path.exists());
+  assert!(!fixture.config_path.parent().unwrap().join("auth.d").exists());
+  mock.shutdown().await;
 }
 
 #[test]
@@ -984,7 +1250,7 @@ async fn profile_endpoint_binding_restricts_sdk_operations() {
     .await
     .expect_err("generation cannot bypass the profile endpoint restriction");
   assert!(
-    matches!(error, Error::BuildEngine { source } if source.to_string().contains("does not expose operation 'responses'"))
+    matches!(error, Error::Request { source } if format!("{source:#}").contains("does not expose operation 'responses'"))
   );
   assert_eq!(mock.requests().len(), 1);
   mock.shutdown().await;
@@ -1031,7 +1297,7 @@ async fn rejected_reload_keeps_the_last_snapshot_until_valid_replacement() {
   let client = fixture.client();
   let mut events = client.subscribe_events();
   for invalid in [
-    "[defaults]\nmode = 'exact'\n".to_string(),
+    "schema_version = 3\n".to_string(),
     "schema_version = 2\n".to_string(),
     original.replace("driver = 'llama-cpp'", "driver = 'unknown-driver'"),
   ] {
@@ -1086,6 +1352,57 @@ async fn rejected_reload_keeps_the_last_snapshot_until_valid_replacement() {
   })
   .await
   .expect("existing event subscription survives failed and successful reloads");
+  first.shutdown().await;
+  second.shutdown().await;
+}
+
+#[tokio::test]
+async fn reload_between_legacy_and_v2_is_atomic_and_replaces_projection_warnings() {
+  let first = MockLlmServer::start(MockLlmConfig::default()).await;
+  let second = MockLlmServer::start(MockLlmConfig::default()).await;
+  let fixture = Fixture::new(first.base_url());
+  let native_config = fs::read_to_string(&fixture.config_path).unwrap();
+  let auth = format!(
+    "version: 1\naccounts:\n  - id: local\n    provider: llama-cpp\n    base_url: {}\n",
+    second.base_url()
+  );
+  fs::write(&fixture.auth_path, &auth).unwrap();
+  let client = fixture.client();
+  client.chat_completions().create(&chat_request()).await.unwrap();
+  assert!(client.config_warnings().is_empty());
+
+  let legacy_config = "[defaults]\nmode = 'exact'\n";
+  fs::write(&fixture.config_path, legacy_config).unwrap();
+  client
+    .reload()
+    .expect("a native v2 snapshot can be replaced by projected legacy input");
+  client.chat_completions().create(&chat_request()).await.unwrap();
+  let projected_warnings = client.config_warnings();
+  assert!(!projected_warnings.is_empty());
+
+  fs::write(&fixture.config_path, "[defaults]\nmode = 'passthrough'\n").unwrap();
+  client
+    .reload()
+    .expect_err("an unsupported legacy recipe cannot replace a working snapshot");
+  assert_eq!(client.config_warnings(), projected_warnings);
+  client.chat_completions().create(&chat_request()).await.unwrap();
+
+  fs::write(&fixture.config_path, &native_config).unwrap();
+  client
+    .reload()
+    .expect("projected legacy snapshots can return to native v2 input");
+  assert!(client.config_warnings().is_empty());
+  client.chat_completions().create(&chat_request()).await.unwrap();
+
+  fs::write(&fixture.config_path, "schema_version = 'bad'\n").unwrap();
+  client
+    .reload()
+    .expect_err("schema detection failure does not replace a native v2 snapshot");
+  assert!(client.config_warnings().is_empty());
+  client.chat_completions().create(&chat_request()).await.unwrap();
+  assert_eq!(first.requests().len(), 3);
+  assert_eq!(second.requests().len(), 2);
+  assert_eq!(fs::read_to_string(&fixture.auth_path).unwrap(), auth);
   first.shutdown().await;
   second.shutdown().await;
 }

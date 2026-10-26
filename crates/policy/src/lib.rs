@@ -34,7 +34,7 @@ pub use route::{
 };
 pub use topology::{
   AccountPoolPlan, AccountSelectionStrategy, AccountSelector, ClientAuthPlan, ConnectAction, ConnectMatch,
-  ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ExecutionPlan, HostPattern, HttpAction, HttpBindingPlan,
+  ConnectRulePlan, EmptyConnectMatch, EmptyHttpMatch, ExecutionRules, HostPattern, HttpAction, HttpBindingPlan,
   HttpMatch, InvalidSubdomainSuffix, ProviderOrigin, ProviderPlan, SessionAffinityPlan,
   DEFAULT_FORWARD_PROXY_REQUEST_BODY_MAX_BYTES,
 };

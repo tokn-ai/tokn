@@ -10,9 +10,9 @@ use snafu::Snafu;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokn_policy::{AccountPoolId, AccountSelectionStrategy, ExecutionPlan, GatewayPlan, SessionAffinityPlan};
+use tokn_policy::{AccountPoolId, AccountSelectionStrategy, ExecutionRules, GatewayPlan, SessionAffinityPlan};
 
-/// Every account pool linked from one compiled execution plan.
+/// Every account pool linked from compiled execution rules.
 pub struct LinkedAccountPools {
   pools: BTreeMap<AccountPoolId, Arc<LinkedAccountPool>>,
 }
@@ -152,7 +152,7 @@ pub fn link_account_pools(plan: &GatewayPlan, providers: &ProviderGraph) -> Pool
 /// Materialize account selectors from execution resources without gateway
 /// hosting. Membership and ordering are identical to [`link_account_pools`].
 pub fn link_execution_account_pools(
-  plan: &ExecutionPlan,
+  plan: &ExecutionRules,
   providers: &ProviderGraph,
 ) -> PoolLinkResult<LinkedAccountPools> {
   let metadata = link_pool_metadata(plan, &providers.metadata).map_err(|error| match error {
