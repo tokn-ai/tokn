@@ -15,9 +15,30 @@ pub use scenarios::{
   streaming_failure_lifecycle, streaming_round_trip, streaming_terminal_lifecycle, streaming_usage_events,
   transport_failure_account_feedback, typed_event_failures, typed_event_retry_attribution, typed_event_summaries,
 };
+pub use scenarios::{
+  buffered_generation_round_trip, generation_cancellation_releases_exchange, generation_upstream_errors,
+  generation_validation_and_controls,
+};
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn buffered_generation_round_trip() {
+    super::buffered_generation_round_trip();
+  }
+  #[test]
+  fn generation_validation_and_controls() {
+    super::generation_validation_and_controls();
+  }
+  #[test]
+  fn generation_upstream_errors() {
+    super::generation_upstream_errors();
+  }
+  #[test]
+  fn generation_cancellation_releases_exchange() {
+    super::generation_cancellation_releases_exchange();
+  }
+
   #[test]
   fn recoverable_refresh_failure_reselects_accounts() {
     super::recoverable_refresh_failure_reselects_accounts();

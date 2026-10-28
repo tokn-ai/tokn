@@ -387,6 +387,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokn-convert",
  "tokn-core",
  "tokn-endpoint-chat-completions",
  "tokn-endpoint-messages",

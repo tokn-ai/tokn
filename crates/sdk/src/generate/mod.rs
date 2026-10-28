@@ -1,12 +1,20 @@
 mod response;
+#[cfg(feature = "std")]
 mod stream;
 
 pub use response::{GenerateResponse, ToolCall, Usage};
+#[cfg(feature = "std")]
 pub use stream::{GenerateEvent, GenerateStream, TextStream};
 
-use std::borrow::Borrow;
-use std::collections::BTreeMap;
-use std::fmt;
+use alloc::{
+  borrow::Borrow,
+  collections::BTreeMap,
+  format,
+  string::{String, ToString},
+  vec,
+  vec::Vec,
+};
+use core::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -15,10 +23,11 @@ use tokn_convert::ir::{
 };
 use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
 use tokn_core::provider::Endpoint;
-use tokn_requests::pipeline::error::RequestsError;
+use tokn_requests::session;
 
-use crate::response::ResponseBody;
-use crate::{Client, Error, RequestOptions, Result};
+#[cfg(feature = "std")]
+use crate::{response::ResponseBody, ResponseAdapter};
+use crate::{Client, Error, PlatformFactory, RequestOptions, Result};
 
 /// An owned, provider-neutral generation request.
 ///
@@ -76,7 +85,7 @@ impl GenerateRequest {
   }
 
   /// Bind this owned request to a client for fluent execution.
-  pub fn bind(self, client: &Client) -> GenerateCall<'_> {
+  pub fn bind<P: PlatformFactory>(self, client: &Client<P>) -> GenerateCall<'_, P> {
     GenerateCall { client, request: self }
   }
 
@@ -443,14 +452,31 @@ pub struct GenerateRequestBuilder {
 }
 
 /// A generation builder bound to a client and ready to send or stream.
-#[derive(Clone)]
+#[cfg(feature = "std")]
 #[must_use = "generation calls do nothing until sent or streamed"]
-pub struct GenerateCall<'client> {
-  client: &'client Client,
+pub struct GenerateCall<'client, P: PlatformFactory = crate::StdPlatform> {
+  client: &'client Client<P>,
   request: GenerateRequest,
 }
 
-impl fmt::Debug for GenerateCall<'_> {
+/// A generation builder bound to a client and ready to send.
+#[cfg(not(feature = "std"))]
+#[must_use = "generation calls do nothing until sent"]
+pub struct GenerateCall<'client, P: PlatformFactory> {
+  client: &'client Client<P>,
+  request: GenerateRequest,
+}
+
+impl<P: PlatformFactory> Clone for GenerateCall<'_, P> {
+  fn clone(&self) -> Self {
+    Self {
+      client: self.client,
+      request: self.request.clone(),
+    }
+  }
+}
+
+impl<P: PlatformFactory> fmt::Debug for GenerateCall<'_, P> {
   fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     formatter
       .debug_struct("GenerateCall")
@@ -461,193 +487,190 @@ impl fmt::Debug for GenerateCall<'_> {
 }
 
 macro_rules! generate_builder_methods {
-  ($builder:ty) => {
-    impl $builder {
-      pub fn prompt(self, prompt: impl Into<String>) -> Self {
-        self.user(prompt)
-      }
+  () => {
+    pub fn prompt(self, prompt: impl Into<String>) -> Self {
+      self.user(prompt)
+    }
 
-      pub fn system(mut self, content: impl Into<String>) -> Self {
-        self.request.messages.push(Message::system(content));
-        self
-      }
+    pub fn system(mut self, content: impl Into<String>) -> Self {
+      self.request.messages.push(Message::system(content));
+      self
+    }
 
-      pub fn user(mut self, content: impl Into<String>) -> Self {
-        self.request.messages.push(Message::user(content));
-        self
-      }
+    pub fn user(mut self, content: impl Into<String>) -> Self {
+      self.request.messages.push(Message::user(content));
+      self
+    }
 
-      pub fn assistant(mut self, content: impl Into<String>) -> Self {
-        self.request.messages.push(Message::assistant(content));
-        self
-      }
+    pub fn assistant(mut self, content: impl Into<String>) -> Self {
+      self.request.messages.push(Message::assistant(content));
+      self
+    }
 
-      pub fn assistant_with_tool_calls(
-        mut self,
-        content: impl Into<String>,
-        tool_calls: impl IntoIterator<Item = ToolCall>,
-      ) -> Self {
-        self
-          .request
-          .messages
-          .push(Message::assistant_with_tool_calls(content, tool_calls));
-        self
-      }
+    pub fn assistant_with_tool_calls(
+      mut self,
+      content: impl Into<String>,
+      tool_calls: impl IntoIterator<Item = ToolCall>,
+    ) -> Self {
+      self
+        .request
+        .messages
+        .push(Message::assistant_with_tool_calls(content, tool_calls));
+      self
+    }
 
-      pub fn tool_result(mut self, call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        self.request.messages.push(Message::tool(call_id, content));
-        self
-      }
+    pub fn tool_result(mut self, call_id: impl Into<String>, content: impl Into<String>) -> Self {
+      self.request.messages.push(Message::tool(call_id, content));
+      self
+    }
 
-      pub fn message(mut self, message: Message) -> Self {
-        self.request.messages.push(message);
-        self
-      }
+    pub fn message(mut self, message: Message) -> Self {
+      self.request.messages.push(message);
+      self
+    }
 
-      pub fn messages(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
-        self.request.messages.extend(messages);
-        self
-      }
+    pub fn messages(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
+      self.request.messages.extend(messages);
+      self
+    }
 
-      pub fn tool(mut self, tool: Tool) -> Self {
-        self.request.tools.push(tool);
-        self
-      }
+    pub fn tool(mut self, tool: Tool) -> Self {
+      self.request.tools.push(tool);
+      self
+    }
 
-      pub fn tool_choice(mut self, tool_choice: impl Into<ToolChoice>) -> Self {
-        self.request.tool_choice = Some(tool_choice.into());
-        self
-      }
+    pub fn tool_choice(mut self, tool_choice: impl Into<ToolChoice>) -> Self {
+      self.request.tool_choice = Some(tool_choice.into());
+      self
+    }
 
-      pub fn temperature(mut self, temperature: f64) -> Self {
-        self.request.temperature = Some(temperature);
-        self
-      }
+    pub fn temperature(mut self, temperature: f64) -> Self {
+      self.request.temperature = Some(temperature);
+      self
+    }
 
-      pub fn top_p(mut self, top_p: f64) -> Self {
-        self.request.top_p = Some(top_p);
-        self
-      }
+    pub fn top_p(mut self, top_p: f64) -> Self {
+      self.request.top_p = Some(top_p);
+      self
+    }
 
-      pub fn top_k(mut self, top_k: u64) -> Self {
-        self.request.top_k = Some(top_k);
-        self
-      }
+    pub fn top_k(mut self, top_k: u64) -> Self {
+      self.request.top_k = Some(top_k);
+      self
+    }
 
-      pub fn max_output_tokens(mut self, max_output_tokens: u64) -> Self {
-        self.request.max_output_tokens = Some(max_output_tokens);
-        self
-      }
+    pub fn max_output_tokens(mut self, max_output_tokens: u64) -> Self {
+      self.request.max_output_tokens = Some(max_output_tokens);
+      self
+    }
 
-      /// Alias for [`Self::max_output_tokens`].
-      pub fn max_tokens(self, max_tokens: u64) -> Self {
-        self.max_output_tokens(max_tokens)
-      }
+    /// Alias for [`Self::max_output_tokens`].
+    pub fn max_tokens(self, max_tokens: u64) -> Self {
+      self.max_output_tokens(max_tokens)
+    }
 
-      pub fn reasoning(mut self, reasoning: ReasoningOptions) -> Self {
-        self.request.reasoning = Some(reasoning);
-        self
-      }
+    pub fn reasoning(mut self, reasoning: ReasoningOptions) -> Self {
+      self.request.reasoning = Some(reasoning);
+      self
+    }
 
-      pub fn reasoning_mode(mut self, mode: ReasoningMode) -> Self {
-        self
-          .request
-          .reasoning
-          .get_or_insert_with(ReasoningOptions::default)
-          .mode = Some(mode);
-        self
-      }
+    pub fn reasoning_mode(mut self, mode: ReasoningMode) -> Self {
+      self
+        .request
+        .reasoning
+        .get_or_insert_with(ReasoningOptions::default)
+        .mode = Some(mode);
+      self
+    }
 
-      pub fn reasoning_enabled(self, enabled: bool) -> Self {
-        self.reasoning_mode(if enabled {
-          ReasoningMode::Enabled
-        } else {
-          ReasoningMode::Disabled
-        })
-      }
+    pub fn reasoning_enabled(self, enabled: bool) -> Self {
+      self.reasoning_mode(if enabled {
+        ReasoningMode::Enabled
+      } else {
+        ReasoningMode::Disabled
+      })
+    }
 
-      pub fn reasoning_effort(mut self, effort: impl Into<ReasoningEffort>) -> Self {
-        self
-          .request
-          .reasoning
-          .get_or_insert_with(ReasoningOptions::default)
-          .effort = Some(effort.into());
-        self
-      }
+    pub fn reasoning_effort(mut self, effort: impl Into<ReasoningEffort>) -> Self {
+      self
+        .request
+        .reasoning
+        .get_or_insert_with(ReasoningOptions::default)
+        .effort = Some(effort.into());
+      self
+    }
 
-      pub fn reasoning_budget_tokens(mut self, budget_tokens: u64) -> Self {
-        self
-          .request
-          .reasoning
-          .get_or_insert_with(ReasoningOptions::default)
-          .budget_tokens = Some(budget_tokens);
-        self
-      }
+    pub fn reasoning_budget_tokens(mut self, budget_tokens: u64) -> Self {
+      self
+        .request
+        .reasoning
+        .get_or_insert_with(ReasoningOptions::default)
+        .budget_tokens = Some(budget_tokens);
+      self
+    }
 
-      pub fn reasoning_summary(mut self, summary: impl Into<ReasoningSummary>) -> Self {
-        self
-          .request
-          .reasoning
-          .get_or_insert_with(ReasoningOptions::default)
-          .summary = Some(summary.into());
-        self
-      }
+    pub fn reasoning_summary(mut self, summary: impl Into<ReasoningSummary>) -> Self {
+      self
+        .request
+        .reasoning
+        .get_or_insert_with(ReasoningOptions::default)
+        .summary = Some(summary.into());
+      self
+    }
 
-      pub fn options(mut self, options: RequestOptions) -> Self {
-        self.request.options = options;
-        self
-      }
+    pub fn options(mut self, options: RequestOptions) -> Self {
+      self.request.options = options;
+      self
+    }
 
-      pub fn profile(mut self, profile: impl Into<String>) -> Self {
-        self.request.options.profile = Some(profile.into());
-        self
-      }
+    pub fn profile(mut self, profile: impl Into<String>) -> Self {
+      self.request.options.profile = Some(profile.into());
+      self
+    }
 
-      pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.request.options.request_id = Some(request_id.into());
-        self
-      }
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+      self.request.options.request_id = Some(request_id.into());
+      self
+    }
 
-      pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.request.options.session_id = Some(session_id.into());
-        self
-      }
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+      self.request.options.session_id = Some(session_id.into());
+      self
+    }
 
-      pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
-        self.request.options.project_id = Some(project_id.into());
-        self
-      }
+    pub fn project_id(mut self, project_id: impl Into<String>) -> Self {
+      self.request.options.project_id = Some(project_id.into());
+      self
+    }
 
-      pub fn initiator(mut self, initiator: impl Into<String>) -> Self {
-        self.request.options.initiator = Some(initiator.into());
-        self
-      }
+    pub fn initiator(mut self, initiator: impl Into<String>) -> Self {
+      self.request.options.initiator = Some(initiator.into());
+      self
+    }
 
-      pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.request.options.headers.push((name.into(), value.into()));
-        self
-      }
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+      self.request.options.headers.push((name.into(), value.into()));
+      self
+    }
 
-      pub fn extra(mut self, name: impl Into<String>, value: Value) -> Self {
-        self.request.extras.insert(name.into(), value);
-        self
-      }
+    pub fn extra(mut self, name: impl Into<String>, value: Value) -> Self {
+      self.request.extras.insert(name.into(), value);
+      self
+    }
 
-      /// Finish building an owned request, detaching it from any bound client.
-      pub fn build(self) -> Result<GenerateRequest> {
-        self.request.validate()?;
-        Ok(self.request)
-      }
+    /// Finish building an owned request, detaching it from any bound client.
+    pub fn build(self) -> Result<GenerateRequest> {
+      self.request.validate()?;
+      Ok(self.request)
     }
   };
 }
 
-generate_builder_methods!(GenerateRequestBuilder);
-generate_builder_methods!(GenerateCall<'_>);
-
 impl GenerateRequestBuilder {
+  generate_builder_methods!();
+
   /// Bind a detached builder to a client without changing the request.
-  pub fn bind(self, client: &Client) -> GenerateCall<'_> {
+  pub fn bind<P: PlatformFactory>(self, client: &Client<P>) -> GenerateCall<'_, P> {
     GenerateCall {
       client,
       request: self.request,
@@ -655,11 +678,16 @@ impl GenerateRequestBuilder {
   }
 }
 
-impl GenerateCall<'_> {
+impl<P: PlatformFactory> GenerateCall<'_, P> {
+  generate_builder_methods!();
+
   pub async fn send(self) -> Result<GenerateResponse> {
     self.client.send(&self.request).await
   }
+}
 
+#[cfg(feature = "std")]
+impl GenerateCall<'_> {
   pub async fn stream(self) -> Result<GenerateStream> {
     self.client.stream(&self.request).await
   }
@@ -669,44 +697,48 @@ impl GenerateCall<'_> {
   }
 }
 
-impl Client {
+impl<P: PlatformFactory> Client<P> {
   /// Start a client-bound generation builder.
-  pub fn generate(&self, model: impl Into<String>) -> GenerateCall<'_> {
+  pub fn generate(&self, model: impl Into<String>) -> GenerateCall<'_, P> {
     GenerateRequest::builder(model).bind(self)
   }
 
-  /// Send an owned or borrowed detached request.
+  /// Send an owned or borrowed detached request through the shared session.
   pub async fn send(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateResponse> {
-    let request = request.borrow();
-    let body = request.responses_body(false)?;
-    let response = self
-      .execute_generation(
-        Endpoint::Responses,
-        body,
-        request.options.clone(),
-        request.generation_options(),
-      )
-      .await
-      .map_err(map_generation_error)?
-      .into_buffered()?;
-    ensure_success(response.status, &response.data)?;
-    let raw = serde_json::from_slice(&response.data).map_err(|source| Error::DeserializeResponse { source })?;
+    let response = self.execute_generation(request.borrow(), false).await?;
+    let session::ResponseBody::Buffered(body) = response.body else {
+      return Err(Error::UnexpectedStream);
+    };
+    ensure_success(response.status, &body)?;
+    let raw = serde_json::from_slice(&body).map_err(|source| Error::DeserializeResponse { source })?;
     Ok(GenerateResponse::from_raw(response.status, response.headers, raw))
   }
 
-  /// Stream semantic generation events from an owned or borrowed request.
-  pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
-    let request = request.borrow();
-    let body = request.responses_body(true)?;
-    let response = self
-      .execute_generation(
+  async fn execute_generation(
+    &self,
+    request: &GenerateRequest,
+    stream: bool,
+  ) -> Result<crate::client::SessionResponse<'_, P>> {
+    let body = request.responses_body(stream)?;
+    let generation_options = request.generation_options();
+    self
+      .run_session(
         Endpoint::Responses,
         body,
         request.options.clone(),
-        request.generation_options(),
+        (!generation_options.is_empty()).then_some(generation_options),
       )
       .await
-      .map_err(map_generation_error)?;
+      .map_err(|error| Error::from_generation(error, Endpoint::Responses))
+  }
+}
+
+#[cfg(feature = "std")]
+impl Client {
+  /// Stream semantic generation events from an owned or borrowed request.
+  pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
+    let response = self.execute_generation(request.borrow(), true).await?;
+    let response = crate::StdPlatform::finish_response(response);
     ensure_raw_success(&response)?;
     Ok(stream::parse_events(response.into_stream()?.into_stream()))
   }
@@ -718,28 +750,7 @@ impl Client {
   }
 }
 
-fn map_generation_error(error: Error) -> Error {
-  let Error::Request { source } = error else {
-    return error;
-  };
-  let source = match source.into_pipeline() {
-    Ok(source) => source,
-    Err(source) => return Error::Request { source },
-  };
-  match source.inner() {
-    RequestsError::UpstreamStatus { status, body } => Error::GenerateResponseStatus {
-      status: *status,
-      body: body.clone(),
-    },
-    RequestsError::InvalidGenerationOptions { .. } | RequestsError::UnsupportedGenerationControl { .. } => {
-      Error::InvalidGenerateRequest {
-        message: source.inner().to_string(),
-      }
-    }
-    _ => Error::Request { source: source.into() },
-  }
-}
-
+#[cfg(feature = "std")]
 fn ensure_raw_success(response: &crate::RawResponse) -> Result<()> {
   if (200..300).contains(&response.status) {
     return Ok(());

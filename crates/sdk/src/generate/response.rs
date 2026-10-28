@@ -1,9 +1,14 @@
-use std::collections::BTreeMap;
+use alloc::{
+  collections::BTreeMap,
+  string::{String, ToString},
+  vec::Vec,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(feature = "std")]
 use tokn_convert::ir::Usage as IrUsage;
-use tokn_headers::HeaderMap;
+use tokn_core::headers::HeaderMap;
 
 /// Friendly buffered output from a provider-neutral generation.
 #[derive(Debug)]
@@ -122,6 +127,7 @@ impl Usage {
     }
   }
 
+  #[cfg(feature = "std")]
   pub(super) fn from_ir(usage: IrUsage) -> Self {
     Self {
       input_tokens: usage.input_tokens,

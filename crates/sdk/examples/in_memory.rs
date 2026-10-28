@@ -18,8 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     "provider": "openai",
     "api_key": std::env::var("OPENAI_API_KEY")?
   }))?;
-  // Adapter::new(transport, runtime) can replace the services here without
-  // changing the rules, accounts, or shared request session.
+  // Adapter::new(transport, runtime) can replace the services here. The same
+  // rules, accounts, and generate().send() call also work with no_std + alloc.
   let client = Client::new(rules, vec![account], StdPlatform::new()?)?;
   let response = client.generate("openai/gpt-5").prompt("Say hello.").send().await?;
   println!("{}", response.text);

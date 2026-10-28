@@ -12,9 +12,7 @@ extern crate alloc;
 
 mod client;
 mod endpoint;
-#[cfg(feature = "std")]
 mod error;
-#[cfg(feature = "std")]
 mod generate;
 #[cfg(feature = "std")]
 mod response;
@@ -26,13 +24,13 @@ pub use client::{
   Services,
 };
 pub use endpoint::{ChatCompletions, Messages, Responses};
-#[cfg(feature = "std")]
 pub use error::{Error, Result};
-#[cfg(feature = "std")]
 pub use generate::{
-  GenerateCall, GenerateEvent, GenerateRequest, GenerateRequestBuilder, GenerateResponse, GenerateStream, Message,
-  Role, TextStream, Tool, ToolCall, ToolChoice, Usage,
+  GenerateCall, GenerateRequest, GenerateRequestBuilder, GenerateResponse, Message, Role, Tool, ToolCall, ToolChoice,
+  Usage,
 };
+#[cfg(feature = "std")]
+pub use generate::{GenerateEvent, GenerateStream, TextStream};
 #[cfg(feature = "std")]
 pub use response::{ByteStream, RawResponse, ResponseBody, StreamResponse};
 #[cfg(feature = "std")]
@@ -50,7 +48,6 @@ pub use tokn_router_legacy_config::v2::V2ProjectionWarning as ConfigWarning;
 
 #[cfg(feature = "std")]
 pub use tokn_core::event::Event;
-#[cfg(feature = "std")]
 pub use tokn_core::generation::{
   GenerationOptions, GenerationOptionsError, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary,
 };

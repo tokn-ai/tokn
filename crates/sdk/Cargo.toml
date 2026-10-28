@@ -49,7 +49,7 @@ thiserror.workspace = true
 tokio = { workspace = true, optional = true }
 tokn-auth = { workspace = true, optional = true }
 tokn-config.workspace = true
-tokn-convert = { workspace = true, optional = true }
+tokn-convert.workspace = true
 tokn-core.workspace = true
 tokn-endpoint-chat-completions.workspace = true
 tokn-endpoint-messages.workspace = true

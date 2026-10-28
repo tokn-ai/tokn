@@ -86,6 +86,10 @@ struct Observation {
 
 impl Fixture {
   async fn new(provider: &'static str, account_count: usize, route: MockRoute) -> Self {
+    Self::with_operation(provider, account_count, route, "preserve").await
+  }
+
+  async fn with_operation(provider: &'static str, account_count: usize, route: MockRoute, operation: &str) -> Self {
     let reply = route.response.clone();
     let server = MockLlmServer::start(MockLlmConfig::default().with_route(route)).await;
     let accounts: Vec<Value> = (0..account_count)
@@ -105,7 +109,7 @@ impl Fixture {
       "defaults": {
         "provider": {"kind": "fixed", "provider": provider},
         "model": {"kind": "qualified", "namespace": "provider"},
-        "operation": "preserve",
+        "operation": operation,
         "wire_identity": "none"
       },
       "providers": {provider: {"driver": provider, "base_url": server.base_url()}}
@@ -455,4 +459,100 @@ async fn session_options_and_explicit_headers_use_the_same_precedence() {
       "injected precedence for {header}={value}"
     );
   }
+}
+
+#[tokio::test]
+async fn friendly_generation_shares_wire_requests_and_normalized_output() {
+  let responses = json!({
+    "id": "generation-parity", "model": "gpt-5", "status": "completed",
+    "output": [
+      {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+      {"type": "reasoning", "summary": [{"type": "summary_text", "text": "considered"}]},
+      {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{\"query\":\"rust\"}"}
+    ],
+    "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8}
+  });
+  let chat = json!({
+    "id": "generation-parity", "model": "gpt-5",
+    "choices": [{"index": 0, "message": {
+      "role": "assistant", "content": "hello", "reasoning_content": "considered",
+      "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{\"query\":\"rust\"}"}}]
+    }, "finish_reason": "tool_calls"}],
+    "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+  });
+  for (driver, endpoint, output) in [
+    ("openai", MockEndpoint::Responses, responses),
+    ("llama-cpp", MockEndpoint::ChatCompletions, chat),
+  ] {
+    let fixture = Fixture::with_operation(
+      driver,
+      1,
+      MockRoute::new(endpoint, MockResponse::json(output)),
+      "translate_compatible",
+    )
+    .await;
+    let request = tokn_sdk::GenerateRequest::builder(format!("{driver}/gpt-5"))
+      .user("hello")
+      .max_output_tokens(128)
+      .tool(tokn_sdk::Tool::function("lookup", json!({"type": "object"})))
+      .tool_choice("lookup")
+      .build()
+      .unwrap();
+    let standard = fixture.standard.send(&request).await.unwrap();
+    let custom = request.bind(&fixture.injected).send().await.unwrap();
+    assert_eq!(standard.http_status, custom.http_status);
+    assert_eq!(standard.raw, custom.raw);
+    assert_eq!(standard.text, "hello");
+    assert_eq!(standard.text, custom.text);
+    assert_eq!(standard.reasoning.as_deref(), Some("considered"));
+    assert_eq!(standard.reasoning, custom.reasoning);
+    assert_eq!(standard.tool_calls, custom.tool_calls);
+    assert_eq!(standard.tool_calls[0].arguments, json!({"query": "rust"}));
+    assert_eq!(standard.usage, custom.usage);
+    assert_eq!(standard.usage.as_ref().unwrap().total_tokens, Some(8));
+    let sent = fixture.server.last_request().unwrap();
+    let captured = fixture.requests.borrow();
+    assert_eq!(captured.len(), 1);
+    let custom = &captured[0];
+    assert_eq!(custom.url.strip_prefix(fixture.server.base_url()).unwrap(), sent.path);
+    assert_eq!(
+      serde_json::from_slice::<Value>(&custom.body).unwrap(),
+      serde_json::from_slice::<Value>(&sent.body).unwrap()
+    );
+    assert_eq!(
+      custom.headers.get("authorization").unwrap().as_str(),
+      sent.header("authorization").unwrap()
+    );
+  }
+}
+
+#[tokio::test]
+async fn friendly_generation_shares_error_classification() {
+  let mut reply = MockResponse::json(json!({"error": {"message": "generation denied"}}));
+  reply.status = 400.try_into().unwrap();
+  let fixture = Fixture::new("openai", 1, MockRoute::new(MockEndpoint::Responses, reply)).await;
+  let request = tokn_sdk::GenerateRequest::builder("openai/gpt-5")
+    .user("hello")
+    .build()
+    .unwrap();
+  for error in [
+    fixture.standard.send(&request).await.unwrap_err(),
+    fixture.injected.send(&request).await.unwrap_err(),
+  ] {
+    assert!(
+      matches!(error, tokn_sdk::Error::GenerateResponseStatus { status: 400, body } if body.contains("generation denied"))
+    );
+  }
+  let invalid = request.into_builder().top_k(40).build().unwrap();
+  for error in [
+    fixture.standard.send(&invalid).await.unwrap_err(),
+    fixture.injected.send(&invalid).await.unwrap_err(),
+  ] {
+    assert!(matches!(error, tokn_sdk::Error::InvalidGenerateRequest { message } if message.contains("top_k")));
+  }
+  assert_eq!(
+    fixture.requests.borrow().len(),
+    1,
+    "invalid controls fail before transport"
+  );
 }
