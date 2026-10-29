@@ -46,6 +46,12 @@ pub struct Services<T, C, E> {
 pub type PlatformServices<'a, P> =
   Services<<P as PlatformFactory>::Exchange<'a>, <P as PlatformFactory>::Clock<'a>, <P as PlatformFactory>::Events<'a>>;
 
+pub(crate) type SessionResponse<'a, P> = session::Response<
+  <P as PlatformFactory>::Exchange<'a>,
+  <P as PlatformFactory>::Clock<'a>,
+  <P as PlatformFactory>::Events<'a>,
+>;
+
 /// A factory for transport, time, and event services. It neither owns execution
 /// state nor interprets requests. Pool handles are snapshotted with client state;
 /// an acquired exchange must not borrow those handles from the snapshot.
@@ -283,18 +289,36 @@ impl<P: ResponseAdapter> Client<P> {
     body: Value,
     options: RequestOptions,
   ) -> Result<P::Response<'_>, P::Error> {
-    self
-      .execute_with_generation_options(endpoint, body, options, None)
+    let response = self
+      .run_session(endpoint, body, options, None)
       .await
+      .map_err(|error| P::execution_error(error, endpoint))?;
+    Ok(P::finish_response(response))
   }
 
-  pub(crate) async fn execute_with_generation_options(
+  pub(crate) async fn execute_typed<T: Serialize>(
+    &self,
+    endpoint: Endpoint,
+    request: &T,
+    stream: bool,
+    options: RequestOptions,
+  ) -> Result<P::Response<'_>, P::Error> {
+    let mut body = serde_json::to_value(request).map_err(P::encode_error)?;
+    body["stream"] = Value::Bool(stream);
+    self.execute(endpoint, body, options).await
+  }
+}
+
+impl<P: PlatformFactory> Client<P> {
+  /// Execute one session before applying endpoint-specific response presentation.
+  /// Both native endpoints and friendly generation use this orchestration path.
+  pub(crate) async fn run_session(
     &self,
     endpoint: Endpoint,
     body: Value,
     options: RequestOptions,
     mut generation_options: Option<GenerationOptions>,
-  ) -> Result<P::Response<'_>, P::Error> {
+  ) -> Result<SessionResponse<'_, P>, session::Error> {
     let snapshot = self.snapshot.load();
     // Acquire external services before reading clocks. A local callback may
     // reenter execution; acquisition reports busy without borrowing its runtime.
@@ -302,14 +326,9 @@ impl<P: ResponseAdapter> Client<P> {
       transport,
       clock,
       events,
-    } = self
-      .platform
-      .acquire(&snapshot.pool)
-      .map_err(|error| P::execution_error(error, endpoint))?;
-    let profile = Self::select_profile(&snapshot, options.profile.as_deref())
-      .map_err(|error| P::execution_error(error, endpoint))?;
-    Self::prepare_generation(&snapshot, &profile, endpoint, &body, &mut generation_options)
-      .map_err(|error| P::execution_error(error, endpoint))?;
+    } = self.platform.acquire(&snapshot.pool)?;
+    let profile = Self::select_profile(&snapshot, options.profile.as_deref())?;
+    Self::prepare_generation(&snapshot, &profile, endpoint, &body, &mut generation_options)?;
     #[cfg(feature = "std")]
     if let Some(metadata) = &snapshot.metadata {
       metadata.refresh(&snapshot.execution);
@@ -321,12 +340,10 @@ impl<P: ResponseAdapter> Client<P> {
     let mut input = RequestInput::new(endpoint, body, options.inbound_headers(), request_id);
     input.profile = Some(profile);
     input.generation_options = generation_options;
-    let response = session::Session::new(snapshot.execution.clone(), input, transport, clock, events)
+    session::Session::new(snapshot.execution.clone(), input, transport, clock, events)
       .with_limits(self.limits)
       .run()
       .await
-      .map_err(|error| P::execution_error(error, endpoint))?;
-    Ok(P::finish_response(response))
   }
 
   pub(crate) fn select_profile(
@@ -382,18 +399,6 @@ impl<P: ResponseAdapter> Client<P> {
       *options = None;
     }
     Ok(())
-  }
-
-  pub(crate) async fn execute_typed<T: Serialize>(
-    &self,
-    endpoint: Endpoint,
-    request: &T,
-    stream: bool,
-    options: RequestOptions,
-  ) -> Result<P::Response<'_>, P::Error> {
-    let mut body = serde_json::to_value(request).map_err(P::encode_error)?;
-    body["stream"] = Value::Bool(stream);
-    self.execute(endpoint, body, options).await
   }
 }
 

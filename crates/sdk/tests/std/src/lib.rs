@@ -282,6 +282,51 @@ mod tests {
   }
 
   #[test]
+  fn buffered_generation_keeps_send_futures_and_detached_requests() {
+    let mut fixture = Fixture::start_with_requests(2);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .unwrap();
+    runtime.block_on(async {
+      tokio::time::timeout(Duration::from_secs(10), async {
+        let client = fixture.client();
+        let invalid = assert_send(client.generate("llama-cpp/test-model").user("hello").top_p(2.0).send())
+          .await
+          .unwrap_err();
+        assert!(matches!(invalid, Error::InvalidGenerateRequest { .. }));
+        let first = assert_send(
+          client
+            .generate("llama-cpp/test-model")
+            .user("hello")
+            .max_output_tokens(64)
+            .send(),
+        )
+        .await
+        .expect("friendly generation remains a Send future on the standard client");
+        let request = tokn_sdk::GenerateRequest::builder("llama-cpp/test-model")
+          .user("hello")
+          .max_output_tokens(64)
+          .build()
+          .unwrap();
+        let second = assert_send(request.bind(&client).clone().send()).await.unwrap();
+        assert_eq!(first.http_status, 200);
+        assert_eq!(first.text, "hello");
+        assert_eq!(first.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(first.raw, second.raw);
+      })
+      .await
+      .expect("friendly generation completed before timeout");
+    });
+    let requests = fixture.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    assert_eq!(requests[0]["model"], "test-model");
+    assert_ne!(requests[0]["stream"], true);
+    assert_eq!(requests[0]["max_tokens"], 64);
+  }
+
+  #[test]
   fn default_consumer_loads_legacy_config_without_migrating_source_files() {
     let mut fixture = Fixture::start();
     let config = "[server]\nhost = 'sdk.private.example'\n[defaults]\nmode = 'exact'\n";

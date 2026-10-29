@@ -3,6 +3,23 @@ extern crate alloc;
 mod scenarios;
 
 #[test]
+fn buffered_generation_round_trip() {
+  scenarios::buffered_generation_round_trip();
+}
+#[test]
+fn generation_validation_and_controls() {
+  scenarios::generation_validation_and_controls();
+}
+#[test]
+fn generation_upstream_errors() {
+  scenarios::generation_upstream_errors();
+}
+#[test]
+fn generation_cancellation_releases_exchange() {
+  scenarios::generation_cancellation_releases_exchange();
+}
+
+#[test]
 fn explicit_profiles_do_not_imply_default() {
   scenarios::explicit_profiles_do_not_imply_default();
 }

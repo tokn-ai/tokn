@@ -3,8 +3,8 @@
 With their default features, the SDKs execute requests in-process using the
 v2 configuration, credentials, account pool, routing, conversion, retry,
 and provider runtime. They do not require a gateway process.
-Rust also supports configured requests with caller-supplied networking in
-`no_std + alloc` environments.
+Rust also supports configured requests and buffered provider-neutral generation
+with caller-supplied networking in `no_std + alloc` environments.
 
 ## Rust
 
@@ -86,6 +86,11 @@ let response = client
 
 println!("{}", response.text);
 ```
+
+Buffered generation works with standard or custom adapters. `GenerateRequest`,
+its detached and client-bound builders, and `GenerateResponse` are also available
+with default features disabled. The returned text, reasoning, tool calls, usage,
+headers, and raw JSON are owned values; they do not retain a transport borrow.
 
 Generation controls use provider-neutral names and are mapped after the route
 selects an upstream endpoint:
@@ -217,7 +222,7 @@ Client<P>
   │    └─ rules, accounts, credentials, pools, model metadata
   └─ adapter services → acquire exchange + clock + events
 
-Client::execute → capture snapshot → Session<exchange, clock, events>
+Client::execute / Client::send → capture snapshot → Session<exchange, clock, events>
 ```
 
 A transport factory or connection pool belongs to the client-level services;
@@ -240,7 +245,7 @@ use tokn_sdk::{Adapter, Client};
 let rules = tokn_sdk::config::v2::compile_execution(&raw_config)?;
 let services = Adapter::new(transport, runtime);
 let client = Client::new(rules, accounts, services)?;
-let response = client.chat_completions().create(&request).await?;
+let response = client.generate("openai/gpt-5").prompt("Say hello.").send().await?;
 ```
 
 With the standard feature, the same constructor accepts the standard services
@@ -272,6 +277,32 @@ credential file, or gateway process is required. The implicit profile is always
 `default`; a configuration with only named profiles requires
 `RequestOptions::with_profile`. The in-memory client checks this when executing
 a request, allowing an explicit profile to be supplied there.
+
+Buffered generation uses the existing session for routing, control validation,
+provider conversion, retries, and events. It presents the resulting Responses
+body as `GenerateResponse` regardless of the selected upstream API. An application
+can share a generation function across service factories without imposing
+`Send` or `'static` bounds:
+
+```rust
+use tokn_sdk::{Client, GenerateResponse, PlatformFactory};
+
+async fn reply<P: PlatformFactory>(client: &Client<P>) -> tokn_sdk::Result<GenerateResponse> {
+  client.generate("openai/gpt-5").prompt("Say hello.").send().await
+}
+```
+
+`generate().send()`, `client.send(request)`, and detached-request validation use
+`tokn_sdk::Error` in both builds. Unsupported typed generation controls produce
+`InvalidGenerateRequest`; upstream HTTP failures produce `GenerateResponseStatus`
+with their status and body. Other execution failures retain their request source:
+the standard request error under std, and `session::Error` under alloc-only builds.
+`Adapter`'s raw and typed endpoint methods keep their existing
+`session::Error` results.
+
+Semantic `stream()` and `stream_text()` generation methods remain available only
+on the standard client. Custom adapters can already use raw or typed endpoint
+streaming and consume the session's SSE events.
 
 Managed request interpretation has one implementation in
 `tokn_requests::interpretation::RequestInterpretation`:
@@ -471,8 +502,8 @@ and capability-based routing. `Client::with_model_metadata` accepts
 accounts, and adapter services. This gives embedded applications the same model
 evidence as std discovery. `Client::with_limits` applies `Limits` to buffered
 responses and SSE records.
-The friendly generation builder and gateway relay/proxy adapters currently
-remain standard-only.
+Gateway relay/proxy adapters remain standard-only; the shared SDK supports the
+managed and fixed-provider relay behavior described above.
 
 Shared `tokn_core::types::{Bytes, SmolStr, Shared}` are concrete types selected at build
 time. Standard builds re-export the original upstream types; embedded builds
@@ -490,8 +521,9 @@ events across all nine upstream/requested API pairs for buffered JSON,
 buffered SSE, and live SSE, including conversion failure and cancellation.
 
 Verification also includes an isolated default-feature SDK consumer and an isolated
-alloc-only consumer that exercises configured requests, injected transports,
-and suspended stream reads. The latter is compiled for both targets below:
+alloc-only consumer that exercises configured requests, custom transports,
+buffered generation, and suspended stream reads. The latter is compiled for both
+targets below:
 
 ```sh
 cargo test --locked --manifest-path crates/sdk/tests/std/Cargo.toml

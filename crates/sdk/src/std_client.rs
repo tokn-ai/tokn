@@ -1,22 +1,18 @@
-use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokn_auth::{default_auth_path, AuthStore};
 use tokn_config::{v2, ExecutionConfigInput};
 use tokn_core::event::{Event, EventBus};
-use tokn_core::generation::GenerationOptions;
 use tokn_core::provider::Endpoint;
 use tokn_core::util::http::HttpClientOptions;
-use tokn_requests::session::{Error as SessionError, ErrorKind, Limits};
-use tokn_requests::v2::adapters::{
-  into_standard_response, pipeline_error, ReqwestExchange, StandardEvents, TokioRuntime,
-};
+use tokn_requests::session::{Error as SessionError, Limits};
+use tokn_requests::v2::adapters::{into_standard_response, ReqwestExchange, StandardEvents, TokioRuntime};
 use tokn_requests::v2::{prepare_execution, HttpClients};
 
 use crate::client::Snapshot;
 use crate::response::RawResponse;
-use crate::{Client, ConfigWarning, PlatformFactory, RequestOptions, ResponseAdapter, Services};
+use crate::{Client, ConfigWarning, PlatformFactory, ResponseAdapter, Services};
 use crate::{Error, Result};
 
 const EVENT_BUS_CAPACITY: usize = 256;
@@ -145,24 +141,7 @@ impl ResponseAdapter for StdPlatform {
   }
 
   fn execution_error(error: SessionError, endpoint: Endpoint) -> Self::Error {
-    if let ErrorKind::UnknownProfile { profile } = &error.kind {
-      return Error::UnknownProfile {
-        profile: profile.to_string(),
-      };
-    }
-    if error.stage == "generation" {
-      return Error::InvalidGenerateRequest {
-        message: error.message.to_string(),
-      };
-    }
-    if error.stage == "config" {
-      return Error::BuildEngine {
-        source: anyhow::Error::new(error),
-      };
-    }
-    Error::Request {
-      source: pipeline_error(error, endpoint).into(),
-    }
+    Error::from_execution(error, endpoint)
   }
 
   fn finish_response<'a>(
@@ -303,22 +282,5 @@ impl Client<StdPlatform> {
   /// Subscribe to lifecycle events. Subscriptions remain valid across reloads.
   pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Arc<Event>> {
     self.platform.subscribe_events()
-  }
-
-  pub(crate) async fn execute_generation(
-    &self,
-    endpoint: Endpoint,
-    body: Value,
-    options: RequestOptions,
-    generation_options: GenerationOptions,
-  ) -> Result<RawResponse> {
-    self
-      .execute_with_generation_options(
-        endpoint,
-        body,
-        options,
-        (!generation_options.is_empty()).then_some(generation_options),
-      )
-      .await
   }
 }
