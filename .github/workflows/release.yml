@@ -22,7 +22,7 @@ jobs:
             artifact_name: tokn-gateway-x86_64-unknown-linux-gnu
             binary_name: tokn-gateway
             archive_ext: tar.gz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: tokn-gateway-aarch64-apple-darwin
             binary_name: tokn-gateway

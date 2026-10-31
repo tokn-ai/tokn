@@ -251,6 +251,250 @@ mod tests {
   }
 
   #[test]
+  fn buffered_sse_tool_calls_keep_identity_and_object_inputs_across_endpoints() {
+    for (from, frames) in [
+      (
+        Endpoint::ChatCompletions,
+        vec![
+          json!({"id":"chat-1","model":"test-model","choices":[{"delta":{"content":"hello"}}]}),
+          json!({"choices":[{"delta":{"tool_calls":[{"index":9,"id":"call-1","function":{"name":"lookup","arguments":"{\"query\":"}}]}}]}),
+          json!({"choices":[{"delta":{"tool_calls":[{"index":3,"id":"call-2","function":{"name":"status","arguments":"{}"}}]}}]}),
+          json!({"choices":[{"delta":{"tool_calls":[{"index":9,"function":{"arguments":"\"rust\"}"}}]},"finish_reason":"tool_calls"}]}),
+        ],
+      ),
+      (
+        Endpoint::Responses,
+        vec![
+          json!({"type":"response.created","response":{"id":"resp-1","model":"test-model"}}),
+          json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"hello"}),
+          json!({"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup"}}),
+          json!({"type":"response.function_call_arguments.delta","output_index":3,"delta":"{\"query\":"}),
+          json!({"type":"response.output_item.added","output_index":7,"item":{"type":"function_call","id":"fc-2","call_id":"call-2","name":"status"}}),
+          json!({"type":"response.function_call_arguments.delta","output_index":7,"delta":"{}"}),
+          json!({"type":"response.function_call_arguments.delta","output_index":3,"delta":"\"rust\"}"}),
+          json!({"type":"response.completed","response":{"id":"resp-1","model":"test-model"}}),
+        ],
+      ),
+      (
+        Endpoint::Messages,
+        vec![
+          json!({"type":"message_start","message":{"id":"msg-1","model":"test-model"}}),
+          json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+          json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+          json!({"type":"content_block_stop","index":0}),
+          json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-1","name":"lookup","input":{}}}),
+          json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}),
+          json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"rust\"}"}}),
+          json!({"type":"content_block_stop","index":2}),
+          json!({"type":"content_block_start","index":5,"content_block":{"type":"tool_use","id":"call-2","name":"status","input":{}}}),
+          json!({"type":"content_block_stop","index":5}),
+          json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+          json!({"type":"message_stop"}),
+        ],
+      ),
+    ] {
+      let mut bytes = Vec::new();
+      for frame in frames {
+        bytes.extend_from_slice(b"data: ");
+        bytes.extend(serde_json::to_vec(&frame).unwrap());
+        bytes.extend_from_slice(b"\n\n");
+      }
+      if from == Endpoint::ChatCompletions {
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+      }
+      for to in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
+        let output = convert_response(
+          from,
+          to,
+          Bytes::copy_from_slice(&bytes),
+          Some("text/event-stream"),
+          usize::MAX,
+          |_| {},
+        )
+        .unwrap();
+        let body = output.body_json.unwrap();
+        let calls: Vec<_> = match to {
+          Endpoint::ChatCompletions => {
+            assert_eq!(body["choices"][0]["message"]["content"], "hello");
+            body["choices"][0]["message"]["tool_calls"]
+              .as_array()
+              .unwrap()
+              .iter()
+              .map(|call| {
+                (
+                  call["id"].clone(),
+                  call["function"]["name"].clone(),
+                  serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap()).unwrap(),
+                )
+              })
+              .collect()
+          }
+          Endpoint::Responses => {
+            assert_eq!(body["output_text"], "hello");
+            body["output"]
+              .as_array()
+              .unwrap()
+              .iter()
+              .filter(|item| item["type"] == "function_call")
+              .map(|call| {
+                (
+                  call["call_id"].clone(),
+                  call["name"].clone(),
+                  serde_json::from_str::<Value>(call["arguments"].as_str().unwrap()).unwrap(),
+                )
+              })
+              .collect()
+          }
+          Endpoint::Messages => {
+            assert_eq!(body["content"][0]["text"], "hello");
+            body["content"]
+              .as_array()
+              .unwrap()
+              .iter()
+              .filter(|item| item["type"] == "tool_use")
+              .map(|call| (call["id"].clone(), call["name"].clone(), call["input"].clone()))
+              .collect()
+          }
+        };
+        assert_eq!(
+          calls,
+          vec![
+            (json!("call-1"), json!("lookup"), json!({"query": "rust"})),
+            (json!("call-2"), json!("status"), json!({})),
+          ],
+          "{from:?} -> {to:?}"
+        );
+        assert!(output.accumulated_sse);
+      }
+    }
+  }
+
+  #[test]
+  fn empty_buffered_tool_arguments_normalize_across_endpoints() {
+    for arguments in [None, Some(""), Some(" \t\n")] {
+      for from in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
+        let frames = match from {
+          Endpoint::ChatCompletions => {
+            let mut function = json!({"name":"lookup"});
+            if let Some(arguments) = arguments {
+              function["arguments"] = json!(arguments);
+            }
+            vec![
+              json!({"choices":[{"delta":{"tool_calls":[{"index":3,"id":"call-1","function":function}]},"finish_reason":"tool_calls"}]}),
+            ]
+          }
+          Endpoint::Responses => {
+            let mut item = json!({"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup"});
+            if let Some(arguments) = arguments {
+              item["arguments"] = json!(arguments);
+            }
+            vec![
+              json!({"type":"response.output_item.added","output_index":3,"item":item}),
+              json!({"type":"response.completed","response":{"id":"resp-1"}}),
+            ]
+          }
+          Endpoint::Messages => {
+            let mut frames = vec![
+              json!({"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call-1","name":"lookup","input":{}}}),
+            ];
+            if let Some(arguments) = arguments {
+              frames.push(json!({"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":arguments}}));
+            }
+            frames.extend([
+              json!({"type":"content_block_stop","index":3}),
+              json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+              json!({"type":"message_stop"}),
+            ]);
+            frames
+          }
+        };
+        let mut bytes = Vec::new();
+        for frame in frames {
+          bytes.extend_from_slice(b"data: ");
+          bytes.extend(serde_json::to_vec(&frame).unwrap());
+          bytes.extend_from_slice(b"\n\n");
+        }
+        if from == Endpoint::ChatCompletions {
+          bytes.extend_from_slice(b"data: [DONE]\n\n");
+        }
+        for to in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
+          let output = convert_response(from, to, Bytes::copy_from_slice(&bytes), None, usize::MAX, |_| {})
+            .unwrap()
+            .body_json
+            .unwrap();
+          let (id, name, input) = match to {
+            Endpoint::ChatCompletions => {
+              let calls = output["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+              assert_eq!(calls.len(), 1);
+              (
+                &calls[0]["id"],
+                &calls[0]["function"]["name"],
+                &calls[0]["function"]["arguments"],
+              )
+            }
+            Endpoint::Responses => {
+              let calls = output["output"].as_array().unwrap();
+              assert_eq!(calls.len(), 1);
+              (&calls[0]["call_id"], &calls[0]["name"], &calls[0]["arguments"])
+            }
+            Endpoint::Messages => {
+              let calls = output["content"].as_array().unwrap();
+              assert_eq!(calls.len(), 1);
+              (&calls[0]["id"], &calls[0]["name"], &calls[0]["input"])
+            }
+          };
+          assert_eq!(id, "call-1", "{from:?} -> {to:?}, {arguments:?}");
+          assert_eq!(name, "lookup", "{from:?} -> {to:?}, {arguments:?}");
+          let expected = if to == Endpoint::Messages {
+            json!({})
+          } else {
+            json!("{}")
+          };
+          assert_eq!(input, &expected);
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn malformed_buffered_tool_arguments_are_preserved_or_rejected_for_messages() {
+    for arguments in [r#"{"query":"#, r#""a string""#] {
+      let body = Bytes::from(format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"choices":[{"delta":{"tool_calls":[{"index":4,"id":"call-1","function":{"name":"lookup","arguments":arguments}}]},"finish_reason":"tool_calls"}]}),
+      ));
+      for to in [Endpoint::ChatCompletions, Endpoint::Responses] {
+        let output = convert_response(Endpoint::ChatCompletions, to, body.clone(), None, usize::MAX, |_| {})
+          .unwrap()
+          .body_json
+          .unwrap();
+        let rendered = match to {
+          Endpoint::ChatCompletions => &output["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+          Endpoint::Responses => &output["output"][0]["arguments"],
+          Endpoint::Messages => unreachable!(),
+        };
+        assert_eq!(rendered, arguments);
+      }
+      assert!(matches!(
+        convert_response(
+          Endpoint::ChatCompletions,
+          Endpoint::Messages,
+          body,
+          None,
+          usize::MAX,
+          |_| panic!("invalid tool input cannot produce a Messages response"),
+        ),
+        Err(BufferedError::Conversion {
+          source: ConvertError::BadShape {
+            field: "tool_use.input",
+            ..
+          }
+        })
+      ));
+    }
+  }
+
+  #[test]
   fn malformed_or_incomplete_sse_and_event_limits_fail_before_observation() {
     for (body, content_type, limit) in [
       (b"not json".as_slice(), None, usize::MAX),

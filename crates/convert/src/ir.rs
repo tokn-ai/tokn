@@ -158,6 +158,9 @@ pub enum IrDelta {
 }
 
 impl IrResponse {
+  /// Apply a delta whose tool indices address this response's dense tool list.
+  /// Protocol block/output indices must be mapped by the stateful accumulator.
+  /// Tool arguments remain string fragments until accumulation is complete.
   pub fn push_delta(&mut self, delta: IrDelta) {
     match delta {
       IrDelta::Text(text) => push_text_part(&mut self.content, text),
@@ -355,6 +358,29 @@ pub fn insert_opt_u64(out: &mut Map<String, Value>, key: &str, value: Option<u64
 mod tests {
   use super::*;
   use serde_json::json;
+
+  #[test]
+  fn response_accumulation_keeps_partial_tool_arguments_as_fragments() {
+    let mut response = IrResponse::default();
+    response.push_delta(IrDelta::ToolCall {
+      index: 0,
+      id: Some("call-1".into()),
+      name: Some("lookup".into()),
+      arguments_delta: r#"{"query":"#.into(),
+    });
+    assert_eq!(response.tool_calls[0].arguments, json!(r#"{"query":"#));
+
+    response.push_delta(IrDelta::ToolCall {
+      index: 0,
+      id: None,
+      name: None,
+      arguments_delta: r#""rust"}"#.into(),
+    });
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id.as_deref(), Some("call-1"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!(r#"{"query":"rust"}"#));
+  }
 
   #[test]
   fn usage_round_trip_preserves_extra_usage_fields() {

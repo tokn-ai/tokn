@@ -186,11 +186,20 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
     content.push(json!({ "type": "thinking", "thinking": reasoning }));
   }
   for call in &resp.tool_calls {
+    let input = match &call.arguments {
+      Value::Object(_) => call.arguments.clone(),
+      Value::String(arguments) if arguments.trim().is_empty() => json!({}),
+      Value::String(arguments) => serde_json::from_str::<Value>(arguments)
+        .ok()
+        .filter(Value::is_object)
+        .ok_or_else(|| ConvertError::bad_shape("tool_use.input", "expected a JSON object"))?,
+      _ => return Err(ConvertError::bad_shape("tool_use.input", "expected a JSON object")),
+    };
     content.push(json!({
       "type": "tool_use",
       "id": call.id.clone().unwrap_or_else(|| "toolu_converted".into()),
       "name": call.name,
-      "input": call.arguments,
+      "input": input,
     }));
   }
   let mut out = json!({
@@ -295,7 +304,23 @@ pub fn delta_from_messages_event(v: &Value) -> Vec<IrDelta> {
   out
 }
 
+/// Format unframed delta events, or a complete Messages stream when `finish`
+/// is true. Incremental streams should retain a stateful `MessagesEmitter`.
 pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Vec<(String, Value)> {
+  if finish {
+    let mut emitter = crate::sse::messages_emit::MessagesEmitter::new(resp_id.into(), model.into());
+    let mut events = emitter.emit(deltas);
+    events.extend(emitter.finish());
+    return events
+      .into_iter()
+      .map(|event| {
+        (
+          event.event.expect("Messages events are named"),
+          event.json.expect("Messages events are JSON"),
+        )
+      })
+      .collect();
+  }
   let mut events = Vec::new();
   for delta in deltas {
     match delta {
@@ -328,23 +353,6 @@ pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish
         json!({ "type": "message_delta", "delta": { "stop_reason": finish_reason_to_messages(reason.as_deref()), "stop_sequence": null } }),
       )),
     }
-  }
-  if finish {
-    events.insert(
-      0,
-      (
-        "message_start".into(),
-        json!({
-          "type": "message_start",
-          "message": { "id": resp_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
-        }),
-      ),
-    );
-    events.push((
-      "content_block_stop".into(),
-      json!({ "type": "content_block_stop", "index": 0 }),
-    ));
-    events.push(("message_stop".into(), json!({ "type": "message_stop" })));
   }
   events
 }
@@ -478,7 +486,7 @@ fn finish_reason_from_messages(reason: &str) -> String {
   .to_string()
 }
 
-fn finish_reason_to_messages(reason: Option<&str>) -> String {
+pub(crate) fn finish_reason_to_messages(reason: Option<&str>) -> String {
   match reason {
     None | Some("stop" | "end_turn" | "stop_sequence") => "end_turn",
     Some("length" | "max_tokens" | "max_output_tokens") => "max_tokens",
@@ -497,6 +505,44 @@ fn _tool_args_string(call: &ToolCall) -> String {
 mod tests {
   use super::*;
   use serde_json::json;
+
+  #[test]
+  fn messages_response_decodes_json_tool_arguments_and_rejects_invalid_input() {
+    for (arguments, expected) in [
+      (json!({"query": "rust"}), json!({"query": "rust"})),
+      (json!(r#"{"query":"rust"}"#), json!({"query": "rust"})),
+      (json!(""), json!({})),
+      (json!(" \t\n"), json!({})),
+    ] {
+      let response = IrResponse {
+        tool_calls: vec![ToolCall {
+          id: Some("call-1".into()),
+          name: "lookup".into(),
+          arguments,
+        }],
+        ..IrResponse::default()
+      };
+      let body = response_to_value(&response).unwrap();
+      assert_eq!(body["content"][0]["input"], expected);
+    }
+
+    for arguments in [json!(r#"{"query":"#), json!("[]"), json!([]), Value::Null] {
+      let response = IrResponse {
+        tool_calls: vec![ToolCall {
+          arguments,
+          ..ToolCall::default()
+        }],
+        ..IrResponse::default()
+      };
+      assert!(matches!(
+        response_to_value(&response),
+        Err(ConvertError::BadShape {
+          field: "tool_use.input",
+          ..
+        })
+      ));
+    }
+  }
 
   #[test]
   fn messages_response_preserves_usage_extras() {
@@ -750,13 +796,13 @@ mod tests {
       other => panic!("expected tool call delta, got {other:?}"),
     }
 
-    let mut response = IrResponse::default();
-    for delta in deltas {
-      response.push_delta(delta);
-    }
+    let mut accumulator = crate::sse::SseAccumulator::new(crate::provider::Endpoint::Messages);
+    accumulator.push_value(&start);
+    let response = accumulator.finish();
 
-    assert_eq!(response.tool_calls[2].id.as_deref(), Some("toolu_123"));
-    assert_eq!(response.tool_calls[2].name, "lookup");
-    assert_eq!(response.tool_calls[2].arguments, json!(r#"{"query":"rust"}"#));
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id.as_deref(), Some("toolu_123"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "rust"}));
   }
 }

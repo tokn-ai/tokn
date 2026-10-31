@@ -44,6 +44,7 @@ pub struct SseMetadata {
 pub struct SseAccumulator {
   endpoint: Endpoint,
   response: IrResponse,
+  tool_indices: BTreeMap<usize, usize>,
   responses: ResponsesState,
   messages: MessagesState,
 }
@@ -53,6 +54,7 @@ impl SseAccumulator {
     Self {
       endpoint,
       response: IrResponse::default(),
+      tool_indices: BTreeMap::new(),
       responses: ResponsesState::default(),
       messages: MessagesState::default(),
     }
@@ -71,13 +73,50 @@ impl SseAccumulator {
       }
     };
     for delta in deltas.iter().cloned() {
-      self.response.push_delta(delta);
+      self.push_response_delta(delta);
     }
     deltas
   }
 
+  fn push_response_delta(&mut self, mut delta: IrDelta) {
+    if let IrDelta::ToolCall { index, .. } = &mut delta {
+      // Messages block indices and Responses output indices also count
+      // non-tool content. Only buffered tool storage needs dense indices;
+      // returned deltas retain their source identity for stream adapters.
+      let next_index = self.tool_indices.len();
+      *index = *self.tool_indices.entry(*index).or_insert(next_index);
+    }
+    self.response.push_delta(delta);
+  }
+
   pub fn finish(self) -> IrResponse {
     let mut response = self.response;
+    if matches!(self.endpoint, Endpoint::Responses) {
+      for (source_index, item) in &self.responses.output_items {
+        let Some(index) = self.tool_indices.get(source_index) else {
+          continue;
+        };
+        let call = &mut response.tool_calls[*index];
+        if call
+          .arguments
+          .as_str()
+          .is_some_and(|arguments| arguments.trim().is_empty())
+        {
+          // A zero-argument call may have no argument deltas at all. A final
+          // item/arguments snapshot can still supply its complete input.
+          call.arguments = Value::String(item.arguments.clone());
+        }
+      }
+    }
+    for call in &mut response.tool_calls {
+      if let Value::String(arguments) = &call.arguments {
+        if arguments.trim().is_empty() {
+          call.arguments = Value::Object(serde_json::Map::new());
+        } else if let Ok(Value::Object(arguments)) = serde_json::from_str(arguments) {
+          call.arguments = Value::Object(arguments);
+        }
+      }
+    }
     if response.id.is_none() {
       response.id = self.responses.response_id.clone();
     }
@@ -122,6 +161,9 @@ impl SseAccumulator {
     self.observe_responses_part(value);
     let mut deltas = crate::value::responses::delta_from_responses_event(value);
     self.observe_responses_deltas(value, &deltas);
+    let mut item_deltas = self.responses_tool_item_deltas(value);
+    item_deltas.append(&mut deltas);
+    let mut deltas = item_deltas;
     if matches!(value.get("type").and_then(Value::as_str), Some("response.completed")) {
       let reason = self.responses_completed_finish_reason(Some(value));
       for delta in &mut deltas {
@@ -143,6 +185,63 @@ impl SseAccumulator {
           }
         }
       }
+    }
+    deltas
+  }
+
+  fn responses_tool_item_deltas(&self, value: &Value) -> Vec<IrDelta> {
+    let snapshot = match value.get("type").and_then(Value::as_str) {
+      Some("response.output_item.added" | "response.output_item.done") => value.get("item"),
+      Some("response.function_call_arguments.done" | "response.custom_tool_call_input.done") => Some(value),
+      _ => return Vec::new(),
+    };
+    let Some(index) = value
+      .get("output_index")
+      .and_then(Value::as_u64)
+      .map(|index| index as usize)
+    else {
+      return Vec::new();
+    };
+    let Some(item) = self.responses.output_items.get(&index) else {
+      return Vec::new();
+    };
+    if !matches!(item.item_type.as_deref(), Some("function_call" | "custom_tool_call")) {
+      return Vec::new();
+    }
+    let mut deltas = Vec::new();
+    let current = self
+      .tool_indices
+      .get(&index)
+      .and_then(|index| self.response.tool_calls.get(*index));
+    let id = item.call_id.as_ref().or(item.id.as_ref());
+    let identity_changed = match current {
+      None => true,
+      Some(current) => {
+        id.is_some_and(|id| current.id.as_ref() != Some(id))
+          || item.name.as_ref().is_some_and(|name| current.name != *name)
+      }
+    };
+    if identity_changed {
+      deltas.push(IrDelta::ToolCall {
+        index,
+        id: id.cloned(),
+        name: item.name.clone(),
+        arguments_delta: String::new(),
+      });
+    }
+    let arguments = current.and_then(|call| call.arguments.as_str()).unwrap_or_default();
+    if let Some(suffix) = snapshot
+      .and_then(|snapshot| snapshot.get("arguments").or_else(|| snapshot.get("input")))
+      .and_then(Value::as_str)
+      .and_then(|snapshot| snapshot.strip_prefix(arguments))
+      .filter(|suffix| !suffix.is_empty())
+    {
+      deltas.push(IrDelta::ToolCall {
+        index,
+        id: None,
+        name: None,
+        arguments_delta: suffix.to_string(),
+      });
     }
     deltas
   }
@@ -460,7 +559,7 @@ mod tests {
     let response = accumulator.finish();
     assert_eq!(response.tool_calls[0].id.as_deref(), Some("toolu_1"));
     assert_eq!(response.tool_calls[0].name, "lookup");
-    assert_eq!(response.tool_calls[0].arguments, json!("{}"));
+    assert_eq!(response.tool_calls[0].arguments, json!({}));
   }
 
   #[test]
@@ -485,6 +584,140 @@ mod tests {
 
     assert!(stop.is_empty());
     let response = accumulator.finish();
-    assert_eq!(response.tool_calls[0].arguments, json!(r#"{"query":"rust"}"#));
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "rust"}));
+  }
+
+  #[test]
+  fn responses_tool_snapshots_emit_identity_and_only_missing_argument_suffixes() {
+    let mut accumulator = SseAccumulator::new(Endpoint::Responses);
+    let start = accumulator.push_value(&json!({
+      "type":"response.output_item.added",
+      "output_index":4,
+      "item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":""}
+    }));
+    assert!(matches!(
+      start.as_slice(),
+      [IrDelta::ToolCall { index: 4, id: Some(id), name: Some(name), arguments_delta }]
+        if id == "call-1" && name == "lookup" && arguments_delta.is_empty()
+    ));
+    accumulator.push_value(&json!({
+      "type":"response.function_call_arguments.delta",
+      "output_index":4,
+      "delta":"{\"query\":"
+    }));
+    let snapshot = json!({
+      "type":"response.function_call_arguments.done",
+      "output_index":4,
+      "arguments":"{\"query\":\"rust\"}"
+    });
+    let suffix = accumulator.push_value(&snapshot);
+    assert!(matches!(
+      suffix.as_slice(),
+      [IrDelta::ToolCall { index: 4, arguments_delta, .. }] if arguments_delta == "\"rust\"}"
+    ));
+    assert!(accumulator.push_value(&snapshot).is_empty());
+    assert!(accumulator.push_value(&json!({
+      "type":"response.output_item.done",
+      "output_index":4,
+      "item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{\"query\":\"rust\"}"}
+    })).is_empty());
+    let response = accumulator.finish();
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].arguments, json!({"query": "rust"}));
+  }
+
+  #[test]
+  fn responses_tool_metadata_corrects_identity_after_argument_deltas() {
+    let mut accumulator = SseAccumulator::new(Endpoint::Responses);
+    accumulator.push_value(&json!({
+      "type":"response.function_call_arguments.delta",
+      "output_index":4,
+      "item_id":"fc-1",
+      "delta":"{}"
+    }));
+    let snapshot = json!({
+      "type":"response.output_item.done",
+      "output_index":4,
+      "item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}
+    });
+    let metadata = accumulator.push_value(&snapshot);
+    assert!(matches!(
+      metadata.as_slice(),
+      [IrDelta::ToolCall { index: 4, id: Some(id), name: Some(name), arguments_delta }]
+        if id == "call-1" && name == "lookup" && arguments_delta.is_empty()
+    ));
+    assert!(accumulator.push_value(&snapshot).is_empty());
+    let response = accumulator.finish();
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id.as_deref(), Some("call-1"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!({}));
+  }
+
+  #[test]
+  fn responses_tool_done_can_supply_a_call_without_prior_deltas() {
+    let mut accumulator = SseAccumulator::new(Endpoint::Responses);
+    let deltas = accumulator.push_value(&json!({
+      "type":"response.output_item.done",
+      "output_index":4,
+      "item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"{}"}
+    }));
+    assert!(matches!(
+      deltas.as_slice(),
+      [IrDelta::ToolCall { index: 4, arguments_delta: identity_arguments, .. },
+        IrDelta::ToolCall { index: 4, arguments_delta: snapshot_arguments, .. }]
+        if identity_arguments.is_empty() && snapshot_arguments == "{}"
+    ));
+    let response = accumulator.finish();
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.tool_calls[0].id.as_deref(), Some("call-1"));
+    assert_eq!(response.tool_calls[0].name, "lookup");
+    assert_eq!(response.tool_calls[0].arguments, json!({}));
+  }
+
+  #[test]
+  fn sparse_tool_indices_are_dense_only_in_the_buffered_response() {
+    for (endpoint, frames, source_index) in [
+      (
+        Endpoint::ChatCompletions,
+        vec![
+          json!({"choices":[{"delta":{"tool_calls":[{"index":9,"id":"call-1","function":{"name":"lookup","arguments":"{}"}}]}}]}),
+        ],
+        9,
+      ),
+      (
+        Endpoint::Responses,
+        vec![
+          json!({"type":"response.output_item.added","output_index":3,"item":{"type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup"}}),
+          json!({"type":"response.function_call_arguments.delta","output_index":3,"delta":"{}"}),
+        ],
+        3,
+      ),
+      (
+        Endpoint::Messages,
+        vec![
+          json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"call-1","name":"lookup","input":{}}}),
+          json!({"type":"content_block_stop","index":2}),
+        ],
+        2,
+      ),
+    ] {
+      let mut accumulator = SseAccumulator::new(endpoint);
+      let mut tool_deltas = 0;
+      for frame in frames {
+        for delta in accumulator.push_value(&frame) {
+          if let IrDelta::ToolCall { index, .. } = delta {
+            assert_eq!(index, source_index);
+            tool_deltas += 1;
+          }
+        }
+      }
+      assert!(tool_deltas > 0);
+      let response = accumulator.finish();
+      assert_eq!(response.tool_calls.len(), 1);
+      assert_eq!(response.tool_calls[0].id.as_deref(), Some("call-1"));
+      assert_eq!(response.tool_calls[0].name, "lookup");
+      assert_eq!(response.tool_calls[0].arguments, json!({}));
+    }
   }
 }
