@@ -452,6 +452,166 @@ async fn all_native_pairs_complete_once_at_the_upstream_terminal_without_eof() {
   }
 }
 
+fn mixed_tool_stream(endpoint: Endpoint) -> Vec<u8> {
+  let events = match endpoint {
+    Endpoint::ChatCompletions => vec![
+      json!({"id": "response-test", "model": "fixture", "choices": [{"index": 0,
+        "delta": {"reasoning_content": "think "}, "finish_reason": null}]}),
+      json!({"choices": [{"index": 0, "delta": {"reasoning_content": "carefully"}, "finish_reason": null}]}),
+      json!({"choices": [{"index": 0, "delta": {"content": TEXT}, "finish_reason": null}]}),
+      json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 4, "id": "call-a", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":"}},
+        {"index": 11, "id": "call-b", "type": "function", "function": {"name": "sum", "arguments": "{\"a\":"}}
+      ]}, "finish_reason": null}]}),
+      json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 11, "function": {"arguments": "2}"}},
+        {"index": 4, "function": {"arguments": "\"x\"}"}}
+      ]}, "finish_reason": null}]}),
+      json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+      // Chat can report final usage after the semantic finish reason.
+      json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}),
+    ],
+    Endpoint::Responses => vec![
+      json!({"type": "response.created", "response": {"id": "response-test", "model": "fixture", "status": "in_progress", "output": []}}),
+      json!({"type": "response.reasoning_text.delta", "item_id": "reasoning-test", "output_index": 0, "content_index": 0, "delta": "think "}),
+      json!({"type": "response.reasoning_text.delta", "item_id": "reasoning-test", "output_index": 0, "content_index": 0, "delta": "carefully"}),
+      json!({"type": "response.output_text.delta", "item_id": "message-test", "output_index": 1, "content_index": 0, "delta": TEXT}),
+      json!({"type": "response.output_item.added", "output_index": 4,
+        "item": {"type": "function_call", "id": "item-a", "call_id": "call-a", "name": "lookup", "arguments": ""}}),
+      json!({"type": "response.output_item.added", "output_index": 11,
+        "item": {"type": "function_call", "id": "item-b", "call_id": "call-b", "name": "sum", "arguments": ""}}),
+      json!({"type": "response.function_call_arguments.delta", "output_index": 4, "item_id": "item-a", "delta": "{\"q\":"}),
+      json!({"type": "response.function_call_arguments.delta", "output_index": 11, "item_id": "item-b", "delta": "{\"a\":"}),
+      json!({"type": "response.function_call_arguments.delta", "output_index": 11, "item_id": "item-b", "delta": "2}"}),
+      json!({"type": "response.function_call_arguments.delta", "output_index": 4, "item_id": "item-a", "delta": "\"x\"}"}),
+      json!({"type": "response.completed", "response": {
+        "id": "response-test", "model": "fixture", "status": "completed",
+        "output": [
+          {"type": "reasoning", "id": "reasoning-test", "content": [{"type": "reasoning_text", "text": "think carefully"}]},
+          {"type": "message", "id": "message-test", "role": "assistant", "content": [{"type": "output_text", "text": TEXT}]},
+          {"type": "function_call", "id": "item-a", "call_id": "call-a", "name": "lookup", "arguments": "{\"q\":\"x\"}"},
+          {"type": "function_call", "id": "item-b", "call_id": "call-b", "name": "sum", "arguments": "{\"a\":2}"}
+        ],
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}
+      }}),
+    ],
+    Endpoint::Messages => unreachable!("fixture exercises cross-endpoint conversion into Messages"),
+  };
+  let mut bytes = encode(&events);
+  if endpoint == Endpoint::ChatCompletions {
+    bytes.extend_from_slice(b"data: [DONE]\r\n\r\n");
+  }
+  bytes
+}
+
+fn assert_messages_block_lifecycle(events: &[SseEvent]) {
+  assert_eq!(
+    events.first().and_then(|event| event.event.as_deref()),
+    Some("message_start")
+  );
+  let mut blocks = Vec::<Value>::new();
+  let mut arguments = Vec::<String>::new();
+  let mut active = None;
+  let mut message_delta_seen = false;
+  let mut stopped = false;
+  let mut final_usage = Value::Null;
+  let mut stop_reason = Value::Null;
+  for (position, event) in events.iter().enumerate() {
+    assert!(!stopped, "no events follow message_stop");
+    let value = event.json.as_ref().expect("Messages events contain JSON");
+    let kind = value["type"].as_str().unwrap();
+    assert_eq!(event.event.as_deref(), Some(kind));
+    match kind {
+      "message_start" => {
+        assert_eq!(position, 0, "message_start occurs exactly once at the beginning");
+        assert_eq!(value["message"]["content"], json!([]));
+        assert_eq!(value["message"]["id"], "response-test");
+        assert_eq!(value["message"]["model"], "fixture");
+      }
+      "content_block_start" => {
+        assert!(!message_delta_seen, "content precedes the final message deltas");
+        assert!(active.is_none(), "the previous block closes before the next starts");
+        let index = value["index"].as_u64().unwrap() as usize;
+        assert_eq!(index, blocks.len(), "target block indexes are dense and never reused");
+        blocks.push(value["content_block"].clone());
+        arguments.push(String::new());
+        active = Some(index);
+      }
+      "content_block_delta" => {
+        assert!(!message_delta_seen);
+        let index = value["index"].as_u64().unwrap() as usize;
+        assert_eq!(active, Some(index), "every delta belongs to its open block");
+        let delta = &value["delta"];
+        let field = match (blocks[index]["type"].as_str().unwrap(), delta["type"].as_str().unwrap()) {
+          ("text", "text_delta") => "text",
+          ("thinking", "thinking_delta") => "thinking",
+          ("tool_use", "input_json_delta") => {
+            arguments[index].push_str(delta["partial_json"].as_str().unwrap());
+            continue;
+          }
+          pair => panic!("delta type must match the open content block: {pair:?}"),
+        };
+        let mut text = blocks[index][field].as_str().unwrap().to_owned();
+        text.push_str(delta[field].as_str().unwrap());
+        blocks[index][field] = Value::String(text);
+      }
+      "content_block_stop" => {
+        let index = value["index"].as_u64().unwrap() as usize;
+        assert_eq!(active.take(), Some(index), "each started block closes exactly once");
+        if blocks[index]["type"] == "tool_use" {
+          assert_eq!(
+            blocks[index]["input"],
+            json!({}),
+            "tool input starts with an empty object"
+          );
+          blocks[index]["input"] = serde_json::from_str(&arguments[index]).expect("complete fixture arguments");
+        }
+      }
+      "message_delta" => {
+        assert!(active.is_none(), "all content blocks close before message_delta");
+        message_delta_seen = true;
+        if let Some(usage) = value.get("usage") {
+          final_usage = usage.clone();
+        }
+        if let Some(reason) = value.pointer("/delta/stop_reason").filter(|reason| !reason.is_null()) {
+          stop_reason = reason.clone();
+        }
+      }
+      "message_stop" => {
+        assert!(active.is_none());
+        assert!(message_delta_seen);
+        stopped = true;
+      }
+      other => panic!("unexpected converted Messages event: {other}"),
+    }
+  }
+  assert!(stopped, "converted stream ends with message_stop");
+  assert_eq!(stop_reason, "tool_use");
+  assert_eq!(final_usage["input_tokens"], 7);
+  assert_eq!(final_usage["output_tokens"], 3);
+  assert_eq!(blocks.len(), 4, "no phantom text or tool blocks");
+  assert_eq!(blocks[0]["type"], "thinking");
+  assert_eq!(blocks[0]["thinking"], "think carefully");
+  assert_eq!(blocks[1], json!({"type": "text", "text": TEXT}));
+  assert_eq!(
+    blocks[2],
+    json!({"type": "tool_use", "id": "call-a", "name": "lookup", "input": {"q": "x"}})
+  );
+  assert_eq!(
+    blocks[3],
+    json!({"type": "tool_use", "id": "call-b", "name": "sum", "input": {"a": 2}})
+  );
+}
+
+#[tokio::test]
+async fn messages_conversion_preserves_mixed_content_and_interleaved_tools_across_transports() {
+  for upstream in [Endpoint::ChatCompletions, Endpoint::Responses] {
+    let mut fixture = Fixture::new(mixed_tool_stream(upstream), true, 3).await;
+    let events = fixture.compare(upstream, Endpoint::Messages, true).await;
+    assert_messages_block_lifecycle(&events);
+  }
+}
+
 #[tokio::test]
 async fn missing_and_failed_terminal_events_fail_once_without_retrying() {
   for upstream in ENDPOINTS {

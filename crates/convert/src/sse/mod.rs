@@ -2,6 +2,7 @@ pub mod accumulate;
 pub mod codec;
 pub mod decoder;
 pub mod event;
+pub mod messages_emit;
 #[cfg(feature = "std")]
 pub mod pipeline;
 mod processor;

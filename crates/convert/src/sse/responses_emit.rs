@@ -1,12 +1,13 @@
 //! State machine that emits a faithful Responses-API SSE lifecycle from a
 //! generic stream of `IrDelta`s.
 //!
-//! Output items are emitted strictly sequentially: each item is fully closed
-//! (its `*.done` events) before the next item's `output_item.added` is sent.
+//! Text and reasoning items close when the content kind changes. Function
+//! calls remain open until the response finishes because their argument deltas
+//! may interleave and the IR has no per-call completion event.
 
 use super::event::SseEvent;
 use crate::ir::{IrDelta, Usage};
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, string::ToString, vec::Vec};
 use serde_json::{json, Value};
 #[cfg(feature = "std")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,7 +22,6 @@ enum OpenItem {
   },
   FunctionCall {
     output_index: usize,
-    chat_index: usize,
     item_id: String,
     call_id: String,
     name: String,
@@ -61,7 +61,8 @@ pub struct ResponsesEmitter {
   next_output_index: usize,
   next_item_counter: usize,
   current: Option<OpenItem>,
-  closed: Vec<Value>,
+  tool_calls: BTreeMap<usize, OpenItem>,
+  closed: BTreeMap<usize, Value>,
   created_emitted: bool,
   in_progress_emitted: bool,
   finished: bool,
@@ -91,7 +92,8 @@ impl ResponsesEmitter {
       next_output_index: 0,
       next_item_counter: 0,
       current: None,
-      closed: Vec::new(),
+      tool_calls: BTreeMap::new(),
+      closed: BTreeMap::new(),
       created_emitted: false,
       in_progress_emitted: false,
       finished: false,
@@ -152,7 +154,7 @@ impl ResponsesEmitter {
       "created_at": self.created_at,
       "status": status,
       "model": self.model,
-      "output": if completed { Value::Array(self.closed.clone()) } else { Value::Array(Vec::new()) },
+      "output": if completed { Value::Array(self.closed.values().cloned().collect()) } else { Value::Array(Vec::new()) },
       "usage": self.usage.as_ref().map(crate::ir::usage_to_io).unwrap_or(Value::Null),
     });
     if completed {
@@ -168,7 +170,7 @@ impl ResponsesEmitter {
   }
 
   pub fn emit(&mut self, deltas: &[IrDelta]) -> Vec<SseEvent> {
-    if deltas.is_empty() {
+    if self.finished || deltas.is_empty() {
       return Vec::new();
     }
     let mut out = Vec::new();
@@ -339,15 +341,14 @@ impl ResponsesEmitter {
 
   fn handle_tool_call(
     &mut self,
-    chat_index: usize,
+    source_index: usize,
     id_hint: Option<String>,
     name_hint: Option<String>,
     args_delta: &str,
     out: &mut Vec<SseEvent>,
   ) {
-    let same_call = matches!(&self.current, Some(OpenItem::FunctionCall { chat_index: ci, .. }) if *ci == chat_index);
-    if !same_call {
-      self.close_current(out);
+    self.close_current(out);
+    if !self.tool_calls.contains_key(&source_index) {
       let output_index = self.next_output_index;
       self.next_output_index += 1;
       let item_id = self.synth_item_id("fc");
@@ -370,14 +371,16 @@ impl ResponsesEmitter {
           }
         }),
       ));
-      self.current = Some(OpenItem::FunctionCall {
-        output_index,
-        chat_index,
-        item_id,
-        call_id,
-        name,
-        arguments: String::new(),
-      });
+      self.tool_calls.insert(
+        source_index,
+        OpenItem::FunctionCall {
+          output_index,
+          item_id,
+          call_id,
+          name,
+          arguments: String::new(),
+        },
+      );
     }
     let (output_index, item_id) = if let Some(OpenItem::FunctionCall {
       output_index,
@@ -386,7 +389,7 @@ impl ResponsesEmitter {
       call_id,
       arguments,
       ..
-    }) = &mut self.current
+    }) = self.tool_calls.get_mut(&source_index)
     {
       arguments.push_str(args_delta);
       if let Some(n) = name_hint {
@@ -426,6 +429,11 @@ impl ResponsesEmitter {
     let mut out = Vec::new();
     self.ensure_started(&mut out);
     self.close_current(&mut out);
+    let mut tool_calls: Vec<_> = core::mem::take(&mut self.tool_calls).into_values().collect();
+    tool_calls.sort_by_key(OpenItem::output_index);
+    for call in tool_calls {
+      self.close_item(call, &mut out);
+    }
     let seq = self.next_seq();
     let (status, _) = crate::ir::responses_completion_status(self.finish_reason.as_deref());
     let event_type = match status {
@@ -493,7 +501,7 @@ impl ResponsesEmitter {
             "item": final_item.clone(),
           }),
         ));
-        self.closed.push(final_item);
+        self.closed.insert(output_index, final_item);
       }
       OpenItem::FunctionCall {
         call_id,
@@ -535,7 +543,7 @@ impl ResponsesEmitter {
             "item": final_item.clone(),
           }),
         ));
-        self.closed.push(final_item);
+        self.closed.insert(output_index, final_item);
       }
       OpenItem::Reasoning {
         summary: text,
@@ -573,7 +581,7 @@ impl ResponsesEmitter {
             "item": final_item.clone(),
           }),
         ));
-        self.closed.push(final_item);
+        self.closed.insert(output_index, final_item);
       }
     }
   }
@@ -582,6 +590,122 @@ impl ResponsesEmitter {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn tool_delta(index: usize, id: Option<&str>, name: Option<&str>, arguments_delta: &str) -> IrDelta {
+    IrDelta::ToolCall {
+      index,
+      id: id.map(str::to_string),
+      name: name.map(str::to_string),
+      arguments_delta: arguments_delta.to_string(),
+    }
+  }
+
+  fn event_values<'a>(events: &'a [SseEvent], event_name: &str) -> Vec<&'a Value> {
+    events
+      .iter()
+      .filter(|event| event.event.as_deref() == Some(event_name))
+      .map(|event| event.json.as_ref().expect("JSON event"))
+      .collect()
+  }
+
+  #[test]
+  fn interleaved_tool_calls_keep_one_item_and_complete_arguments_per_call() {
+    let mut emitter = ResponsesEmitter::with_created_at("resp_1".into(), "model".into(), 1);
+    let mut events = emitter.emit(&[
+      IrDelta::Reasoning("plan".into()),
+      tool_delta(5, Some("call_weather"), Some("weather"), "{\"city\":"),
+      tool_delta(2, Some("call_clock"), Some("clock"), "{\"zone\":"),
+    ]);
+    events.extend(emitter.emit(&[
+      tool_delta(5, Some("call_weather"), Some("weather"), "\"Paris\"}"),
+      tool_delta(2, Some("call_clock"), Some("clock"), "\"UTC\"}"),
+      tool_delta(5, Some("call_weather"), Some("weather"), ""),
+    ]));
+
+    let added = event_values(&events, "response.output_item.added");
+    assert_eq!(added.len(), 3, "reasoning and exactly two function-call items");
+    let weather_item = added[1]["item"]["id"].clone();
+    let clock_item = added[2]["item"]["id"].clone();
+    assert_ne!(weather_item, clock_item);
+    assert_eq!(added[1]["output_index"], 1);
+    assert_eq!(added[2]["output_index"], 2);
+    let argument_deltas = event_values(&events, "response.function_call_arguments.delta");
+    assert_eq!(argument_deltas.len(), 4);
+    for (event, item_id, output_index) in [
+      (argument_deltas[0], &weather_item, 1),
+      (argument_deltas[1], &clock_item, 2),
+      (argument_deltas[2], &weather_item, 1),
+      (argument_deltas[3], &clock_item, 2),
+    ] {
+      assert_eq!(&event["item_id"], item_id);
+      assert_eq!(event["output_index"], output_index);
+    }
+    assert!(event_values(&events, "response.function_call_arguments.done").is_empty());
+
+    events.extend(emitter.finish());
+
+    let arguments_done = event_values(&events, "response.function_call_arguments.done");
+    assert_eq!(arguments_done.len(), 2);
+    assert_eq!(arguments_done[0]["item_id"], weather_item);
+    assert_eq!(arguments_done[0]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(arguments_done[1]["item_id"], clock_item);
+    assert_eq!(arguments_done[1]["arguments"], "{\"zone\":\"UTC\"}");
+    let completed = event_values(&events, "response.completed");
+    let output = completed[0]["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["type"], "reasoning");
+    assert_eq!(output[1]["id"], weather_item);
+    assert_eq!(output[1]["call_id"], "call_weather");
+    assert_eq!(output[1]["name"], "weather");
+    assert_eq!(output[1]["arguments"], "{\"city\":\"Paris\"}");
+    assert_eq!(output[2]["id"], clock_item);
+    assert_eq!(output[2]["call_id"], "call_clock");
+    assert_eq!(output[2]["name"], "clock");
+    assert_eq!(output[2]["arguments"], "{\"zone\":\"UTC\"}");
+    for (sequence, event) in events.iter().enumerate() {
+      assert_eq!(event.json.as_ref().unwrap()["sequence_number"], sequence);
+    }
+    assert!(emitter.finish().is_empty());
+    assert!(emitter.emit(&[tool_delta(5, None, None, "ignored")]).is_empty());
+  }
+
+  #[test]
+  fn tool_calls_survive_text_interleaving_and_accept_late_identity_hints() {
+    let mut emitter = ResponsesEmitter::with_created_at("resp_1".into(), "model".into(), 1);
+    let mut events = emitter.emit(&[
+      tool_delta(7, None, None, "{"),
+      IrDelta::Text("working".into()),
+      tool_delta(2, Some("call_second"), Some("second"), "{}"),
+      tool_delta(7, Some("call_first"), Some("first"), "}"),
+      tool_delta(7, Some("call_first"), Some("first"), ""),
+    ]);
+    events.extend(emitter.finish());
+
+    let added = event_values(&events, "response.output_item.added");
+    assert_eq!(
+      added.len(),
+      3,
+      "the first call must not be recreated after text or another call"
+    );
+    let done = event_values(&events, "response.output_item.done");
+    assert_eq!(done.len(), 3);
+    let completed = event_values(&events, "response.completed");
+    let output = completed[0]["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0]["id"], added[0]["item"]["id"]);
+    assert_eq!(output[0]["call_id"], "call_first");
+    assert_eq!(output[0]["name"], "first");
+    assert_eq!(output[0]["arguments"], "{}");
+    assert_eq!(output[1]["type"], "message");
+    assert_eq!(output[1]["content"][0]["text"], "working");
+    assert_eq!(output[2]["id"], added[2]["item"]["id"]);
+    assert_eq!(output[2]["call_id"], "call_second");
+    assert_eq!(output[2]["name"], "second");
+    for event in done {
+      let index = event["output_index"].as_u64().unwrap() as usize;
+      assert_eq!(&event["item"], &output[index]);
+    }
+  }
 
   #[test]
   fn merges_split_usage_before_terminal_event() {

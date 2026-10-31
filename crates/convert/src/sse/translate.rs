@@ -1,5 +1,6 @@
 use super::accumulate::SseAccumulator;
 use super::event::SseEvent;
+use super::messages_emit::MessagesEmitter;
 use super::responses_emit::ResponsesEmitter;
 use super::transformer::EventTransformer;
 use crate::error::{ConvertError, Result};
@@ -167,129 +168,73 @@ fn terminal_reason(
   }
 }
 
-struct EmitState {
-  to: Endpoint,
-  id: String,
-  model: String,
-  started: bool,
-  finished: bool,
-  responses: Option<ResponsesEmitter>,
+enum EmitState {
+  Chat { id: String, model: String },
+  Responses(ResponsesEmitter),
+  Messages(MessagesEmitter),
 }
 
 impl EmitState {
   fn new(to: Endpoint, created_at: u64) -> Self {
-    let id: String = match to {
-      Endpoint::ChatCompletions => "chatcmpl-converted".into(),
-      Endpoint::Responses => "resp_converted".into(),
-      Endpoint::Messages => "msg_converted".into(),
-    };
-    let responses = if matches!(to, Endpoint::Responses) {
-      Some(ResponsesEmitter::with_created_at(id.clone(), String::new(), created_at))
-    } else {
-      None
-    };
-    Self {
-      to,
-      id,
-      model: String::new(),
-      started: false,
-      finished: false,
-      responses,
+    match to {
+      Endpoint::ChatCompletions => Self::Chat {
+        id: "chatcmpl-converted".into(),
+        model: String::new(),
+      },
+      Endpoint::Responses => Self::Responses(ResponsesEmitter::with_created_at(
+        "resp_converted".into(),
+        String::new(),
+        created_at,
+      )),
+      Endpoint::Messages => Self::Messages(MessagesEmitter::new("msg_converted".into(), String::new())),
     }
   }
 
   fn update_metadata(&mut self, metadata: super::accumulate::SseMetadata) {
-    if let Some(id) = metadata.response_id {
-      self.id = id.clone();
-      if let Some(emitter) = self.responses.as_mut() {
-        emitter.update_id(id);
+    match self {
+      Self::Chat { id, model } => {
+        if let Some(value) = metadata.response_id {
+          *id = value;
+        }
+        if let Some(value) = metadata.model {
+          *model = value;
+        }
       }
-    }
-    if let Some(model) = metadata.model {
-      self.model = model.clone();
-      if let Some(emitter) = self.responses.as_mut() {
-        emitter.update_model(model);
+      Self::Responses(emitter) => {
+        if let Some(id) = metadata.response_id {
+          emitter.update_id(id);
+        }
+        if let Some(model) = metadata.model {
+          emitter.update_model(model);
+        }
+      }
+      Self::Messages(emitter) => {
+        if let Some(id) = metadata.response_id {
+          emitter.update_id(id);
+        }
+        if let Some(model) = metadata.model {
+          emitter.update_model(model);
+        }
       }
     }
   }
 
   fn emit(&mut self, deltas: &[IrDelta]) -> Vec<SseEvent> {
-    if deltas.is_empty() {
-      return Vec::new();
+    match self {
+      Self::Chat { id, model } => crate::value::chat::chunk_from_deltas(id, model, deltas, false)
+        .into_iter()
+        .map(|value| SseEvent::json(None, value))
+        .collect(),
+      Self::Responses(emitter) => emitter.emit(deltas),
+      Self::Messages(emitter) => emitter.emit(deltas),
     }
-    let mut out = Vec::new();
-    if !self.started && !matches!(self.to, Endpoint::Responses) {
-      out.extend(self.start());
-      self.started = true;
-    }
-    match self.to {
-      Endpoint::ChatCompletions => {
-        for value in crate::value::chat::chunk_from_deltas(&self.id, &self.model, deltas, false) {
-          out.push(SseEvent::json(None, value));
-        }
-      }
-      Endpoint::Responses => {
-        if let Some(emitter) = self.responses.as_mut() {
-          out.extend(emitter.emit(deltas));
-          self.started = true;
-        }
-      }
-      Endpoint::Messages => {
-        for (event, value) in crate::value::messages::events_from_deltas(&self.id, &self.model, deltas, false) {
-          out.push(SseEvent::json(Some(&event), value));
-        }
-      }
-    }
-    out
   }
 
   fn finish(&mut self) -> Vec<SseEvent> {
-    if self.finished {
-      return Vec::new();
-    }
-    self.finished = true;
-    let mut out = Vec::new();
-    if !self.started && !matches!(self.to, Endpoint::Responses) {
-      out.extend(self.start());
-      self.started = true;
-    }
-    match self.to {
-      Endpoint::ChatCompletions => out.push(SseEvent::done()),
-      Endpoint::Responses => {
-        if let Some(emitter) = self.responses.as_mut() {
-          out.extend(emitter.finish());
-        }
-      }
-      Endpoint::Messages => {
-        out.push(SseEvent::json(
-          Some("content_block_stop"),
-          serde_json::json!({ "type": "content_block_stop", "index": 0 }),
-        ));
-        out.push(SseEvent::json(
-          Some("message_stop"),
-          serde_json::json!({ "type": "message_stop" }),
-        ));
-      }
-    }
-    out
-  }
-
-  fn start(&self) -> Vec<SseEvent> {
-    match self.to {
-      Endpoint::ChatCompletions | Endpoint::Responses => Vec::new(),
-      Endpoint::Messages => vec![
-        SseEvent::json(
-          Some("message_start"),
-          serde_json::json!({
-            "type": "message_start",
-            "message": { "id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": [], "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 } }
-          }),
-        ),
-        SseEvent::json(
-          Some("content_block_start"),
-          serde_json::json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
-        ),
-      ],
+    match self {
+      Self::Chat { .. } => vec![SseEvent::done()],
+      Self::Responses(emitter) => emitter.finish(),
+      Self::Messages(emitter) => emitter.finish(),
     }
   }
 }
@@ -298,6 +243,51 @@ impl EmitState {
 mod tests {
   use super::*;
   use serde_json::json;
+
+  #[test]
+  fn responses_tool_without_argument_deltas_keeps_its_messages_block() {
+    for arguments in ["", "{}", "{\"q\":\"x\"}"] {
+      let mut translator = EndpointTranslator::new(Endpoint::Responses, Endpoint::Messages);
+      let mut events = Vec::new();
+      for value in [
+        json!({"type":"response.created","response":{"id":"resp-1","model":"model"}}),
+        json!({"type":"response.output_item.added","output_index":7,"item":{
+          "type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":"",
+        }}),
+        json!({"type":"response.output_item.done","output_index":7,"item":{
+          "type":"function_call","id":"fc-1","call_id":"call-1","name":"lookup","arguments":arguments,
+        }}),
+        json!({"type":"response.completed","response":{"id":"resp-1","model":"model"}}),
+      ] {
+        events.extend(translator.transform(SseEvent::json(None, value)).unwrap());
+      }
+      events.extend(translator.finish().unwrap());
+      assert_eq!(
+        events
+          .iter()
+          .filter(|event| event.event.as_deref() == Some("content_block_start"))
+          .count(),
+        1
+      );
+      let mut accumulator = SseAccumulator::new(Endpoint::Messages);
+      for event in events {
+        accumulator.push_value(event.json.as_ref().unwrap());
+      }
+      let response = accumulator.finish();
+      assert_eq!(response.tool_calls.len(), 1);
+      assert_eq!(response.tool_calls[0].id.as_deref(), Some("call-1"));
+      assert_eq!(response.tool_calls[0].name, "lookup");
+      assert_eq!(
+        response.tool_calls[0].arguments,
+        if arguments.trim().is_empty() {
+          json!({})
+        } else {
+          serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+        }
+      );
+      assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    }
+  }
 
   #[test]
   fn responses_to_chat_finishes_when_upstream_ends_without_done_sentinel() {
@@ -577,13 +567,17 @@ mod tests {
   fn responses_to_chat_uses_output_item_metadata_for_function_calls() {
     let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
 
-    assert!(t
+    let started = t
       .transform(SseEvent::json(
         Some("response.output_item.added"),
         json!({"type":"response.output_item.added","output_index":1,"item":{"id":"fc_1","call_id":"call_1","type":"function_call","status":"in_progress","name":"exec_command","arguments":""}}),
       ))
-      .unwrap()
-      .is_empty());
+      .unwrap();
+    let identity = &started[0].json.as_ref().unwrap()["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(identity["index"], 1);
+    assert_eq!(identity["id"], "call_1");
+    assert_eq!(identity["function"]["name"], "exec_command");
+    assert_eq!(identity["function"]["arguments"], "");
 
     let tool = t
       .transform(SseEvent::json(
@@ -597,13 +591,14 @@ mod tests {
     assert_eq!(call["function"]["name"], "exec_command");
     assert_eq!(call["function"]["arguments"], "{\"cmd\":");
 
-    assert!(t
+    let completed = t
       .transform(SseEvent::json(
         Some("response.function_call_arguments.done"),
         json!({"type":"response.function_call_arguments.done","output_index":1,"arguments":"{\"cmd\": \"ls\"}"}),
       ))
-      .unwrap()
-      .is_empty());
+      .unwrap();
+    let suffix = &completed[0].json.as_ref().unwrap()["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(suffix["function"]["arguments"], " \"ls\"}");
   }
 
   #[test]
@@ -711,13 +706,16 @@ mod tests {
   fn responses_to_chat_supports_custom_tool_call_input_delta() {
     let mut t = EndpointTranslator::new(Endpoint::Responses, Endpoint::ChatCompletions);
 
-    assert!(t
+    let started = t
       .transform(SseEvent::json(
         Some("response.output_item.added"),
         json!({"type":"response.output_item.added","output_index":2,"item":{"id":"ctc_1","call_id":"call_custom","type":"custom_tool_call","status":"in_progress","name":"apply_patch","input":""}}),
       ))
-      .unwrap()
-      .is_empty());
+      .unwrap();
+    let identity = &started[0].json.as_ref().unwrap()["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(identity["id"], "call_custom");
+    assert_eq!(identity["function"]["name"], "apply_patch");
+    assert_eq!(identity["function"]["arguments"], "");
 
     let tool = t
       .transform(SseEvent::json(
@@ -1116,7 +1114,7 @@ mod tests {
   }
 
   #[test]
-  fn chat_to_responses_handles_two_sequential_function_calls() {
+  fn chat_to_responses_keeps_function_calls_open_until_finish() {
     let mut t = EndpointTranslator::new(Endpoint::ChatCompletions, Endpoint::Responses);
     let mut events = Vec::new();
     events.extend(
@@ -1149,10 +1147,10 @@ mod tests {
         "response.in_progress",
         "response.output_item.added", // call a
         "response.function_call_arguments.delta",
-        "response.function_call_arguments.done",
-        "response.output_item.done",  // a closed
         "response.output_item.added", // call b
         "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
         "response.function_call_arguments.done",
         "response.output_item.done",
         "response.completed",
@@ -1162,12 +1160,12 @@ mod tests {
     let a_added = &events[2].json.as_ref().unwrap()["item"];
     assert_eq!(a_added["call_id"], "a");
     assert_eq!(a_added["name"], "x");
-    let b_added = &events[6].json.as_ref().unwrap()["item"];
+    let b_added = &events[4].json.as_ref().unwrap()["item"];
     assert_eq!(b_added["call_id"], "b");
     assert_eq!(b_added["name"], "y");
     assert_eq!(
       b_added["id"].as_str().unwrap(),
-      events[6].json.as_ref().unwrap()["item"]["id"].as_str().unwrap()
+      events[4].json.as_ref().unwrap()["item"]["id"].as_str().unwrap()
     );
   }
 }
