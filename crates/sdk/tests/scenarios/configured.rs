@@ -1612,6 +1612,6 @@ pub fn configured_transport_encoding() {
 #[path = "multimedia.rs"]
 mod multimedia;
 pub use multimedia::{
-  multimedia_native_inputs, multimedia_output_continuation, multimedia_tool_context_and_snapshot,
-  multimedia_unsupported_fails_before_transport,
+  multimedia_history_image, multimedia_native_inputs, multimedia_output_continuation,
+  multimedia_tool_context_and_snapshot, multimedia_unsupported_fails_before_transport,
 };

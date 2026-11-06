@@ -8,6 +8,10 @@ use tokn_sdk::{
   RetrievedContext, Tool, VideoContent,
 };
 
+#[path = "history_images.rs"]
+mod history_images;
+pub use history_images::multimedia_history_image;
+
 const AUDIO: &[u8] = br#"{"id":"speech","choices":[{"index":0,"message":{"role":"assistant","content":"hello","audio":{"id":"audio-fixture","data":"AQID","transcript":"spoken hello","expires_at":2000000000}},"finish_reason":"stop"}]}"#;
 const IMAGE: &[u8] = br#"{"id":"drawing","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here it is"}]},{"type":"image_generation_call","id":"image-fixture","status":"completed","output_format":"png","result":"AQID"}]}"#;
 const TOOL: &[u8] = br#"{"id":"tool","status":"completed","output":[{"type":"function_call","call_id":"capture-1","name":"capture","arguments":"{}"}]}"#;
@@ -46,6 +50,10 @@ fn media_client<'a>(
 }
 
 pub fn multimedia_native_inputs() {
+  assert_eq!(
+    multimedia_history_image(ImageContent::new(MediaResource::inline("image/png", vec![1, 2, 3]))),
+    10
+  );
   for (endpoint, reply) in [
     (Endpoint::Responses, RESPONSES_JSON),
     (Endpoint::ChatCompletions, CHAT_JSON),

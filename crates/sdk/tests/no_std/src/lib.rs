@@ -201,8 +201,8 @@ extern crate std;
 mod reentrant;
 
 pub use scenarios::{
-  multimedia_native_inputs, multimedia_output_continuation, multimedia_tool_context_and_snapshot,
-  multimedia_unsupported_fails_before_transport,
+  multimedia_history_image, multimedia_native_inputs, multimedia_output_continuation,
+  multimedia_tool_context_and_snapshot, multimedia_unsupported_fails_before_transport,
 };
 #[cfg(test)]
 mod multimedia_tests {
