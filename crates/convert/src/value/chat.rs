@@ -1,7 +1,8 @@
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use crate::provider::Endpoint;
 use alloc::collections::BTreeMap;
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
 
 const REQUEST_KEYS: &[&str] = &[
@@ -97,7 +98,7 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
     messages.push(json!({ "role": "system", "content": system }));
   }
   for msg in &req.messages {
-    messages.extend(message_to_chat(msg));
+    messages.extend(message_to_chat(msg)?);
   }
   out.insert("messages".into(), Value::Array(messages));
   if !req.tools.is_empty() {
@@ -147,7 +148,14 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
     .get("message")
     .unwrap_or(choice.get("delta").unwrap_or(&Value::Null));
   let role = msg.get("role").and_then(Value::as_str).map(Role::from_wire);
-  let mut content = content_from_chat(msg.get("content"));
+  let mut content = content_from_chat(msg.get("content"))?;
+  let mut extras = BTreeMap::new();
+  if let Some(audio) = msg.get("audio").filter(|audio| !audio.is_null()) {
+    content.push(ContentPart::Media {
+      content: Box::new(crate::media::audio_from_chat(audio)?),
+    });
+    extras.insert("__chat_audio".into(), audio.clone());
+  }
   if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
     content.push(ContentPart::Reasoning {
       text: reasoning.to_string(),
@@ -166,7 +174,7 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
     tool_calls,
     usage: usage_from_openai(v),
     finish_reason: choice.get("finish_reason").and_then(Value::as_str).map(str::to_string),
-    extras: BTreeMap::new(),
+    extras,
   })
 }
 
@@ -177,6 +185,25 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
     Value::String(resp.role.as_ref().unwrap_or(&Role::Assistant).as_str().to_string()),
   );
   msg.insert("content".into(), Value::String(text_from_parts(&resp.content)));
+  for part in &resp.content {
+    match part {
+      ContentPart::Media { content } if matches!(content.as_ref(), tokn_core::content::Content::Audio(_)) => {
+        let tokn_core::content::Content::Audio(audio) = content.as_ref() else {
+          unreachable!()
+        };
+        let native = resp.extras.get("__chat_audio").cloned().unwrap_or_else(
+          || json!({"data":audio.resource.encode_base64(), "transcript":audio.transcript.as_ref().map(|t| &t.text)}),
+        );
+        msg.insert("audio".into(), native);
+      }
+      ContentPart::Media { .. } | ContentPart::Native { .. } | ContentPart::Raw { .. } => {
+        return Err(crate::media::unsupported(
+          "nontext output has no portable Chat assistant representation",
+        ))
+      }
+      _ => {}
+    }
+  }
   if let Some(reasoning) = reasoning_from_parts(&resp.content) {
     msg.insert("reasoning_content".into(), Value::String(reasoning));
   }
@@ -256,10 +283,40 @@ pub fn delta_from_chat_chunk(v: &Value) -> Vec<IrDelta> {
   out
 }
 
-pub fn chunk_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Vec<Value> {
+pub fn chunk_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Result<Vec<Value>> {
   let mut values = Vec::new();
   for delta in deltas {
     match delta {
+      IrDelta::Audio {
+        id,
+        data,
+        transcript,
+        expires_at,
+        ..
+      } => {
+        if !data.is_empty() {
+          tokn_core::content::decode_base64(data).map_err(|error| ConvertError::sse(error.to_string()))?;
+        }
+        let mut audio = Map::new();
+        if let Some(id) = id {
+          audio.insert("id".into(), json!(id));
+        }
+        if !data.is_empty() {
+          audio.insert("data".into(), json!(data));
+        }
+        if let Some(transcript) = transcript {
+          audio.insert("transcript".into(), json!(transcript));
+        }
+        if let Some(expires_at) = expires_at {
+          audio.insert("expires_at".into(), json!(expires_at));
+        }
+        values.push(json!({"id":resp_id,"object":"chat.completion.chunk","model":model,"choices":[{"index":0,"delta":{"audio":audio},"finish_reason":null}]}));
+      }
+      IrDelta::Media { .. } | IrDelta::ImagePreview { .. } => {
+        return Err(crate::media::unsupported(
+          "Chat streaming cannot emit this media content",
+        ))
+      }
       IrDelta::Text(text) => values.push(json!({
         "id": resp_id,
         "object": "chat.completion.chunk",
@@ -315,18 +372,25 @@ pub fn chunk_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish:
       "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
     }));
   }
-  values
+  Ok(values)
 }
 
 fn message_from_value(msg: &Value, role: &str) -> Result<IrMessage> {
   let tool_call_id = msg.get("tool_call_id").and_then(Value::as_str).map(str::to_string);
   let content = if role == "tool" {
-    vec![ContentPart::ToolResult {
-      id: tool_call_id.clone(),
-      content: msg.get("content").cloned().unwrap_or(Value::Null),
-    }]
+    if let Some(parts) = crate::media::tool_parts(Endpoint::ChatCompletions, &msg["content"])? {
+      vec![ContentPart::ToolResultParts {
+        id: tool_call_id.clone(),
+        content: parts,
+      }]
+    } else {
+      vec![ContentPart::ToolResult {
+        id: tool_call_id.clone(),
+        content: msg.get("content").cloned().unwrap_or(Value::Null),
+      }]
+    }
   } else {
-    content_from_chat(msg.get("content"))
+    content_from_chat(msg.get("content"))?
   };
   Ok(IrMessage {
     role: Role::from_wire(role),
@@ -337,44 +401,43 @@ fn message_from_value(msg: &Value, role: &str) -> Result<IrMessage> {
   })
 }
 
-fn content_from_chat(content: Option<&Value>) -> Vec<ContentPart> {
-  match content {
+fn content_from_chat(content: Option<&Value>) -> Result<Vec<ContentPart>> {
+  Ok(match content {
     Some(Value::String(s)) => vec![ContentPart::Text { text: s.clone() }],
-    Some(Value::Array(parts)) => parts.iter().map(part_from_chat).collect(),
+    Some(Value::Array(parts)) => parts.iter().map(part_from_chat).collect::<Result<_>>()?,
     Some(Value::Null) | None => Vec::new(),
-    Some(v) => vec![ContentPart::Raw { value: v.clone() }],
-  }
+    Some(_) => return Err(ConvertError::bad_shape("content", "expected text or content parts")),
+  })
 }
 
-fn part_from_chat(v: &Value) -> ContentPart {
-  match v.get("type").and_then(Value::as_str) {
-    Some("text") => ContentPart::Text {
-      text: v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
-    },
-    _ => ContentPart::Raw { value: v.clone() },
-  }
+fn part_from_chat(v: &Value) -> Result<ContentPart> {
+  crate::media::parse_part(Endpoint::ChatCompletions, v)
 }
 
-fn message_to_chat(msg: &IrMessage) -> Vec<Value> {
-  let mut messages: Vec<_> = msg
-    .content
-    .iter()
-    .filter_map(|part| match part {
-      ContentPart::ToolResult { id, content } => Some(json!({
-        "role": "tool",
-        "tool_call_id": id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(),
-        "content": tool_result_text(content),
-      })),
-      _ => None,
-    })
-    .collect();
+fn message_to_chat(msg: &IrMessage) -> Result<Vec<Value>> {
+  let mut messages = Vec::new();
+  for part in &msg.content {
+    let (id, content) = match part {
+      ContentPart::ToolResult { id, content } => (id, Value::String(tool_result_text(content))),
+      ContentPart::ToolResultParts { id, content } => {
+        (id, crate::media::render_tool_parts(Endpoint::ChatCompletions, content)?)
+      }
+      _ => continue,
+    };
+    messages.push(json!({"role":"tool", "tool_call_id":id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(), "content":content}));
+  }
   let remaining: Vec<_> = msg
     .content
     .iter()
-    .filter(|part| !matches!(part, ContentPart::ToolResult { .. }))
+    .filter(|part| {
+      !matches!(
+        part,
+        ContentPart::ToolResult { .. } | ContentPart::ToolResultParts { .. }
+      )
+    })
     .collect();
   if remaining.is_empty() && !messages.is_empty() {
-    return messages;
+    return Ok(messages);
   }
 
   let mut out = Map::new();
@@ -395,7 +458,7 @@ fn message_to_chat(msg: &IrMessage) -> Vec<Value> {
   if let Some(name) = &msg.name {
     out.insert("name".into(), Value::String(name.clone()));
   }
-  out.insert("content".into(), content_to_chat(&remaining));
+  out.insert("content".into(), content_to_chat(&remaining, role)?);
   let tool_calls: Vec<_> = remaining
     .iter()
     .filter_map(|p| match p {
@@ -420,24 +483,38 @@ fn message_to_chat(msg: &IrMessage) -> Vec<Value> {
     out.insert("reasoning_content".into(), Value::String(reasoning));
   }
   messages.push(Value::Object(out));
-  messages
+  Ok(messages)
 }
 
-fn content_to_chat(parts: &[&ContentPart]) -> Value {
-  if parts.iter().any(|part| matches!(part, ContentPart::Raw { .. })) {
-    return Value::Array(
-      parts
-        .iter()
-        .filter_map(|part| match part {
-          ContentPart::Text { text } => Some(json!({ "type": "text", "text": text })),
-          ContentPart::Raw { value } => Some(value.clone()),
-          _ => None,
-        })
-        .collect(),
-    );
+fn content_to_chat(parts: &[&ContentPart], role: &str) -> Result<Value> {
+  if parts.iter().any(|part| {
+    matches!(
+      part,
+      ContentPart::Raw { .. } | ContentPart::Native { .. } | ContentPart::Media { .. }
+    )
+  }) {
+    let mut rendered = Vec::new();
+    for part in parts {
+      match part {
+        ContentPart::Text { text } => rendered.push(json!({"type":"text", "text":text})),
+        ContentPart::Media { content } => rendered.extend(crate::media::content_to_parts(
+          Endpoint::ChatCompletions,
+          content,
+          role,
+        )?),
+        ContentPart::Native { endpoint, value } => {
+          rendered.push(crate::media::native_part(Endpoint::ChatCompletions, endpoint, value)?)
+        }
+        ContentPart::Raw { value } => {
+          rendered.extend(crate::media::raw_to_parts(Endpoint::ChatCompletions, value, role)?)
+        }
+        _ => {}
+      }
+    }
+    return Ok(Value::Array(rendered));
   }
 
-  Value::String(
+  Ok(Value::String(
     parts
       .iter()
       .filter_map(|part| match part {
@@ -446,7 +523,7 @@ fn content_to_chat(parts: &[&ContentPart]) -> Value {
       })
       .collect::<Vec<_>>()
       .join(""),
-  )
+  ))
 }
 
 fn tool_result_text(content: &Value) -> String {

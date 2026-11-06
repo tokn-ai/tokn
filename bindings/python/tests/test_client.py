@@ -18,6 +18,8 @@ from tokn_requests import (
   Completed,
   ConfigurationError,
   GenerateRequest,
+  ImageContent,
+  MediaResource,
   Message,
   ReasoningDelta,
   ReasoningEffort,
@@ -30,6 +32,7 @@ from tokn_requests import (
   SerializationError,
   StreamError,
   TextDelta,
+  TextContent,
   ToknError,
   Tool,
   ToolCall,
@@ -716,6 +719,26 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
 
     self.assertFalse(ProviderHandler.requests)
 
+  async def test_media_input_reaches_native_provider_wire(self) -> None:
+    response = (
+      await self.client()
+      .generate("llama-cpp/mock-model")
+      .user(
+        [
+          TextContent("Describe this image."),
+          ImageContent(MediaResource.inline("image/png", b"image fixture")),
+        ]
+      )
+      .send()
+    )
+    content = self.last_request()["body"]["messages"][0]["content"]
+    self.assertEqual(content[0], {"type": "text", "text": "Describe this image."})
+    self.assertEqual(
+      content[1],
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2UgZml4dHVyZQ=="}},
+    )
+    self.assertEqual(response.content, [TextContent("mock answer")])
+
   async def test_client_bound_generation_normalizes_response(self) -> None:
     response = await (
       self.client()
@@ -749,6 +772,8 @@ class PythonSdkTests(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(response.finish_reason, "tool_calls")
     self.assertEqual(response.text, "mock answer")
     self.assertEqual(response.reasoning, "mock reasoning")
+    self.assertEqual(response.content, [TextContent("mock answer")])
+    self.assertEqual(response.endpoint, "responses")
     self.assertEqual(
       response.tool_calls,
       [

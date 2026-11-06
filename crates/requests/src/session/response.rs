@@ -68,9 +68,15 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
             .ok_or_else(|| native_sse::invalid("native continuation request was not captured"))?;
           NativeGeneration::new(
             self.provider_origin(&resolved),
+            self.input.endpoint,
+            self
+              .input
+              .continuation
+              .as_ref()
+              .and_then(|request| request.state.clone()),
             request,
             outcome,
-            self.limits.max_response_bytes,
+            self.limits,
           )
         })
         .transpose()?;
@@ -160,8 +166,24 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
           ContinuationError::InvalidState("native continuation request was not captured"),
         )
       })?;
-      let state = continuation::capture(self.provider_origin(&resolved), native_request, &native_response)
-        .map_err(|error| Self::continuation_error("convert_response", error))?;
+      let previous = self
+        .input
+        .continuation
+        .as_ref()
+        .and_then(|request| request.state.as_ref());
+      let state = continuation::capture_with_previous(
+        self.provider_origin(&resolved),
+        native_request,
+        &native_response,
+        previous,
+      )
+      .map_err(|error| Self::continuation_error("convert_response", error))?;
+      if serialized_len(&state)? > self.limits.max_checkpoint_bytes {
+        return Err(Self::continuation_error(
+          "convert_response",
+          ContinuationError::InvalidState("native continuation state exceeds checkpoint byte limit"),
+        ));
+      }
       let bytes = if accumulated_sse {
         // Canonical projection must see the same complete native output that
         // produced the checkpoint, including snapshot-only stream content.
@@ -321,31 +343,37 @@ pub struct EventStream<T: Transport, C: Clock, E: Events> {
 
 struct NativeGeneration {
   origin: ProviderOrigin,
+  output_endpoint: Endpoint,
+  previous: Option<ProviderState>,
   request: Value,
   outcome: ContinuationOutcome,
   assembler: Option<native_sse::Assembler>,
-  max_bytes: usize,
+  limits: Limits,
 }
 
 impl NativeGeneration {
   fn new(
     origin: ProviderOrigin,
+    output_endpoint: Endpoint,
+    previous: Option<ProviderState>,
     request: Value,
     outcome: ContinuationOutcome,
-    max_bytes: usize,
+    limits: Limits,
   ) -> Result<Self, Error> {
-    if serialized_len(&request)? > max_bytes {
+    if serialized_len(&request)? > limits.max_checkpoint_bytes {
       return Err(native_sse::invalid(
         "native continuation request exceeds checkpoint byte limit",
       ));
     }
-    let assembler = Some(native_sse::Assembler::new(origin.endpoint, max_bytes));
+    let assembler = Some(native_sse::Assembler::new(origin.endpoint, limits.max_response_bytes));
     Ok(Self {
       origin,
+      output_endpoint,
+      previous,
       request,
       outcome,
       assembler,
-      max_bytes,
+      limits,
     })
   }
 
@@ -357,16 +385,17 @@ impl NativeGeneration {
       return Ok(None);
     }
     let response = self.assembler.take().expect("native assembler is present").finish()?;
-    let state = continuation::capture(self.origin.clone(), &self.request, &response)
-      .map_err(|source| Error::new("stream", source).with_kind(ErrorKind::Continuation(source)))?;
-    if serialized_len(&state)? > self.max_bytes {
+    let state =
+      continuation::capture_with_previous(self.origin.clone(), &self.request, &response, self.previous.as_ref())
+        .map_err(|source| Error::new("stream", source).with_kind(ErrorKind::Continuation(source)))?;
+    if serialized_len(&state)? > self.limits.max_checkpoint_bytes {
       return Err(native_sse::invalid(
         "native continuation state exceeds checkpoint byte limit",
       ));
     }
-    let canonical = tokn_convert::convert_response(self.origin.endpoint, Endpoint::Responses, &response)
+    let canonical = tokn_convert::convert_response(self.origin.endpoint, self.output_endpoint, &response)
       .map_err(|error| Error::new("stream", error))?;
-    if serialized_len(&canonical)? > self.max_bytes {
+    if serialized_len(&canonical)? > self.limits.max_response_bytes {
       return Err(native_sse::invalid("completed generation exceeds byte limit"));
     }
     Ok(Some((

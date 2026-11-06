@@ -6,7 +6,7 @@ use tokn_config::{v2, ExecutionConfigInput};
 use tokn_core::event::{Event, EventBus};
 use tokn_core::provider::Endpoint;
 use tokn_core::util::http::HttpClientOptions;
-use tokn_requests::session::{Error as SessionError, Limits};
+use tokn_requests::session::Error as SessionError;
 use tokn_requests::v2::adapters::{into_standard_response, ReqwestExchange, StandardEvents, TokioRuntime};
 use tokn_requests::v2::{prepare_execution, HttpClients};
 
@@ -53,11 +53,7 @@ impl ClientBuilder {
     };
     let snapshot = load_snapshot(&source)?;
     let platform = StdPlatform::with_http_clients(snapshot.pool.clone());
-    let mut client = Client::from_snapshot(platform, snapshot).with_limits(Limits {
-      max_response_bytes: usize::MAX,
-      max_event_bytes: usize::MAX,
-      max_error_body_bytes: 8 * 1024,
-    });
+    let mut client = Client::from_snapshot(platform, snapshot);
     client.source = Some(source);
     Ok(client)
   }

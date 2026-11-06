@@ -54,16 +54,25 @@ test("the native client loads configured credentials and completes a provider re
     return;
   }
 
-  const requests: Array<{ readonly path: string; readonly body: Record<string, unknown> }> = [];
+  const requests: Array<{
+    readonly path: string;
+    readonly body: Record<string, unknown>;
+  }> = [];
   const server = createServer(async (incoming, outgoing) => {
     const chunks: Buffer[] = [];
     for await (const chunk of incoming) {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<
+      string,
+      unknown
+    >;
     requests.push({ path: incoming.url ?? "", body });
 
-    if (body["stream"] === true && JSON.stringify(body).includes("idle cancellation")) {
+    if (
+      body["stream"] === true &&
+      JSON.stringify(body).includes("idle cancellation")
+    ) {
       outgoing.writeHead(200, {
         "content-type": "text/event-stream",
       });
@@ -77,12 +86,20 @@ test("the native client loads configured credentials and completes a provider re
         {
           id: "chatcmpl-typescript-stream",
           model: "mock-model",
-          choices: [{ index: 0, delta: { role: "assistant", content: "native " }, finish_reason: null }],
+          choices: [
+            {
+              index: 0,
+              delta: { role: "assistant", content: "native " },
+              finish_reason: null,
+            },
+          ],
         },
         {
           id: "chatcmpl-typescript-stream",
           model: "mock-model",
-          choices: [{ index: 0, delta: { content: "stream" }, finish_reason: null }],
+          choices: [
+            { index: 0, delta: { content: "stream" }, finish_reason: null },
+          ],
         },
         {
           id: "chatcmpl-typescript-stream",
@@ -210,7 +227,10 @@ test("the native client loads configured credentials and completes a provider re
         Promise.race([
           pendingRead,
           new Promise<never>((_, reject) => {
-            timeout = setTimeout(() => reject(new Error("native stream cancellation timed out")), 5_000);
+            timeout = setTimeout(
+              () => reject(new Error("native stream cancellation timed out")),
+              5_000,
+            );
           }),
         ]),
         (error: unknown) => error instanceof CancelledError,
@@ -222,7 +242,8 @@ test("the native client loads configured credentials and completes a provider re
     assert.equal(requests.length, 3);
     assert.equal(requests[2]?.body["stream"], true);
 
-    const legacyConfig = '[server]\nhost = "sdk.private.example"\n[defaults]\nmode = "exact"\n';
+    const legacyConfig =
+      '[server]\nhost = "sdk.private.example"\n[defaults]\nmode = "exact"\n';
     const legacyAuth = [
       "version: 1",
       "accounts:",
@@ -233,14 +254,49 @@ test("the native client loads configured credentials and completes a provider re
     ].join("\n");
     await writeFile(configPath, legacyConfig);
     await writeFile(authPath, legacyAuth);
-    const legacyClient = await Client.create({ config_path: configPath, auth_path: authPath });
+    const legacyClient = await Client.create({
+      config_path: configPath,
+      auth_path: authPath,
+    });
     try {
-      const legacyResponse = await legacyClient.generate("llama-cpp/mock-model").prompt("legacy input").send();
+      const legacyResponse = await legacyClient
+        .generate("llama-cpp/mock-model")
+        .prompt("legacy input")
+        .send();
       assert.equal(legacyResponse.text, "native answer");
       assert.equal(requests.length, 4);
       assert.equal(requests[3]?.body["model"], "mock-model");
       assert.equal(await readFile(configPath, "utf8"), legacyConfig);
       assert.equal(await readFile(authPath, "utf8"), legacyAuth);
+      const media_response = await legacyClient
+        .generate("llama-cpp/mock-model")
+        .user([
+          { type: "text", text: "Describe this image." },
+          {
+            type: "image",
+            resource: {
+              source: { type: "inline", data: "aW1hZ2U=" },
+              media_type: "image/png",
+            },
+          },
+        ])
+        .send();
+      assert.deepEqual(requests[4]?.body["messages"], [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image." },
+            {
+              type: "image_url",
+              image_url: { url: "data:image/png;base64,aW1hZ2U=" },
+            },
+          ],
+        },
+      ]);
+      assert.deepEqual(media_response.content, [
+        { type: "text", text: "native answer" },
+      ]);
+      assert.equal(media_response.endpoint, "responses");
     } finally {
       await legacyClient.close();
     }

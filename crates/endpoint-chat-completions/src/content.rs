@@ -37,6 +37,23 @@ pub enum ContentPart {
     #[serde(default, flatten)]
     extras: Extras,
   },
-  #[serde(other)]
-  Other,
+  File {
+    file: FileInput,
+    #[serde(default, flatten)]
+    extras: Extras,
+  },
+  #[serde(untagged)]
+  Other(Value),
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FileInput {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub file_id: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub file_data: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub filename: Option<String>,
+  #[serde(default, flatten)]
+  pub extras: Extras,
 }

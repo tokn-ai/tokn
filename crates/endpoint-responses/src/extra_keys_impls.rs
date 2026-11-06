@@ -77,7 +77,7 @@ impl ExtraKeys for InputContentPart {
       InputContentPart::InputImage { fields }
       | InputContentPart::InputAudio { fields }
       | InputContentPart::InputFile { fields } => push_extras(fields, prefix, out),
-      InputContentPart::Other => {}
+      InputContentPart::Other(_) => {}
     }
   }
 }
@@ -114,7 +114,7 @@ impl ExtraKeys for ReasoningPart {
       ReasoningPart::ReasoningText { extras, .. }
       | ReasoningPart::SummaryText { extras, .. }
       | ReasoningPart::Text { extras, .. } => push_extras(extras, prefix, out),
-      ReasoningPart::Other => {}
+      ReasoningPart::Other(_) => {}
     }
   }
 }
@@ -137,6 +137,7 @@ impl ExtraKeys for OutputItem {
       OutputItem::Message(m) => m.extra_keys_into(out, prefix),
       OutputItem::Reasoning(t) => t.extra_keys_into(out, prefix),
       OutputItem::FunctionCall(t) => t.extra_keys_into(out, prefix),
+      OutputItem::ImageGeneration(image) => push_extras(&image.extras, prefix, out),
       OutputItem::Other(_) => {}
     }
   }
@@ -161,7 +162,7 @@ impl ExtraKeys for OutputContentPart {
       OutputContentPart::OutputText { extras, .. } | OutputContentPart::Refusal { extras, .. } => {
         push_extras(extras, prefix, out)
       }
-      OutputContentPart::Other => {}
+      OutputContentPart::Other(_) => {}
     }
   }
 }
@@ -188,6 +189,7 @@ impl ExtraKeys for ResponsesEvent {
         response.extra_keys_into(out, &join_path(prefix, "response"));
       }
       E::OutputItemAdded { extras, .. }
+      | E::ImageGenerationPartial { extras, .. }
       | E::OutputItemDone { extras, .. }
       | E::ContentPartAdded { extras, .. }
       | E::ContentPartDone { extras, .. }

@@ -169,3 +169,23 @@ fn shared_status_classification() {
 fn transport_encoding_capability() {
   scenarios::configured_transport_encoding();
 }
+
+#[test]
+fn multimedia_native_inputs() {
+  scenarios::multimedia_native_inputs();
+}
+
+#[test]
+fn multimedia_output_continuation() {
+  scenarios::multimedia_output_continuation();
+}
+
+#[test]
+fn multimedia_tool_context_and_snapshot() {
+  scenarios::multimedia_tool_context_and_snapshot();
+}
+
+#[test]
+fn multimedia_unsupported_fails_before_transport() {
+  scenarios::multimedia_unsupported_fails_before_transport();
+}

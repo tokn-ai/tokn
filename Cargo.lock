@@ -2938,6 +2938,7 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "directories",
  "h2",

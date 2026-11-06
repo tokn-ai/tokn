@@ -59,9 +59,9 @@ impl MessagesEmitter {
     self.model = model;
   }
 
-  pub fn emit(&mut self, deltas: &[IrDelta]) -> Vec<SseEvent> {
+  pub fn emit(&mut self, deltas: &[IrDelta]) -> crate::Result<Vec<SseEvent>> {
     if self.finished || deltas.is_empty() {
-      return Vec::new();
+      return Ok(Vec::new());
     }
     // Include initial usage in message_start. Later cumulative updates are
     // delivered after all blocks close, including updates after Finish.
@@ -74,6 +74,9 @@ impl MessagesEmitter {
     self.start(&mut out);
     for delta in deltas {
       match delta {
+        IrDelta::Media { .. } | IrDelta::Audio { .. } | IrDelta::ImagePreview { .. } => {
+          return Err(crate::media::unsupported("Messages cannot emit generated media output"))
+        }
         IrDelta::Text(text) | IrDelta::Reasoning(text) if text.is_empty() => {}
         IrDelta::Text(text) | IrDelta::Reasoning(text) => {
           let thinking = matches!(delta, IrDelta::Reasoning(_));
@@ -127,7 +130,7 @@ impl MessagesEmitter {
         IrDelta::Finish(reason) => self.finish_reason = reason.clone(),
       }
     }
-    out
+    Ok(out)
   }
 
   pub fn finish(&mut self) -> Vec<SseEvent> {
@@ -293,12 +296,14 @@ mod tests {
   #[test]
   fn tool_only_stream_has_one_tool_block_and_no_fabricated_text() {
     let mut emitter = MessagesEmitter::new("msg-1".into(), "model".into());
-    let mut events = emitter.emit(&[tool(11, Some("call-1"), Some("lookup"), "{\"q\":")]);
+    let mut events = emitter
+      .emit(&[tool(11, Some("call-1"), Some("lookup"), "{\"q\":")])
+      .unwrap();
     assert_eq!(
       kinds(&events),
       ["message_start", "content_block_start", "content_block_delta"]
     );
-    events.extend(emitter.emit(&[tool(11, None, None, "\"x\"}")]));
+    events.extend(emitter.emit(&[tool(11, None, None, "\"x\"}")]).unwrap());
     events.extend(emitter.finish());
     assert_eq!(
       kinds(&events),
@@ -321,21 +326,23 @@ mod tests {
     );
     assert_eq!(events[5].json.as_ref().unwrap()["delta"]["stop_reason"], "tool_use");
     assert!(emitter.finish().is_empty());
-    assert!(emitter.emit(&[IrDelta::Text("late".into())]).is_empty());
+    assert!(emitter.emit(&[IrDelta::Text("late".into())]).unwrap().is_empty());
   }
 
   #[test]
   fn late_identity_and_interleaved_arguments_keep_serialized_blocks() {
     let mut emitter = MessagesEmitter::new("msg-1".into(), "model".into());
-    let mut events = emitter.emit(&[tool(7, None, None, "{\"x\":")]);
+    let mut events = emitter.emit(&[tool(7, None, None, "{\"x\":")]).unwrap();
     assert_eq!(kinds(&events), ["message_start"]);
     assert!(emitter
       .emit(&[tool(19, Some("call-b"), Some("second"), "{\"y\":3}")])
+      .unwrap()
       .is_empty());
     assert!(emitter
       .emit(&[IrDelta::Text("tail".into()), IrDelta::Reasoning("why".into())])
+      .unwrap()
       .is_empty());
-    let resumed = emitter.emit(&[tool(7, Some("call-a"), Some("first"), "2}")]);
+    let resumed = emitter.emit(&[tool(7, Some("call-a"), Some("first"), "2}")]).unwrap();
     assert_eq!(kinds(&resumed), ["content_block_start", "content_block_delta"]);
     assert_eq!(resumed[1].json.as_ref().unwrap()["delta"]["partial_json"], "{\"x\":2}");
     events.extend(resumed);
@@ -358,7 +365,7 @@ mod tests {
         "message_delta" | "message_stop" => assert!(active.is_none()),
         _ => {}
       }
-      accumulator.push_value(value);
+      accumulator.push_value(value).unwrap();
     }
     assert_eq!(next_index, 4);
     let response = accumulator.finish();
@@ -379,25 +386,28 @@ mod tests {
   fn empty_arguments_and_usage_after_finish_are_preserved() {
     for arguments in ["", " \n\t"] {
       let mut emitter = MessagesEmitter::new("msg-1".into(), "model".into());
-      let mut events = emitter.emit(&[
-        IrDelta::Usage(Usage {
-          input_tokens: Some(2),
-          output_tokens: Some(0),
-          ..Usage::default()
-        }),
-        tool(25, Some("call-1"), Some("status"), arguments),
-        IrDelta::Finish(Some("length".into())),
-      ]);
+      let mut events = emitter
+        .emit(&[
+          IrDelta::Usage(Usage {
+            input_tokens: Some(2),
+            output_tokens: Some(0),
+            ..Usage::default()
+          }),
+          tool(25, Some("call-1"), Some("status"), arguments),
+          IrDelta::Finish(Some("length".into())),
+        ])
+        .unwrap();
       assert!(emitter
         .emit(&[IrDelta::Usage(Usage {
           output_tokens: Some(8),
           ..Usage::default()
         })])
+        .unwrap()
         .is_empty());
       events.extend(emitter.finish());
       let mut accumulator = SseAccumulator::new(Endpoint::Messages);
       for event in &events {
-        accumulator.push_value(event.json.as_ref().unwrap());
+        accumulator.push_value(event.json.as_ref().unwrap()).unwrap();
       }
       let response = accumulator.finish();
       assert_eq!(response.tool_calls[0].arguments, json!({}));
@@ -412,8 +422,10 @@ mod tests {
   #[test]
   fn empty_stream_has_no_content_block_events() {
     let mut emitter = MessagesEmitter::new("msg-1".into(), "model".into());
-    assert!(emitter.emit(&[]).is_empty());
-    let mut events = emitter.emit(&[IrDelta::Text(String::new()), IrDelta::Reasoning(String::new())]);
+    assert!(emitter.emit(&[]).unwrap().is_empty());
+    let mut events = emitter
+      .emit(&[IrDelta::Text(String::new()), IrDelta::Reasoning(String::new())])
+      .unwrap();
     events.extend(emitter.finish());
     assert_eq!(kinds(&events), ["message_start", "message_delta", "message_stop"]);
     assert_eq!(events[1].json.as_ref().unwrap()["delta"]["stop_reason"], "end_turn");

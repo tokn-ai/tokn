@@ -1,8 +1,9 @@
 use super::chat::args_to_string;
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use crate::provider::Endpoint;
 use alloc::collections::BTreeMap;
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
 
 const REQUEST_KEYS: &[&str] = &[
@@ -75,10 +76,11 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
   if let Some(system) = &req.system {
     out.insert("instructions".into(), Value::String(system.clone()));
   }
-  out.insert(
-    "input".into(),
-    Value::Array(req.messages.iter().flat_map(message_to_responses_input_items).collect()),
-  );
+  let mut input = Vec::new();
+  for message in &req.messages {
+    input.extend(message_to_responses_input_items(message)?);
+  }
+  out.insert("input".into(), Value::Array(input));
   if !req.tools.is_empty() {
     out.insert(
       "tools".into(),
@@ -151,7 +153,18 @@ fn normalize_reasoning(reasoning: Option<Value>, reasoning_effort: Option<&str>)
 pub fn response_from_value(v: &Value) -> Result<IrResponse> {
   let mut content = Vec::new();
   let mut tool_calls = Vec::new();
-  if let Some(text) = v.get("output_text").and_then(Value::as_str) {
+  if let Some(text) = v.get("output_text").and_then(Value::as_str).filter(|_| {
+    !v.get("output").and_then(Value::as_array).is_some_and(|items| {
+      items.iter().any(|item| {
+        item["type"] == "message"
+          && item["content"].as_array().is_some_and(|parts| {
+            parts
+              .iter()
+              .any(|part| matches!(part["type"].as_str(), Some("output_text" | "text")) && part["text"].is_string())
+          })
+      })
+    })
+  }) {
     content.push(ContentPart::Text { text: text.to_string() });
   }
   if let Some(output) = v.get("output").and_then(Value::as_array) {
@@ -172,7 +185,7 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
                     .unwrap_or_default()
                     .to_string(),
                 }),
-                _ => content.push(ContentPart::Raw { value: part.clone() }),
+                _ => content.push(crate::media::parse_part(Endpoint::Responses, part)?),
               }
             }
           }
@@ -190,7 +203,18 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_else(|| item.get("arguments").cloned().unwrap_or(Value::Null)),
         }),
-        _ => {}
+        Some("image_generation_call") => content.push(ContentPart::Media {
+          content: Box::new(crate::media::image_from_responses(item)?),
+        }),
+        Some("reasoning") => {
+          if let Some(text) = reasoning_text_from_input_item(item) {
+            content.push(ContentPart::Reasoning { text });
+          }
+        }
+        _ => content.push(ContentPart::Native {
+          endpoint: Endpoint::Responses.as_str().into(),
+          value: item.clone(),
+        }),
       }
     }
   }
@@ -224,16 +248,38 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
   let id = resp.id.clone().unwrap_or_else(|| "resp_converted".into());
   let mut output = Vec::new();
   let mut content = Vec::new();
-  let text = text_from_parts(&resp.content);
-  if !text.is_empty() {
-    content.push(json!({ "type": "output_text", "text": text, "annotations": [] }));
+  for part in &resp.content {
+    match part {
+      ContentPart::Text { text } if !text.is_empty() => {
+        content.push(json!({"type":"output_text", "text":text, "annotations":[]}))
+      }
+      ContentPart::Reasoning { text } if !text.is_empty() => content.push(json!({"type":"reasoning", "summary":text})),
+      ContentPart::Media { content: media } => {
+        let tokn_core::content::Content::Image(image) = media.as_ref() else {
+          return Err(crate::media::unsupported(
+            "nonimage media output has no portable Responses representation",
+          ));
+        };
+        flush_output_content(&id, &mut content, &mut output);
+        let mut item = json!({"type":"image_generation_call", "id":format!("ig_{id}_{}", output.len()), "status":"completed", "result":image.resource.encode_base64().ok_or_else(|| crate::media::unsupported("generated Responses images require inline bytes"))?});
+        if let Some(format) = crate::media::image_output_format(image)? {
+          item["output_format"] = json!(format);
+        }
+        output.push(item);
+      }
+      ContentPart::Native { endpoint, value } => {
+        flush_output_content(&id, &mut content, &mut output);
+        output.push(crate::media::native_part(Endpoint::Responses, endpoint, value)?)
+      }
+      ContentPart::Raw { .. } => {
+        return Err(crate::media::unsupported(
+          "nonimage media output has no portable Responses representation",
+        ))
+      }
+      _ => {}
+    }
   }
-  if let Some(reasoning) = reasoning_from_parts(&resp.content) {
-    content.push(json!({ "type": "reasoning", "summary": reasoning }));
-  }
-  if !content.is_empty() {
-    output.push(json!({ "type": "message", "id": format!("msg_{id}"), "status": "completed", "role": "assistant", "content": content }));
-  }
+  flush_output_content(&id, &mut content, &mut output);
   for call in &resp.tool_calls {
     output.push(json!({
       "type": "function_call",
@@ -260,6 +306,12 @@ pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
     out["incomplete_details"] = json!({"reason": reason});
   }
   Ok(out)
+}
+
+fn flush_output_content(id: &str, content: &mut Vec<Value>, output: &mut Vec<Value>) {
+  if !content.is_empty() {
+    output.push(json!({"type":"message", "id":format!("msg_{id}_{}", output.len()), "status":"completed", "role":"assistant", "content":core::mem::take(content)}));
+  }
 }
 
 pub fn delta_from_responses_event(v: &Value) -> Vec<IrDelta> {
@@ -320,10 +372,32 @@ pub(crate) fn completed_finish_reason(response: &Value) -> &'static str {
   }
 }
 
-pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Vec<(String, Value)> {
+pub fn events_from_deltas(
+  resp_id: &str,
+  model: &str,
+  deltas: &[IrDelta],
+  finish: bool,
+) -> Result<Vec<(String, Value)>> {
+  if deltas
+    .iter()
+    .any(|delta| matches!(delta, IrDelta::Media { .. } | IrDelta::ImagePreview { .. }))
+  {
+    let mut emitter = crate::sse::responses_emit::ResponsesEmitter::new(resp_id.into(), model.into());
+    let mut events = emitter.emit(deltas)?;
+    if finish {
+      events.extend(emitter.finish());
+    }
+    return Ok(
+      events
+        .into_iter()
+        .map(|event| (event.event.unwrap_or_default(), event.json.unwrap_or(Value::Null)))
+        .collect(),
+    );
+  }
   let mut events = Vec::new();
   for delta in deltas {
     match delta {
+      IrDelta::Audio { .. } | IrDelta::Media { .. } | IrDelta::ImagePreview { .. } => return Err(crate::media::unsupported("Responses streaming cannot emit this media output")),
       IrDelta::Text(text) => events.push((
         "response.output_text.delta".into(),
         json!({ "type": "response.output_text.delta", "response_id": resp_id, "output_index": 0, "content_index": 0, "delta": text }),
@@ -349,7 +423,7 @@ pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish
       }),
     ));
   }
-  events
+  Ok(events)
 }
 
 fn input_to_messages(input: &Value) -> Result<(Vec<String>, Vec<IrMessage>)> {
@@ -405,16 +479,34 @@ fn input_to_messages(input: &Value) -> Result<(Vec<String>, Vec<IrMessage>)> {
         flush_pending_assistant(&mut messages, &mut pending_assistant);
         let call_id = item.get("call_id").and_then(Value::as_str).map(str::to_string);
         let output = item.get("output").cloned().unwrap_or(Value::Null);
-        messages.push(IrMessage {
-          role: Role::Tool,
-          content: vec![ContentPart::ToolResult {
+        let content = if let Some(content) = crate::media::tool_parts(Endpoint::Responses, &output)? {
+          ContentPart::ToolResultParts {
+            id: call_id.clone(),
+            content,
+          }
+        } else {
+          ContentPart::ToolResult {
             id: call_id.clone(),
             content: output,
-          }],
+          }
+        };
+        messages.push(IrMessage {
+          role: Role::Tool,
+          content: vec![content],
           tool_call_id: call_id,
           name: None,
           raw: None,
         });
+        continue;
+      }
+      Some("image_generation_call") => {
+        push_assistant_part(
+          &mut pending_assistant,
+          ContentPart::Native {
+            endpoint: Endpoint::Responses.as_str().into(),
+            value: item.clone(),
+          },
+        );
         continue;
       }
       _ => {}
@@ -496,7 +588,7 @@ fn input_item_to_message(item: &Value) -> Result<IrMessage> {
   let role = Role::from_wire(item.get("role").and_then(Value::as_str).unwrap_or("user"));
   let content = match item.get("content") {
     Some(Value::String(s)) => vec![ContentPart::Text { text: s.clone() }],
-    Some(Value::Array(parts)) => parts.iter().map(part_from_responses).collect(),
+    Some(Value::Array(parts)) => parts.iter().map(part_from_responses).collect::<Result<_>>()?,
     Some(v) => vec![ContentPart::Raw { value: v.clone() }],
     None => Vec::new(),
   };
@@ -509,50 +601,58 @@ fn input_item_to_message(item: &Value) -> Result<IrMessage> {
   })
 }
 
-fn part_from_responses(v: &Value) -> ContentPart {
-  match v.get("type").and_then(Value::as_str) {
-    Some("input_text") | Some("output_text") | Some("text") => ContentPart::Text {
-      text: v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
-    },
-    _ => ContentPart::Raw { value: v.clone() },
-  }
+fn part_from_responses(v: &Value) -> Result<ContentPart> {
+  crate::media::parse_part(Endpoint::Responses, v)
 }
 
-fn message_to_responses_input_items(msg: &IrMessage) -> Vec<Value> {
-  let mut items: Vec<_> = msg
-    .content
-    .iter()
-    .filter_map(|part| match part {
-      ContentPart::ToolResult { id, content } => Some(json!({
-        "type": "function_call_output",
-        "call_id": id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(),
-        "output": tool_result_output(content),
-      })),
-      _ => None,
-    })
-    .collect();
+fn message_to_responses_input_items(msg: &IrMessage) -> Result<Vec<Value>> {
+  let mut items = Vec::new();
+  for part in &msg.content {
+    let (id, content) = match part {
+      ContentPart::ToolResult { id, content } => (id, Value::String(tool_result_output(content))),
+      ContentPart::ToolResultParts { id, content } => {
+        (id, crate::media::render_tool_parts(Endpoint::Responses, content)?)
+      }
+      _ => continue,
+    };
+    items.push(json!({"type":"function_call_output", "call_id":id.as_ref().or(msg.tool_call_id.as_ref()).cloned().unwrap_or_default(), "output":content}));
+  }
   let has_tool_results = !items.is_empty();
   if msg.role == Role::Tool && !has_tool_results {
-    return vec![json!({
+    return Ok(vec![json!({
       "type": "function_call_output",
       "call_id": msg.tool_call_id.clone().unwrap_or_default(),
       "output": text_from_parts(&msg.content),
-    })];
+    })]);
   }
   let role = if has_tool_results { &Role::User } else { &msg.role };
   let text_type = match role {
     Role::Assistant => "output_text",
     _ => "input_text",
   };
-  let parts: Vec<_> = msg
-    .content
-    .iter()
-    .filter_map(|p| match p {
-      ContentPart::Text { text } => Some(json!({ "type": text_type, "text": text })),
-      ContentPart::Raw { value } => Some(value.clone()),
-      _ => None,
-    })
-    .collect();
+  let mut parts = Vec::new();
+  for part in &msg.content {
+    match part {
+      ContentPart::Text { text } => parts.push(json!({"type":text_type, "text":text})),
+      ContentPart::Media { content } => parts.extend(crate::media::content_to_parts(
+        Endpoint::Responses,
+        content,
+        role.as_str(),
+      )?),
+      ContentPart::Native { endpoint, value } => {
+        let native = crate::media::native_part(Endpoint::Responses, endpoint, value)?;
+        if value["type"] == "image_generation_call" {
+          items.push(native);
+        } else {
+          parts.push(native);
+        }
+      }
+      ContentPart::Raw { value } => {
+        parts.extend(crate::media::raw_to_parts(Endpoint::Responses, value, role.as_str())?)
+      }
+      _ => {}
+    }
+  }
   let tool_calls: Vec<_> = msg
     .content
     .iter()
@@ -570,7 +670,7 @@ fn message_to_responses_input_items(msg: &IrMessage) -> Vec<Value> {
     items.push(json!({ "role": role.as_str(), "content": parts }));
   }
   items.extend(tool_calls);
-  items
+  Ok(items)
 }
 
 fn tool_result_output(content: &Value) -> String {

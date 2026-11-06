@@ -5,11 +5,11 @@ use tokn_endpoint_responses::ResponsesEvent;
 
 pub fn delta_from_endpoint_event(event: &ResponsesEvent) -> Result<Vec<IrDelta>> {
   let value = serde_json::to_value(event)?;
-  Ok(crate::value::responses::delta_from_responses_event(&value))
+  crate::sse::SseAccumulator::new(crate::provider::Endpoint::Responses).push_value(&value)
 }
 
 pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Result<Vec<ResponsesEvent>> {
-  crate::value::responses::events_from_deltas(resp_id, model, deltas, finish)
+  crate::value::responses::events_from_deltas(resp_id, model, deltas, finish)?
     .into_iter()
     .map(|(_, value)| serde_json::from_value(value).map_err(Into::into))
     .collect()

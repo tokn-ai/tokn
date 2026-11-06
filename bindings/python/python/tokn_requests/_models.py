@@ -17,6 +17,11 @@ from typing import (
   cast,
 )
 
+from ._content import (
+  AudioOutputOptions, Content, ContentBody, ImageGenerationOptions, TextContent,
+  content_body_from_dict, content_body_to_dict,
+)
+
 if TYPE_CHECKING:
   from ._client import Client, GenerateCall, GenerateRequestBuilder
 
@@ -521,30 +526,30 @@ class Message:
   """A simple provider-neutral conversation message."""
 
   role: Role
-  content: str
+  content: ContentBody
   tool_call_id: str | None = None
   tool_calls: list[ToolCall] = field(default_factory=list)
 
   @classmethod
-  def system(cls, content: str) -> Message:
+  def system(cls, content: ContentBody) -> Message:
     return cls(Role.SYSTEM, content)
 
   @classmethod
-  def user(cls, content: str) -> Message:
+  def user(cls, content: ContentBody) -> Message:
     return cls(Role.USER, content)
 
   @classmethod
-  def assistant(cls, content: str) -> Message:
+  def assistant(cls, content: ContentBody) -> Message:
     return cls(Role.ASSISTANT, content)
 
   @classmethod
-  def tool(cls, call_id: str, content: str) -> Message:
+  def tool(cls, call_id: str, content: ContentBody) -> Message:
     return cls(Role.TOOL, content, tool_call_id=call_id)
 
   @classmethod
   def assistant_with_tool_calls(
     cls,
-    content: str,
+    content: ContentBody,
     tool_calls: Iterable[ToolCall],
   ) -> Message:
     return cls(Role.ASSISTANT, content, tool_calls=list(tool_calls))
@@ -552,7 +557,7 @@ class Message:
   def to_dict(self) -> JsonObject:
     data: JsonObject = {
       "role": self.role.value,
-      "content": self.content,
+      "content": content_body_to_dict(self.content),
     }
     if self.tool_call_id is not None:
       data["tool_call_id"] = self.tool_call_id
@@ -564,7 +569,7 @@ class Message:
   def from_dict(cls, data: Mapping[str, Any]) -> Message:
     return cls(
       role=Role.from_dict(_required(data, "role")),
-      content=_string(data, "content"),
+      content=content_body_from_dict(_required(data, "content")),
       tool_call_id=_optional_string(data, "tool_call_id"),
       tool_calls=_models(data.get("tool_calls", []), ToolCall, "tool_calls"),
     )
@@ -639,6 +644,8 @@ class GenerateRequest:
   extras: JsonObject = field(default_factory=dict)
   top_k: int | None = None
   reasoning: ReasoningOptions | None = None
+  audio_output: AudioOutputOptions | None = None
+  image_generation: ImageGenerationOptions | None = None
 
   @classmethod
   def builder(cls, model: str) -> GenerateRequestBuilder:
@@ -665,15 +672,18 @@ class GenerateRequest:
       raise ValueError("at least one message or prompt is required")
     if all(
       message.role == Role.SYSTEM
-      or (
-        not message.content
-        and message.tool_call_id is None
-        and not message.tool_calls
-      )
+      or (not message.content and message.tool_call_id is None and not message.tool_calls)
       for message in self.messages
     ):
       raise ValueError("at least one non-system message must contain content")
     for message in self.messages:
+      content_body_from_dict(content_body_to_dict(message.content))
+      if (
+        message.role == Role.SYSTEM
+        and not isinstance(message.content, str)
+        and any(not isinstance(part, TextContent) for part in message.content)
+      ):
+        raise ValueError("system instructions require text content")
       if message.role != Role.ASSISTANT and message.tool_calls:
         raise ValueError("tool calls are only valid on assistant messages")
       if message.role == Role.TOOL:
@@ -682,9 +692,7 @@ class GenerateRequest:
       elif message.tool_call_id is not None:
         raise ValueError("tool_call_id is only valid on tool messages")
       if any(
-        tool_call.id is None
-        or not tool_call.id.strip()
-        or not tool_call.name.strip()
+        tool_call.id is None or not tool_call.id.strip() or not tool_call.name.strip()
         for tool_call in message.tool_calls
       ):
         raise ValueError("assistant tool calls require non-empty ids and names")
@@ -693,9 +701,7 @@ class GenerateRequest:
       ("top_p", self.top_p),
     ):
       if value is not None and (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
       ):
         raise ValueError(f"{name} must be finite")
     if self.top_p is not None and not 0 <= self.top_p <= 1:
@@ -706,18 +712,14 @@ class GenerateRequest:
       or self.max_output_tokens <= 0
       or self.max_output_tokens > _U64_MAX
     ):
-      raise ValueError(
-        f"max_output_tokens must be between 1 and {_U64_MAX}"
-      )
+      raise ValueError(f"max_output_tokens must be between 1 and {_U64_MAX}")
     if self.top_k is not None and (
       isinstance(self.top_k, bool)
       or not isinstance(self.top_k, int)
       or self.top_k < 0
       or self.top_k > _U64_MAX
     ):
-      raise ValueError(
-        f"top_k must be a non-negative integer no greater than {_U64_MAX}"
-      )
+      raise ValueError(f"top_k must be a non-negative integer no greater than {_U64_MAX}")
     if self.reasoning is not None:
       self.reasoning.validate()
       conflicting = sorted(
@@ -730,9 +732,11 @@ class GenerateRequest:
       )
       if conflicting:
         names = ", ".join(conflicting)
-        raise ValueError(
-          f"typed reasoning conflicts with extras keys: {names}"
-        )
+        raise ValueError(f"typed reasoning conflicts with extras keys: {names}")
+    if self.audio_output is not None:
+      AudioOutputOptions.from_dict(self.audio_output.to_dict())
+    if self.image_generation is not None:
+      ImageGenerationOptions.from_dict(self.image_generation.to_dict())
     if any(not tool.name.strip() for tool in self.tools):
       raise ValueError("tool names cannot be empty")
     if any(not isinstance(tool.parameters, Mapping) for tool in self.tools):
@@ -762,6 +766,10 @@ class GenerateRequest:
       data["max_output_tokens"] = self.max_output_tokens
     if self.reasoning is not None:
       data["reasoning"] = self.reasoning.to_dict()
+    if self.audio_output is not None:
+      data["audio_output"] = self.audio_output.to_dict()
+    if self.image_generation is not None:
+      data["image_generation"] = self.image_generation.to_dict()
     if not self.options.is_empty:
       data["options"] = self.options.to_dict()
     if self.extras:
@@ -800,6 +808,18 @@ class GenerateRequest:
           else _mapping(reasoning, "reasoning")
         )
       ),
+      audio_output=(
+        None
+        if data.get("audio_output") is None
+        else AudioOutputOptions.from_dict(_mapping(data["audio_output"], "audio_output"))
+      ),
+      image_generation=(
+        None
+        if data.get("image_generation") is None
+        else ImageGenerationOptions.from_dict(
+          _mapping(data["image_generation"], "image_generation")
+        )
+      ),
     )
 
   def to_json(self) -> str:
@@ -825,12 +845,15 @@ class GenerateResponse:
   reasoning: str | None = None
   tool_calls: list[ToolCall] = field(default_factory=list)
   usage: Usage | None = None
+  endpoint: Literal["responses", "chat_completions", "messages"] = "responses"
+  content: list[Content] = field(default_factory=list)
 
   def to_dict(self) -> JsonObject:
     headers: JsonObject = {}
     for name, value in self.headers.items():
       headers[name] = value if isinstance(value, str) else list(value)
     return {
+      "endpoint": self.endpoint,
       "http_status": self.http_status,
       "headers": headers,
       "id": self.id,
@@ -838,6 +861,7 @@ class GenerateResponse:
       "status": self.status,
       "finish_reason": self.finish_reason,
       "text": self.text,
+      "content": [part.to_dict() for part in self.content],
       "reasoning": self.reasoning,
       "tool_calls": [tool_call.to_dict() for tool_call in self.tool_calls],
       "usage": None if self.usage is None else self.usage.to_dict(),
@@ -860,7 +884,15 @@ class GenerateResponse:
           raise TypeError(f"header '{name}' values must be strings")
         headers[str(name)] = list(values)
     usage_data = data.get("usage")
+    endpoint = data.get("endpoint", "responses")
+    if endpoint not in {"responses", "chat_completions", "messages"}:
+      raise ValueError("unsupported generation response endpoint")
+    content = content_body_from_dict(data.get("content", []))
+    if isinstance(content, str):
+      raise TypeError("response content must be an array")
     return cls(
+      endpoint=endpoint,
+      content=list(content),
       http_status=http_status,
       headers=headers,
       id=_optional_string(data, "id"),
@@ -919,6 +951,49 @@ class ReasoningDelta(GenerateEvent):
 
 
 @dataclass(frozen=True, slots=True)
+class ContentCompleted(GenerateEvent):
+  index: int
+  content: Content
+
+  def to_dict(self) -> JsonObject:
+    return {"type": "content_completed", "index": self.index, "content": self.content.to_dict()}
+
+
+@dataclass(frozen=True, slots=True)
+class AudioDelta(GenerateEvent):
+  index: int
+  data: str
+  id: str | None = None
+  transcript: str | None = None
+  expires_at: int | None = None
+
+  def to_dict(self) -> JsonObject:
+    return {
+      "type": "audio_delta",
+      "index": self.index,
+      "data": self.data,
+      "id": self.id,
+      "transcript": self.transcript,
+      "expires_at": self.expires_at,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ImagePreview(GenerateEvent):
+  index: int
+  preview_index: int
+  content: Content
+
+  def to_dict(self) -> JsonObject:
+    return {
+      "type": "image_preview",
+      "index": self.index,
+      "preview_index": self.preview_index,
+      "content": self.content.to_dict(),
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCallDelta(GenerateEvent):
   index: int
   id: str | None
@@ -972,6 +1047,28 @@ def generate_event_from_dict(data: Mapping[str, Any]) -> GenerateEvent:
     return TextDelta(text=_string(data, "text"))
   if kind == "reasoning_delta":
     return ReasoningDelta(text=_string(data, "text"))
+  if kind in {"content_completed", "image_preview", "audio_delta"}:
+    index = _required(data, "index")
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+      raise ValueError("content index must be a non-negative integer")
+    if kind == "audio_delta":
+      expires_at = _optional_int(data, "expires_at")
+      if expires_at is not None and expires_at < 0:
+        raise ValueError("expires_at must be non-negative")
+      return AudioDelta(
+        index=index,
+        data=_string(data, "data"),
+        id=_optional_string(data, "id"),
+        transcript=_optional_string(data, "transcript"),
+        expires_at=expires_at,
+      )
+    content = Content.from_dict(_mapping(_required(data, "content"), "content"))
+    if kind == "content_completed":
+      return ContentCompleted(index=index, content=content)
+    preview_index = _required(data, "preview_index")
+    if isinstance(preview_index, bool) or not isinstance(preview_index, int) or preview_index < 0:
+      raise ValueError("preview_index must be a non-negative integer")
+    return ImagePreview(index=index, preview_index=preview_index, content=content)
   if kind == "tool_call_delta":
     index = _required(data, "index")
     if isinstance(index, bool) or not isinstance(index, int):
@@ -995,6 +1092,9 @@ def generate_event_from_dict(data: Mapping[str, Any]) -> GenerateEvent:
 
 
 __all__ = [
+  "AudioDelta",
+  "ContentCompleted",
+  "ImagePreview",
   "Completed",
   "GenerateEvent",
   "GenerateRequest",

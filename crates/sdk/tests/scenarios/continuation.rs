@@ -179,7 +179,7 @@ pub fn conversation_tool_steer_context_and_restore() {
     assert!(conversation
       .history()
       .iter()
-      .all(|message| !message.content.contains("document-content")));
+      .all(|message| !message.content.text().contains("document-content")));
 
     let sent = sent.borrow();
     assert_eq!(sent.len(), 2);

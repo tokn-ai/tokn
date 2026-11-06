@@ -19,6 +19,7 @@ std = [
 [dependencies]
 async-trait = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+base64.workspace = true
 bytes = { workspace = true, optional = true }
 directories = { workspace = true, optional = true }
 http = { workspace = true, optional = true }

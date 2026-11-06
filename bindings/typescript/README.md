@@ -87,6 +87,37 @@ const response = await client.send(request);
 Builder methods use camelCase. Fields that cross the serialization boundary
 use snake_case.
 
+## Text and media
+
+Message and tool-result content accepts a string or an ordered array of typed
+text, image, audio, video, document, and transcript parts. The same content
+types appear in `response.content` and can be reused for display or later input.
+
+```ts
+import type { ImageContent } from "@tokn-ai/requests";
+
+const image: ImageContent = {
+  type: "image",
+  resource: {
+    source: { type: "remote", url: "https://example.invalid/chart.png" },
+    media_type: "image/png",
+  },
+};
+const response = await client.generate("vision")
+  .user([{ type: "text", text: "Explain this chart." }, image])
+  .send();
+```
+
+Inline resources store standard base64 in `source.data`. Application asset
+references require explicit resolution; provider references retain their
+account/backend scope. Endpoint and model capabilities determine which media
+representations can be sent. Unsupported conversions return an error.
+Use `audioOutput({ voice, format })` to request speech and
+`imageGeneration({ output_format: "png" })` for the Responses image-generation
+tool. Streaming exposes `audio_delta`, `image_preview`, and
+`content_completed` events in addition to text and tools. Previews and chunks
+are provisional until the generation completes.
+
 ## Streaming and cancellation
 
 Generation streams are pull-based async iterables:

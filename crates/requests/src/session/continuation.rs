@@ -65,6 +65,16 @@ impl ProviderOrigin {
     &self.backend
   }
 
+  /// Media handles can be shared across models within the same account/backend.
+  pub fn asset_scope(&self) -> tokn_core::content::ProviderAssetScope {
+    tokn_core::content::ProviderAssetScope {
+      provider: self.provider.clone(),
+      account: self.account.clone(),
+      backend: self.backend.clone(),
+      upstream_account_digest: self.provider_account_digest.clone(),
+    }
+  }
+
   /// Bind an explicitly supplied upstream account identity independently of
   /// credential material, so refreshing tokens does not change this scope.
   pub fn with_provider_account_id(mut self, account_id: Option<&str>) -> Self {
@@ -95,8 +105,8 @@ impl ProviderState {
   }
 
   /// Automatic fallback can discard opaque reasoning, but it must not silently
-  /// omit user-visible native output that portable text/function messages
-  /// cannot represent. Explicitly clearing the checkpoint is a caller decision.
+  /// omit user-visible native output that portable history cannot represent.
+  /// Explicitly clearing the checkpoint is a caller decision.
   pub(crate) fn validate_restart(&self) -> Result<()> {
     if self.version != STATE_VERSION {
       return Err(ContinuationError::InvalidState("unsupported checkpoint version"));
@@ -118,10 +128,13 @@ impl ProviderState {
           _ => {}
         },
         Endpoint::ChatCompletions if item["role"] == "assistant" => {
-          if item.get("refusal").is_some_and(|value| !value.is_null())
-            || item.get("audio").is_some_and(|value| !value.is_null())
-          {
+          if item.get("refusal").is_some_and(|value| !value.is_null()) {
             return Err(unportable_restart());
+          }
+          if let Some(audio) = item.get("audio").filter(|value| !value.is_null()) {
+            if !audio["data"].as_str().is_some_and(|data| !data.is_empty()) {
+              return Err(unportable_restart());
+            }
           }
           if !item["content"].is_null() {
             validate_text_restart_content(&item["content"], &["text"])?;
@@ -194,10 +207,36 @@ type Result<T> = core::result::Result<T, ContinuationError>;
 /// Server-side handles are deliberately unsupported: native replay also works
 /// when Responses storage is disabled and retains encrypted reasoning items.
 pub fn capture(origin: ProviderOrigin, native_request: &Value, native_response: &Value) -> Result<ProviderState> {
+  capture_with_previous(origin, native_request, native_response, None)
+}
+
+pub(crate) fn capture_with_previous(
+  origin: ProviderOrigin,
+  native_request: &Value,
+  native_response: &Value,
+  previous: Option<&ProviderState>,
+) -> Result<ProviderState> {
   validate_origin(&origin)?;
   validate_model(&origin, native_request)?;
   let context_digest = context_digest(origin.endpoint, native_request)?;
   let mut history = input(origin.endpoint, native_request)?;
+  // Chat accepts only an audio id in assistant history. Retain the completed
+  // asset and expiry in the checkpoint even after another request is captured.
+  if origin.endpoint == Endpoint::ChatCompletions {
+    if let Some(previous) = previous.filter(|previous| previous.origin == origin) {
+      for item in &mut history {
+        if item["role"] == "assistant" && item["audio"]["id"].is_string() {
+          if let Some(old) = previous
+            .history
+            .iter()
+            .find(|old| old["role"] == "assistant" && old["audio"]["id"] == item["audio"]["id"])
+          {
+            item["audio"] = old["audio"].clone();
+          }
+        }
+      }
+    }
+  }
   validate_history(origin.endpoint, &history, false)?;
   history.extend(assistant_output(origin.endpoint, native_response)?);
   validate_history(origin.endpoint, &history, true)?;
@@ -248,9 +287,36 @@ pub fn replay(state: &ProviderState, origin: &ProviderOrigin, fresh_native_suffi
   let mut history = state.history.clone();
   history.extend(suffix);
   validate_history(origin.endpoint, &history, false)?;
+  if origin.endpoint == Endpoint::ChatCompletions {
+    for item in &mut history {
+      if item["role"] == "assistant" && item.get("audio").is_some_and(|audio| !audio.is_null()) {
+        item["audio"] = json!({"id": required_string(&item["audio"], "id")?});
+      }
+    }
+  }
   let mut request = fresh_native_suffix.clone();
   request[history_key(origin.endpoint)] = Value::Array(history);
   Ok(request)
+}
+
+/// Replay using the execution host's wall clock to reject expired native media.
+pub fn replay_at(
+  state: &ProviderState,
+  origin: &ProviderOrigin,
+  fresh_native_suffix: &Value,
+  unix_seconds: u64,
+) -> Result<Value> {
+  if state.origin.endpoint == Endpoint::ChatCompletions
+    && state.history.iter().any(|item| {
+      item["role"] == "assistant"
+        && item["audio"]["expires_at"]
+          .as_u64()
+          .is_some_and(|expires| expires <= unix_seconds)
+    })
+  {
+    return Err(ContinuationError::Incompatible("native audio reference has expired"));
+  }
+  replay(state, origin, fresh_native_suffix)
 }
 
 fn deserialize_endpoint<'de, D: Deserializer<'de>>(deserializer: D) -> core::result::Result<Endpoint, D::Error> {
@@ -404,6 +470,7 @@ fn assistant_output(endpoint: Endpoint, response: &Value) -> Result<Vec<Value>> 
         match item["type"].as_str() {
           Some("message") => validate_responses_output_message(item)?,
           Some("function_call" | "custom_tool_call") => {}
+          Some("image_generation_call") => validate_generated_image(item)?,
           Some("reasoning")
             if item["encrypted_content"]
               .as_str()
@@ -439,6 +506,15 @@ fn assistant_output(endpoint: Endpoint, response: &Value) -> Result<Vec<Value>> 
         ));
       }
       validate_chat_assistant(message)?;
+      if let Some(audio) = message.get("audio").filter(|audio| !audio.is_null()) {
+        tokn_core::content::decode_base64(required_string(audio, "data")?)
+          .map_err(|_| ContinuationError::InvalidState("native Chat audio data is not valid base64"))?;
+        if !audio["transcript"].is_string() || !audio["expires_at"].is_u64() {
+          return Err(ContinuationError::InvalidState(
+            "native Chat audio output is incomplete",
+          ));
+        }
+      }
       Ok(alloc::vec![message.clone()])
     }
   }
@@ -505,10 +581,16 @@ fn validate_chat_assistant(message: &Value) -> Result<()> {
       return Err(ContinuationError::InvalidState("invalid Chat assistant text field"));
     }
   }
-  if message.get("audio").is_some_and(|value| !value.is_null()) {
-    return Err(ContinuationError::Unsupported(
-      "native Chat audio output cannot be replayed",
-    ));
+  if let Some(audio) = message.get("audio").filter(|value| !value.is_null()) {
+    required_string(audio, "id")?;
+    for key in ["data", "transcript"] {
+      if audio.get(key).is_some_and(|value| !value.is_string()) {
+        return Err(ContinuationError::InvalidState("invalid native Chat audio field"));
+      }
+    }
+    if audio.get("expires_at").is_some_and(|value| !value.is_u64()) {
+      return Err(ContinuationError::InvalidState("invalid native Chat audio expiry"));
+    }
   }
   if let Some(calls) = message.get("tool_calls").filter(|value| !value.is_null()) {
     let calls = calls.as_array().ok_or(ContinuationError::InvalidState(
@@ -521,6 +603,16 @@ fn validate_chat_assistant(message: &Value) -> Result<()> {
         ));
       }
     }
+  }
+  Ok(())
+}
+
+fn validate_generated_image(item: &Value) -> Result<()> {
+  required_string(item, "id")?;
+  tokn_core::content::decode_base64(required_string(item, "result")?)
+    .map_err(|_| ContinuationError::InvalidState("native generated image is not valid base64"))?;
+  if item["status"] != "completed" {
+    return Err(ContinuationError::InvalidState("native generated image is incomplete"));
   }
   Ok(())
 }
@@ -561,6 +653,7 @@ fn validate_history(endpoint: Endpoint, history: &[Value], allow_pending: bool) 
     }
     match endpoint {
       Endpoint::Responses => match item["type"].as_str() {
+        Some("image_generation_call") => validate_generated_image(item)?,
         Some("function_call" | "custom_tool_call") => {
           required_string(item, "name")?;
           add_call(&mut pending, &mut seen, required_string(item, "call_id")?)?;

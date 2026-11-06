@@ -66,8 +66,8 @@ pub enum ContentBlock {
     #[serde(default, flatten)]
     extras: Extras,
   },
-  #[serde(other)]
-  Other,
+  #[serde(untagged)]
+  Other(Value),
 }
 
 /// Delta variants emitted inside `content_block_delta` events.
@@ -94,6 +94,6 @@ pub enum ContentBlockDelta {
     #[serde(default, flatten)]
     extras: Extras,
   },
-  #[serde(other)]
-  Other,
+  #[serde(untagged)]
+  Other(Value),
 }

@@ -9,6 +9,9 @@ from ._client import (
   TextStream,
 )
 from ._models import (
+  AudioDelta,
+  ContentCompleted,
+  ImagePreview,
   Completed,
   GenerateEvent,
   GenerateRequest,
@@ -30,6 +33,13 @@ from ._models import (
   Usage,
   UsageEvent,
 )
+from ._content import (
+  AssetReference, AudioContent, AudioFormat, AudioOutputOptions, Content, ContentBody,
+  DocumentContent, ImageContent, ImageDetail, ImageDimensions, ImageGenerationOptions,
+  InlineSource, MediaResource, MediaSource, ProviderAssetReference, ProviderAssetScope,
+  RemoteSource, TextContent, TranscriptContent, TranscriptSegment, VideoContent,
+  VideoFrame, VideoSource,
+)
 from ._native import (
   APIStatusError,
   AuthenticationError,
@@ -41,6 +51,12 @@ from ._native import (
 )
 
 __all__ = [
+  "AssetReference", "AudioContent", "AudioDelta", "AudioFormat", "AudioOutputOptions",
+  "Content", "ContentBody", "ContentCompleted", "DocumentContent", "ImageContent",
+  "ImageDetail", "ImageDimensions", "ImageGenerationOptions", "ImagePreview",
+  "InlineSource", "MediaResource", "MediaSource", "ProviderAssetReference",
+  "ProviderAssetScope", "RemoteSource", "TextContent", "TranscriptContent",
+  "TranscriptSegment", "VideoContent", "VideoFrame", "VideoSource",
   "APIStatusError",
   "AuthenticationError",
   "Client",

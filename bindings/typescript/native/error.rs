@@ -51,9 +51,9 @@ pub(crate) fn sdk_error(error: SdkError) -> NapiError {
     | SdkError::UnexpectedBuffered => native_error(REQUEST_ERROR, message),
     SdkError::GenerateResponseStatus { status, body } => api_status_error(message, status, body),
     SdkError::GenerateStream { .. } | SdkError::DeserializeStreamEvent { .. } => native_error(STREAM_ERROR, message),
-    SdkError::SerializeRequest { .. } | SdkError::DeserializeResponse { .. } => {
-      native_error(SERIALIZATION_ERROR, message)
-    }
+    SdkError::SerializeRequest { .. }
+    | SdkError::DeserializeResponse { .. }
+    | SdkError::DecodeGenerateResponse { .. } => native_error(SERIALIZATION_ERROR, message),
   }
 }
 

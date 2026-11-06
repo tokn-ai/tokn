@@ -14,6 +14,7 @@ pub(super) struct Chat {
   choice_metadata: Map<String, Value>,
   finish_reason: Option<String>,
   seen_choice: bool,
+  audio_data: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -72,7 +73,15 @@ impl Chat {
         .get("delta")
         .and_then(Value::as_object)
         .ok_or_else(|| error("native Chat stream choice has no delta object"))?;
-      if self.finish_reason.is_some() && delta.values().any(|value| !value.is_null()) {
+      if self.finish_reason.is_some()
+        && delta.iter().any(|(key, value)| {
+          !value.is_null()
+            && (key != "audio"
+              || !value
+                .as_object()
+                .is_some_and(|audio| audio.keys().all(|key| key == "expires_at")))
+        })
+      {
         return Err(error("native Chat content arrived after its finish reason"));
       }
       self.push_delta(delta)?;
@@ -119,10 +128,46 @@ impl Chat {
           destination.push_str(text);
         }
         "tool_calls" => self.push_tools(value)?,
+        "audio" => self.push_audio(value)?,
         // An opaque array can be retained exactly when supplied as one native
         // value. Conflicting later fragments need a provider-specific codec.
         "reasoning_details" if value.is_array() => preserve(&mut self.message, key, value)?,
         _ => return Err(error("native Chat delta has an unsupported field or shape")),
+      }
+    }
+    Ok(())
+  }
+
+  fn push_audio(&mut self, value: &Value) -> Result<(), Error> {
+    let fields = value
+      .as_object()
+      .ok_or_else(|| error("native Chat audio delta is not an object"))?;
+    let audio = self.message.entry("audio").or_insert_with(|| json!({}));
+    let audio = audio.as_object_mut().expect("audio initialized as object");
+    for (key, value) in fields {
+      match key.as_str() {
+        "data" => {
+          let encoded = value
+            .as_str()
+            .ok_or_else(|| error("native Chat audio data is not a string"))?;
+          let bytes = tokn_core::content::decode_base64(encoded)
+            .map_err(|_| error("native Chat audio chunk is not valid base64"))?;
+          self.audio_data.extend_from_slice(&bytes);
+        }
+        "transcript" => {
+          let text = value
+            .as_str()
+            .ok_or_else(|| error("native Chat audio transcript is not a string"))?;
+          let destination = audio.entry(key.clone()).or_insert_with(|| Value::String(String::new()));
+          let Value::String(destination) = destination else {
+            unreachable!("transcript initialized as string")
+          };
+          destination.push_str(text);
+        }
+        "id" if value.as_str().is_some_and(|id| !id.is_empty()) => preserve(audio, key, value)?,
+        "expires_at" if value.is_u64() => preserve(audio, key, value)?,
+        "id" | "expires_at" => return Err(error("invalid native Chat audio metadata")),
+        _ => preserve(audio, key, value)?,
       }
     }
     Ok(())
@@ -236,6 +281,19 @@ impl Chat {
     }
     self.message.entry("role").or_insert_with(|| json!("assistant"));
     self.message.entry("content").or_insert(Value::Null);
+    if let Some(audio) = self.message.get_mut("audio") {
+      if !audio["id"].is_string() || !audio["expires_at"].is_u64() || self.audio_data.is_empty() {
+        return Err(error("native Chat audio output is incomplete"));
+      }
+      let audio = audio.as_object_mut().expect("audio initialized as object");
+      audio.insert(
+        "data".into(),
+        Value::String(tokn_core::content::encode_base64(&self.audio_data)),
+      );
+      audio
+        .entry("transcript")
+        .or_insert_with(|| Value::String(String::new()));
+    }
     if !self.calls.is_empty() {
       let mut calls = Vec::with_capacity(self.calls.len());
       for mut call in self.calls {
@@ -288,6 +346,37 @@ fn preserve(destination: &mut Map<String, Value>, key: &str, value: &Value) -> R
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn audio_chunks_decode_independently_and_keep_trailing_expiry() {
+    let mut chat = Chat::default();
+    for frame in [
+      json!({"choices":[{"index":0,"delta":{"audio":{"id":"audio-1","data":"YQ==","transcript":"hel"}}}]}),
+      json!({"choices":[{"index":0,"delta":{"audio":{"data":"YmM=","transcript":"lo"}},"finish_reason":"stop"}]}),
+      json!({"choices":[{"index":0,"delta":{"audio":{"expires_at":200}}}]}),
+    ] {
+      chat.push(&frame).unwrap();
+    }
+    let response = chat.finish().unwrap();
+    assert_eq!(
+      response["choices"][0]["message"]["audio"],
+      json!({
+        "id":"audio-1", "data":"YWJj", "transcript":"hello", "expires_at":200,
+      })
+    );
+  }
+
+  #[test]
+  fn partial_audio_and_content_after_finish_are_rejected() {
+    let mut chat = Chat::default();
+    chat
+      .push(&json!({"choices":[{"delta":{"audio":{"id":"audio-1","data":"YQ=="}},"finish_reason":"stop"}]}))
+      .unwrap();
+    assert!(chat
+      .push(&json!({"choices":[{"delta":{"audio":{"data":"Yg=="}}}]}))
+      .is_err());
+    assert!(chat.finish().is_err());
+  }
 
   #[test]
   fn reconstructs_sparse_parallel_tools_with_native_reasoning_and_late_usage() {

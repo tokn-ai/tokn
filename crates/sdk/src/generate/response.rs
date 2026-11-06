@@ -10,6 +10,101 @@ use serde_json::Value;
 #[cfg(feature = "std")]
 use tokn_convert::ir::Usage as IrUsage;
 use tokn_core::headers::HeaderMap;
+use tokn_core::{
+  content::{AudioFormat, Content, ContentBody},
+  Endpoint,
+};
+
+/// Request evidence supplements omitted media metadata consistently for
+/// previews, completed parts and buffered output. Provider metadata wins.
+#[derive(Clone, Copy)]
+pub(super) struct OutputContentMetadata {
+  audio_format: Option<AudioFormat>,
+  image_media_type: Option<&'static str>,
+}
+
+impl OutputContentMetadata {
+  pub(super) fn for_request(request: &super::GenerateRequest) -> Self {
+    let audio_format = request.audio_output.as_ref().map(|options| options.format).or_else(|| {
+      match request.extras.get("audio")?.get("format")?.as_str()? {
+        "wav" => Some(AudioFormat::Wav),
+        "mp3" => Some(AudioFormat::Mp3),
+        "flac" => Some(AudioFormat::Flac),
+        "opus" => Some(AudioFormat::Opus),
+        "pcm16" => Some(AudioFormat::Pcm16),
+        "aac" => Some(AudioFormat::Aac),
+        _ => None,
+      }
+    });
+    let image_media_type = request
+      .image_generation
+      .as_ref()
+      .map(|options| options.output_format.media_type())
+      .or_else(|| image_tool_media_type(request.extras.get("tools")?));
+    Self {
+      audio_format,
+      image_media_type,
+    }
+  }
+
+  pub(super) fn enrich_content(self, content: &mut Content) {
+    match content {
+      Content::Audio(audio) => {
+        if audio.format.is_none() {
+          audio.format = audio
+            .resource
+            .media_type
+            .as_deref()
+            .and_then(AudioFormat::from_media_type)
+            .or(self.audio_format);
+        }
+        if audio.resource.media_type.is_none() {
+          audio.resource.media_type = audio.format.map(|format| format.media_type().into());
+        }
+      }
+      Content::Image(image) if image.resource.media_type.is_none() => {
+        image.resource.media_type = self.image_media_type.map(Into::into);
+      }
+      _ => {}
+    }
+  }
+
+  #[cfg(feature = "std")]
+  pub(super) fn enrich_event(self, event: &mut super::GenerateEvent) {
+    match event {
+      super::GenerateEvent::ContentCompleted { content, .. } | super::GenerateEvent::ImagePreview { content, .. } => {
+        self.enrich_content(content);
+      }
+      _ => {}
+    }
+  }
+}
+
+fn image_tool_media_type(tools: &Value) -> Option<&'static str> {
+  let mut media_type = None;
+  for tool in tools
+    .as_array()?
+    .iter()
+    .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("image_generation"))
+  {
+    // PNG is the native image-generation tool's default only when a tool is
+    // actually requested. Without that evidence an unknown type stays unknown.
+    let current = match tool.get("output_format") {
+      None => "image/png",
+      Some(value) => match value.as_str()? {
+        "png" => "image/png",
+        "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        _ => return None,
+      },
+    };
+    if media_type.is_some_and(|existing| existing != current) {
+      return None;
+    }
+    media_type = Some(current);
+  }
+  media_type
+}
 
 /// Friendly buffered output from a provider-neutral generation.
 #[derive(Debug)]
@@ -21,10 +116,14 @@ pub struct GenerateResponse {
   pub status: Option<String>,
   pub finish_reason: Option<String>,
   pub text: String,
+  /// Ordered text and media suitable for display or subsequent model input.
+  pub content: Vec<Content>,
   pub reasoning: Option<String>,
   pub tool_calls: Vec<ToolCall>,
   pub usage: Option<Usage>,
-  /// Full canonical Responses payload after routing and endpoint conversion.
+  /// Endpoint used for `raw` and the semantic event stream.
+  pub endpoint: Endpoint,
+  /// Full payload in `endpoint` format after routing and endpoint conversion.
   pub raw: Value,
   /// Native checkpoint for the next compatible generation.
   pub provider_state: Option<ProviderState>,
@@ -41,7 +140,11 @@ impl GenerateResponse {
     raw: Value,
     continuation: Option<tokn_requests::session::ContinuationResponse>,
   ) -> crate::Result<Self> {
-    let mut reply = Self::from_raw(status, headers, raw);
+    let mut reply = Self::from_endpoint(status, headers, raw, request.source_endpoint())?;
+    let metadata = OutputContentMetadata::for_request(request);
+    for content in &mut reply.content {
+      metadata.enrich_content(content);
+    }
     if let Some(continuation) = continuation {
       reply.provider_state = Some(ProviderState::capture(request, &reply, continuation.state)?);
       reply.continuation_status = continuation.outcome;
@@ -59,6 +162,7 @@ impl GenerateResponse {
       &self.status,
       &self.finish_reason,
       &self.text,
+      &self.content,
       &self.tool_calls,
       &self.provider_state,
       self.continuation_status,
@@ -81,31 +185,116 @@ impl GenerateResponse {
 
   /// Portable assistant history entry corresponding to this generation.
   pub fn assistant_message(&self) -> super::Message {
-    super::Message::assistant_with_tool_calls(&self.text, self.tool_calls.clone())
+    let content = if self.content.iter().all(|part| matches!(part, Content::Text(_))) {
+      ContentBody::Text(self.text.clone())
+    } else {
+      ContentBody::Parts(self.content.clone())
+    };
+    super::Message::assistant_with_tool_calls(content, self.tool_calls.clone())
   }
 
+  #[cfg(test)]
   pub(crate) fn from_raw(http_status: u16, headers: HeaderMap, raw: Value) -> Self {
-    let tool_calls = output_tool_calls(&raw);
-    Self {
+    Self::from_endpoint(http_status, headers, raw, Endpoint::Responses).expect("valid response fixture")
+  }
+
+  fn from_endpoint(http_status: u16, headers: HeaderMap, raw: Value, endpoint: Endpoint) -> crate::Result<Self> {
+    let ir = match endpoint {
+      Endpoint::Responses => tokn_convert::value::responses::response_from_value(&raw),
+      Endpoint::ChatCompletions => tokn_convert::value::chat::response_from_value(&raw),
+      Endpoint::Messages => tokn_convert::value::messages::response_from_value(&raw),
+    }
+    .map_err(|source| crate::Error::DecodeGenerateResponse { source })?;
+    for part in &ir.content {
+      let value = match part {
+        tokn_convert::ir::ContentPart::Native { value, .. } | tokn_convert::ir::ContentPart::Raw { value } => value,
+        _ => continue,
+      };
+      if matches!(
+        value.get("type").and_then(Value::as_str),
+        Some(
+          "output_audio"
+            | "audio"
+            | "input_audio"
+            | "input_video"
+            | "video"
+            | "output_video"
+            | "video_url"
+            | "output_image"
+            | "input_image"
+            | "image"
+            | "image_url"
+            | "input_file"
+            | "output_file"
+            | "file"
+            | "document"
+            | "image_generation_call"
+        )
+      ) {
+        return Err(crate::Error::DecodeGenerateResponse {
+          source: tokn_convert::error::ConvertError::UnsupportedFeature {
+            message: "the endpoint returned a media representation that cannot be decoded into portable content".into(),
+          },
+        });
+      }
+    }
+    let mut content: Vec<_> = ir
+      .content
+      .iter()
+      .filter_map(|part| match part {
+        tokn_convert::ir::ContentPart::Text { text } => Some(Content::text(text)),
+        tokn_convert::ir::ContentPart::Media { content } => Some(content.as_ref().clone()),
+        _ => None,
+      })
+      .collect();
+    let text = tokn_convert::ir::text_from_parts(&ir.content);
+    if content.is_empty() && !text.is_empty() {
+      content.push(Content::text(&text));
+    }
+    let reasoning = if endpoint == Endpoint::Responses {
+      output_reasoning(&raw)
+    } else {
+      tokn_convert::ir::reasoning_from_parts(&ir.content)
+    };
+    let tool_calls = if endpoint == Endpoint::Responses {
+      output_tool_calls(&raw)
+    } else {
+      ir.tool_calls
+        .into_iter()
+        .map(|call| ToolCall {
+          id: call.id,
+          name: call.name,
+          arguments: call.arguments,
+        })
+        .collect()
+    };
+    let finish_reason = if endpoint == Endpoint::Responses {
+      finish_reason(&raw, !tool_calls.is_empty())
+    } else {
+      ir.finish_reason
+    };
+    Ok(Self {
       http_status,
       headers,
       id: raw.get("id").and_then(Value::as_str).map(str::to_string),
       model: raw.get("model").and_then(Value::as_str).map(str::to_string),
       status: raw.get("status").and_then(Value::as_str).map(str::to_string),
-      finish_reason: finish_reason(&raw, !tool_calls.is_empty()),
-      text: output_text(&raw),
-      reasoning: output_reasoning(&raw),
+      finish_reason,
+      text,
+      content,
+      reasoning,
       tool_calls,
       usage: raw
         .get("usage")
         .filter(|usage| usage.is_object())
         .map(Usage::from_value),
       raw,
+      endpoint,
       provider_state: None,
       continuation_status: ContinuationStatus::Started,
       generation_binding: None,
       prepared_request_digest: None,
-    }
+    })
   }
 }
 
@@ -198,26 +387,6 @@ impl Usage {
       extras: usage.extras,
     }
   }
-}
-
-fn output_text(response: &Value) -> String {
-  if let Some(text) = response
-    .get("output_text")
-    .and_then(Value::as_str)
-    .filter(|text| !text.is_empty())
-  {
-    return text.to_string();
-  }
-  response
-    .get("output")
-    .and_then(Value::as_array)
-    .into_iter()
-    .flatten()
-    .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
-    .flat_map(|item| item.get("content").and_then(Value::as_array).into_iter().flatten())
-    .filter(|part| matches!(part.get("type").and_then(Value::as_str), Some("output_text" | "text")))
-    .filter_map(|part| part.get("text").and_then(Value::as_str))
-    .collect()
 }
 
 fn output_reasoning(response: &Value) -> Option<String> {
@@ -333,14 +502,82 @@ mod tests {
   use serde_json::json;
 
   #[test]
-  fn prefers_output_text_without_duplication() {
+  fn media_metadata_uses_request_evidence_and_preserves_provider_encoding() {
+    use crate::{AudioOutputOptions, GenerateRequest, ImageGenerationOptions, ImageOutputFormat};
+    use tokn_core::content::{AudioContent, ImageContent, MediaResource};
+
+    let request = GenerateRequest::builder("media")
+      .prompt("produce media")
+      .build()
+      .unwrap();
+    let unknown_image = || Content::Image(ImageContent::new(MediaResource::from_bytes(alloc::vec![1, 2, 3])));
+    let mut content = unknown_image();
+    OutputContentMetadata::for_request(&request).enrich_content(&mut content);
+    assert!(matches!(&content, Content::Image(image) if image.resource.media_type.is_none()));
+
+    let jpeg = request
+      .clone()
+      .into_builder()
+      .image_generation(ImageGenerationOptions {
+        output_format: ImageOutputFormat::Jpeg,
+        ..ImageGenerationOptions::default()
+      })
+      .build()
+      .unwrap();
+    OutputContentMetadata::for_request(&jpeg).enrich_content(&mut content);
+    assert!(matches!(&content, Content::Image(image) if image.resource.media_type.as_deref() == Some("image/jpeg")));
+
+    let mut provider_image = Content::Image(ImageContent::new(MediaResource::inline("image/webp", alloc::vec![1])));
+    OutputContentMetadata::for_request(&jpeg).enrich_content(&mut provider_image);
+    assert!(
+      matches!(&provider_image, Content::Image(image) if image.resource.media_type.as_deref() == Some("image/webp"))
+    );
+
+    let raw_tool = request
+      .clone()
+      .into_builder()
+      .extra("tools", json!([{"type":"image_generation","output_format":"webp"}]))
+      .build()
+      .unwrap();
+    let mut raw_image = unknown_image();
+    OutputContentMetadata::for_request(&raw_tool).enrich_content(&mut raw_image);
+    assert!(matches!(&raw_image, Content::Image(image) if image.resource.media_type.as_deref() == Some("image/webp")));
+
+    let audio_request = request
+      .into_builder()
+      .audio_output(AudioOutputOptions::new("voice", AudioFormat::Mp3))
+      .build()
+      .unwrap();
+    let mut audio = Content::Audio(AudioContent::new(MediaResource::from_bytes(alloc::vec![1])));
+    OutputContentMetadata::for_request(&audio_request).enrich_content(&mut audio);
+    assert!(
+      matches!(&audio, Content::Audio(audio) if audio.format == Some(AudioFormat::Mp3) && audio.resource.media_type.as_deref() == Some("audio/mpeg"))
+    );
+  }
+
+  #[test]
+  fn unsupported_media_cannot_be_reported_as_an_empty_success() {
+    let result = GenerateResponse::from_endpoint(
+      200,
+      HeaderMap::new(),
+      json!({
+        "status": "completed", "output": [{"type":"message","role":"assistant",
+        "content":[{"type":"output_audio","data":"AQID"}]}]
+      }),
+      Endpoint::Responses,
+    );
+    assert!(matches!(result, Err(crate::Error::DecodeGenerateResponse { .. })));
+  }
+
+  #[test]
+  fn projects_structured_text_without_duplication() {
     let response = GenerateResponse::from_raw(
       200,
       HeaderMap::new(),
       json!({
         "id": "resp_1",
         "status": "completed",
-        "output_text": "hello",
+        "output_text": "outdated convenience projection",
         "output": [{
           "type": "message",
           "content": [{"type": "output_text", "text": "hello"}]
@@ -350,6 +587,7 @@ mod tests {
     );
 
     assert_eq!(response.text, "hello");
+    assert_eq!(response.content, alloc::vec![Content::text("hello")]);
     assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     assert_eq!(response.usage.expect("usage").total_tokens, Some(3));
   }

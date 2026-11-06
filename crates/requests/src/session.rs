@@ -19,6 +19,7 @@ use tokn_accounts::{
   pool_state::{AffinityPolicy, PoolState, Selection},
   selection::{select_route, CandidateBinding, RouteSelection, SelectionRequest},
 };
+use tokn_core::content::{MediaKind, ProviderAssetReference};
 use tokn_core::generation::{GenerationOptions, ReasoningEffort};
 use tokn_core::request_event::RecordEvent;
 use tokn_core::{
@@ -37,6 +38,9 @@ use tokn_service::transport::{Request, ResponseHead, Transport};
 
 pub mod continuation;
 mod events;
+mod media;
+#[cfg(all(test, feature = "std"))]
+mod media_tests;
 mod native_sse;
 mod response;
 
@@ -105,13 +109,18 @@ pub struct Limits {
   pub max_response_bytes: usize,
   pub max_event_bytes: usize,
   pub max_error_body_bytes: usize,
+  /// Maximum serialized native request/history and completed continuation
+  /// checkpoint. Independent of the size allowed for a single response.
+  pub max_checkpoint_bytes: usize,
 }
 impl Default for Limits {
   fn default() -> Self {
     Self {
-      max_response_bytes: 4 * 1024 * 1024,
-      max_event_bytes: 64 * 1024,
+      // Generated media may occupy one complete base64-bearing SSE event.
+      max_response_bytes: 64 * 1024 * 1024,
+      max_event_bytes: 32 * 1024 * 1024,
       max_error_body_bytes: 8 * 1024,
+      max_checkpoint_bytes: 64 * 1024 * 1024,
     }
   }
 }
@@ -122,6 +131,10 @@ pub struct ModelCapabilities {
   pub endpoints: Option<Vec<Endpoint>>,
   pub reasoning_efforts: Option<Vec<ReasoningEffort>>,
   pub reasoning_supported: Option<bool>,
+  /// None means unknown; an empty list explicitly advertises no inputs.
+  pub input_modalities: Option<Vec<MediaKind>>,
+  /// None means unknown; an empty list explicitly advertises no outputs.
+  pub output_modalities: Option<Vec<MediaKind>>,
 }
 pub type ModelInventory = BTreeMap<SmolStr, ModelCapabilities>;
 
@@ -221,6 +234,8 @@ struct ContinuationBinding<'a> {
   binding: &'a Binding,
   required: Option<&'a ProviderOrigin>,
   compatible: bool,
+  media: &'a media::Requirements,
+  input: &'a RequestInput,
 }
 
 impl CandidateBinding for ContinuationBinding<'_> {
@@ -247,6 +262,21 @@ impl ContinuationBinding<'_> {
       && self
         .required
         .is_none_or(|origin| origin.model == model && origin.endpoint == endpoint)
+      && self.binding.models.with(|models| {
+        models
+          .get(model)
+          .is_none_or(|capabilities| self.media.accepts(capabilities))
+      })
+      && (self.media.is_text_only()
+        || tokn_convert::media::validate_request(
+          self.input.endpoint,
+          endpoint,
+          self
+            .required
+            .and_then(|_| self.input.continuation.as_ref()?.suffix.as_ref())
+            .unwrap_or(&self.input.body),
+        )
+        .is_ok())
   }
 }
 
@@ -446,6 +476,9 @@ pub struct RequestInput {
   pub dry_run: bool,
   /// Native continuation controls, carried outside the ordinary HTTP payload.
   pub continuation: Option<ContinuationRequest>,
+  /// Origin-scoped resource handles referenced by the SDK's typed content.
+  /// They are never serialized into the upstream HTTP payload.
+  pub media_assets: Vec<ProviderAssetReference>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -454,6 +487,9 @@ pub struct ContinuationRequest {
   pub policy: ContinuationPolicy,
   /// Fresh input in the inbound endpoint shape, after validating the covered history.
   pub suffix: Option<Value>,
+  /// The main body contains only a fresh suffix because portable history cannot
+  /// be encoded for this operation. Native replay remains possible; restart does not.
+  pub restart_unavailable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +515,7 @@ impl RequestInput {
       method: "POST",
       dry_run: false,
       continuation: None,
+      media_assets: Vec::new(),
     }
   }
 }
@@ -625,7 +662,15 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
       allowed_providers: self.input.allowed_providers.as_ref(),
     };
     let now = self.observer().clock.now();
-    if required.is_none() {
+    let media = media::Requirements::from_request(self.input.endpoint, &self.input.body);
+    let known_modalities = pool.members.iter().any(|&index| {
+      self.state.bindings[index].models.with(|models| {
+        models
+          .values()
+          .any(|metadata| metadata.input_modalities.is_some() || metadata.output_modalities.is_some())
+      })
+    });
+    if required.is_none() && media.is_text_only() && self.input.media_assets.is_empty() && !known_modalities {
       return select_route(
         route,
         request,
@@ -639,14 +684,21 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
       .iter()
       .map(|&index| {
         let binding = &self.state.bindings[index];
-        let compatible =
-          required.is_none_or(|origin| binding.continuation_origin(origin.endpoint, origin.model.as_str()) == *origin);
+        let compatible = required
+          .is_none_or(|origin| binding.continuation_origin(origin.endpoint, origin.model.as_str()) == *origin)
+          && self
+            .input
+            .media_assets
+            .iter()
+            .all(|asset| media::matches_asset(binding, asset));
         (
           index,
           ContinuationBinding {
             binding,
             required,
             compatible,
+            media: &media,
+            input: &self.input,
           },
         )
       })
@@ -862,6 +914,13 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
       .plan
       .route(profile.route())
       .ok_or_else(|| Error::new("resolve", "unknown route"))?;
+    media::validate_assets(&self.input.media_assets, self.observer().clock.unix_seconds())?;
+    if !self.input.media_assets.is_empty() && matches!(route, RoutePlan::Relay(_)) {
+      return Err(Error::new(
+        "resolve",
+        "provider-scoped media requires a managed account route",
+      ));
+    }
     if let Some(continuation) = &self.input.continuation {
       if matches!(route, RoutePlan::Relay(_)) {
         return Err(Self::continuation_error(
@@ -934,6 +993,17 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
         .as_ref()
         .is_some_and(|request| request.policy == ContinuationPolicy::AllowRestart)
       {
+        if self
+          .input
+          .continuation
+          .as_ref()
+          .is_some_and(|request| request.restart_unavailable)
+        {
+          return Err(Self::continuation_error(
+            "resolve",
+            ContinuationError::Unsupported("portable media history cannot be encoded for restart"),
+          ));
+        }
         state
           .validate_restart()
           .map_err(|error| Self::continuation_error("resolve", error))?;
@@ -966,11 +1036,17 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
         self.emit_resolved(extracted, &resolved);
         Ok(resolved)
       }
-      RouteSelection::NoAccount => Err(Error::new("resolve", "no eligible account for this request").with_kind(
-        ErrorKind::NoAccount {
+      RouteSelection::NoAccount => {
+        let media = media::Requirements::from_request(self.input.endpoint, &self.input.body);
+        let reason = if !media.is_text_only() || !self.input.media_assets.is_empty() {
+          "no eligible account satisfies this request's media capabilities, endpoint, and resource scope"
+        } else {
+          "no eligible account for this request"
+        };
+        Err(Error::new("resolve", reason).with_kind(ErrorKind::NoAccount {
           model: extracted.model.clone(),
-        },
-      )),
+        }))
+      }
       RouteSelection::ProviderAccessDenied => {
         Err(Error::new("resolve", "provider access denied").with_kind(ErrorKind::ProviderAccessDenied))
       }
@@ -1074,30 +1150,55 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
     }
     crate::preparation::apply_compaction_priority(&driver, extracted.request_classification, &mut shaped);
     if let Some(request) = &self.input.continuation {
+      if let Some(state) = &request.state {
+        let bytes = serde_json::to_vec(state).map_err(|error| Error::new("convert_request", error))?;
+        if bytes.len() > self.limits.max_checkpoint_bytes {
+          return Err(Self::continuation_error(
+            "convert_request",
+            ContinuationError::InvalidState("native history exceeds checkpoint byte limit"),
+          ));
+        }
+      }
       let origin = self.provider_origin(resolved);
       let outcome = match &request.state {
-        Some(state) if resolved.continuation_compatible => match continuation::replay(state, &origin, &shaped) {
-          Ok(body) => {
-            shaped = body;
-            ContinuationOutcome::Continued
+        Some(state) if resolved.continuation_compatible => {
+          match continuation::replay_at(state, &origin, &shaped, self.observer().clock.unix_seconds()) {
+            Ok(body) => {
+              shaped = body;
+              ContinuationOutcome::Continued
+            }
+            Err(ContinuationError::Incompatible(_)) if request.policy == ContinuationPolicy::AllowRestart => {
+              if request.restart_unavailable {
+                return Err(Self::continuation_error(
+                  "convert_request",
+                  ContinuationError::Unsupported("portable media history cannot be encoded for restart"),
+                ));
+              }
+              state
+                .validate_restart()
+                .map_err(|error| Self::continuation_error("convert_request", error))?;
+              shaped = self.shape_managed_body(resolved, &self.input.body)?;
+              crate::preparation::apply_compaction_priority(&driver, extracted.request_classification, &mut shaped);
+              ContinuationOutcome::Restarted
+            }
+            Err(error) => return Err(Self::continuation_error("convert_request", error)),
           }
-          Err(ContinuationError::Incompatible(_)) if request.policy == ContinuationPolicy::AllowRestart => {
-            state
-              .validate_restart()
-              .map_err(|error| Self::continuation_error("convert_request", error))?;
-            shaped = self.shape_managed_body(resolved, &self.input.body)?;
-            crate::preparation::apply_compaction_priority(&driver, extracted.request_classification, &mut shaped);
-            ContinuationOutcome::Restarted
-          }
-          Err(error) => return Err(Self::continuation_error("convert_request", error)),
-        },
+        }
         Some(_) => ContinuationOutcome::Restarted,
         None => ContinuationOutcome::Started,
       };
-      self.native_request = Some(shaped.clone());
       self.continuation_outcome = Some(outcome);
     }
     let mut decoded = Bytes::from(serde_json::to_vec(&shaped).map_err(|error| Error::new("convert_request", error))?);
+    if self.continuation_outcome.is_some() {
+      if decoded.len() > self.limits.max_checkpoint_bytes {
+        return Err(Self::continuation_error(
+          "convert_request",
+          ContinuationError::InvalidState("native request exceeds checkpoint byte limit"),
+        ));
+      }
+      self.native_request = Some(shaped.clone());
+    }
     prepared.body = if shaped == self.input.body {
       self.input.raw_body.clone()
     } else {

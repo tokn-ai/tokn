@@ -166,6 +166,30 @@ response = await client.send(request)
 As an alternative to `client.send(request)`, use
 `await request.bind(client).send()` when fluent binding is more convenient.
 
+Text, images, audio, video, documents, and transcripts have reusable content
+classes. Messages and tool results accept plain text or ordered content lists;
+completed media appears in `response.content`.
+
+```python
+from tokn_requests import ImageContent, MediaResource, TextContent
+
+image = ImageContent(MediaResource.remote("https://example.invalid/chart.png"))
+response = await client.generate("vision").user([
+  TextContent("Explain this chart."),
+  image,
+]).send()
+```
+
+`MediaResource.inline(media_type, data)` accepts immutable Python bytes and
+serializes them as base64. Provider references keep their account/backend scope;
+application asset references require explicit resolution before sending.
+Selected endpoint and model capabilities determine valid representations, and
+unsupported conversions return errors. Use `AudioOutputOptions` with
+`.audio_output(...)` to request speech or `ImageGenerationOptions` with
+`.image_generation(...)` for the Responses image-generation tool. Media streams
+expose typed `AudioDelta`, `ImagePreview`, and `ContentCompleted` events.
+Previews and chunks remain provisional until generation completes.
+
 Semantic streaming returns typed events:
 
 ```python

@@ -199,3 +199,27 @@ extern crate std;
 #[cfg(test)]
 #[path = "../../reentrant.rs"]
 mod reentrant;
+
+pub use scenarios::{
+  multimedia_native_inputs, multimedia_output_continuation, multimedia_tool_context_and_snapshot,
+  multimedia_unsupported_fails_before_transport,
+};
+#[cfg(test)]
+mod multimedia_tests {
+  #[test]
+  fn multimedia_native_inputs() {
+    super::multimedia_native_inputs();
+  }
+  #[test]
+  fn multimedia_output_continuation() {
+    super::multimedia_output_continuation();
+  }
+  #[test]
+  fn multimedia_tool_context_and_snapshot() {
+    super::multimedia_tool_context_and_snapshot();
+  }
+  #[test]
+  fn multimedia_unsupported_fails_before_transport() {
+    super::multimedia_unsupported_fails_before_transport();
+  }
+}

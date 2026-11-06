@@ -14,23 +14,25 @@ use alloc::{
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokn_core::types::Shared;
 
-use crate::{GenerateRequest, GenerateRequestBuilder, GenerateResponse, Message, ProviderState, Role, ToolCall};
+use crate::{
+  ContentBody, GenerateRequest, GenerateRequestBuilder, GenerateResponse, Message, ProviderState, Role, ToolCall,
+};
 
 /// Retrieved data supplied to one generation, with its source identity.
 ///
 /// Context is retained in a pending request for exact retries. It is not
 /// appended to portable history. Native continuation may still retain context
 /// already consumed by the provider; omitting it later does not erase it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RetrievedContext {
   pub source_id: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub source_version: Option<String>,
-  pub content: String,
+  pub content: ContentBody,
 }
 
 impl RetrievedContext {
-  pub fn new(source_id: impl Into<String>, content: impl Into<String>) -> Self {
+  pub fn new(source_id: impl Into<String>, content: impl Into<ContentBody>) -> Self {
     Self {
       source_id: source_id.into(),
       source_version: None,
@@ -211,9 +213,13 @@ impl Conversation {
   }
 
   /// Submit input now, or queue steering behind an active generation/tools.
-  pub fn submit_user(&mut self, content: impl Into<String>) -> Result<InputDisposition> {
+  pub fn submit_user(&mut self, content: impl Into<ContentBody>) -> Result<InputDisposition> {
     let content = content.into();
-    if content.trim().is_empty() {
+    crate::generate::validate_input_content(&content, Role::User).map_err(invalid_request)?;
+    content.validate().map_err(|error| ConversationError::InvalidRequest {
+      message: error.to_string(),
+    })?;
+    if content.is_blank() {
       return Err(ConversationError::EmptyInput);
     }
     let message = Message::user(content);
@@ -247,11 +253,16 @@ impl Conversation {
   ///
   /// This method never executes a tool. Persist the result before requesting
   /// another generation; uncertain external effects need reconciliation.
-  pub fn record_tool_result(&mut self, call_id: impl Into<String>, content: impl Into<String>) -> Result<()> {
+  pub fn record_tool_result(&mut self, call_id: impl Into<String>, content: impl Into<ContentBody>) -> Result<()> {
     if self.pending.is_some() {
       return Err(ConversationError::GenerationPending);
     }
     let call_id = call_id.into();
+    let content = content.into();
+    crate::generate::validate_input_content(&content, Role::Tool).map_err(invalid_request)?;
+    content.validate().map_err(|error| ConversationError::InvalidRequest {
+      message: error.to_string(),
+    })?;
     let Some(assistant) = self.history.iter().rposition(|message| message.role == Role::Assistant) else {
       return Err(ConversationError::UnknownToolCall { call_id });
     };
@@ -325,6 +336,7 @@ impl Conversation {
     request.provider_state = self.provider_state.clone();
     request.generation_binding = Some(binding.clone());
     request.validate().map_err(invalid_request)?;
+    request.validate_snapshot_media().map_err(invalid_request)?;
     let prepared = PreparedGeneration {
       binding,
       instruction_count,
@@ -363,7 +375,7 @@ impl Conversation {
     }
     validate_tool_calls(&response.tool_calls)?;
     let revision = self.next_revision()?;
-    let assistant = Message::assistant_with_tool_calls(response.text, response.tool_calls);
+    let assistant = response.assistant_message();
     self.history.push(assistant);
     self.provider_state = response.provider_state;
     self.pending = None;
@@ -417,7 +429,9 @@ impl Conversation {
     validate_history(&self.history)?;
     if self.queued_inputs.iter().any(|message| {
       message.role != Role::User
-        || message.content.trim().is_empty()
+        || message.content.is_blank()
+        || message.content.validate().is_err()
+        || crate::generate::validate_input_content(&message.content, Role::User).is_err()
         || message.tool_call_id.is_some()
         || !message.tool_calls.is_empty()
     }) {
@@ -442,6 +456,7 @@ impl Conversation {
       }
       validate_context(&request.context)?;
       request.validate().map_err(invalid_request)?;
+      request.validate_snapshot_media().map_err(invalid_request)?;
     }
     Ok(())
   }
@@ -450,7 +465,7 @@ impl Conversation {
 fn validate_context(context: &[RetrievedContext]) -> Result<()> {
   if context
     .iter()
-    .any(|item| item.source_id.trim().is_empty() || item.content.trim().is_empty())
+    .any(|item| item.source_id.trim().is_empty() || item.content.is_blank() || item.content.validate().is_err())
   {
     return Err(ConversationError::InvalidContext);
   }
@@ -473,11 +488,20 @@ fn validate_tool_calls(calls: &[ToolCall]) -> Result<()> {
 fn validate_history(history: &[Message]) -> Result<()> {
   let mut pending = BTreeSet::new();
   for message in history {
+    if message.role == Role::Assistant {
+      crate::generate::validate_snapshot_content(&message.content).map_err(invalid_request)?;
+    } else {
+      crate::generate::validate_input_content(&message.content, message.role).map_err(invalid_request)?;
+    }
+    message
+      .content
+      .validate()
+      .map_err(|error| invalid_stored(&error.to_string()))?;
     match message.role {
       Role::System => return Err(invalid_stored("system instructions belong to generation settings")),
       Role::User => {
         if !pending.is_empty()
-          || message.content.trim().is_empty()
+          || message.content.is_blank()
           || message.tool_call_id.is_some()
           || !message.tool_calls.is_empty()
         {
@@ -567,7 +591,7 @@ mod tests {
       .messages
       .iter()
       .filter(|message| message.role == Role::System)
-      .map(|message| message.content.as_str())
+      .map(|message| message.content.text())
       .collect::<Vec<_>>()
       .join("\n\n");
     let native_request = json!({"model": request.model, "instructions": instructions, "input": input});
@@ -595,6 +619,58 @@ mod tests {
   }
 
   #[test]
+  fn unsupported_input_and_tool_media_leave_history_and_queue_unchanged() {
+    use crate::{
+      content::ImageDetail, AudioContent, Content, DocumentContent, ImageContent, MediaResource, VideoContent,
+    };
+    let mut document = DocumentContent::new(MediaResource::inline("application/pdf", b"%PDF-fixture".to_vec()));
+    document.title = Some("Reference title".into());
+    let inputs: Vec<ContentBody> = vec![
+      VideoContent::new(MediaResource::inline("video/mp4", vec![1, 2, 3])).into(),
+      AudioContent::new(MediaResource::inline("audio/flac", vec![1, 2, 3])).into(),
+      vec![
+        Content::from(document),
+        ImageContent::new(MediaResource::inline("image/png", vec![1, 2, 3]))
+          .with_detail(ImageDetail::High)
+          .into(),
+      ]
+      .into(),
+    ];
+    let mut conversation = Conversation::new("media-intake").unwrap();
+    let initial = serialized(&conversation);
+    for input in &inputs {
+      assert!(conversation.submit_user(input.clone()).is_err());
+      assert_eq!(serialized(&conversation), initial);
+    }
+    conversation.submit_user("inspect the attachment").unwrap();
+    let prepared = conversation.prepare(settings(), Vec::new()).unwrap();
+    let pending = serialized(&conversation);
+    for input in &inputs {
+      assert!(conversation.submit_user(input.clone()).is_err());
+      assert_eq!(serialized(&conversation), pending);
+    }
+    conversation
+      .commit(
+        &prepared,
+        response(&prepared, "", vec![ToolCall::new("inspect", json!({})).id("call-a")]),
+      )
+      .unwrap();
+    let awaiting_tool = serialized(&conversation);
+    let audio = AudioContent::new(MediaResource::inline("audio/wav", vec![1, 2, 3]));
+    let mut audio_conversation = Conversation::new("audio-input").unwrap();
+    audio_conversation.submit_user(audio.clone()).unwrap();
+    for input in inputs.into_iter().chain(core::iter::once(audio.into())) {
+      assert!(conversation.record_tool_result("call-a", input).is_err());
+      assert_eq!(serialized(&conversation), awaiting_tool);
+      assert_eq!(conversation.outstanding_tool_calls().len(), 1);
+    }
+    conversation
+      .record_tool_result("call-a", "usable extracted text")
+      .unwrap();
+    assert!(conversation.outstanding_tool_calls().is_empty());
+  }
+
+  #[test]
   fn steering_waits_for_the_next_snapshot_and_retries_retain_retrieved_context() {
     let mut conversation = Conversation::new("conversation-a").unwrap();
     assert_eq!(
@@ -604,7 +680,7 @@ mod tests {
     let context = RetrievedContext::new("source-a", "Original retrieved excerpt.").with_source_version("v1");
     let prepared = conversation.prepare(settings(), vec![context.clone()]).unwrap();
     assert_eq!(prepared.request().messages[0].role, Role::System);
-    assert_eq!(prepared.request().messages[1].content, "first question");
+    assert_eq!(prepared.request().messages[1].content.text(), "first question");
     assert_eq!(prepared.context(), &[context]);
     assert!(matches!(
       conversation.prepare(settings(), Vec::new()),
@@ -621,21 +697,21 @@ mod tests {
       .commit(&prepared, response(&prepared, "first reply", Vec::new()))
       .unwrap();
     assert_eq!(conversation.history().len(), 2);
-    assert_eq!(conversation.queued_inputs()[0].content, "new instruction");
+    assert_eq!(conversation.queued_inputs()[0].content.text(), "new instruction");
 
     let next = conversation
       .prepare(settings(), vec![RetrievedContext::new("source-b", "New excerpt.")])
       .unwrap();
     assert_eq!(next.generation_id(), prepared.generation_id() + 1);
     assert_eq!(next.request().messages.len(), 4);
-    assert_eq!(next.request().messages[2].content, "first reply");
-    assert_eq!(next.request().messages[3].content, "new instruction");
+    assert_eq!(next.request().messages[2].content.text(), "first reply");
+    assert_eq!(next.request().messages[3].content.text(), "new instruction");
     assert_eq!(next.context()[0].source_id, "source-b");
     assert!(conversation.queued_inputs().is_empty());
     assert!(conversation
       .history()
       .iter()
-      .all(|message| !message.content.contains("excerpt")));
+      .all(|message| !message.content.text().contains("excerpt")));
   }
 
   #[test]
@@ -727,7 +803,7 @@ mod tests {
     let next = conversation.prepare(settings(), Vec::new()).unwrap();
     assert_eq!(next.request().messages[3].tool_call_id.as_deref(), Some("call-b"));
     assert_eq!(next.request().messages[4].tool_call_id.as_deref(), Some("call-a"));
-    assert_eq!(next.request().messages[5].content, "also explain the result");
+    assert_eq!(next.request().messages[5].content.text(), "also explain the result");
   }
 
   #[test]
@@ -748,7 +824,7 @@ mod tests {
     restored
       .commit(&prepared, response(&prepared, "recovered answer", Vec::new()))
       .unwrap();
-    assert_eq!(restored.history()[1].content, "recovered answer");
+    assert_eq!(restored.history()[1].content.text(), "recovered answer");
     assert!(restored.pending().is_none());
     assert!(!serialized(&restored).as_object().unwrap().contains_key("pending"));
     assert!(!serde_json::to_string(&restored)
@@ -778,7 +854,7 @@ mod tests {
     ));
     assert_eq!(serialized(&conversation), before);
     let next = conversation.prepare(settings(), Vec::new()).unwrap();
-    assert_eq!(next.request().messages[2].content, "queued");
+    assert_eq!(next.request().messages[2].content.text(), "queued");
   }
 
   #[test]
@@ -810,7 +886,7 @@ mod tests {
     limited.finish_reason = Some("length".into());
     limited.bind_prepared(prepared.request()).unwrap();
     conversation.commit(&prepared, limited).unwrap();
-    assert_eq!(conversation.history()[1].content, "partial but acknowledged");
+    assert_eq!(conversation.history()[1].content.text(), "partial but acknowledged");
   }
 
   #[test]
@@ -858,7 +934,7 @@ mod tests {
     assert_eq!(restored.history()[2].tool_call_id.as_deref(), Some("call-b"));
     restored.record_tool_result("call-a", "reconciled result").unwrap();
     let next = restored.prepare(settings(), Vec::new()).unwrap();
-    assert_eq!(next.request().messages[5].content, "queued steering");
+    assert_eq!(next.request().messages[5].content.text(), "queued steering");
 
     for message in [
       Message::tool("call-b", "duplicate result"),
@@ -924,7 +1000,7 @@ mod tests {
       )
       .unwrap();
     assert!(restarted.request().provider_state.is_none());
-    assert_eq!(restarted.request().messages[4].content, "queued steering");
+    assert_eq!(restarted.request().messages[4].content.text(), "queued steering");
   }
 
   #[test]

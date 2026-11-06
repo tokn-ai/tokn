@@ -31,7 +31,9 @@ function nativeError(
   message: string,
   details: { readonly status?: number; readonly body?: string } = {},
 ): Error {
-  return new Error(`TOKN_ERROR:${JSON.stringify({ code, message, ...details })}`);
+  return new Error(
+    `TOKN_ERROR:${JSON.stringify({ code, message, ...details })}`,
+  );
 }
 
 class FakeCancellation implements NativeCancellation {
@@ -51,7 +53,9 @@ class FakeCancellation implements NativeCancellation {
 
   untilCancelled(): Promise<never> {
     if (this.aborted) {
-      return Promise.reject(nativeError("cancelled", "operation was cancelled"));
+      return Promise.reject(
+        nativeError("cancelled", "operation was cancelled"),
+      );
     }
     return new Promise((_, reject) => {
       this.listeners.add(() => {
@@ -121,21 +125,29 @@ class FakeClient implements NativeClient {
     JSON.stringify({ type: "text_delta", text: "hello" }),
     JSON.stringify({ type: "completed", finish_reason: "stop" }),
   ]) as NativeGenerateStream & FakePullStream<string>;
-  requestEventStream: NativeRequestEventStream & { closeCalls: number } = new FakePullStream<string>([
-    JSON.stringify({
-      request_id: "request-1",
-      attempt: 0,
-      ts: 1,
-      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
-    }),
-  ]) as NativeRequestEventStream & FakePullStream<string>;
-  textOutputStream = new FakePullStream<string>(["hello", " world"]) as NativeTextStream &
-    FakePullStream<string>;
+  requestEventStream: NativeRequestEventStream & { closeCalls: number } =
+    new FakePullStream<string>([
+      JSON.stringify({
+        request_id: "request-1",
+        attempt: 0,
+        ts: 1,
+        payload: {
+          category: "stage",
+          event: { type: "started", data: { request_endpoint: "responses" } },
+        },
+      }),
+    ]) as NativeRequestEventStream & FakePullStream<string>;
+  textOutputStream = new FakePullStream<string>([
+    "hello",
+    " world",
+  ]) as NativeTextStream & FakePullStream<string>;
 
   constructor() {
     Object.assign(this.byteStream, {
       status: 200,
-      headersJson: JSON.stringify({ "content-type": "application/octet-stream" }),
+      headersJson: JSON.stringify({
+        "content-type": "application/octet-stream",
+      }),
     });
   }
 
@@ -182,7 +194,10 @@ class FakeClient implements NativeClient {
     return this.byteStream;
   }
 
-  async sendGenerate(requestJson: string, cancellation: NativeCancellation): Promise<string> {
+  async sendGenerate(
+    requestJson: string,
+    cancellation: NativeCancellation,
+  ): Promise<string> {
     this.lastRequestJson = requestJson;
     this.lastCancellation = cancellation as FakeCancellation;
     if (this.generateError !== undefined) {
@@ -191,35 +206,48 @@ class FakeClient implements NativeClient {
     if (this.blockGenerate) {
       return await this.lastCancellation.untilCancelled();
     }
-    return this.generateResponseJson ?? JSON.stringify({
-      http_status: 200,
-      headers: { "content-type": "application/json" },
-      id: "response-1",
-      model: "smart",
-      status: "completed",
-      finish_reason: "stop",
-      text: "hello",
-      reasoning: null,
-      tool_calls: [],
-      usage: null,
-      raw: { id: "response-1" },
-    });
+    return (
+      this.generateResponseJson ??
+      JSON.stringify({
+        http_status: 200,
+        endpoint: "responses",
+        content: [{ type: "text", text: "hello" }],
+        headers: { "content-type": "application/json" },
+        id: "response-1",
+        model: "smart",
+        status: "completed",
+        finish_reason: "stop",
+        text: "hello",
+        reasoning: null,
+        tool_calls: [],
+        usage: null,
+        raw: { id: "response-1" },
+      })
+    );
   }
 
-  async generateStream(requestJson: string, cancellation: NativeCancellation): Promise<NativeGenerateStream> {
+  async generateStream(
+    requestJson: string,
+    cancellation: NativeCancellation,
+  ): Promise<NativeGenerateStream> {
     this.lastRequestJson = requestJson;
     this.lastCancellation = cancellation as FakeCancellation;
     return this.eventStream;
   }
 
-  async textStream(requestJson: string, cancellation: NativeCancellation): Promise<NativeTextStream> {
+  async textStream(
+    requestJson: string,
+    cancellation: NativeCancellation,
+  ): Promise<NativeTextStream> {
     this.lastRequestJson = requestJson;
     this.lastCancellation = cancellation as FakeCancellation;
     return this.textOutputStream;
   }
 }
 
-function fakeBinding(client: FakeClient): NativeBinding & { readonly options: string[] } {
+function fakeBinding(
+  client: FakeClient,
+): NativeBinding & { readonly options: string[] } {
   const options: string[] = [];
   return {
     options,
@@ -278,7 +306,8 @@ test("native binding validation uses the public configuration error type", async
     Client.create(),
     (error: unknown) =>
       error instanceof ConfigurationError &&
-      error.message === "the native @tokn-ai/requests binding does not expose the expected API",
+      error.message ===
+        "the native @tokn-ai/requests binding does not expose the expected API",
   );
 
   setNativeBindingForTests({
@@ -289,7 +318,8 @@ test("native binding validation uses the public configuration error type", async
     Client.create(),
     (error: unknown) =>
       error instanceof ConfigurationError &&
-      error.message === "the native @tokn-ai/requests binding uses an unsupported ABI version",
+      error.message ===
+        "the native @tokn-ai/requests binding uses an unsupported ABI version",
   );
 });
 
@@ -314,7 +344,10 @@ test("request lifecycle subscriptions expose structured events", async () => {
       request_id: "request-1",
       attempt: 0,
       ts: 1,
-      payload: { category: "stage", event: { type: "started", data: { request_endpoint: "responses" } } },
+      payload: {
+        category: "stage",
+        event: { type: "started", data: { request_endpoint: "responses" } },
+      },
     },
   });
   await events.close();
@@ -372,7 +405,9 @@ test("raw endpoint namespaces and methods share the same request path", async ()
   setNativeBindingForTests(fakeBinding(native));
   const client = await Client.create();
 
-  const response = await client.chat.completions.create<{ readonly id: string }>(
+  const response = await client.chat.completions.create<{
+    readonly id: string;
+  }>(
     { model: "smart", messages: [] },
     { profile: "work", request_id: "request-1" },
   );
@@ -402,7 +437,8 @@ test("AbortSignal cancels the native operation", async () => {
 
   await assert.rejects(
     pending,
-    (error: unknown) => error instanceof CancelledError && error.code === "cancelled",
+    (error: unknown) =>
+      error instanceof CancelledError && error.code === "cancelled",
   );
   assert.equal(native.lastCancellation?.aborted, true);
 });
@@ -428,7 +464,9 @@ test("native status errors become stable public error classes", async () => {
 
 test("malformed native error payloads are not exposed in fallback messages", async () => {
   const native = new FakeClient();
-  native.generateError = new Error("native bridge failed: TOKN_ERROR:{not-json");
+  native.generateError = new Error(
+    "native bridge failed: TOKN_ERROR:{not-json",
+  );
   setNativeBindingForTests(fakeBinding(native));
   const client = await Client.create();
 
@@ -445,6 +483,8 @@ test("malformed native generation responses become serialization errors", async 
   const native = new FakeClient();
   native.generateResponseJson = JSON.stringify({
     http_status: 200,
+    endpoint: "responses",
+    content: [{ type: "text", text: "hello" }],
     headers: {},
     text: "incomplete",
     raw: {},
@@ -462,7 +502,10 @@ test("pull streams support async iteration and explicit cleanup", async () => {
   const native = new FakeClient();
   setNativeBindingForTests(fakeBinding(native));
   const client = await Client.create();
-  const stream = await client.generateStream({ model: "smart", prompt: "Hello" });
+  const stream = await client.generateStream({
+    model: "smart",
+    prompt: "Hello",
+  });
   const events: GenerateEvent[] = [];
 
   for await (const event of stream) {
@@ -482,7 +525,10 @@ test("malformed native stream events become serialization errors", async () => {
   ]) as NativeGenerateStream & FakePullStream<string>;
   setNativeBindingForTests(fakeBinding(native));
   const client = await Client.create();
-  const stream = await client.generateStream({ model: "smart", prompt: "Hello" });
+  const stream = await client.generateStream({
+    model: "smart",
+    prompt: "Hello",
+  });
 
   await assert.rejects(
     stream.next(),
@@ -523,10 +569,7 @@ test("raw streams yield Uint8Array chunks and preserve metadata", async () => {
 
   assert.equal(stream.status, 200);
   assert.equal(stream.headers["content-type"], "application/octet-stream");
-  assert.deepEqual(chunks, [
-    [1, 2],
-    [3],
-  ]);
+  assert.deepEqual(chunks, [[1, 2], [3]]);
 });
 
 test("close is idempotent and rejects later work", async () => {

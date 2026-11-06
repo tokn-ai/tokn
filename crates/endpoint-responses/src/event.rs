@@ -30,6 +30,17 @@ pub struct ResponsesEventCommon {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponsesEvent {
+  #[serde(rename = "response.image_generation_call.partial_image")]
+  ImageGenerationPartial {
+    #[serde(default, flatten)]
+    common: ResponsesEventCommon,
+    partial_image_index: u64,
+    partial_image_b64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_format: Option<String>,
+    #[serde(default, flatten)]
+    extras: Extras,
+  },
   #[serde(rename = "response.created")]
   Created {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,6 +256,7 @@ impl ResponsesEvent {
 
   pub fn kind(&self) -> &str {
     match self {
+      Self::ImageGenerationPartial { .. } => "response.image_generation_call.partial_image",
       Self::Created { .. } => "response.created",
       Self::InProgress { .. } => "response.in_progress",
       Self::OutputItemAdded { .. } => "response.output_item.added",

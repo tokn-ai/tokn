@@ -62,6 +62,11 @@ pub enum Error {
     #[source]
     source: tokn_convert::error::ConvertError,
   },
+  #[error("failed to decode generation content: {source}")]
+  DecodeGenerateResponse {
+    #[source]
+    source: tokn_convert::error::ConvertError,
+  },
   #[error("generation request failed with HTTP status {status}: {body}")]
   GenerateResponseStatus { status: u16, body: String },
   #[error("generation stream failed: {message}")]

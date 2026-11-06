@@ -1,5 +1,6 @@
 import { SerializationError } from "./errors.js";
 import { parseJsonObject } from "./serialization.js";
+import { validateContent } from "./content.js";
 import type {
   GenerateEvent,
   GenerateResponse,
@@ -19,12 +20,17 @@ function isObject(value: JsonValue | undefined): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isNullableString(value: JsonValue | undefined): value is string | null {
+function isNullableString(
+  value: JsonValue | undefined,
+): value is string | null {
   return value === null || typeof value === "string";
 }
 
 function isTokenCount(value: JsonValue | undefined): value is number | null {
-  return value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+  return (
+    value === null ||
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+  );
 }
 
 function requireOwn(object: JsonObject, key: string, label: string): JsonValue {
@@ -42,7 +48,10 @@ export function validateNativeHeaders(
     if (typeof header === "string") {
       continue;
     }
-    if (Array.isArray(header) && header.every((item) => typeof item === "string")) {
+    if (
+      Array.isArray(header) &&
+      header.every((item) => typeof item === "string")
+    ) {
       continue;
     }
     invalid(`an invalid value for ${label} '${name}'`);
@@ -50,7 +59,10 @@ export function validateNativeHeaders(
   return value as Readonly<Record<string, HeaderValue>>;
 }
 
-export function parseNativeHeaders(value: string, label = "response header"): Readonly<Record<string, HeaderValue>> {
+export function parseNativeHeaders(
+  value: string,
+  label = "response header",
+): Readonly<Record<string, HeaderValue>> {
   return validateNativeHeaders(parseJsonObject(value, `${label}s`), label);
 }
 
@@ -86,6 +98,19 @@ function validateUsage(value: JsonValue, label: string): Usage {
 
 export function parseNativeGenerateResponse(value: string): GenerateResponse {
   const response = parseJsonObject(value, "generation response");
+  if (
+    !["responses", "chat_completions", "messages"].includes(
+      requireOwn(response, "endpoint", "generation response") as string,
+    )
+  ) {
+    return invalid("an invalid generation response endpoint");
+  }
+  const content = requireOwn(response, "content", "generation response");
+  if (!Array.isArray(content))
+    return invalid("generation response content that is not an array");
+  content.forEach((part, index) =>
+    validateContent(part, `content[${index}]`, invalid),
+  );
   const httpStatus = requireOwn(response, "http_status", "generation response");
   if (
     typeof httpStatus !== "number" ||
@@ -115,7 +140,9 @@ export function parseNativeGenerateResponse(value: string): GenerateResponse {
   if (!Array.isArray(toolCalls)) {
     return invalid("generation response tool calls that are not an array");
   }
-  toolCalls.forEach((toolCall, index) => validateToolCall(toolCall, `tool call at index ${index}`));
+  toolCalls.forEach((toolCall, index) =>
+    validateToolCall(toolCall, `tool call at index ${index}`),
+  );
 
   const usage = requireOwn(response, "usage", "generation response");
   if (usage !== null) {
@@ -129,6 +156,53 @@ export function parseNativeGenerateEvent(value: string): GenerateEvent {
   const event = parseJsonObject(value, "generation event");
   const type = requireOwn(event, "type", "generation event");
   switch (type) {
+    case "content_completed":
+    case "image_preview": {
+      const index = requireOwn(event, "index", `${type} event`);
+      if (
+        typeof index !== "number" ||
+        !Number.isSafeInteger(index) ||
+        index < 0
+      )
+        return invalid(`an invalid ${type} event index`);
+      validateContent(
+        requireOwn(event, "content", `${type} event`),
+        `${type} content`,
+        invalid,
+      );
+      if (type === "image_preview") {
+        const preview_index = requireOwn(
+          event,
+          "preview_index",
+          `${type} event`,
+        );
+        if (
+          typeof preview_index !== "number" ||
+          !Number.isSafeInteger(preview_index) ||
+          preview_index < 0
+        )
+          return invalid("an invalid image_preview index");
+      }
+      break;
+    }
+    case "audio_delta": {
+      const index = requireOwn(event, "index", "audio_delta event");
+      if (
+        typeof index !== "number" ||
+        !Number.isSafeInteger(index) ||
+        index < 0
+      )
+        return invalid("an invalid audio_delta event index");
+      if (typeof requireOwn(event, "data", "audio_delta event") !== "string")
+        return invalid("an invalid audio_delta event data");
+      for (const key of ["id", "transcript"]) {
+        if (!isNullableString(requireOwn(event, key, "audio_delta event")))
+          return invalid(`an invalid audio_delta event ${key}`);
+      }
+      if (!isTokenCount(requireOwn(event, "expires_at", "audio_delta event")))
+        return invalid("an invalid audio_delta event expires_at");
+      break;
+    }
     case "text_delta":
     case "reasoning_delta":
       if (typeof requireOwn(event, "text", `${type} event`) !== "string") {
@@ -137,15 +211,24 @@ export function parseNativeGenerateEvent(value: string): GenerateEvent {
       break;
     case "tool_call_delta": {
       const index = requireOwn(event, "index", "tool_call_delta event");
-      if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 0) {
+      if (
+        typeof index !== "number" ||
+        !Number.isSafeInteger(index) ||
+        index < 0
+      ) {
         return invalid("an invalid tool_call_delta event index");
       }
       for (const key of ["id", "name"]) {
-        if (!isNullableString(requireOwn(event, key, "tool_call_delta event"))) {
+        if (
+          !isNullableString(requireOwn(event, key, "tool_call_delta event"))
+        ) {
           return invalid(`an invalid tool_call_delta event '${key}'`);
         }
       }
-      if (typeof requireOwn(event, "arguments_delta", "tool_call_delta event") !== "string") {
+      if (
+        typeof requireOwn(event, "arguments_delta", "tool_call_delta event") !==
+        "string"
+      ) {
         return invalid("an invalid tool_call_delta event arguments_delta");
       }
       break;
@@ -154,7 +237,9 @@ export function parseNativeGenerateEvent(value: string): GenerateEvent {
       validateUsage(requireOwn(event, "usage", "usage event"), "stream usage");
       break;
     case "completed":
-      if (!isNullableString(requireOwn(event, "finish_reason", "completed event"))) {
+      if (
+        !isNullableString(requireOwn(event, "finish_reason", "completed event"))
+      ) {
         return invalid("an invalid completed event finish_reason");
       }
       break;
@@ -172,7 +257,10 @@ export function parseNativeGenerateEvent(value: string): GenerateEvent {
 
 export function parseNativeRequestEvent(value: string): RequestEvent {
   const event = parseJsonObject(value, "request lifecycle event");
-  if (typeof requireOwn(event, "request_id", "request lifecycle event") !== "string") {
+  if (
+    typeof requireOwn(event, "request_id", "request lifecycle event") !==
+    "string"
+  ) {
     return invalid("a request lifecycle event without a string request_id");
   }
   for (const key of ["attempt", "ts"]) {

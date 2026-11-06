@@ -32,6 +32,12 @@ pub(super) fn digest<T: Serialize + ?Sized>(value: &T) -> Result<String> {
 }
 
 impl ProviderState {
+  /// Scope for provider-owned media produced by this continuation's backend.
+  /// Asset scope is independent of the model-bound continuation checkpoint.
+  pub fn asset_scope(&self) -> tokn_core::content::ProviderAssetScope {
+    self.native.origin().asset_scope()
+  }
+
   pub(crate) fn capture(
     request: &GenerateRequest,
     reply: &GenerateResponse,
@@ -100,6 +106,7 @@ impl GenerateRequest {
       state: self.provider_state.as_ref().map(|state| state.native.clone()),
       policy: self.continuation_policy,
       suffix,
+      restart_unavailable: false,
     })
   }
 }

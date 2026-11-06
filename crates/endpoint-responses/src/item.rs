@@ -164,6 +164,7 @@ pub enum OutputItem {
   Message(TaggedOutputMessage),
   Reasoning(TaggedReasoning),
   FunctionCall(TaggedFunctionCall),
+  ImageGeneration(ImageGenerationItem),
   Other(Value),
 }
 
@@ -181,9 +182,33 @@ impl<'de> Deserialize<'de> for OutputItem {
       Some("function_call") => serde_json::from_value(value)
         .map(OutputItem::FunctionCall)
         .map_err(serde::de::Error::custom),
+      Some("image_generation_call") => serde_json::from_value(value)
+        .map(OutputItem::ImageGeneration)
+        .map_err(serde::de::Error::custom),
       _ => Ok(OutputItem::Other(value)),
     }
   }
+}
+
+/// Result from the Responses image-generation tool. Progress items may not
+/// carry bytes yet; completed items carry a base64-encoded result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ImageGenerationItem {
+  #[serde(rename = "type", default = "image_generation_type")]
+  pub kind: String,
+  pub id: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub status: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub result: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub output_format: Option<String>,
+  #[serde(default, flatten)]
+  pub extras: Extras,
+}
+
+fn image_generation_type() -> String {
+  "image_generation_call".into()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

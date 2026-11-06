@@ -7,7 +7,7 @@ use tokn_endpoint_core::{join_path, push_extras, ExtraKeys};
 
 use crate::content::{ChatContent, ContentPart};
 use crate::event::{ChatChunk, ChatDelta, ChatEvent, ChunkChoice};
-use crate::message::{ChatMessage, ChatToolCall, ChatToolFunction};
+use crate::message::{ChatAudio, ChatMessage, ChatToolCall, ChatToolFunction};
 use crate::request::{ChatRequest, ChatToolDef};
 use crate::response::{ChatChoice, ChatResponse};
 use crate::usage::ChatUsage;
@@ -37,6 +37,7 @@ impl ExtraKeys for ChatMessage {
     push_extras(&self.extras, prefix, out);
     self.content.extra_keys_into(out, &join_path(prefix, "content"));
     self.tool_calls.extra_keys_into(out, &join_path(prefix, "tool_calls"));
+    self.audio.extra_keys_into(out, &join_path(prefix, "audio"));
   }
 }
 
@@ -54,8 +55,18 @@ impl ExtraKeys for ContentPart {
       ContentPart::Text { extras, .. }
       | ContentPart::ImageUrl { extras, .. }
       | ContentPart::InputAudio { extras, .. } => push_extras(extras, prefix, out),
-      ContentPart::Other => {}
+      ContentPart::File { file, extras } => {
+        push_extras(extras, prefix, out);
+        push_extras(&file.extras, &join_path(prefix, "file"), out);
+      }
+      ContentPart::Other(_) => {}
     }
+  }
+}
+
+impl ExtraKeys for ChatAudio {
+  fn extra_keys_into(&self, out: &mut Vec<String>, prefix: &str) {
+    push_extras(&self.extras, prefix, out);
   }
 }
 
@@ -106,6 +117,7 @@ impl ExtraKeys for ChatDelta {
   fn extra_keys_into(&self, out: &mut Vec<String>, prefix: &str) {
     push_extras(&self.extras, prefix, out);
     self.tool_calls.extra_keys_into(out, &join_path(prefix, "tool_calls"));
+    self.audio.extra_keys_into(out, &join_path(prefix, "audio"));
   }
 }
 
