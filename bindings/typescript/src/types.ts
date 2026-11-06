@@ -1,11 +1,20 @@
+import type {
+  AudioOutputOptions,
+  Content,
+  ContentBody,
+  ImageGenerationOptions,
+} from "./content.js";
+
 export type JsonPrimitive = boolean | number | string | null;
-export type JsonValue = JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
+export type JsonValue =
+  JsonPrimitive | readonly JsonValue[] | { readonly [key: string]: JsonValue };
 export type JsonObject = { readonly [key: string]: JsonValue };
 
 export type Endpoint = "responses" | "chat_completions" | "messages";
 export type Role = "system" | "user" | "assistant" | "tool";
 export type ReasoningMode = "enabled" | "disabled" | "adaptive";
-export type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | (string & {});
+export type ReasoningEffort =
+  "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | (string & {});
 export type ReasoningSummary = "auto" | "concise" | "detailed" | (string & {});
 export type HeaderValue = string | readonly string[];
 
@@ -37,7 +46,8 @@ export interface ReasoningOptions {
   readonly summary?: ReasoningSummary;
 }
 
-export type ToolChoice = "auto" | "none" | "required" | { readonly tool: string };
+export type ToolChoice =
+  "auto" | "none" | "required" | { readonly tool: string };
 
 export interface Tool {
   readonly name: string;
@@ -54,7 +64,7 @@ export interface ToolCall {
 
 export interface Message {
   readonly role: Role;
-  readonly content: string;
+  readonly content: ContentBody;
   readonly tool_call_id?: string;
   readonly tool_calls?: readonly ToolCall[];
 }
@@ -69,6 +79,8 @@ export interface GenerateRequest {
   readonly top_k?: number;
   readonly max_output_tokens?: number;
   readonly reasoning?: ReasoningOptions;
+  readonly audio_output?: AudioOutputOptions;
+  readonly image_generation?: ImageGenerationOptions;
   readonly options?: RequestOptions;
   readonly extras?: JsonObject;
 }
@@ -79,7 +91,7 @@ interface GenerateInputFields extends Omit<GenerateRequest, "messages"> {
 
 export type GenerateInput =
   | (GenerateInputFields & {
-      readonly prompt: string;
+      readonly prompt: ContentBody;
       readonly messages?: readonly Message[];
     })
   | (GenerateInputFields & {
@@ -97,6 +109,7 @@ export interface Usage {
 }
 
 export interface GenerateResponse {
+  readonly endpoint: Endpoint;
   readonly http_status: number;
   readonly headers: Readonly<Record<string, HeaderValue>>;
   readonly id: string | null;
@@ -104,6 +117,7 @@ export interface GenerateResponse {
   readonly status: string | null;
   readonly finish_reason: string | null;
   readonly text: string;
+  readonly content: readonly Content[];
   readonly reasoning: string | null;
   readonly tool_calls: readonly ToolCall[];
   readonly usage: Usage | null;
@@ -111,6 +125,25 @@ export interface GenerateResponse {
 }
 
 export type GenerateEvent =
+  | {
+      readonly type: "content_completed";
+      readonly index: number;
+      readonly content: Content;
+    }
+  | {
+      readonly type: "audio_delta";
+      readonly index: number;
+      readonly id: string | null;
+      readonly data: string;
+      readonly transcript: string | null;
+      readonly expires_at: number | null;
+    }
+  | {
+      readonly type: "image_preview";
+      readonly index: number;
+      readonly preview_index: number;
+      readonly content: Content;
+    }
   | {
       readonly type: "text_delta";
       readonly text: string;
@@ -153,7 +186,8 @@ export interface RequestEvent {
   readonly payload: JsonObject;
 }
 
-export interface AsyncStream<T> extends AsyncIterableIterator<T>, AsyncDisposable {
+export interface AsyncStream<T>
+  extends AsyncIterableIterator<T>, AsyncDisposable {
   close(): Promise<void>;
 }
 

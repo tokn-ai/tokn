@@ -29,8 +29,8 @@ pub use endpoint::{ChatCompletions, Messages, Responses};
 pub use error::{Error, Result};
 pub use generate::ProviderState;
 pub use generate::{
-  GenerateCall, GenerateRequest, GenerateRequestBuilder, GenerateResponse, Message, Role, Tool, ToolCall, ToolChoice,
-  Usage,
+  AudioOutputFormat, AudioOutputOptions, GenerateCall, GenerateRequest, GenerateRequestBuilder, GenerateResponse,
+  ImageGenerationOptions, ImageOutputFormat, Message, Role, Tool, ToolCall, ToolChoice, Usage,
 };
 #[cfg(feature = "std")]
 pub use generate::{GenerateEvent, GenerateStream, TextStream};
@@ -39,6 +39,11 @@ pub use response::{ByteStream, RawResponse, ResponseBody, StreamResponse};
 #[cfg(feature = "std")]
 pub use std_client::{ClientBuilder, StdPlatform};
 pub use tokn_config as config;
+pub use tokn_core::content;
+pub use tokn_core::content::{
+  AudioContent, Content, ContentBody, DocumentContent, ImageContent, MediaResource, MediaSource, TextContent,
+  TranscriptContent, VideoContent,
+};
 pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
 pub use tokn_requests::configured::{Adapter, EventRuntime, Lifecycle, Limits, Runtime};

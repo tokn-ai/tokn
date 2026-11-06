@@ -9,6 +9,7 @@ extern crate std;
 
 pub mod account;
 pub mod authority;
+pub mod content;
 #[cfg(feature = "std")]
 pub mod db;
 pub mod endpoint;

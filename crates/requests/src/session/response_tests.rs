@@ -86,9 +86,11 @@ fn stream(frames: &[Value]) -> Fixture {
       Endpoint::ChatCompletions,
       "model",
     ),
+    Endpoint::Responses,
+    None,
     request,
     ContinuationOutcome::Started,
-    max_response_bytes,
+    Limits::default(),
   )
   .unwrap();
   let source = Source {

@@ -12,6 +12,49 @@ fn origin(endpoint: Endpoint) -> ProviderOrigin {
   )
 }
 
+#[test]
+fn audio_continuation_sends_only_native_id_and_retains_expiry_across_generations() {
+  let origin = origin(Endpoint::ChatCompletions);
+  let request = json!({"model":"model","messages":[{"role":"user","content":"say hello"}],
+    "modalities":["text","audio"],"audio":{"voice":"alloy","format":"wav"}});
+  let response = json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":null,
+    "audio":{"id":"audio-1","data":"YQ==","transcript":"hello","expires_at":200}}}]});
+  let state = capture(origin.clone(), &request, &response).unwrap();
+  let mut suffix = request.clone();
+  suffix["messages"] = json!([{"role":"user","content":"continue"}]);
+  let replayed = replay_at(&state, &origin, &suffix, 199).unwrap();
+  assert_eq!(replayed["messages"][1]["audio"], json!({"id":"audio-1"}));
+  assert!(matches!(
+    replay_at(&state, &origin, &suffix, 200),
+    Err(ContinuationError::Incompatible(_))
+  ));
+  let next = json!({"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"done"}}]});
+  let next_state = capture_with_previous(origin.clone(), &replayed, &next, Some(&state)).unwrap();
+  assert_eq!(
+    next_state.history[1]["audio"],
+    response["choices"][0]["message"]["audio"]
+  );
+  assert!(replay_at(&next_state, &origin, &suffix, 200).is_err());
+  assert!(next_state.validate_restart().is_ok());
+}
+
+#[test]
+fn generated_images_remain_in_order_in_native_history() {
+  let origin = origin(Endpoint::Responses);
+  let request = json!({"model":"model","input":[{"role":"user","content":"draw a tree"}],
+    "tools":[{"type":"image_generation"}]});
+  let image =
+    json!({"type":"image_generation_call","id":"image-1","status":"completed", "result":"YQ==", "output_format":"png"});
+  let response = json!({"status":"completed","output":[image,
+    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"Here it is"}]}]});
+  let state = capture(origin.clone(), &request, &response).unwrap();
+  let mut suffix = request.clone();
+  suffix["input"] = json!([{"role":"user","content":"make it blue"}]);
+  let replayed = replay(&state, &origin, &suffix).unwrap();
+  assert_eq!(replayed["input"][1], image);
+  assert_eq!(replayed["input"].as_array().unwrap().len(), 4);
+}
+
 fn messages_request(messages: Value) -> Value {
   json!({
     "model": "model", "system": [{"type": "text", "text": "stable system", "cache_control": {"type": "ephemeral"}}],

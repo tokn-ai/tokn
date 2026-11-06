@@ -53,3 +53,26 @@ export type {
   Usage,
 } from "./types.js";
 export type { ToknErrorCode, ToknErrorOptions } from "./errors.js";
+export type {
+  AssetReference,
+  AudioContent,
+  AudioFormat,
+  AudioOutputOptions,
+  Content,
+  ContentBody,
+  DocumentContent,
+  ImageContent,
+  ImageDetail,
+  ImageDimensions,
+  ImageGenerationOptions,
+  MediaResource,
+  MediaSource,
+  ProviderAssetReference,
+  ProviderAssetScope,
+  TextContent,
+  TranscriptContent,
+  TranscriptSegment,
+  VideoContent,
+  VideoFrame,
+  VideoSource,
+} from "./content.js";

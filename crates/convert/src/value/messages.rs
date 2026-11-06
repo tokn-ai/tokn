@@ -1,6 +1,7 @@
 use super::chat::args_to_string;
 use crate::error::{ConvertError, Result};
 use crate::ir::*;
+use crate::provider::Endpoint;
 use alloc::collections::BTreeMap;
 use alloc::{string::String, string::ToString, vec::Vec};
 use serde_json::{json, Map, Value};
@@ -82,7 +83,7 @@ pub fn request_to_value(req: &IrRequest) -> Result<Value> {
   }
   out.insert(
     "messages".into(),
-    Value::Array(req.messages.iter().map(message_to_messages).collect()),
+    Value::Array(req.messages.iter().map(message_to_messages).collect::<Result<_>>()?),
   );
   let tools: Vec<Value> = req
     .tools
@@ -150,7 +151,7 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
           name: part.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
           arguments: part.get("input").cloned().unwrap_or(Value::Null),
         }),
-        _ => content.push(ContentPart::Raw { value: part.clone() }),
+        _ => content.push(crate::media::parse_part(Endpoint::Messages, part)?),
       }
     }
   }
@@ -177,6 +178,16 @@ pub fn response_from_value(v: &Value) -> Result<IrResponse> {
 }
 
 pub fn response_to_value(resp: &IrResponse) -> Result<Value> {
+  if resp.content.iter().any(|part| {
+    matches!(
+      part,
+      ContentPart::Media { .. } | ContentPart::Native { .. } | ContentPart::Raw { .. }
+    )
+  }) {
+    return Err(crate::media::unsupported(
+      "nontext output has no portable Messages assistant representation",
+    ));
+  }
   let mut content = Vec::new();
   let text = text_from_parts(&resp.content);
   if !text.is_empty() {
@@ -306,24 +317,32 @@ pub fn delta_from_messages_event(v: &Value) -> Vec<IrDelta> {
 
 /// Format unframed delta events, or a complete Messages stream when `finish`
 /// is true. Incremental streams should retain a stateful `MessagesEmitter`.
-pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Vec<(String, Value)> {
+pub fn events_from_deltas(
+  resp_id: &str,
+  model: &str,
+  deltas: &[IrDelta],
+  finish: bool,
+) -> Result<Vec<(String, Value)>> {
   if finish {
     let mut emitter = crate::sse::messages_emit::MessagesEmitter::new(resp_id.into(), model.into());
-    let mut events = emitter.emit(deltas);
+    let mut events = emitter.emit(deltas)?;
     events.extend(emitter.finish());
-    return events
-      .into_iter()
-      .map(|event| {
-        (
-          event.event.expect("Messages events are named"),
-          event.json.expect("Messages events are JSON"),
-        )
-      })
-      .collect();
+    return Ok(
+      events
+        .into_iter()
+        .map(|event| {
+          (
+            event.event.expect("Messages events are named"),
+            event.json.expect("Messages events are JSON"),
+          )
+        })
+        .collect(),
+    );
   }
   let mut events = Vec::new();
   for delta in deltas {
     match delta {
+      IrDelta::Media { .. } | IrDelta::Audio { .. } | IrDelta::ImagePreview { .. } => return Err(crate::media::unsupported("Messages streaming cannot emit media output")),
       IrDelta::Text(text) => events.push((
         "content_block_delta".into(),
         json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": text } }),
@@ -354,31 +373,31 @@ pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish
       )),
     }
   }
-  events
+  Ok(events)
 }
 
 fn message_from_messages(v: &Value) -> Result<IrMessage> {
   let role = Role::from_wire(v.get("role").and_then(Value::as_str).unwrap_or("user"));
   Ok(IrMessage {
     role,
-    content: content_from_messages(v.get("content")),
+    content: content_from_messages(v.get("content"))?,
     tool_call_id: None,
     name: None,
     raw: None,
   })
 }
 
-fn content_from_messages(content: Option<&Value>) -> Vec<ContentPart> {
-  match content {
+fn content_from_messages(content: Option<&Value>) -> Result<Vec<ContentPart>> {
+  Ok(match content {
     Some(Value::String(s)) => vec![ContentPart::Text { text: s.clone() }],
-    Some(Value::Array(parts)) => parts.iter().map(part_from_messages).collect(),
-    Some(v) => vec![ContentPart::Raw { value: v.clone() }],
+    Some(Value::Array(parts)) => parts.iter().map(part_from_messages).collect::<Result<_>>()?,
+    Some(_) => return Err(ConvertError::bad_shape("content", "expected text or content parts")),
     None => Vec::new(),
-  }
+  })
 }
 
-fn part_from_messages(v: &Value) -> ContentPart {
-  match v.get("type").and_then(Value::as_str) {
+fn part_from_messages(v: &Value) -> Result<ContentPart> {
+  Ok(match v.get("type").and_then(Value::as_str) {
     Some("text") => ContentPart::Text {
       text: v.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
     },
@@ -397,30 +416,41 @@ fn part_from_messages(v: &Value) -> ContentPart {
         arguments: v.get("input").cloned().unwrap_or(Value::Null),
       },
     },
-    Some("tool_result") => ContentPart::ToolResult {
-      id: v.get("tool_use_id").and_then(Value::as_str).map(str::to_string),
-      content: v.get("content").cloned().unwrap_or(Value::Null),
-    },
-    _ => ContentPart::Raw { value: v.clone() },
-  }
+    Some("tool_result") => {
+      let id = v.get("tool_use_id").and_then(Value::as_str).map(str::to_string);
+      if let Some(content) = crate::media::tool_parts(Endpoint::Messages, &v["content"])? {
+        ContentPart::ToolResultParts { id, content }
+      } else {
+        ContentPart::ToolResult {
+          id,
+          content: v.get("content").cloned().unwrap_or(Value::Null),
+        }
+      }
+    }
+    _ => crate::media::parse_part(Endpoint::Messages, v)?,
+  })
 }
 
-fn message_to_messages(msg: &IrMessage) -> Value {
-  let content: Vec<_> = msg.content.iter().map(part_to_messages).collect();
-  let role = if msg
-    .content
-    .iter()
-    .any(|part| matches!(part, ContentPart::ToolResult { .. }))
-  {
+fn message_to_messages(msg: &IrMessage) -> Result<Value> {
+  let role = if msg.content.iter().any(|part| {
+    matches!(
+      part,
+      ContentPart::ToolResult { .. } | ContentPart::ToolResultParts { .. }
+    )
+  }) {
     "user"
   } else {
     msg.role.as_str()
   };
-  json!({ "role": role, "content": content })
+  let mut content = Vec::new();
+  for part in &msg.content {
+    content.extend(part_to_messages(part, role)?);
+  }
+  Ok(json!({ "role": role, "content": content }))
 }
 
-fn part_to_messages(part: &ContentPart) -> Value {
-  match part {
+fn part_to_messages(part: &ContentPart, role: &str) -> Result<Vec<Value>> {
+  Ok(vec![match part {
     ContentPart::Text { text } => json!({ "type": "text", "text": text }),
     ContentPart::Reasoning { text } => json!({ "type": "thinking", "thinking": text }),
     ContentPart::ToolCall { call } => json!({
@@ -434,8 +464,13 @@ fn part_to_messages(part: &ContentPart) -> Value {
       "tool_use_id": id,
       "content": content,
     }),
-    ContentPart::Raw { value } => value.clone(),
-  }
+    ContentPart::ToolResultParts { id, content } => {
+      json!({"type":"tool_result", "tool_use_id":id, "content":crate::media::render_tool_parts(Endpoint::Messages, content)?})
+    }
+    ContentPart::Media { content } => return crate::media::content_to_parts(Endpoint::Messages, content, role),
+    ContentPart::Native { endpoint, value } => crate::media::native_part(Endpoint::Messages, endpoint, value)?,
+    ContentPart::Raw { value } => return crate::media::raw_to_parts(Endpoint::Messages, value, role),
+  }])
 }
 
 fn system_to_string(system: Option<&Value>) -> Option<String> {
@@ -760,7 +795,8 @@ mod tests {
         "claude-test",
         &[IrDelta::Finish(Some(canonical_reason.into()))],
         false,
-      );
+      )
+      .unwrap();
       assert_eq!(events[0].1["delta"]["stop_reason"], messages_reason);
     }
   }
@@ -797,7 +833,7 @@ mod tests {
     }
 
     let mut accumulator = crate::sse::SseAccumulator::new(crate::provider::Endpoint::Messages);
-    accumulator.push_value(&start);
+    accumulator.push_value(&start).unwrap();
     let response = accumulator.finish();
 
     assert_eq!(response.tool_calls.len(), 1);

@@ -45,6 +45,8 @@ pub struct ChatDelta {
   pub content: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub reasoning_content: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub audio: Option<crate::message::ChatAudio>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub tool_calls: Vec<ChatToolCall>,
   #[serde(default, flatten)]

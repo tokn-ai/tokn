@@ -1,5 +1,11 @@
 import { RequestError } from "./errors.js";
 import { parseJson, serializeJson } from "./serialization.js";
+import { isEmptyContent, validateContentBody } from "./content.js";
+import type {
+  AudioOutputOptions,
+  ContentBody,
+  ImageGenerationOptions,
+} from "./content.js";
 import type {
   GenerateInput,
   GenerateRequest,
@@ -18,13 +24,22 @@ import type {
 
 const ROLES = new Set(["system", "user", "assistant", "tool"]);
 const REASONING_MODES = new Set(["enabled", "disabled", "adaptive"]);
-const REASONING_EXTRAS = new Set(["reasoning", "thinking", "reasoning_effort", "output_config"]);
+const REASONING_EXTRAS = new Set([
+  "reasoning",
+  "thinking",
+  "reasoning_effort",
+  "output_config",
+]);
 
 function fail(message: string): never {
   throw new RequestError(message);
 }
 
-function requireString(value: unknown, name: string, allowEmpty = false): string {
+function requireString(
+  value: unknown,
+  name: string,
+  allowEmpty = false,
+): string {
   if (typeof value !== "string" || (!allowEmpty && value.trim() === "")) {
     fail(`${name} must be ${allowEmpty ? "a string" : "a non-empty string"}`);
   }
@@ -44,6 +59,46 @@ function safeInteger(value: unknown, name: string, minimum: number): number {
 
 function cloneJson<T>(value: T, name: string): T {
   return parseJson(serializeJson(value, name), name) as T;
+}
+
+function normalizeContent(value: ContentBody, name = "content"): ContentBody {
+  validateContentBody(value, name);
+  return cloneJson(value, name);
+}
+
+function normalizeAudioOutput(
+  value: AudioOutputOptions | undefined,
+): AudioOutputOptions | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    fail("audio_output must be an object");
+  const voice = requireString(value.voice, "audio_output.voice");
+  if (!["wav", "mp3", "flac", "opus", "pcm16", "aac"].includes(value.format))
+    fail("audio_output.format is unsupported");
+  return { voice, format: value.format };
+}
+
+function normalizeImageGeneration(
+  value: ImageGenerationOptions | undefined,
+): ImageGenerationOptions | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    fail("image_generation must be an object");
+  for (const key of ["model", "size", "quality", "background"] as const) {
+    if (value[key] !== undefined)
+      requireString(value[key], `image_generation.${key}`);
+  }
+  if (
+    value.output_format !== undefined &&
+    !["png", "jpeg", "webp"].includes(value.output_format)
+  )
+    fail("image_generation.output_format is unsupported");
+  if (value.partial_images !== undefined) {
+    safeInteger(value.partial_images, "image_generation.partial_images", 0);
+    if (value.partial_images > 3)
+      fail("image_generation.partial_images must be no greater than 3");
+  }
+  return cloneJson(value, "image_generation");
 }
 
 function normalizeToolCall(value: ToolCall, name: string): ToolCall {
@@ -68,8 +123,18 @@ function normalizeMessage(value: Message, index: number): Message {
   if (typeof value.role !== "string" || !ROLES.has(value.role)) {
     fail(`messages[${index}].role is not supported`);
   }
-  const content = requireString(value.content, `messages[${index}].content`, true);
-  const toolCallId = optionalString(value.tool_call_id, `messages[${index}].tool_call_id`);
+  const content = normalizeContent(value.content, `messages[${index}].content`);
+  if (
+    value.role === "system" &&
+    typeof content !== "string" &&
+    content.some((part) => part.type !== "text")
+  ) {
+    fail("system instructions require text content");
+  }
+  const toolCallId = optionalString(
+    value.tool_call_id,
+    `messages[${index}].tool_call_id`,
+  );
   const rawToolCalls = value.tool_calls ?? [];
   if (!Array.isArray(rawToolCalls)) {
     fail(`messages[${index}].tool_calls must be an array`);
@@ -107,7 +172,11 @@ function normalizeTool(value: Tool, index: number): Tool {
     fail(`tools[${index}].strict must be a boolean`);
   }
   const parameters = value.parameters ?? {};
-  if (typeof parameters !== "object" || parameters === null || Array.isArray(parameters)) {
+  if (
+    typeof parameters !== "object" ||
+    parameters === null ||
+    Array.isArray(parameters)
+  ) {
     fail(`tools[${index}].parameters must be a JSON object`);
   }
   return {
@@ -115,12 +184,20 @@ function normalizeTool(value: Tool, index: number): Tool {
     parameters: cloneJson(parameters, `tools[${index}].parameters`),
     ...(value.description === undefined
       ? {}
-      : { description: requireString(value.description, `tools[${index}].description`, true) }),
+      : {
+          description: requireString(
+            value.description,
+            `tools[${index}].description`,
+            true,
+          ),
+        }),
     ...(value.strict === undefined ? {} : { strict: value.strict }),
   };
 }
 
-function normalizeToolChoice(value: ToolChoice | undefined): ToolChoice | undefined {
+function normalizeToolChoice(
+  value: ToolChoice | undefined,
+): ToolChoice | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -135,10 +212,14 @@ function normalizeToolChoice(value: ToolChoice | undefined): ToolChoice | undefi
   ) {
     return { tool: requireString(value.tool, "tool_choice.tool") };
   }
-  return fail("tool_choice must be 'auto', 'none', 'required', or { tool: name }");
+  return fail(
+    "tool_choice must be 'auto', 'none', 'required', or { tool: name }",
+  );
 }
 
-function normalizeReasoning(value: ReasoningOptions | undefined): ReasoningOptions | undefined {
+function normalizeReasoning(
+  value: ReasoningOptions | undefined,
+): ReasoningOptions | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -147,7 +228,10 @@ function normalizeReasoning(value: ReasoningOptions | undefined): ReasoningOptio
   }
 
   const mode = value.mode;
-  if (mode !== undefined && (typeof mode !== "string" || !REASONING_MODES.has(mode))) {
+  if (
+    mode !== undefined &&
+    (typeof mode !== "string" || !REASONING_MODES.has(mode))
+  ) {
     fail(`unknown reasoning mode '${String(mode)}'`);
   }
   // Effort and summary vocabularies are provider-extensible; known values are
@@ -158,10 +242,20 @@ function normalizeReasoning(value: ReasoningOptions | undefined): ReasoningOptio
     value.budget_tokens === undefined
       ? undefined
       : safeInteger(value.budget_tokens, "reasoning.budget_tokens", 1);
-  if (mode === undefined && effort === undefined && summary === undefined && budgetTokens === undefined) {
+  if (
+    mode === undefined &&
+    effort === undefined &&
+    summary === undefined &&
+    budgetTokens === undefined
+  ) {
     fail("reasoning options cannot be empty");
   }
-  if (mode === "disabled" && (effort !== undefined || summary !== undefined || budgetTokens !== undefined)) {
+  if (
+    mode === "disabled" &&
+    (effort !== undefined ||
+      summary !== undefined ||
+      budgetTokens !== undefined)
+  ) {
     fail("disabled reasoning cannot set effort, budget_tokens, or summary");
   }
   if (mode === "adaptive" && budgetTokens !== undefined) {
@@ -176,7 +270,9 @@ function normalizeReasoning(value: ReasoningOptions | undefined): ReasoningOptio
   };
 }
 
-export function normalizeRequestOptions(value: RequestOptions | undefined): RequestOptions | undefined {
+export function normalizeRequestOptions(
+  value: RequestOptions | undefined,
+): RequestOptions | undefined {
   if (value === undefined) {
     return undefined;
   }
@@ -197,11 +293,21 @@ export function normalizeRequestOptions(value: RequestOptions | undefined): Requ
     ] as const;
   });
   const normalized: RequestOptions = {
-    ...(value.profile === undefined ? {} : { profile: requireString(value.profile, "profile") }),
-    ...(value.request_id === undefined ? {} : { request_id: requireString(value.request_id, "request_id") }),
-    ...(value.session_id === undefined ? {} : { session_id: requireString(value.session_id, "session_id") }),
-    ...(value.project_id === undefined ? {} : { project_id: requireString(value.project_id, "project_id") }),
-    ...(value.initiator === undefined ? {} : { initiator: requireString(value.initiator, "initiator") }),
+    ...(value.profile === undefined
+      ? {}
+      : { profile: requireString(value.profile, "profile") }),
+    ...(value.request_id === undefined
+      ? {}
+      : { request_id: requireString(value.request_id, "request_id") }),
+    ...(value.session_id === undefined
+      ? {}
+      : { session_id: requireString(value.session_id, "session_id") }),
+    ...(value.project_id === undefined
+      ? {}
+      : { project_id: requireString(value.project_id, "project_id") }),
+    ...(value.initiator === undefined
+      ? {}
+      : { initiator: requireString(value.initiator, "initiator") }),
     ...(headers === undefined || headers.length === 0 ? {} : { headers }),
   };
   return Object.keys(normalized).length === 0 ? undefined : normalized;
@@ -231,7 +337,9 @@ export function createRequest(input: GenerateInput): GenerateRequest {
       .filter((message) => message.role !== "system")
       .every(
         (message) =>
-          message.content === "" && message.tool_call_id === undefined && (message.tool_calls?.length ?? 0) === 0,
+          isEmptyContent(message.content) &&
+          message.tool_call_id === undefined &&
+          (message.tool_calls?.length ?? 0) === 0,
       )
   ) {
     fail("at least one non-system message must contain content");
@@ -243,30 +351,46 @@ export function createRequest(input: GenerateInput): GenerateRequest {
   const tools = (input.tools ?? []).map(normalizeTool);
   const toolChoice = normalizeToolChoice(input.tool_choice);
   const reasoning = normalizeReasoning(input.reasoning);
+  const audio_output = normalizeAudioOutput(input.audio_output);
+  const image_generation = normalizeImageGeneration(input.image_generation);
   const options = normalizeRequestOptions(input.options);
   if (
     input.extras !== undefined &&
-    (typeof input.extras !== "object" || input.extras === null || Array.isArray(input.extras))
+    (typeof input.extras !== "object" ||
+      input.extras === null ||
+      Array.isArray(input.extras))
   ) {
     fail("extras must be a JSON object");
   }
-  const extras = input.extras === undefined ? undefined : cloneJson(input.extras, "extras");
+  const extras =
+    input.extras === undefined ? undefined : cloneJson(input.extras, "extras");
   if (reasoning !== undefined && extras !== undefined) {
-    const conflict = Object.keys(extras).find((key) => REASONING_EXTRAS.has(key));
+    const conflict = Object.keys(extras).find((key) =>
+      REASONING_EXTRAS.has(key),
+    );
     if (conflict !== undefined) {
       fail(`typed reasoning conflicts with extras['${conflict}']`);
     }
   }
 
   const temperature = input.temperature;
-  if (temperature !== undefined && (typeof temperature !== "number" || !Number.isFinite(temperature))) {
+  if (
+    temperature !== undefined &&
+    (typeof temperature !== "number" || !Number.isFinite(temperature))
+  ) {
     fail("temperature must be finite");
   }
   const topP = input.top_p;
-  if (topP !== undefined && (typeof topP !== "number" || !Number.isFinite(topP) || topP < 0 || topP > 1)) {
+  if (
+    topP !== undefined &&
+    (typeof topP !== "number" || !Number.isFinite(topP) || topP < 0 || topP > 1)
+  ) {
     fail("top_p must be between 0 and 1");
   }
-  const topK = input.top_k === undefined ? undefined : safeInteger(input.top_k, "top_k", 0);
+  const topK =
+    input.top_k === undefined
+      ? undefined
+      : safeInteger(input.top_k, "top_k", 0);
   const maxOutputTokens =
     input.max_output_tokens === undefined
       ? undefined
@@ -280,38 +404,49 @@ export function createRequest(input: GenerateInput): GenerateRequest {
     ...(temperature === undefined ? {} : { temperature }),
     ...(topP === undefined ? {} : { top_p: topP }),
     ...(topK === undefined ? {} : { top_k: topK }),
-    ...(maxOutputTokens === undefined ? {} : { max_output_tokens: maxOutputTokens }),
+    ...(maxOutputTokens === undefined
+      ? {}
+      : { max_output_tokens: maxOutputTokens }),
     ...(reasoning === undefined ? {} : { reasoning }),
+    ...(audio_output === undefined ? {} : { audio_output }),
+    ...(image_generation === undefined ? {} : { image_generation }),
     ...(options === undefined ? {} : { options }),
-    ...(extras === undefined || Object.keys(extras).length === 0 ? {} : { extras }),
+    ...(extras === undefined || Object.keys(extras).length === 0
+      ? {}
+      : { extras }),
   };
   return cloneJson(request, "generation request");
 }
 
-export function systemMessage(content: string): Message {
-  return { role: "system", content: requireString(content, "content", true) };
+export function systemMessage(content: ContentBody): Message {
+  return normalizeMessage({ role: "system", content }, 0);
 }
 
-export function userMessage(content: string): Message {
-  return { role: "user", content: requireString(content, "content", true) };
+export function userMessage(content: ContentBody): Message {
+  return { role: "user", content: normalizeContent(content) };
 }
 
-export function assistantMessage(content: string, toolCalls: readonly ToolCall[] = []): Message {
+export function assistantMessage(
+  content: ContentBody,
+  toolCalls: readonly ToolCall[] = [],
+): Message {
   return {
     role: "assistant",
-    content: requireString(content, "content", true),
+    content: normalizeContent(content),
     ...(toolCalls.length === 0
       ? {}
       : {
-          tool_calls: toolCalls.map((call, index) => normalizeToolCall(call, `tool_calls[${index}]`)),
+          tool_calls: toolCalls.map((call, index) =>
+            normalizeToolCall(call, `tool_calls[${index}]`),
+          ),
         }),
   };
 }
 
-export function toolMessage(toolCallId: string, content: string): Message {
+export function toolMessage(toolCallId: string, content: ContentBody): Message {
   return {
     role: "tool",
-    content: requireString(content, "content", true),
+    content: normalizeContent(content),
     tool_call_id: requireString(toolCallId, "tool_call_id"),
   };
 }
@@ -333,6 +468,8 @@ export class RequestBuilder {
   protected topKValue?: number;
   protected maxOutputTokensValue?: number;
   protected reasoningValue?: MutableReasoningOptions;
+  protected audio_output_value: AudioOutputOptions | undefined;
+  protected image_generation_value: ImageGenerationOptions | undefined;
   protected requestOptionsValue: RequestOptions = {};
   protected readonly extrasValue: Record<string, JsonValue> = {};
 
@@ -340,26 +477,26 @@ export class RequestBuilder {
     this.modelName = requireString(model, "model");
   }
 
-  prompt(content: string): this {
+  prompt(content: ContentBody): this {
     return this.user(content);
   }
 
-  system(content: string): this {
+  system(content: ContentBody): this {
     this.messageList.push(systemMessage(content));
     return this;
   }
 
-  user(content: string): this {
+  user(content: ContentBody): this {
     this.messageList.push(userMessage(content));
     return this;
   }
 
-  assistant(content: string, toolCalls: readonly ToolCall[] = []): this {
+  assistant(content: ContentBody, toolCalls: readonly ToolCall[] = []): this {
     this.messageList.push(assistantMessage(content, toolCalls));
     return this;
   }
 
-  toolResult(toolCallId: string, content: string): this {
+  toolResult(toolCallId: string, content: ContentBody): this {
     this.messageList.push(toolMessage(toolCallId, content));
     return this;
   }
@@ -419,6 +556,16 @@ export class RequestBuilder {
     return this;
   }
 
+  audioOutput(options: AudioOutputOptions): this {
+    this.audio_output_value = normalizeAudioOutput(options);
+    return this;
+  }
+
+  imageGeneration(options: ImageGenerationOptions): this {
+    this.image_generation_value = normalizeImageGeneration(options);
+    return this;
+  }
+
   reasoningMode(mode: ReasoningMode): this {
     this.reasoningOptions().mode = mode;
     return this;
@@ -457,17 +604,26 @@ export class RequestBuilder {
   }
 
   requestId(requestId: string): this {
-    this.requestOptionsValue = { ...this.requestOptionsValue, request_id: requestId };
+    this.requestOptionsValue = {
+      ...this.requestOptionsValue,
+      request_id: requestId,
+    };
     return this;
   }
 
   sessionId(sessionId: string): this {
-    this.requestOptionsValue = { ...this.requestOptionsValue, session_id: sessionId };
+    this.requestOptionsValue = {
+      ...this.requestOptionsValue,
+      session_id: sessionId,
+    };
     return this;
   }
 
   projectId(projectId: string): this {
-    this.requestOptionsValue = { ...this.requestOptionsValue, project_id: projectId };
+    this.requestOptionsValue = {
+      ...this.requestOptionsValue,
+      project_id: projectId,
+    };
     return this;
   }
 
@@ -485,7 +641,10 @@ export class RequestBuilder {
   }
 
   extra(name: string, value: JsonValue): this {
-    this.extrasValue[requireString(name, "extra name")] = cloneJson(value, `extras.${name}`);
+    this.extrasValue[requireString(name, "extra name")] = cloneJson(
+      value,
+      `extras.${name}`,
+    );
     return this;
   }
 
@@ -494,14 +653,32 @@ export class RequestBuilder {
       model: this.modelName,
       messages: this.messageList,
       tools: this.toolList,
-      ...(this.selectedToolChoice === undefined ? {} : { tool_choice: this.selectedToolChoice }),
-      ...(this.temperatureValue === undefined ? {} : { temperature: this.temperatureValue }),
+      ...(this.selectedToolChoice === undefined
+        ? {}
+        : { tool_choice: this.selectedToolChoice }),
+      ...(this.temperatureValue === undefined
+        ? {}
+        : { temperature: this.temperatureValue }),
       ...(this.topPValue === undefined ? {} : { top_p: this.topPValue }),
       ...(this.topKValue === undefined ? {} : { top_k: this.topKValue }),
-      ...(this.maxOutputTokensValue === undefined ? {} : { max_output_tokens: this.maxOutputTokensValue }),
-      ...(this.reasoningValue === undefined ? {} : { reasoning: this.reasoningValue }),
-      ...(Object.keys(this.requestOptionsValue).length === 0 ? {} : { options: this.requestOptionsValue }),
-      ...(Object.keys(this.extrasValue).length === 0 ? {} : { extras: this.extrasValue }),
+      ...(this.maxOutputTokensValue === undefined
+        ? {}
+        : { max_output_tokens: this.maxOutputTokensValue }),
+      ...(this.reasoningValue === undefined
+        ? {}
+        : { reasoning: this.reasoningValue }),
+      ...(this.audio_output_value === undefined
+        ? {}
+        : { audio_output: this.audio_output_value }),
+      ...(this.image_generation_value === undefined
+        ? {}
+        : { image_generation: this.image_generation_value }),
+      ...(Object.keys(this.requestOptionsValue).length === 0
+        ? {}
+        : { options: this.requestOptionsValue }),
+      ...(Object.keys(this.extrasValue).length === 0
+        ? {}
+        : { extras: this.extrasValue }),
     });
   }
 

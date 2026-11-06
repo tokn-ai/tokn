@@ -8,13 +8,13 @@ pub fn delta_from_endpoint_event(event: &ChatEvent) -> Result<Vec<IrDelta>> {
     ChatEvent::Done => Ok(Vec::new()),
     ChatEvent::Chunk(chunk) => {
       let value = serde_json::to_value(chunk)?;
-      Ok(crate::value::chat::delta_from_chat_chunk(&value))
+      crate::sse::SseAccumulator::new(crate::provider::Endpoint::ChatCompletions).push_value(&value)
     }
   }
 }
 
 pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Result<Vec<ChatEvent>> {
-  crate::value::chat::chunk_from_deltas(resp_id, model, deltas, finish)
+  crate::value::chat::chunk_from_deltas(resp_id, model, deltas, finish)?
     .into_iter()
     .map(|value| serde_json::from_value(value).map_err(Into::into))
     .collect()

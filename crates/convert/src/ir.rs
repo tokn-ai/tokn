@@ -1,5 +1,5 @@
 use alloc::collections::BTreeMap;
-use alloc::{string::String, string::ToString, vec::Vec};
+use alloc::{boxed::Box, string::String, string::ToString, vec::Vec};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -59,11 +59,34 @@ impl Role {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ContentPart {
-  Text { text: String },
-  Reasoning { text: String },
-  ToolCall { call: ToolCall },
-  ToolResult { id: Option<String>, content: Value },
-  Raw { value: Value },
+  Text {
+    text: String,
+  },
+  Reasoning {
+    text: String,
+  },
+  ToolCall {
+    call: ToolCall,
+  },
+  ToolResult {
+    id: Option<String>,
+    content: Value,
+  },
+  ToolResultParts {
+    id: Option<String>,
+    content: Vec<tokn_core::content::Content>,
+  },
+  Media {
+    content: Box<tokn_core::content::Content>,
+  },
+  /// Content with endpoint-specific semantics that cannot safely be translated.
+  Native {
+    endpoint: String,
+    value: Value,
+  },
+  Raw {
+    value: Value,
+  },
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -147,6 +170,23 @@ pub fn responses_completion_status(finish_reason: Option<&str>) -> (&'static str
 pub enum IrDelta {
   Text(String),
   Reasoning(String),
+  /// Complete media content. Previews are separate and never committed here.
+  Media {
+    index: usize,
+    content: Box<tokn_core::content::Content>,
+  },
+  Audio {
+    index: usize,
+    id: Option<String>,
+    data: String,
+    transcript: Option<String>,
+    expires_at: Option<u64>,
+  },
+  ImagePreview {
+    index: usize,
+    preview_index: u64,
+    image: Box<tokn_core::content::Content>,
+  },
   ToolCall {
     index: usize,
     id: Option<String>,
@@ -165,6 +205,9 @@ impl IrResponse {
     match delta {
       IrDelta::Text(text) => push_text_part(&mut self.content, text),
       IrDelta::Reasoning(text) => push_reasoning_part(&mut self.content, text),
+      IrDelta::Media { content, .. } => self.content.push(ContentPart::Media { content }),
+      // Stateful accumulation retains binary fragments and preview identity.
+      IrDelta::Audio { .. } | IrDelta::ImagePreview { .. } => {}
       IrDelta::ToolCall {
         index,
         id,

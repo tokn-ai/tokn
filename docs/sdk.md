@@ -168,7 +168,7 @@ Unsupported explicit controls fail clearly after routing rather than being
 silently dropped or reinterpreted. Raw endpoint clients remain the escape
 hatch for an exact provider wire shape.
 
-V2 relay profiles preserve the generated Responses payload,
+V2 relay profiles preserve the generated native payload,
 except detected compaction requests sent to Codex always use
 `service_tier: "priority"`, overriding any incoming tier. Their outgoing
 `x-codex-routing-hint` also uses the outgoing model and `tier=priority`,
@@ -201,6 +201,112 @@ The façade deliberately hides router `AppState`, account handles, and request
 pipeline stages. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
 when an exact endpoint wire shape is required.
+
+### Text and media
+
+`tokn_core::content`, re-exported as `tokn_sdk::content`, contains owned,
+serializable content values shared by input, output and application renderers.
+`Content` wraps first-class `TextContent`, `ImageContent`, `AudioContent`,
+`VideoContent`, `DocumentContent` and `TranscriptContent` structs. These types
+also work in alloc-only builds. Generation settings and display layout stay
+outside the content values.
+
+Messages, tool results and retrieved context accept `ContentBody`, which is
+either a string or an ordered array of content. Existing string JSON remains
+valid. Rust callers can pass strings, individual content values, or vectors.
+
+```rust
+use tokn_sdk::{Content, GenerateRequest, ImageContent, MediaResource};
+
+let image = ImageContent::new(MediaResource::inline("image/png", image_bytes));
+let request = GenerateRequest::builder("vision-model")
+  .user(vec![Content::text("Explain this chart"), image.into()])
+  .build()?;
+let response = client.send(request).await?;
+for part in &response.content {
+  // Match Content variants to display text, images, playable audio or documents.
+}
+```
+
+`GenerateResponse.content` preserves ordered text and supported generated
+media. `text` is a convenience projection of textual message content; audio
+transcripts are available on `AudioContent.transcript`. `endpoint` identifies
+the format of `raw`. Text/image/document requests normally use Responses as their source
+format. Audio input or requested speech selects Chat Completions; Anthropic file
+references and titled documents select Messages. A managed
+route converts only when the selected endpoint can represent that content.
+
+| Content/operation | Chat Completions | Responses | Messages |
+| --- | --- | --- | --- |
+| Image input | URL or inline bytes | URL, inline bytes, scoped file ID | URL, inline bytes, scoped file ID |
+| PDF input | Inline bytes or scoped file ID | URL, inline bytes, scoped file ID | URL, inline bytes, scoped file ID |
+| Audio input | Inline WAV/MP3 | Explicit unsupported error | Explicit unsupported error |
+| Speech output | Typed audio and transcript | Explicit unsupported error | Explicit unsupported error |
+| Image generation | Explicit unsupported error | Native image-generation tool | Explicit unsupported error |
+| Sampled video frames | Timestamped images | Timestamped images | Timestamped images |
+
+Support also depends on the selected model and source representation. Known
+incompatible input/output modalities are filtered before network I/O; absent
+catalogue evidence does not promise model support. Non-PDF document formats
+are checked against the endpoint's supported representations. A `VideoContent`
+can hold an encoded resource or explicitly supplied timestamped frames. The
+current three endpoint adapters lower supplied frames; they reject encoded
+video rather than implicitly sampling frames or discarding an audio track.
+Wire mappings follow the documented [OpenAI file inputs](https://developers.openai.com/api/docs/guides/file-inputs),
+[Chat audio](https://developers.openai.com/api/docs/guides/audio-chat-completions),
+[image-generation tool](https://developers.openai.com/api/docs/guides/tools-image-generation),
+and Claude [vision](https://platform.claude.com/docs/en/build-with-claude/vision)
+and [PDF inputs](https://platform.claude.com/docs/en/build-with-claude/pdf-support).
+
+```rust
+use tokn_sdk::{AudioOutputFormat, AudioOutputOptions, ImageGenerationOptions};
+
+let speech = client.generate("speech-model")
+  .prompt("Read this aloud")
+  .audio_output(AudioOutputOptions::new("alloy", AudioOutputFormat::Wav))
+  .send().await?;
+
+let drawing = client.generate("image-capable-model")
+  .prompt("Draw a diagram of the water cycle")
+  .image_generation(ImageGenerationOptions::default())
+  .send().await?;
+```
+
+These are LLM endpoint operations. Standalone transcription, image-generation
+and real-time session clients are separate APIs; the shared content values are
+available for those integrations without introducing a conversation dependency.
+
+Streaming emits `AudioDelta`, `ImagePreview` and `ContentCompleted` alongside
+text/tool events. Each audio delta carries an independently encoded base64
+chunk; decode chunks before concatenating their bytes. Image previews are
+provisional. `send_streaming` returns the completed content and checkpoint,
+and only that returned response can be committed to a conversation. A dropped
+or broken stream leaves the pending request available for retry.
+
+Resources can contain immutable inline bytes, a remote URL, an application
+asset reference, or a provider-scoped reference. Loading, fetching, uploading
+and transcoding are explicit application operations. `ContentBody::try_map_resources`
+and `GenerateRequest::try_map_media` allow an application resolver to replace
+references with retained bytes. No local path or credentials are serialized
+by the content model. Supplied byte digests are verified during validation.
+
+Conversation input and tool results require inline bytes or scoped provider handles.
+Materialize remote URLs and application assets before submitting them; rejected
+input leaves history unchanged. Retrieved media is checked during preparation.
+Provider handles are checked against their account,
+backend and expiry. `ProviderState::asset_scope()` supplies the scope for
+resources from a captured backend. A provider switch fails when required media
+cannot be represented or accessed; `AllowRestart` does not authorize dropping
+media. Native Chat audio continuation uses its expiring playback ID, while
+the portable history retains generated audio bytes for application reuse.
+
+Large media may require explicit `Limits` settings. `max_response_bytes` bounds
+the received response, `max_event_bytes` bounds an SSE event, and
+`max_checkpoint_bytes` separately bounds retained native history. Exceeding a
+checkpoint request budget fails before sending the request. Both standard and
+in-memory SDK clients default to 64 MiB per response, 32 MiB per event and
+64 MiB per checkpoint; `.with_limits(...)` overrides these budgets. Ordinary
+semantic streams enforce the response budget cumulatively.
 
 ### Conversations
 
@@ -348,8 +454,8 @@ credential file, or gateway process is required. The implicit profile is always
 a request, allowing an explicit profile to be supplied there.
 
 Buffered generation uses the existing session for routing, control validation,
-provider conversion, retries, and events. It presents the resulting Responses
-body as `GenerateResponse` regardless of the selected upstream API. An application
+provider conversion, retries, and events. It presents typed content as
+`GenerateResponse` and identifies its underlying wire format with `endpoint`. An application
 can share a generation function across service factories without imposing
 `Send` or `'static` bounds:
 

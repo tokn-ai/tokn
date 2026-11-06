@@ -76,6 +76,7 @@ tokn-provider-opencode = { version = "0.2.4", path = "crates/provider-opencode",
 tokn-provider-zai = { version = "0.2.4", path = "crates/provider-zai", default-features = false }
 
 anyhow = "1"
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 arc-swap = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }

@@ -21,9 +21,9 @@ pub mod usage;
 #[cfg(debug_assertions)]
 mod extra_keys_impls;
 
-pub use content::{ChatContent, ContentPart};
+pub use content::{ChatContent, ContentPart, FileInput};
 pub use event::{ChatChunk, ChatDelta, ChatEvent, ChunkChoice};
-pub use message::{ChatMessage, ChatToolCall, ChatToolFunction};
+pub use message::{ChatAudio, ChatMessage, ChatToolCall, ChatToolFunction};
 pub use parameters::{ChatExtraParameters, ChatRequestParameters};
 pub use request::{ChatRequest, ChatToolChoice, ChatToolDef};
 pub use response::{ChatChoice, ChatResponse};

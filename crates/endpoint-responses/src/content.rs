@@ -25,8 +25,8 @@ pub enum InputContentPart {
     #[serde(default, flatten)]
     fields: Extras,
   },
-  #[serde(other)]
-  Other,
+  #[serde(untagged)]
+  Other(Value),
 }
 
 /// Content part attached to an assistant `message` output item.
@@ -47,8 +47,8 @@ pub enum OutputContentPart {
     #[serde(default, flatten)]
     extras: Extras,
   },
-  #[serde(other)]
-  Other,
+  #[serde(untagged)]
+  Other(Value),
 }
 
 /// One element of a `reasoning` item's `content` or `summary` arrays.
@@ -70,6 +70,6 @@ pub enum ReasoningPart {
     #[serde(default, flatten)]
     extras: Extras,
   },
-  #[serde(other)]
-  Other,
+  #[serde(untagged)]
+  Other(Value),
 }

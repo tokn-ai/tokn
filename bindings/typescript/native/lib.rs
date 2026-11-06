@@ -469,6 +469,7 @@ where
 
 #[derive(Serialize)]
 struct SerializableGenerateResponse<'a, H> {
+  endpoint: Endpoint,
   http_status: u16,
   headers: &'a H,
   id: Option<&'a str>,
@@ -476,6 +477,7 @@ struct SerializableGenerateResponse<'a, H> {
   status: Option<&'a str>,
   finish_reason: Option<&'a str>,
   text: &'a str,
+  content: &'a [tokn_sdk::Content],
   reasoning: Option<&'a str>,
   tool_calls: &'a [ToolCall],
   usage: &'a Option<Usage>,
@@ -484,6 +486,7 @@ struct SerializableGenerateResponse<'a, H> {
 
 fn serialize_generate_response(response: &GenerateResponse) -> serde_json::Result<String> {
   serde_json::to_string(&SerializableGenerateResponse {
+    endpoint: response.endpoint,
     http_status: response.http_status,
     headers: &response.headers,
     id: response.id.as_deref(),
@@ -491,6 +494,7 @@ fn serialize_generate_response(response: &GenerateResponse) -> serde_json::Resul
     status: response.status.as_deref(),
     finish_reason: response.finish_reason.as_deref(),
     text: &response.text,
+    content: &response.content,
     reasoning: response.reasoning.as_deref(),
     tool_calls: &response.tool_calls,
     usage: &response.usage,

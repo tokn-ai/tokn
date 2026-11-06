@@ -7,7 +7,156 @@ import {
   createRequest,
   request,
   userMessage,
+  type Content,
 } from "../src/index.js";
+import {
+  parseNativeGenerateEvent,
+  parseNativeGenerateResponse,
+} from "../src/native-values.js";
+
+test("multimedia content and output options survive builders as independent snapshots", () => {
+  const parts: Content[] = [
+    { type: "text", text: "Describe the sequence" },
+    {
+      type: "image",
+      resource: {
+        source: { type: "inline", data: "aW1hZ2U=" },
+        media_type: "image/png",
+      },
+    },
+    {
+      type: "document",
+      resource: {
+        source: { type: "remote", url: "https://example.invalid/document.pdf" },
+      },
+      filename: "document.pdf",
+    },
+    {
+      type: "audio",
+      resource: {
+        source: { type: "inline", data: "YXVkaW8=" },
+        media_type: "audio/wav",
+      },
+      format: "wav",
+    },
+    {
+      type: "video",
+      source: {
+        type: "frames",
+        value: [
+          {
+            timestamp_ms: 10,
+            image: {
+              resource: {
+                source: {
+                  type: "remote",
+                  url: "https://example.invalid/frame.png",
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+    {
+      type: "transcript",
+      text: "spoken text",
+      segments: [
+        { text: "spoken", start_ms: 0, end_ms: 100, speaker: "speaker-1" },
+      ],
+    },
+  ];
+  const built = request("media")
+    .user(parts)
+    .audioOutput({ voice: "voice", format: "wav" })
+    .build();
+  assert.deepEqual(built.messages[0]?.content, parts);
+  assert.deepEqual(built.audio_output, { voice: "voice", format: "wav" });
+  parts.pop();
+  assert.equal((built.messages[0]?.content as readonly Content[]).length, 6);
+  const image_request = request("images")
+    .prompt("draw an image")
+    .imageGeneration({ output_format: "webp", partial_images: 2 })
+    .build();
+  assert.deepEqual(image_request.image_generation, {
+    output_format: "webp",
+    partial_images: 2,
+  });
+  assert.throws(() => request("media").system(parts).build(), RequestError);
+  assert.throws(
+    () =>
+      createRequest({
+        model: "media",
+        prompt: [
+          {
+            type: "audio",
+            resource: { source: { type: "inline", data: "invalid!" } },
+          },
+        ],
+      }),
+    RequestError,
+  );
+});
+
+test("native media responses and streaming events retain typed content", () => {
+  const content: Content = {
+    type: "image",
+    resource: {
+      source: { type: "inline", data: "aW1hZ2U=" },
+      media_type: "image/png",
+    },
+  };
+  const response = parseNativeGenerateResponse(
+    JSON.stringify({
+      endpoint: "responses",
+      content: [content],
+      http_status: 200,
+      headers: {},
+      id: "result",
+      model: "media",
+      status: "completed",
+      finish_reason: "stop",
+      text: "",
+      reasoning: null,
+      tool_calls: [],
+      usage: null,
+      raw: {},
+    }),
+  );
+  assert.deepEqual(response.content, [content]);
+  for (const event of [
+    { type: "content_completed", index: 2, content },
+    { type: "image_preview", index: 2, preview_index: 1, content },
+    {
+      type: "audio_delta",
+      index: 0,
+      id: "audio",
+      data: "YQ==",
+      transcript: "hello",
+      expires_at: null,
+    },
+  ])
+    assert.deepEqual(parseNativeGenerateEvent(JSON.stringify(event)), event);
+  assert.throws(
+    () =>
+      parseNativeGenerateEvent(
+        JSON.stringify({ type: "content_completed", index: -1, content }),
+      ),
+    SerializationError,
+  );
+  assert.throws(
+    () =>
+      parseNativeGenerateEvent(
+        JSON.stringify({
+          type: "image_preview",
+          index: 0,
+          preview_index: 0,
+          content: { type: "unknown" },
+        }),
+      ),
+    SerializationError,
+  );
+});
 
 test("createRequest turns prompt input into an owned wire request", () => {
   const input = {
@@ -94,12 +243,25 @@ test("built requests are independent snapshots", () => {
 
 test("request validation catches values JavaScript cannot represent safely", () => {
   assert.throws(
-    () => createRequest({ model: "smart", prompt: "hello", max_output_tokens: Number.MAX_SAFE_INTEGER + 1 }),
-    (error: unknown) => error instanceof RequestError && error.code === "request_error",
+    () =>
+      createRequest({
+        model: "smart",
+        prompt: "hello",
+        max_output_tokens: Number.MAX_SAFE_INTEGER + 1,
+      }),
+    (error: unknown) =>
+      error instanceof RequestError && error.code === "request_error",
   );
   assert.throws(
-    () => createRequest({ model: "smart", prompt: "hello", temperature: Number.NaN }),
-    (error: unknown) => error instanceof RequestError && error.message === "temperature must be finite",
+    () =>
+      createRequest({
+        model: "smart",
+        prompt: "hello",
+        temperature: Number.NaN,
+      }),
+    (error: unknown) =>
+      error instanceof RequestError &&
+      error.message === "temperature must be finite",
   );
   assert.throws(
     () =>
@@ -129,7 +291,8 @@ test("JSON serialization omits undefined object properties but rejects undefined
       }),
     (error: unknown) =>
       error instanceof SerializationError &&
-      error.message === "extras.items[0] contains a value that JSON cannot represent",
+      error.message ===
+        "extras.items[0] contains a value that JSON cannot represent",
   );
 });
 
@@ -144,7 +307,8 @@ test("malformed JavaScript containers produce stable request errors", () => {
   for (const input of malformed) {
     assert.throws(
       () => createRequest(input as never),
-      (error: unknown) => error instanceof RequestError && error.code === "request_error",
+      (error: unknown) =>
+        error instanceof RequestError && error.code === "request_error",
     );
   }
 });
@@ -160,7 +324,8 @@ test("typed reasoning rejects ambiguous extras", () => {
       }),
     (error: unknown) =>
       error instanceof RequestError &&
-      error.message === "typed reasoning conflicts with extras['reasoning_effort']",
+      error.message ===
+        "typed reasoning conflicts with extras['reasoning_effort']",
   );
 });
 

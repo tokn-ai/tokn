@@ -169,3 +169,57 @@ fn shared_status_classification() {
 fn transport_encoding_capability() {
   scenarios::configured_transport_encoding();
 }
+
+#[test]
+fn multimedia_native_inputs() {
+  scenarios::multimedia_native_inputs();
+}
+
+#[test]
+fn multimedia_output_continuation() {
+  scenarios::multimedia_output_continuation();
+}
+
+#[test]
+fn multimedia_tool_context_and_snapshot() {
+  scenarios::multimedia_tool_context_and_snapshot();
+}
+
+#[test]
+fn multimedia_unsupported_fails_before_transport() {
+  scenarios::multimedia_unsupported_fails_before_transport();
+}
+
+/// Each JSONL line is one native image block, exported locally from history.
+/// No private fixtures or filesystem paths are embedded in this test.
+#[test]
+#[ignore = "requires TOKN_TEST_IMAGE_PARTS_JSONL pointing to a local image corpus"]
+fn multimedia_history_images() {
+  use std::io::BufRead;
+  let path = std::env::var_os("TOKN_TEST_IMAGE_PARTS_JSONL").expect("set TOKN_TEST_IMAGE_PARTS_JSONL");
+  let file = std::fs::File::open(path).unwrap_or_else(|_| panic!("cannot read local image corpus"));
+  let mut images = 0_usize;
+  let mut requests = 0;
+  for line in std::io::BufReader::new(file).lines() {
+    let line = line.unwrap_or_else(|_| panic!("cannot read image corpus line"));
+    let part: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|_| panic!("invalid image corpus JSON"));
+    let endpoint = match part["type"].as_str() {
+      Some("input_image") => tokn_sdk::Endpoint::Responses,
+      Some("image_url") => tokn_sdk::Endpoint::ChatCompletions,
+      Some("image") => tokn_sdk::Endpoint::Messages,
+      _ => panic!("unsupported image corpus block"),
+    };
+    let content =
+      tokn_convert::media::content_from_part(endpoint, &part).unwrap_or_else(|_| panic!("cannot decode corpus image"));
+    let Some(tokn_sdk::Content::Image(image)) = content else {
+      panic!("corpus image requires materialization");
+    };
+    requests += scenarios::multimedia_history_image(image);
+    images += 1;
+    if images.is_multiple_of(64) {
+      println!("history image SDK replay progress: {images} images; {requests} offline requests");
+    }
+  }
+  assert!(images > 0, "image corpus was empty");
+  println!("history image SDK replay: {images} images; {requests} offline requests");
+}

@@ -200,6 +200,11 @@ impl<P: PlatformFactory> Client<P> {
     self
   }
 
+  #[cfg(feature = "std")]
+  pub(crate) fn limits(&self) -> Limits {
+    self.limits
+  }
+
   /// Extract external services, dropping this client's configuration and state.
   pub fn into_platform(self) -> P {
     self.platform
@@ -290,7 +295,7 @@ impl<P: ResponseAdapter> Client<P> {
     options: RequestOptions,
   ) -> Result<P::Response<'_>, P::Error> {
     let response = self
-      .run_session(endpoint, body, options, None, None)
+      .run_session(endpoint, body, options, None, None, Vec::new())
       .await
       .map_err(|error| P::execution_error(error, endpoint))?;
     Ok(P::finish_response(response))
@@ -319,6 +324,7 @@ impl<P: PlatformFactory> Client<P> {
     options: RequestOptions,
     mut generation_options: Option<GenerationOptions>,
     continuation: Option<session::ContinuationRequest>,
+    media_assets: Vec<tokn_core::content::ProviderAssetReference>,
   ) -> Result<SessionResponse<'_, P>, session::Error> {
     let snapshot = self.snapshot.load();
     // Acquire external services before reading clocks. A local callback may
@@ -342,6 +348,7 @@ impl<P: PlatformFactory> Client<P> {
     input.profile = Some(profile);
     input.generation_options = generation_options;
     input.continuation = continuation;
+    input.media_assets = media_assets;
     session::Session::new(snapshot.execution.clone(), input, transport, clock, events)
       .with_limits(self.limits)
       .run()
@@ -391,11 +398,15 @@ impl<P: PlatformFactory> Client<P> {
       .is_some_and(|route| matches!(route, RoutePlan::Relay(_)));
     if let (true, Some(generation)) = (is_relay, options.as_ref()) {
       if generation.top_k.is_some() || generation.reasoning.is_some() {
-        return Err(session::Error::new("generation", "typed top_k and reasoning controls require a managed route; a relay profile forwards the generated Responses payload verbatim"));
+        return Err(session::Error::new("generation", "typed top_k and reasoning controls require a managed route; a relay profile forwards the generated native payload verbatim"));
       }
       if let Some(limit) = generation.max_output_tokens {
-        if endpoint != Endpoint::Responses || body.get("max_output_tokens").and_then(Value::as_u64) != Some(limit) {
-          return Err(session::Error::new("generation", "typed max_output_tokens cannot be lowered in a relay profile; the verbatim request must already contain the matching Responses field"));
+        let field = match endpoint {
+          Endpoint::Responses => "max_output_tokens",
+          Endpoint::ChatCompletions | Endpoint::Messages => "max_tokens",
+        };
+        if body.get(field).and_then(Value::as_u64) != Some(limit) {
+          return Err(session::Error::new("generation", "typed max_output_tokens cannot be lowered in a relay profile; the native request must already contain its matching token limit"));
         }
       }
       *options = None;

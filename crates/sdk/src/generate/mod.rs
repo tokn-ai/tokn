@@ -1,8 +1,11 @@
+mod media;
 mod response;
 mod state;
 #[cfg(feature = "std")]
 mod stream;
 
+pub(crate) use media::{validate_input_content, validate_snapshot_content};
+pub use media::{AudioOutputFormat, AudioOutputOptions, ImageGenerationOptions, ImageOutputFormat};
 pub use response::{GenerateResponse, ToolCall, Usage};
 pub use state::ProviderState;
 #[cfg(feature = "std")]
@@ -10,6 +13,7 @@ pub use stream::{GenerateEvent, GenerateStream, TextStream};
 
 use alloc::{
   borrow::Borrow,
+  boxed::Box,
   collections::BTreeMap,
   format,
   string::{String, ToString},
@@ -23,6 +27,7 @@ use serde_json::{Map, Value};
 use tokn_convert::ir::{
   ContentPart as IrContentPart, IrMessage, IrRequest, Role as IrRole, Sampling, ToolCall as IrToolCall,
 };
+use tokn_core::content::{Content, ContentBody, ContentRef};
 use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, ReasoningOptions, ReasoningSummary};
 use tokn_core::provider::Endpoint;
 use tokn_requests::session;
@@ -55,6 +60,12 @@ pub struct GenerateRequest {
   pub max_output_tokens: Option<u64>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub reasoning: Option<ReasoningOptions>,
+  /// Request speech alongside text. This selects a Chat Completions source.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub audio_output: Option<AudioOutputOptions>,
+  /// Enable the Responses image-generation tool.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub image_generation: Option<ImageGenerationOptions>,
   #[serde(default, skip_serializing_if = "RequestOptions::is_empty")]
   pub options: RequestOptions,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -92,6 +103,8 @@ impl GenerateRequest {
         top_k: None,
         max_output_tokens: None,
         reasoning: None,
+        audio_output: None,
+        image_generation: None,
         options: RequestOptions::default(),
         extras: BTreeMap::new(),
         context: Vec::new(),
@@ -116,6 +129,7 @@ impl GenerateRequest {
   /// Validate fields required by the provider-neutral generation API.
   pub fn validate(&self) -> Result<()> {
     self.validate_provider_prefix()?;
+    self.validate_media()?;
     if self.model.trim().is_empty() {
       return Err(Error::InvalidGenerateRequest {
         message: "model cannot be empty".into(),
@@ -137,6 +151,17 @@ impl GenerateRequest {
       });
     }
     for message in &self.messages {
+      message
+        .content
+        .validate()
+        .map_err(|error| Error::InvalidGenerateRequest {
+          message: error.to_string(),
+        })?;
+      if message.role == Role::System && !message.content.is_text_only() {
+        return Err(Error::InvalidGenerateRequest {
+          message: "system instructions must contain only text".into(),
+        });
+      }
       if message.role != Role::Assistant && !message.tool_calls.is_empty() {
         return Err(Error::InvalidGenerateRequest {
           message: "tool calls are only valid on assistant messages".into(),
@@ -219,7 +244,7 @@ impl GenerateRequest {
     }
   }
 
-  fn responses_body(&self, stream: bool) -> Result<Value> {
+  fn request_body(&self, stream: bool) -> Result<Value> {
     self.validate()?;
     self.render_messages(stream, self.messages.iter())
   }
@@ -230,7 +255,7 @@ impl GenerateRequest {
     for message in input {
       if message.role == Role::System {
         if !message.content.is_empty() {
-          system.push(message.content.clone());
+          system.push(message.content.text());
         }
         continue;
       }
@@ -239,8 +264,26 @@ impl GenerateRequest {
     if !self.context.is_empty() {
       // The document envelope is user input and preserves exact content and
       // source versions. Provider instructions retain their original role.
-      let documents = serde_json::json!({ "retrieved_context": self.context });
-      messages.push(Message::user(documents.to_string()).to_ir());
+      if self
+        .context
+        .iter()
+        .all(|item| matches!(item.content, ContentBody::Text(_)))
+      {
+        let documents = serde_json::json!({ "retrieved_context": self.context });
+        messages.push(Message::user(documents.to_string()).to_ir());
+      } else {
+        for document in &self.context {
+          let metadata = serde_json::json!({"retrieved_context": {
+            "source_id": document.source_id, "source_version": document.source_version,
+          }});
+          let mut parts = vec![Content::text(metadata.to_string())];
+          parts.extend(document.content.iter().map(|part| match part {
+            ContentRef::Text(text) => Content::text(text),
+            ContentRef::Part(content) => content.clone(),
+          }));
+          messages.push(Message::user(parts).to_ir());
+        }
+      }
     }
 
     let request = IrRequest {
@@ -261,8 +304,13 @@ impl GenerateRequest {
       stream,
       extras: self.extras.clone(),
     };
-    let body = tokn_convert::value::responses::request_to_value(&request)
-      .map_err(|source| Error::BuildGenerateRequest { source })?;
+    let mut body = match self.source_endpoint() {
+      Endpoint::Responses => tokn_convert::value::responses::request_to_value(&request),
+      Endpoint::ChatCompletions => tokn_convert::value::chat::request_to_value(&request),
+      Endpoint::Messages => tokn_convert::value::messages::request_to_value(&request),
+    }
+    .map_err(|source| Error::BuildGenerateRequest { source })?;
+    self.render_media_options(&mut body);
     Ok(body)
   }
 }
@@ -280,7 +328,7 @@ fn validate_finite(name: &str, value: Option<f64>) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
   pub role: Role,
-  pub content: String,
+  pub content: ContentBody,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub tool_call_id: Option<String>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -288,19 +336,19 @@ pub struct Message {
 }
 
 impl Message {
-  pub fn system(content: impl Into<String>) -> Self {
+  pub fn system(content: impl Into<ContentBody>) -> Self {
     Self::new(Role::System, content)
   }
 
-  pub fn user(content: impl Into<String>) -> Self {
+  pub fn user(content: impl Into<ContentBody>) -> Self {
     Self::new(Role::User, content)
   }
 
-  pub fn assistant(content: impl Into<String>) -> Self {
+  pub fn assistant(content: impl Into<ContentBody>) -> Self {
     Self::new(Role::Assistant, content)
   }
 
-  pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+  pub fn tool(call_id: impl Into<String>, content: impl Into<ContentBody>) -> Self {
     Self {
       role: Role::Tool,
       content: content.into(),
@@ -309,7 +357,10 @@ impl Message {
     }
   }
 
-  pub fn assistant_with_tool_calls(content: impl Into<String>, tool_calls: impl IntoIterator<Item = ToolCall>) -> Self {
+  pub fn assistant_with_tool_calls(
+    content: impl Into<ContentBody>,
+    tool_calls: impl IntoIterator<Item = ToolCall>,
+  ) -> Self {
     Self::assistant(content).with_tool_calls(tool_calls)
   }
 
@@ -323,7 +374,7 @@ impl Message {
     self
   }
 
-  pub fn new(role: Role, content: impl Into<String>) -> Self {
+  pub fn new(role: Role, content: impl Into<ContentBody>) -> Self {
     Self {
       role,
       content: content.into(),
@@ -334,16 +385,31 @@ impl Message {
 
   fn to_ir(&self) -> IrMessage {
     let mut content = if self.role == Role::Tool {
-      vec![IrContentPart::ToolResult {
-        id: self.tool_call_id.clone(),
-        content: Value::String(self.content.clone()),
-      }]
-    } else if self.content.is_empty() {
-      Vec::new()
+      match &self.content {
+        ContentBody::Text(text) => vec![IrContentPart::ToolResult {
+          id: self.tool_call_id.clone(),
+          content: Value::String(text.clone()),
+        }],
+        ContentBody::Parts(parts) => vec![IrContentPart::ToolResultParts {
+          id: self.tool_call_id.clone(),
+          content: parts.clone(),
+        }],
+      }
     } else {
-      vec![IrContentPart::Text {
-        text: self.content.clone(),
-      }]
+      self
+        .content
+        .iter()
+        .filter_map(|part| match part {
+          ContentRef::Text("") => None,
+          ContentRef::Text(text) => Some(IrContentPart::Text { text: text.into() }),
+          ContentRef::Part(Content::Text(text)) => Some(IrContentPart::Text {
+            text: text.text.clone(),
+          }),
+          ContentRef::Part(content) => Some(IrContentPart::Media {
+            content: Box::new(content.clone()),
+          }),
+        })
+        .collect()
     };
     if self.role == Role::Assistant {
       content.extend(self.tool_calls.iter().map(|call| IrContentPart::ToolCall {
@@ -538,28 +604,28 @@ macro_rules! generate_builder_methods {
       self
     }
 
-    pub fn prompt(self, prompt: impl Into<String>) -> Self {
+    pub fn prompt(self, prompt: impl Into<ContentBody>) -> Self {
       self.user(prompt)
     }
 
-    pub fn system(mut self, content: impl Into<String>) -> Self {
+    pub fn system(mut self, content: impl Into<ContentBody>) -> Self {
       self.request.messages.push(Message::system(content));
       self
     }
 
-    pub fn user(mut self, content: impl Into<String>) -> Self {
+    pub fn user(mut self, content: impl Into<ContentBody>) -> Self {
       self.request.messages.push(Message::user(content));
       self
     }
 
-    pub fn assistant(mut self, content: impl Into<String>) -> Self {
+    pub fn assistant(mut self, content: impl Into<ContentBody>) -> Self {
       self.request.messages.push(Message::assistant(content));
       self
     }
 
     pub fn assistant_with_tool_calls(
       mut self,
-      content: impl Into<String>,
+      content: impl Into<ContentBody>,
       tool_calls: impl IntoIterator<Item = ToolCall>,
     ) -> Self {
       self
@@ -569,7 +635,7 @@ macro_rules! generate_builder_methods {
       self
     }
 
-    pub fn tool_result(mut self, call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool_result(mut self, call_id: impl Into<String>, content: impl Into<ContentBody>) -> Self {
       self.request.messages.push(Message::tool(call_id, content));
       self
     }
@@ -586,6 +652,16 @@ macro_rules! generate_builder_methods {
 
     pub fn tool(mut self, tool: Tool) -> Self {
       self.request.tools.push(tool);
+      self
+    }
+
+    pub fn audio_output(mut self, options: AudioOutputOptions) -> Self {
+      self.request.audio_output = Some(options);
+      self
+    }
+
+    pub fn image_generation(mut self, options: ImageGenerationOptions) -> Self {
+      self.request.image_generation = Some(options);
       self
     }
 
@@ -788,21 +864,24 @@ impl<P: PlatformFactory> Client<P> {
     mut on_event: impl FnMut(GenerateEvent),
   ) -> Result<GenerateResponse> {
     let request = request.borrow();
+    let endpoint = request.source_endpoint();
+    let output_metadata = response::OutputContentMetadata::for_request(request);
     let response = self
       .execute_generation(request, GenerationDelivery::StreamingResponse)
       .await?;
     let session::ResponseBody::Stream(mut events) = response.body else {
       return Err(Error::UnexpectedBuffered);
     };
-    let mut accumulator = tokn_convert::sse::SseAccumulator::new(Endpoint::Responses);
+    let mut accumulator = tokn_convert::sse::SseAccumulator::new(endpoint);
     while let Some(event) = events
       .next_event()
       .await
-      .map_err(|source| Error::from_generation(source, Endpoint::Responses))?
+      .map_err(|source| Error::from_generation(source, endpoint))?
     {
       if let Some(value) = event.json {
-        for event in stream::results_from_value(&mut accumulator, value) {
-          let event = event?;
+        for event in stream::results_for_endpoint(&mut accumulator, endpoint, value) {
+          let mut event = event?;
+          output_metadata.enrich_event(&mut event);
           if !matches!(event, GenerateEvent::Completed { .. }) {
             on_event(event);
           }
@@ -827,9 +906,10 @@ impl<P: PlatformFactory> Client<P> {
     delivery: GenerationDelivery,
   ) -> Result<crate::client::SessionResponse<'_, P>> {
     let stream = !matches!(delivery, GenerationDelivery::Buffered);
-    let body = request.responses_body(stream)?;
+    let endpoint = request.source_endpoint();
+    request.validate()?;
     let generation_options = request.generation_options();
-    let continuation = match delivery {
+    let mut continuation = match delivery {
       GenerationDelivery::Buffered if !request.wants_checkpoint() => None,
       #[cfg(feature = "std")]
       GenerationDelivery::Events if request.wants_checkpoint() => {
@@ -841,16 +921,33 @@ impl<P: PlatformFactory> Client<P> {
       GenerationDelivery::Events => None,
       _ => Some(request.continuation(stream)?),
     };
+    let body = match request.request_body(stream) {
+      Ok(body) => body,
+      Err(Error::BuildGenerateRequest { .. }) if request.provider_state.is_some() => {
+        let continuation = continuation.as_mut().ok_or_else(|| Error::InvalidGenerateRequest {
+          message: "native media history requires a continuation checkpoint".into(),
+        })?;
+        continuation.restart_unavailable = true;
+        continuation
+          .suffix
+          .clone()
+          .ok_or_else(|| Error::InvalidGenerateRequest {
+            message: "native media history requires a fresh request suffix".into(),
+          })?
+      }
+      Err(error) => return Err(error),
+    };
     self
       .run_session(
-        Endpoint::Responses,
+        endpoint,
         body,
         request.options.clone(),
         (!generation_options.is_empty()).then_some(generation_options),
         continuation,
+        request.media_assets(),
       )
       .await
-      .map_err(|error| Error::from_generation(error, Endpoint::Responses))
+      .map_err(|error| Error::from_generation(error, endpoint))
   }
 }
 
@@ -858,12 +955,29 @@ impl<P: PlatformFactory> Client<P> {
 impl Client {
   /// Stream semantic generation events from an owned or borrowed request.
   pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
+    use futures_util::StreamExt as _;
+
+    let endpoint = request.borrow().source_endpoint();
+    let output_metadata = response::OutputContentMetadata::for_request(request.borrow());
     let response = self
       .execute_generation(request.borrow(), GenerationDelivery::Events)
       .await?;
     let response = crate::StdPlatform::finish_response(response);
     ensure_raw_success(&response)?;
-    Ok(stream::parse_events(response.into_stream()?.into_stream()))
+    Ok(
+      stream::parse_endpoint_events(
+        response.into_stream()?.into_stream(),
+        endpoint,
+        self.limits().max_response_bytes,
+      )
+      .map(move |result| {
+        result.map(|mut event| {
+          output_metadata.enrich_event(&mut event);
+          event
+        })
+      })
+      .boxed(),
+    )
   }
 
   /// Stream only generated text deltas.
@@ -969,7 +1083,7 @@ mod tests {
       .build()
       .expect("build request");
 
-    let body = request.responses_body(false).expect("build Responses body");
+    let body = request.request_body(false).expect("build Responses body");
 
     assert!(body.get("top_k").is_none());
     assert!(body.get("reasoning").is_none());

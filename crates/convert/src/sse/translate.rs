@@ -10,6 +10,7 @@ use alloc::{string::String, string::ToString, vec::Vec};
 
 pub struct EndpointTranslator {
   from: Endpoint,
+  to: Endpoint,
   acc: SseAccumulator,
   emit: EmitState,
   terminal_seen: bool,
@@ -39,6 +40,7 @@ impl EndpointTranslator {
   pub fn with_created_at(from: Endpoint, to: Endpoint, created_at: u64) -> Self {
     Self {
       from,
+      to,
       acc: SseAccumulator::new(from),
       emit: EmitState::new(to, created_at),
       terminal_seen: false,
@@ -54,6 +56,7 @@ impl EndpointTranslator {
     if !self.terminal_seen {
       return Err(ConvertError::sse("upstream stream ended before a terminal event"));
     }
+    self.acc.validate_complete()?;
     self.emit.update_metadata(self.acc.metadata());
     Ok(self.emit.finish())
   }
@@ -69,7 +72,7 @@ impl EventTransformer for EndpointTranslator {
         !self.terminal_seen && matches!(self.from, Endpoint::Responses) && self.acc.responses_has_tool_call();
       self.terminal_seen = true;
       let mut out = if infer_responses_finish {
-        self.emit.emit(&[IrDelta::Finish(Some("tool_calls".into()))])
+        self.emit.emit(&[IrDelta::Finish(Some("tool_calls".into()))])?
       } else {
         Vec::new()
       };
@@ -80,7 +83,8 @@ impl EventTransformer for EndpointTranslator {
       .json
       .as_ref()
       .ok_or_else(|| ConvertError::sse("expected JSON SSE payload"))?;
-    let mut deltas = self.acc.push_value(value);
+    crate::media::validate_stream_event(self.from, self.to, value)?;
+    let mut deltas = self.acc.push_value(value)?;
     let terminal_reason = terminal_reason(self.from, value, &self.acc, &deltas);
     if let Some(reason) = terminal_reason {
       if self.terminal_seen {
@@ -106,7 +110,7 @@ impl EventTransformer for EndpointTranslator {
       }
     }
     self.emit.update_metadata(self.acc.metadata());
-    Ok(self.emit.emit(&deltas))
+    self.emit.emit(&deltas)
   }
 
   fn finish(&mut self) -> Result<Vec<SseEvent>> {
@@ -219,12 +223,14 @@ impl EmitState {
     }
   }
 
-  fn emit(&mut self, deltas: &[IrDelta]) -> Vec<SseEvent> {
+  fn emit(&mut self, deltas: &[IrDelta]) -> Result<Vec<SseEvent>> {
     match self {
-      Self::Chat { id, model } => crate::value::chat::chunk_from_deltas(id, model, deltas, false)
-        .into_iter()
-        .map(|value| SseEvent::json(None, value))
-        .collect(),
+      Self::Chat { id, model } => Ok(
+        crate::value::chat::chunk_from_deltas(id, model, deltas, false)?
+          .into_iter()
+          .map(|value| SseEvent::json(None, value))
+          .collect(),
+      ),
       Self::Responses(emitter) => emitter.emit(deltas),
       Self::Messages(emitter) => emitter.emit(deltas),
     }
@@ -271,7 +277,7 @@ mod tests {
       );
       let mut accumulator = SseAccumulator::new(Endpoint::Messages);
       for event in events {
-        accumulator.push_value(event.json.as_ref().unwrap());
+        accumulator.push_value(event.json.as_ref().unwrap()).unwrap();
       }
       let response = accumulator.finish();
       assert_eq!(response.tool_calls.len(), 1);

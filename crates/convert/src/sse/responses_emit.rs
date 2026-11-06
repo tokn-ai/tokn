@@ -62,6 +62,7 @@ pub struct ResponsesEmitter {
   next_item_counter: usize,
   current: Option<OpenItem>,
   tool_calls: BTreeMap<usize, OpenItem>,
+  images: BTreeMap<usize, (usize, String)>,
   closed: BTreeMap<usize, Value>,
   created_emitted: bool,
   in_progress_emitted: bool,
@@ -93,6 +94,7 @@ impl ResponsesEmitter {
       next_item_counter: 0,
       current: None,
       tool_calls: BTreeMap::new(),
+      images: BTreeMap::new(),
       closed: BTreeMap::new(),
       created_emitted: false,
       in_progress_emitted: false,
@@ -169,9 +171,9 @@ impl ResponsesEmitter {
     response
   }
 
-  pub fn emit(&mut self, deltas: &[IrDelta]) -> Vec<SseEvent> {
+  pub fn emit(&mut self, deltas: &[IrDelta]) -> crate::Result<Vec<SseEvent>> {
     if self.finished || deltas.is_empty() {
-      return Vec::new();
+      return Ok(Vec::new());
     }
     let mut out = Vec::new();
     self.ensure_started(&mut out);
@@ -179,6 +181,13 @@ impl ResponsesEmitter {
       match delta {
         IrDelta::Text(text) => self.handle_text(text, &mut out),
         IrDelta::Reasoning(text) => self.handle_reasoning(text, &mut out),
+        IrDelta::Media { index, content } => self.handle_image(*index, None, content, &mut out)?,
+        IrDelta::ImagePreview {
+          index,
+          preview_index,
+          image,
+        } => self.handle_image(*index, Some(*preview_index), image, &mut out)?,
+        IrDelta::Audio { .. } => return Err(crate::media::unsupported("Responses cannot emit Chat audio deltas")),
         IrDelta::ToolCall {
           index,
           id,
@@ -199,7 +208,59 @@ impl ResponsesEmitter {
         }
       }
     }
-    out
+    Ok(out)
+  }
+
+  fn handle_image(
+    &mut self,
+    source_index: usize,
+    preview: Option<u64>,
+    content: &tokn_core::content::Content,
+    out: &mut Vec<SseEvent>,
+  ) -> crate::Result<()> {
+    let tokn_core::content::Content::Image(image) = content else {
+      return Err(crate::media::unsupported("Responses media output requires an image"));
+    };
+    let format = crate::media::image_output_format(image)?;
+    let data = image
+      .resource
+      .encode_base64()
+      .ok_or_else(|| crate::media::unsupported("generated image output requires inline bytes"))?;
+    self.close_current(out);
+    let (index, id) = if let Some(identity) = self.images.get(&source_index) {
+      identity.clone()
+    } else {
+      let index = self.next_output_index;
+      self.next_output_index += 1;
+      let id = self.synth_item_id("ig");
+      self.images.insert(source_index, (index, id.clone()));
+      let seq = self.next_seq();
+      out.push(SseEvent::json(Some("response.output_item.added"), json!({"type":"response.output_item.added", "sequence_number":seq, "output_index":index, "item":{"id":id,"type":"image_generation_call","status":"in_progress","result":null}})));
+      (index, id)
+    };
+    if let Some(preview) = preview {
+      let seq = self.next_seq();
+      let mut event = json!({"type":"response.image_generation_call.partial_image", "sequence_number":seq, "output_index":index, "item_id":id, "partial_image_index":preview, "partial_image_b64":data});
+      if let Some(format) = format {
+        event["output_format"] = json!(format);
+      }
+      out.push(SseEvent::json(
+        Some("response.image_generation_call.partial_image"),
+        event,
+      ));
+    } else {
+      let mut item = json!({"type":"image_generation_call", "id":id, "status":"completed", "result":data});
+      if let Some(format) = format {
+        item["output_format"] = json!(format);
+      }
+      self.closed.insert(index, item.clone());
+      let seq = self.next_seq();
+      out.push(SseEvent::json(
+        Some("response.output_item.done"),
+        json!({"type":"response.output_item.done", "sequence_number":seq, "output_index":index, "item":item}),
+      ));
+    }
+    Ok(())
   }
 
   fn close_current(&mut self, out: &mut Vec<SseEvent>) {
@@ -611,16 +672,22 @@ mod tests {
   #[test]
   fn interleaved_tool_calls_keep_one_item_and_complete_arguments_per_call() {
     let mut emitter = ResponsesEmitter::with_created_at("resp_1".into(), "model".into(), 1);
-    let mut events = emitter.emit(&[
-      IrDelta::Reasoning("plan".into()),
-      tool_delta(5, Some("call_weather"), Some("weather"), "{\"city\":"),
-      tool_delta(2, Some("call_clock"), Some("clock"), "{\"zone\":"),
-    ]);
-    events.extend(emitter.emit(&[
-      tool_delta(5, Some("call_weather"), Some("weather"), "\"Paris\"}"),
-      tool_delta(2, Some("call_clock"), Some("clock"), "\"UTC\"}"),
-      tool_delta(5, Some("call_weather"), Some("weather"), ""),
-    ]));
+    let mut events = emitter
+      .emit(&[
+        IrDelta::Reasoning("plan".into()),
+        tool_delta(5, Some("call_weather"), Some("weather"), "{\"city\":"),
+        tool_delta(2, Some("call_clock"), Some("clock"), "{\"zone\":"),
+      ])
+      .unwrap();
+    events.extend(
+      emitter
+        .emit(&[
+          tool_delta(5, Some("call_weather"), Some("weather"), "\"Paris\"}"),
+          tool_delta(2, Some("call_clock"), Some("clock"), "\"UTC\"}"),
+          tool_delta(5, Some("call_weather"), Some("weather"), ""),
+        ])
+        .unwrap(),
+    );
 
     let added = event_values(&events, "response.output_item.added");
     assert_eq!(added.len(), 3, "reasoning and exactly two function-call items");
@@ -666,19 +733,24 @@ mod tests {
       assert_eq!(event.json.as_ref().unwrap()["sequence_number"], sequence);
     }
     assert!(emitter.finish().is_empty());
-    assert!(emitter.emit(&[tool_delta(5, None, None, "ignored")]).is_empty());
+    assert!(emitter
+      .emit(&[tool_delta(5, None, None, "ignored")])
+      .unwrap()
+      .is_empty());
   }
 
   #[test]
   fn tool_calls_survive_text_interleaving_and_accept_late_identity_hints() {
     let mut emitter = ResponsesEmitter::with_created_at("resp_1".into(), "model".into(), 1);
-    let mut events = emitter.emit(&[
-      tool_delta(7, None, None, "{"),
-      IrDelta::Text("working".into()),
-      tool_delta(2, Some("call_second"), Some("second"), "{}"),
-      tool_delta(7, Some("call_first"), Some("first"), "}"),
-      tool_delta(7, Some("call_first"), Some("first"), ""),
-    ]);
+    let mut events = emitter
+      .emit(&[
+        tool_delta(7, None, None, "{"),
+        IrDelta::Text("working".into()),
+        tool_delta(2, Some("call_second"), Some("second"), "{}"),
+        tool_delta(7, Some("call_first"), Some("first"), "}"),
+        tool_delta(7, Some("call_first"), Some("first"), ""),
+      ])
+      .unwrap();
     events.extend(emitter.finish());
 
     let added = event_values(&events, "response.output_item.added");
@@ -710,15 +782,19 @@ mod tests {
   #[test]
   fn merges_split_usage_before_terminal_event() {
     let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
-    emitter.emit(&[IrDelta::Usage(Usage {
-      input_tokens: Some(7),
-      ..Usage::default()
-    })]);
-    emitter.emit(&[IrDelta::Usage(Usage {
-      output_tokens: Some(5),
-      total_tokens: Some(12),
-      ..Usage::default()
-    })]);
+    emitter
+      .emit(&[IrDelta::Usage(Usage {
+        input_tokens: Some(7),
+        ..Usage::default()
+      })])
+      .unwrap();
+    emitter
+      .emit(&[IrDelta::Usage(Usage {
+        output_tokens: Some(5),
+        total_tokens: Some(12),
+        ..Usage::default()
+      })])
+      .unwrap();
 
     let completed = emitter
       .finish()
@@ -735,7 +811,7 @@ mod tests {
   #[test]
   fn length_finish_emits_incomplete_terminal_event() {
     let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
-    emitter.emit(&[IrDelta::Finish(Some("length".into()))]);
+    emitter.emit(&[IrDelta::Finish(Some("length".into()))]).unwrap();
 
     let terminal = emitter.finish().pop().expect("terminal event");
 
@@ -748,7 +824,7 @@ mod tests {
   #[test]
   fn cancelled_finish_emits_cancelled_terminal_event() {
     let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
-    emitter.emit(&[IrDelta::Finish(Some("cancelled".into()))]);
+    emitter.emit(&[IrDelta::Finish(Some("cancelled".into()))]).unwrap();
 
     let terminal = emitter.finish().pop().expect("terminal event");
 
@@ -759,12 +835,14 @@ mod tests {
   #[test]
   fn empty_function_arguments_are_closed_as_an_empty_object() {
     let mut emitter = ResponsesEmitter::new("resp_1".into(), "model".into());
-    emitter.emit(&[IrDelta::ToolCall {
-      index: 0,
-      id: Some("call_1".into()),
-      name: Some("ping".into()),
-      arguments_delta: String::new(),
-    }]);
+    emitter
+      .emit(&[IrDelta::ToolCall {
+        index: 0,
+        id: Some("call_1".into()),
+        name: Some("ping".into()),
+        arguments_delta: String::new(),
+      }])
+      .unwrap();
 
     let events = emitter.finish();
     let arguments_done = events

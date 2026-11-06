@@ -66,7 +66,7 @@ impl ExtraKeys for ContentBlock {
       | ContentBlock::Image { extras, .. }
       | ContentBlock::Document { extras, .. } => push_extras(extras, prefix, out),
       ContentBlock::RedactedThinking { fields } => push_extras(fields, prefix, out),
-      ContentBlock::Other => {}
+      ContentBlock::Other(_) => {}
     }
   }
 }
@@ -78,7 +78,7 @@ impl ExtraKeys for ContentBlockDelta {
       | ContentBlockDelta::ThinkingDelta { extras, .. }
       | ContentBlockDelta::SignatureDelta { extras, .. }
       | ContentBlockDelta::InputJsonDelta { extras, .. } => push_extras(extras, prefix, out),
-      ContentBlockDelta::Other => {}
+      ContentBlockDelta::Other(_) => {}
     }
   }
 }

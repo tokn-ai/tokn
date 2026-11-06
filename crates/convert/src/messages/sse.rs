@@ -11,7 +11,7 @@ pub fn delta_from_endpoint_event(event: &MessagesEvent) -> Result<Vec<IrDelta>> 
 /// Format delta fragments, or a complete stream when `finish` is true.
 /// Retain `tokn_convert::sse::messages_emit::MessagesEmitter` for live streams.
 pub fn events_from_deltas(resp_id: &str, model: &str, deltas: &[IrDelta], finish: bool) -> Result<Vec<MessagesEvent>> {
-  crate::value::messages::events_from_deltas(resp_id, model, deltas, finish)
+  crate::value::messages::events_from_deltas(resp_id, model, deltas, finish)?
     .into_iter()
     .map(|(_, value)| serde_json::from_value(value).map_err(Into::into))
     .collect()

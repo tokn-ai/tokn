@@ -22,6 +22,24 @@ pub struct ChatMessage {
   /// Provider extension carrying chain-of-thought style reasoning.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub reasoning_content: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub audio: Option<ChatAudio>,
+  #[serde(default, flatten)]
+  pub extras: Extras,
+}
+
+/// Audio output, a streamed fragment, or an assistant history reference. The
+/// wire context determines which fields are required; references carry only id.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ChatAudio {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub id: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub data: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub expires_at: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub transcript: Option<String>,
   #[serde(default, flatten)]
   pub extras: Extras,
 }

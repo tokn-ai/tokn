@@ -12,6 +12,7 @@ pub mod buffered;
 pub mod chat;
 pub mod error;
 pub mod ir;
+pub mod media;
 pub mod messages;
 pub mod responses;
 pub mod sse;
@@ -28,6 +29,7 @@ pub fn convert_request(from: Endpoint, to: Endpoint, body: &Value) -> Result<Val
   if from == to {
     return Ok(body.clone());
   }
+  media::validate_request(from, to, body)?;
   let req = match from {
     Endpoint::ChatCompletions => value::chat::request_from_value(body)?,
     Endpoint::Responses => value::responses::request_from_value(body)?,

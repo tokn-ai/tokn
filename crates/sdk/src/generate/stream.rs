@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use tokn_convert::ir::IrDelta;
 use tokn_convert::sse::SseAccumulator;
+use tokn_core::content::Content;
 use tokn_core::provider::Endpoint;
 
 use super::response::finish_reason;
@@ -27,6 +28,24 @@ pub enum GenerateEvent {
     id: Option<String>,
     name: Option<String>,
     arguments_delta: String,
+  },
+  /// A complete generated media part. Partial previews use `ImagePreview`.
+  ContentCompleted {
+    index: usize,
+    content: Box<Content>,
+  },
+  /// One independently encoded audio chunk and optional transcript delta.
+  AudioDelta {
+    index: usize,
+    id: Option<String>,
+    data: String,
+    transcript: Option<String>,
+    expires_at: Option<u64>,
+  },
+  ImagePreview {
+    index: usize,
+    preview_index: u64,
+    content: Box<Content>,
   },
   Usage {
     usage: Usage,
@@ -51,16 +70,33 @@ struct EventParseState {
   accumulator: SseAccumulator,
   pending: VecDeque<Result<GenerateEvent>>,
   stop_after_pending: bool,
+  endpoint: Endpoint,
+  finish_reason: Option<String>,
+  max_bytes: usize,
+  consumed_bytes: usize,
 }
 
 impl EventParseState {
-  fn new(bytes: crate::ByteStream) -> Self {
+  fn new(bytes: crate::ByteStream, endpoint: Endpoint, max_bytes: usize) -> Self {
     Self {
       events: bytes.eventsource(),
-      accumulator: SseAccumulator::new(Endpoint::Responses),
+      accumulator: SseAccumulator::new(endpoint),
       pending: VecDeque::new(),
       stop_after_pending: false,
+      endpoint,
+      finish_reason: None,
+      max_bytes,
+      consumed_bytes: 0,
     }
+  }
+
+  fn account_event(&mut self, data_bytes: usize, name_bytes: usize) -> bool {
+    let size = data_bytes.saturating_add(name_bytes);
+    if size > self.max_bytes.saturating_sub(self.consumed_bytes) {
+      return false;
+    }
+    self.consumed_bytes = self.consumed_bytes.saturating_add(size);
+    true
   }
 
   fn enqueue(&mut self, results: Vec<Result<GenerateEvent>>, terminal: bool) {
@@ -80,39 +116,130 @@ impl EventParseState {
   }
 }
 
+#[cfg(test)]
 pub(super) fn parse_events(bytes: crate::ByteStream) -> GenerateStream {
-  stream::unfold(EventParseState::new(bytes), |mut state| async move {
-    loop {
-      if let Some(result) = state.pending.pop_front() {
-        return Some((result, state));
-      }
-      if state.stop_after_pending {
-        return None;
-      }
+  parse_endpoint_events(bytes, Endpoint::Responses, usize::MAX)
+}
 
-      match state.events.next().await {
-        Some(Ok(event)) if event.data.trim().is_empty() => {}
-        Some(Ok(event)) if event.data.trim() == "[DONE]" => {
-          state.stop_after_pending = true;
+pub(super) fn parse_endpoint_events(bytes: crate::ByteStream, endpoint: Endpoint, max_bytes: usize) -> GenerateStream {
+  stream::unfold(
+    EventParseState::new(bytes, endpoint, max_bytes),
+    |mut state| async move {
+      loop {
+        if let Some(result) = state.pending.pop_front() {
+          return Some((result, state));
         }
-        Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
-          Ok(value) => {
-            let terminal = is_terminal_value(&value);
-            let results = results_from_value(&mut state.accumulator, value);
-            state.enqueue(results, terminal);
+        if state.stop_after_pending {
+          return None;
+        }
+
+        match state.events.next().await {
+          Some(Ok(event)) if !state.account_event(event.data.len(), event.event.len()) => {
+            state.fail(Error::GenerateStream {
+              message: "generation stream exceeds response byte limit".into(),
+            });
           }
-          Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
-        },
-        Some(Err(error)) => state.fail(Error::GenerateStream {
-          message: error.to_string(),
-        }),
-        None => state.fail(Error::GenerateStream {
-          message: "generation stream ended before a terminal event".into(),
-        }),
+          Some(Ok(event)) if event.data.trim().is_empty() => {}
+          Some(Ok(event)) if event.data.trim() == "[DONE]" => {
+            if state.endpoint == Endpoint::ChatCompletions {
+              if let Err(error) = state.accumulator.validate_complete() {
+                state.fail(Error::GenerateStream {
+                  message: error.to_string(),
+                });
+                continue;
+              }
+              state.enqueue(
+                vec![Ok(GenerateEvent::Completed {
+                  finish_reason: state.finish_reason.clone(),
+                })],
+                true,
+              );
+            } else {
+              state.fail(Error::GenerateStream {
+                message: "stream ended before its terminal response event".into(),
+              });
+            }
+          }
+          Some(Ok(event)) => match serde_json::from_str::<Value>(&event.data) {
+            Ok(value) => {
+              let terminal = match state.endpoint {
+                Endpoint::Responses => is_terminal_value(&value),
+                Endpoint::Messages => value["type"] == "message_stop",
+                Endpoint::ChatCompletions => false,
+              };
+              if state.endpoint == Endpoint::ChatCompletions {
+                if let Some(reason) = value
+                  .get("choices")
+                  .and_then(Value::as_array)
+                  .into_iter()
+                  .flatten()
+                  .find(|choice| choice.get("index").and_then(Value::as_u64).unwrap_or(0) == 0)
+                  .and_then(|choice| choice.get("finish_reason"))
+                  .and_then(Value::as_str)
+                {
+                  state.finish_reason = Some(reason.into());
+                }
+              }
+              let endpoint = state.endpoint;
+              let results = results_for_endpoint(&mut state.accumulator, endpoint, value);
+              state.enqueue(results, terminal);
+            }
+            Err(source) => state.fail(Error::DeserializeStreamEvent { source }),
+          },
+          Some(Err(error)) => state.fail(Error::GenerateStream {
+            message: error.to_string(),
+          }),
+          None => state.fail(Error::GenerateStream {
+            message: "generation stream ended before a terminal event".into(),
+          }),
+        }
       }
-    }
-  })
+    },
+  )
   .boxed()
+}
+
+pub(super) fn results_for_endpoint(
+  accumulator: &mut SseAccumulator,
+  endpoint: Endpoint,
+  value: Value,
+) -> Vec<Result<GenerateEvent>> {
+  if endpoint == Endpoint::Responses {
+    return results_from_value(accumulator, value);
+  }
+  if value["type"] == "error" || value.get("error").is_some_and(|error| !error.is_null()) {
+    return vec![Err(Error::GenerateStream {
+      message: stream_error_message(&value),
+    })];
+  }
+  let deltas = match accumulator.push_value(&value) {
+    Ok(deltas) => deltas,
+    Err(error) => {
+      return vec![Err(Error::GenerateStream {
+        message: error.to_string(),
+      })]
+    }
+  };
+  if endpoint == Endpoint::Messages && value["type"] == "message_stop" {
+    if let Err(error) = accumulator.validate_complete() {
+      return vec![Err(Error::GenerateStream {
+        message: error.to_string(),
+      })];
+    }
+    return vec![Ok(GenerateEvent::Completed {
+      finish_reason: accumulator.finish_reason().map(str::to_string),
+    })];
+  }
+  deltas
+    .into_iter()
+    .filter_map(|delta| {
+      if matches!(endpoint, Endpoint::ChatCompletions | Endpoint::Messages) && matches!(delta, IrDelta::Finish(_)) {
+        None
+      } else {
+        Some(Ok(event_from_delta(delta)))
+      }
+    })
+    .collect()
 }
 
 fn is_terminal_value(value: &Value) -> bool {
@@ -142,8 +269,22 @@ pub(super) fn results_from_value(accumulator: &mut SseAccumulator, value: Value)
   .then(|| value.get("response"))
   .flatten()
   .and_then(|response| finish_reason(response, response_has_tool_calls(response)));
-  let deltas = accumulator.push_value(&value);
+  let deltas = match accumulator.push_value(&value) {
+    Ok(deltas) => deltas,
+    Err(error) => {
+      return vec![Err(Error::GenerateStream {
+        message: error.to_string(),
+      })]
+    }
+  };
 
+  if kind == "response.completed" {
+    if let Err(error) = accumulator.validate_complete() {
+      return vec![Err(Error::GenerateStream {
+        message: error.to_string(),
+      })];
+    }
+  }
   if matches!(kind, "response.failed" | "error") {
     return vec![Err(Error::GenerateStream {
       message: stream_error_message(&value),
@@ -255,6 +396,29 @@ fn event_from_delta(delta: IrDelta) -> GenerateEvent {
       usage: Usage::from_ir(usage),
     },
     IrDelta::Finish(finish_reason) => GenerateEvent::Completed { finish_reason },
+    IrDelta::Media { index, content } => GenerateEvent::ContentCompleted { index, content },
+    IrDelta::Audio {
+      index,
+      id,
+      data,
+      transcript,
+      expires_at,
+    } => GenerateEvent::AudioDelta {
+      index,
+      id,
+      data,
+      transcript,
+      expires_at,
+    },
+    IrDelta::ImagePreview {
+      index,
+      preview_index,
+      image,
+    } => GenerateEvent::ImagePreview {
+      index,
+      preview_index,
+      content: image,
+    },
   }
 }
 
@@ -263,6 +427,72 @@ mod tests {
   use super::*;
   use bytes::Bytes;
   use futures_util::stream;
+
+  #[tokio::test]
+  async fn messages_complete_once_at_message_stop_and_ignore_later_frames() {
+    let body = sse([
+      serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}),
+      serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+      serde_json::json!({"type":"message_stop"}),
+      serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ignored"}}),
+    ]);
+    let events = parse_endpoint_events(byte_stream(body), Endpoint::Messages, usize::MAX)
+      .try_collect::<Vec<_>>()
+      .await
+      .unwrap();
+    assert_eq!(
+      events
+        .iter()
+        .filter(|event| matches!(event, GenerateEvent::Completed { .. }))
+        .count(),
+      1
+    );
+    assert!(matches!(events.last(), Some(GenerateEvent::Completed{finish_reason:Some(reason)}) if reason == "stop"));
+    assert!(!events
+      .iter()
+      .any(|event| matches!(event, GenerateEvent::TextDelta{text} if text == "ignored")));
+  }
+
+  #[tokio::test]
+  async fn messages_finish_reason_without_message_stop_is_incomplete() {
+    let body = sse([serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}})]);
+    let mut events = parse_endpoint_events(byte_stream(body), Endpoint::Messages, usize::MAX);
+    assert!(matches!(events.next().await, Some(Err(Error::GenerateStream { .. }))));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn image_preview_without_completed_image_cannot_complete() {
+    let body = sse([
+      serde_json::json!({"type":"response.image_generation_call.partial_image","output_index":0,"partial_image_index":0,"partial_image_b64":"AQID","output_format":"png"}),
+      serde_json::json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+    ]);
+    let mut events = parse_events(byte_stream(body));
+    assert!(matches!(
+      events.next().await,
+      Some(Ok(GenerateEvent::ImagePreview { .. }))
+    ));
+    assert!(matches!(events.next().await, Some(Err(Error::GenerateStream { .. }))));
+    assert!(events.next().await.is_none());
+  }
+
+  #[tokio::test]
+  async fn cumulative_audio_stream_limit_prevents_unbounded_accumulation() {
+    let chunk = serde_json::json!({"choices":[{"index":0,"delta":{"audio":{"id":"audio-1","data":"AQID"}}}]});
+    let limit = (chunk.to_string().len() + "message".len()) * 2;
+    let body = format!("{}data: [DONE]\n\n", sse([chunk.clone(), chunk.clone(), chunk]));
+    let mut events = parse_endpoint_events(byte_stream(body), Endpoint::ChatCompletions, limit);
+    for _ in 0..2 {
+      assert!(matches!(
+        events.next().await,
+        Some(Ok(GenerateEvent::AudioDelta { .. }))
+      ));
+    }
+    assert!(
+      matches!(events.next().await, Some(Err(Error::GenerateStream { message })) if message.contains("byte limit"))
+    );
+    assert!(events.next().await.is_none());
+  }
 
   fn byte_stream(body: String) -> crate::ByteStream {
     Box::pin(stream::once(async move { Ok(Bytes::from(body)) }))

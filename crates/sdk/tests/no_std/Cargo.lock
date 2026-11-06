@@ -225,6 +225,7 @@ dependencies = [
 name = "tokn-core"
 version = "0.2.4"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "sha2",

@@ -342,6 +342,7 @@ pub(super) fn request_service(
           max_response_bytes: usize::MAX,
           max_event_bytes: usize::MAX,
           max_error_body_bytes: 8 * 1024,
+          ..crate::session::Limits::default()
         })
         .run()
         .await
@@ -413,11 +414,12 @@ pub(super) fn refresh_models(
     ids.extend(info.model_cache.snapshot().unwrap_or_default());
     let mut inventory = ModelInventory::new();
     for id in ids {
+      let model_info = provider.model_info(&id);
       let reasoning_efforts = provider.reasoning_efforts(&id);
       let reasoning_supported = if reasoning_efforts.as_ref().is_some_and(|values| !values.is_empty()) {
         Some(true)
       } else {
-        provider.model_info(&id).map(|model| model.capabilities.reasoning)
+        model_info.as_ref().map(|model| model.capabilities.reasoning)
       };
       let endpoints = [
         tokn_core::Endpoint::ChatCompletions,
@@ -433,11 +435,31 @@ pub(super) fn refresh_models(
           endpoints: Some(endpoints),
           reasoning_efforts,
           reasoning_supported,
+          input_modalities: model_info
+            .as_ref()
+            .map(|model| media_modalities(&model.capabilities.input)),
+          output_modalities: model_info
+            .as_ref()
+            .map(|model| media_modalities(&model.capabilities.output)),
         },
       );
     }
     state.set_binding_models(binding.provider_id(), binding.account_id(), inventory);
   }
+}
+
+fn media_modalities(modalities: &tokn_core::provider::Modalities) -> Vec<tokn_core::content::MediaKind> {
+  use tokn_core::content::MediaKind;
+  [
+    (modalities.text, MediaKind::Text),
+    (modalities.image, MediaKind::Image),
+    (modalities.audio, MediaKind::Audio),
+    (modalities.video, MediaKind::Video),
+    (modalities.pdf, MediaKind::Document),
+  ]
+  .into_iter()
+  .filter_map(|(supported, kind)| supported.then_some(kind))
+  .collect()
 }
 
 /// Preserve the standard request error taxonomy when presenting session errors.

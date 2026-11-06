@@ -211,6 +211,177 @@ fn template(endpoint: Endpoint) -> tokn_sdk::GenerateRequestBuilder {
 }
 
 #[tokio::test]
+async fn streamed_audio_keeps_padded_chunks_and_trailing_expiry_across_retry() {
+  use tokn_sdk::{AudioOutputFormat, AudioOutputOptions, Content, MediaSource};
+  let mut bytes = frames(vec![
+    json!({"id":"speech","choices":[{"index":0,"delta":{"role":"assistant","audio":{"id":"audio-1","data":"AQ==","transcript":"hel"}}}]}),
+    json!({"id":"speech","choices":[{"index":0,"delta":{"audio":{"data":"Ag==","transcript":"lo"}},"finish_reason":"stop"}]}),
+    json!({"id":"speech","choices":[{"index":0,"delta":{"audio":{"expires_at":2000000000}}}]}),
+  ]);
+  let truncated = bytes.len();
+  bytes.extend_from_slice(b"data: [DONE]\n\n");
+  let requests = Rc::new(RefCell::new(Vec::new()));
+  let client = client(
+    Endpoint::ChatCompletions,
+    requests.clone(),
+    vec![
+      Reply {
+        bytes: bytes.clone(),
+        fail_after: Some(truncated),
+      },
+      Reply {
+        bytes,
+        fail_after: None,
+      },
+      Reply {
+        bytes: stream(Endpoint::ChatCompletions, false),
+        fail_after: None,
+      },
+    ],
+  );
+  let template =
+    || template(Endpoint::ChatCompletions).audio_output(AudioOutputOptions::new("alloy", AudioOutputFormat::Wav));
+  let mut conversation = Conversation::new("audio-stream").unwrap();
+  conversation.submit_user("Say hello").unwrap();
+  let first = conversation.prepare(template(), vec![]).unwrap();
+  let mut events = Vec::new();
+  assert!(client
+    .send_streaming(first.request(), |event| events.push(event))
+    .await
+    .is_err());
+  assert!(!events
+    .iter()
+    .any(|event| matches!(event, GenerateEvent::Completed { .. })));
+  assert_eq!(conversation.history().len(), 1);
+  let retry = conversation.retry().unwrap();
+  events.clear();
+  let reply = client
+    .send_streaming(retry.request(), |event| events.push(event))
+    .await
+    .unwrap();
+  assert_eq!(
+    events
+      .iter()
+      .filter(|event| matches!(event, GenerateEvent::Completed { .. }))
+      .count(),
+    1
+  );
+  assert!(events.iter().any(|event| matches!(
+    event,
+    GenerateEvent::AudioDelta {
+      expires_at: Some(2000000000),
+      ..
+    }
+  )));
+  let audio = reply
+    .content
+    .iter()
+    .find_map(|part| match part {
+      Content::Audio(audio) => Some(audio),
+      _ => None,
+    })
+    .unwrap();
+  assert!(matches!(&audio.resource.source, MediaSource::Inline { data } if data.as_ref() == [1,2]));
+  assert_eq!(audio.transcript.as_ref().unwrap().text, "hello");
+  conversation.commit(&retry, reply).unwrap();
+  conversation.submit_user("Continue").unwrap();
+  let next = conversation.prepare(template(), vec![]).unwrap();
+  client.send_streaming(next.request(), |_| {}).await.unwrap();
+  let sent = requests.borrow();
+  assert_eq!(sent[0].body, sent[1].body);
+  let body: Value = serde_json::from_slice(&sent[2].body).unwrap();
+  assert_eq!(
+    body["messages"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .find(|message| message["role"] == "assistant")
+      .unwrap()["audio"],
+    json!({"id":"audio-1"})
+  );
+}
+
+#[tokio::test]
+async fn image_previews_do_not_duplicate_completed_content_or_enter_history() {
+  use tokn_sdk::{Content, ImageGenerationOptions, ImageOutputFormat};
+  let preview_bytes = vec![42; 96 * 1024];
+  let preview_base64 = tokn_core::content::encode_base64(&preview_bytes);
+  // The provider omits output_format on both preview and completed output.
+  let image = json!({"type":"image_generation_call","id":"image-1","status":"completed","result":"AQID"});
+  let bytes = frames(vec![
+    json!({"type":"response.created","response":{"id":"response-1","status":"in_progress"}}),
+    json!({"type":"response.output_item.added","output_index":0,"item":{"type":"image_generation_call","id":"image-1","status":"in_progress","result":null}}),
+    json!({"type":"response.image_generation_call.partial_image","output_index":0,"item_id":"image-1","partial_image_index":0,"partial_image_b64":preview_base64}),
+    json!({"type":"response.output_item.done","output_index":0,"item":image}),
+    json!({"type":"response.completed","response":{"id":"response-1","status":"completed","output":[image]}}),
+  ]);
+  let requests = Rc::new(RefCell::new(Vec::new()));
+  let client = client(
+    Endpoint::Responses,
+    requests,
+    vec![Reply {
+      bytes,
+      fail_after: None,
+    }],
+  );
+  let mut conversation = Conversation::new("image-stream").unwrap();
+  conversation.submit_user("Draw a bird").unwrap();
+  let prepared = conversation
+    .prepare(
+      template(Endpoint::Responses).image_generation(ImageGenerationOptions {
+        output_format: ImageOutputFormat::Jpeg,
+        ..ImageGenerationOptions::default()
+      }),
+      vec![],
+    )
+    .unwrap();
+  let mut events = Vec::new();
+  let reply = client
+    .send_streaming(prepared.request(), |event| events.push(event))
+    .await
+    .unwrap();
+  assert_eq!(
+    events
+      .iter()
+      .filter(|event| matches!(event, GenerateEvent::ImagePreview { .. }))
+      .count(),
+    1
+  );
+  assert_eq!(
+    events
+      .iter()
+      .filter(|event| matches!(event, GenerateEvent::ContentCompleted { .. }))
+      .count(),
+    1
+  );
+  assert_eq!(reply.content.len(), 1);
+  for event in &events {
+    let content = match event {
+      GenerateEvent::ImagePreview { content, .. } => {
+        let Content::Image(image) = content.as_ref() else {
+          panic!("image preview")
+        };
+        assert_eq!(image.resource.bytes().unwrap().as_ref(), preview_bytes.as_slice());
+        content.as_ref()
+      }
+      GenerateEvent::ContentCompleted { content, .. } => content.as_ref(),
+      _ => continue,
+    };
+    let Content::Image(image) = content else {
+      panic!("image content")
+    };
+    assert_eq!(image.resource.media_type.as_deref(), Some("image/jpeg"));
+  }
+  let Content::Image(image) = &reply.content[0] else {
+    panic!("image response")
+  };
+  assert_eq!(image.resource.media_type.as_deref(), Some("image/jpeg"));
+  assert_eq!(conversation.history().len(), 1);
+  conversation.commit(&prepared, reply).unwrap();
+  assert_eq!(conversation.history()[1].content.clone().into_parts().len(), 1);
+}
+
+#[tokio::test]
 async fn live_native_generations_commit_tools_and_adopt_queued_steering_at_the_next_request() {
   for endpoint in [Endpoint::ChatCompletions, Endpoint::Responses, Endpoint::Messages] {
     let requests = Rc::new(RefCell::new(Vec::new()));

@@ -30,6 +30,7 @@ from ._models import (
   ToolChoice,
   generate_event_from_dict,
 )
+from ._content import AudioOutputOptions, ContentBody, ImageGenerationOptions
 from ._native import (
   NativeClient,
   NativeGenerateStream,
@@ -155,24 +156,24 @@ class _GenerateBuilder(Generic[_BuilderT]):
   def _self(self) -> _BuilderT:
     return cast(_BuilderT, self)
 
-  def prompt(self, prompt: str) -> _BuilderT:
+  def prompt(self, prompt: ContentBody) -> _BuilderT:
     return self.user(prompt)
 
-  def system(self, content: str) -> _BuilderT:
+  def system(self, content: ContentBody) -> _BuilderT:
     self._request.messages.append(Message.system(content))
     return self._self()
 
-  def user(self, content: str) -> _BuilderT:
+  def user(self, content: ContentBody) -> _BuilderT:
     self._request.messages.append(Message.user(content))
     return self._self()
 
-  def assistant(self, content: str) -> _BuilderT:
+  def assistant(self, content: ContentBody) -> _BuilderT:
     self._request.messages.append(Message.assistant(content))
     return self._self()
 
   def assistant_with_tool_calls(
     self,
-    content: str,
+    content: ContentBody,
     tool_calls: Iterable[ToolCall],
   ) -> _BuilderT:
     self._request.messages.append(
@@ -180,7 +181,7 @@ class _GenerateBuilder(Generic[_BuilderT]):
     )
     return self._self()
 
-  def tool_result(self, call_id: str, content: str) -> _BuilderT:
+  def tool_result(self, call_id: str, content: ContentBody) -> _BuilderT:
     self._request.messages.append(Message.tool(call_id, content))
     return self._self()
 
@@ -227,6 +228,14 @@ class _GenerateBuilder(Generic[_BuilderT]):
     if not isinstance(options, ReasoningOptions):
       raise TypeError("reasoning options must be ReasoningOptions")
     self._request.reasoning = ReasoningOptions.from_dict(options.to_dict())
+    return self._self()
+
+  def audio_output(self, options: AudioOutputOptions) -> _BuilderT:
+    self._request.audio_output = AudioOutputOptions.from_dict(options.to_dict())
+    return self._self()
+
+  def image_generation(self, options: ImageGenerationOptions) -> _BuilderT:
+    self._request.image_generation = ImageGenerationOptions.from_dict(options.to_dict())
     return self._self()
 
   def reasoning_mode(
