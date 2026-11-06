@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod client;
+mod conversation;
 mod endpoint;
 mod error;
 mod generate;
@@ -23,8 +24,10 @@ pub use client::{
   BufferedResponse, Client, PlatformFactory, PlatformResponse, PlatformServices, RequestOptions, ResponseAdapter,
   Services,
 };
+pub use conversation::{Conversation, ConversationError, InputDisposition, PreparedGeneration, RetrievedContext};
 pub use endpoint::{ChatCompletions, Messages, Responses};
 pub use error::{Error, Result};
+pub use generate::ProviderState;
 pub use generate::{
   GenerateCall, GenerateRequest, GenerateRequestBuilder, GenerateResponse, Message, Role, Tool, ToolCall, ToolChoice,
   Usage,
@@ -40,6 +43,7 @@ pub use tokn_core::{account, settings, usage};
 pub use tokn_policy as policy;
 pub use tokn_requests::configured::{Adapter, EventRuntime, Lifecycle, Limits, Runtime};
 pub use tokn_requests::session;
+pub use tokn_requests::session::{ContinuationOutcome as ContinuationStatus, ContinuationPolicy};
 pub use tokn_requests::session::{ModelCapabilities, ModelInventory};
 pub use tokn_service::transport;
 

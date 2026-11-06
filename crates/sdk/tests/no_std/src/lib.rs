@@ -10,6 +10,7 @@ pub use scenarios::{
   configured_client_relay, configured_provider_policies, configured_relay_policies, configured_status_policy,
   configured_transport_encoding, copilot_refresh_uses_injected_transport_and_reuses_credentials,
   cross_format_round_trip, event_timestamps_and_local_sink, explicit_profiles_do_not_imply_default,
+  native_continuation_binds_upstream_account_without_binding_credentials,
   recoverable_refresh_failure_reselects_accounts, response_body_failure_does_not_retry, retry_fallback_affinity,
   retry_schedule_and_exhaustion, stream_errors_and_cancellation, streaming_cancellation_lifecycle,
   streaming_failure_lifecycle, streaming_round_trip, streaming_terminal_lifecycle, streaming_usage_events,
@@ -19,9 +20,49 @@ pub use scenarios::{
   buffered_generation_round_trip, generation_cancellation_releases_exchange, generation_upstream_errors,
   generation_validation_and_controls,
 };
+pub use scenarios::{
+  conversation_failed_generation_retries_exact_snapshot, conversation_tool_steer_context_and_restore,
+  native_continuation_prefers_compatible_fallback, native_continuation_rechecks_route_after_retry,
+  native_continuation_rejects_changed_history_and_settings, native_continuation_requires_explicit_restart,
+};
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn native_continuation_binds_upstream_account_without_binding_credentials() {
+    super::native_continuation_binds_upstream_account_without_binding_credentials();
+  }
+
+  #[test]
+  fn conversation_failed_generation_retries_exact_snapshot() {
+    super::conversation_failed_generation_retries_exact_snapshot();
+  }
+
+  #[test]
+  fn conversation_tool_steer_context_and_restore() {
+    super::conversation_tool_steer_context_and_restore();
+  }
+
+  #[test]
+  fn native_continuation_prefers_compatible_fallback() {
+    super::native_continuation_prefers_compatible_fallback();
+  }
+
+  #[test]
+  fn native_continuation_rechecks_route_after_retry() {
+    super::native_continuation_rechecks_route_after_retry();
+  }
+
+  #[test]
+  fn native_continuation_rejects_changed_history_and_settings() {
+    super::native_continuation_rejects_changed_history_and_settings();
+  }
+
+  #[test]
+  fn native_continuation_requires_explicit_restart() {
+    super::native_continuation_requires_explicit_restart();
+  }
+
   #[test]
   fn buffered_generation_round_trip() {
     super::buffered_generation_round_trip();

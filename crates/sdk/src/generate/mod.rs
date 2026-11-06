@@ -1,8 +1,10 @@
 mod response;
+mod state;
 #[cfg(feature = "std")]
 mod stream;
 
 pub use response::{GenerateResponse, ToolCall, Usage};
+pub use state::ProviderState;
 #[cfg(feature = "std")]
 pub use stream::{GenerateEvent, GenerateStream, TextStream};
 
@@ -25,9 +27,10 @@ use tokn_core::generation::{GenerationOptions, ReasoningEffort, ReasoningMode, R
 use tokn_core::provider::Endpoint;
 use tokn_requests::session;
 
+use crate::conversation::GenerationBinding;
 #[cfg(feature = "std")]
 use crate::{response::ResponseBody, ResponseAdapter};
-use crate::{Client, Error, PlatformFactory, RequestOptions, Result};
+use crate::{Client, ContinuationPolicy, Error, PlatformFactory, RequestOptions, Result, RetrievedContext};
 
 /// An owned, provider-neutral generation request.
 ///
@@ -56,6 +59,22 @@ pub struct GenerateRequest {
   pub options: RequestOptions,
   #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
   pub extras: BTreeMap<String, Value>,
+  /// Documents supplied for this generation, in retrieval order.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub context: Vec<RetrievedContext>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub provider_state: Option<ProviderState>,
+  #[serde(default, skip_serializing_if = "is_default_policy")]
+  pub continuation_policy: ContinuationPolicy,
+  /// Request a continuation checkpoint on an otherwise standalone buffered call.
+  #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+  pub capture_provider_state: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) generation_binding: Option<GenerationBinding>,
+}
+
+fn is_default_policy(value: &ContinuationPolicy) -> bool {
+  *value == ContinuationPolicy::default()
 }
 
 impl GenerateRequest {
@@ -75,6 +94,11 @@ impl GenerateRequest {
         reasoning: None,
         options: RequestOptions::default(),
         extras: BTreeMap::new(),
+        context: Vec::new(),
+        provider_state: None,
+        continuation_policy: ContinuationPolicy::default(),
+        capture_provider_state: false,
+        generation_binding: None,
       },
     }
   }
@@ -91,6 +115,7 @@ impl GenerateRequest {
 
   /// Validate fields required by the provider-neutral generation API.
   pub fn validate(&self) -> Result<()> {
+    self.validate_provider_prefix()?;
     if self.model.trim().is_empty() {
       return Err(Error::InvalidGenerateRequest {
         message: "model cannot be empty".into(),
@@ -196,9 +221,13 @@ impl GenerateRequest {
 
   fn responses_body(&self, stream: bool) -> Result<Value> {
     self.validate()?;
+    self.render_messages(stream, self.messages.iter())
+  }
+
+  fn render_messages<'a>(&self, stream: bool, input: impl Iterator<Item = &'a Message>) -> Result<Value> {
     let mut system = Vec::new();
     let mut messages = Vec::new();
-    for message in &self.messages {
+    for message in input {
       if message.role == Role::System {
         if !message.content.is_empty() {
           system.push(message.content.clone());
@@ -206,6 +235,12 @@ impl GenerateRequest {
         continue;
       }
       messages.push(message.to_ir());
+    }
+    if !self.context.is_empty() {
+      // The document envelope is user input and preserves exact content and
+      // source versions. Provider instructions retain their original role.
+      let documents = serde_json::json!({ "retrieved_context": self.context });
+      messages.push(Message::user(documents.to_string()).to_ir());
     }
 
     let request = IrRequest {
@@ -488,6 +523,21 @@ impl<P: PlatformFactory> fmt::Debug for GenerateCall<'_, P> {
 
 macro_rules! generate_builder_methods {
   () => {
+    pub fn capture_provider_state(mut self, capture: bool) -> Self {
+      self.request.capture_provider_state = capture;
+      self
+    }
+
+    pub fn provider_state(mut self, state: ProviderState) -> Self {
+      self.request.provider_state = Some(state);
+      self
+    }
+
+    pub fn continuation_policy(mut self, policy: ContinuationPolicy) -> Self {
+      self.request.continuation_policy = policy;
+      self
+    }
+
     pub fn prompt(self, prompt: impl Into<String>) -> Self {
       self.user(prompt)
     }
@@ -669,6 +719,10 @@ macro_rules! generate_builder_methods {
 impl GenerateRequestBuilder {
   generate_builder_methods!();
 
+  pub(crate) fn into_unvalidated_request(self) -> GenerateRequest {
+    self.request
+  }
+
   /// Bind a detached builder to a client without changing the request.
   pub fn bind<P: PlatformFactory>(self, client: &Client<P>) -> GenerateCall<'_, P> {
     GenerateCall {
@@ -697,6 +751,15 @@ impl GenerateCall<'_> {
   }
 }
 
+#[derive(Clone, Copy)]
+enum GenerationDelivery {
+  Buffered,
+  #[cfg(feature = "std")]
+  Events,
+  #[cfg(feature = "std")]
+  StreamingResponse,
+}
+
 impl<P: PlatformFactory> Client<P> {
   /// Start a client-bound generation builder.
   pub fn generate(&self, model: impl Into<String>) -> GenerateCall<'_, P> {
@@ -705,28 +768,86 @@ impl<P: PlatformFactory> Client<P> {
 
   /// Send an owned or borrowed detached request through the shared session.
   pub async fn send(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateResponse> {
-    let response = self.execute_generation(request.borrow(), false).await?;
+    let request = request.borrow();
+    let response = self.execute_generation(request, GenerationDelivery::Buffered).await?;
     let session::ResponseBody::Buffered(body) = response.body else {
       return Err(Error::UnexpectedStream);
     };
     ensure_success(response.status, &body)?;
     let raw = serde_json::from_slice(&body).map_err(|source| Error::DeserializeResponse { source })?;
-    Ok(GenerateResponse::from_raw(response.status, response.headers, raw))
+    GenerateResponse::finish(request, response.status, response.headers, raw, response.continuation)
+  }
+
+  /// Deliver live events and return a complete, checkpointed assistant response.
+  /// Dropping the future or receiving a stream error leaves a conversation's
+  /// prepared input pending for retry. Only commit the returned response.
+  #[cfg(feature = "std")]
+  pub async fn send_streaming(
+    &self,
+    request: impl Borrow<GenerateRequest>,
+    mut on_event: impl FnMut(GenerateEvent),
+  ) -> Result<GenerateResponse> {
+    let request = request.borrow();
+    let response = self
+      .execute_generation(request, GenerationDelivery::StreamingResponse)
+      .await?;
+    let session::ResponseBody::Stream(mut events) = response.body else {
+      return Err(Error::UnexpectedBuffered);
+    };
+    let mut accumulator = tokn_convert::sse::SseAccumulator::new(Endpoint::Responses);
+    while let Some(event) = events
+      .next_event()
+      .await
+      .map_err(|source| Error::from_generation(source, Endpoint::Responses))?
+    {
+      if let Some(value) = event.json {
+        for event in stream::results_from_value(&mut accumulator, value) {
+          let event = event?;
+          if !matches!(event, GenerateEvent::Completed { .. }) {
+            on_event(event);
+          }
+        }
+      }
+    }
+    let (raw, checkpoint) = events
+      .take_completed_generation()
+      .ok_or_else(|| Error::GenerateStream {
+        message: "stream ended without a complete native response".into(),
+      })?;
+    let reply = GenerateResponse::finish(request, response.status, response.headers, raw, Some(checkpoint))?;
+    on_event(GenerateEvent::Completed {
+      finish_reason: reply.finish_reason.clone(),
+    });
+    Ok(reply)
   }
 
   async fn execute_generation(
     &self,
     request: &GenerateRequest,
-    stream: bool,
+    delivery: GenerationDelivery,
   ) -> Result<crate::client::SessionResponse<'_, P>> {
+    let stream = !matches!(delivery, GenerationDelivery::Buffered);
     let body = request.responses_body(stream)?;
     let generation_options = request.generation_options();
+    let continuation = match delivery {
+      GenerationDelivery::Buffered if !request.wants_checkpoint() => None,
+      #[cfg(feature = "std")]
+      GenerationDelivery::Events if request.wants_checkpoint() => {
+        return Err(Error::InvalidGenerateRequest {
+          message: "use send_streaming() to stream events and receive the provider checkpoint".into(),
+        })
+      }
+      #[cfg(feature = "std")]
+      GenerationDelivery::Events => None,
+      _ => Some(request.continuation(stream)?),
+    };
     self
       .run_session(
         Endpoint::Responses,
         body,
         request.options.clone(),
         (!generation_options.is_empty()).then_some(generation_options),
+        continuation,
       )
       .await
       .map_err(|error| Error::from_generation(error, Endpoint::Responses))
@@ -737,7 +858,9 @@ impl<P: PlatformFactory> Client<P> {
 impl Client {
   /// Stream semantic generation events from an owned or borrowed request.
   pub async fn stream(&self, request: impl Borrow<GenerateRequest>) -> Result<GenerateStream> {
-    let response = self.execute_generation(request.borrow(), true).await?;
+    let response = self
+      .execute_generation(request.borrow(), GenerationDelivery::Events)
+      .await?;
     let response = crate::StdPlatform::finish_response(response);
     ensure_raw_success(&response)?;
     Ok(stream::parse_events(response.into_stream()?.into_stream()))

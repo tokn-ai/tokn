@@ -53,6 +53,10 @@ pub enum Error {
   },
   #[error("invalid generation request: {message}")]
   InvalidGenerateRequest { message: String },
+  #[error("provider checkpoint belongs to a different message history")]
+  ProviderStateHistoryMismatch,
+  #[error("provider continuation failed: {source}")]
+  Continuation { source: session::ContinuationError },
   #[error("failed to build provider-neutral generation request")]
   BuildGenerateRequest {
     #[source]
@@ -117,6 +121,7 @@ impl Error {
   pub(crate) fn from_generation(error: session::Error, endpoint: Endpoint) -> Self {
     use tokn_requests::preparation::PreparationError;
     match &error.kind {
+      ErrorKind::Continuation(source) => Self::Continuation { source: *source },
       ErrorKind::UpstreamStatus { status, body } => Self::GenerateResponseStatus {
         status: *status,
         body: body.to_string(),

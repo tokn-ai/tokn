@@ -43,6 +43,8 @@ pub(crate) fn sdk_error(error: SdkError) -> NapiError {
     | SdkError::ReloadUnavailable => native_error(CONFIGURATION_ERROR, message),
     SdkError::LoadCredentials { .. } => native_error(AUTHENTICATION_ERROR, message),
     SdkError::InvalidGenerateRequest { .. }
+    | SdkError::ProviderStateHistoryMismatch
+    | SdkError::Continuation { .. }
     | SdkError::BuildGenerateRequest { .. }
     | SdkError::Request { .. }
     | SdkError::UnexpectedStream

@@ -1,4 +1,3 @@
-#[cfg(feature = "std")]
 pub mod digest;
 #[cfg(feature = "std")]
 pub mod http;

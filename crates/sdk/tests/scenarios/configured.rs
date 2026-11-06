@@ -18,6 +18,15 @@ use tokn_sdk::{
   Adapter, Client, Endpoint, Lifecycle, Limits, PlatformResponse, RequestOptions, Runtime,
 };
 
+#[path = "continuation.rs"]
+mod continuation;
+pub use continuation::{
+  conversation_failed_generation_retries_exact_snapshot, conversation_tool_steer_context_and_restore,
+  native_continuation_binds_upstream_account_without_binding_credentials,
+  native_continuation_prefers_compatible_fallback, native_continuation_rechecks_route_after_retry,
+  native_continuation_rejects_changed_history_and_settings, native_continuation_requires_explicit_restart,
+};
+
 #[path = "generation.rs"]
 mod generation;
 pub use generation::{

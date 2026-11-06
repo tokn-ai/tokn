@@ -556,3 +556,64 @@ async fn friendly_generation_shares_error_classification() {
     "invalid controls fail before transport"
   );
 }
+
+#[tokio::test]
+async fn native_continuation_uses_the_same_wire_history_on_standard_and_injected_clients() {
+  use tokn_sdk::{ContinuationStatus, GenerateRequest, RetrievedContext};
+
+  let reply = json!({
+    "id":"native-fixture", "status":"completed", "output":[
+      {"type":"reasoning", "id":"reasoning-fixture", "summary":[], "encrypted_content":"opaque-fixture"},
+      {"type":"message", "role":"assistant", "content":[{"type":"output_text","text":"hello"}]}
+    ]
+  });
+  let fixture = Fixture::new(
+    "openai",
+    1,
+    MockRoute::new(MockEndpoint::Responses, MockResponse::json(reply)),
+  )
+  .await;
+  let initial = GenerateRequest::builder("openai/gpt-5")
+    .system("Keep the original instructions")
+    .user("initial input")
+    .extra("include", json!(["message.output_text.logprobs"]))
+    .capture_provider_state(true)
+    .build()
+    .unwrap();
+  let standard = fixture.standard.send(&initial).await.unwrap();
+  let injected = fixture.injected.send(&initial).await.unwrap();
+  assert_eq!(standard.continuation_status, ContinuationStatus::Started);
+  assert_eq!(standard.provider_state, injected.provider_state);
+  let state = standard.provider_state.clone().unwrap();
+  assert!(!format!("{state:?}").contains("opaque-fixture"));
+  let mut next = initial
+    .into_builder()
+    .message(standard.assistant_message())
+    .user("next input")
+    .provider_state(state)
+    .build()
+    .unwrap();
+  next.context.push(RetrievedContext::new("guide", "current retrieval"));
+  let standard = fixture.standard.send(&next).await.unwrap();
+  let injected = fixture.injected.send(&next).await.unwrap();
+  assert_eq!(standard.continuation_status, ContinuationStatus::Continued);
+  assert_eq!(injected.continuation_status, ContinuationStatus::Continued);
+  let standard_requests = fixture.server.requests();
+  let injected_requests = fixture.requests.borrow();
+  assert_eq!(standard_requests.len(), 2);
+  assert_eq!(injected_requests.len(), 2);
+  for (standard, injected) in standard_requests.iter().zip(injected_requests.iter()) {
+    let standard: Value = serde_json::from_slice(&standard.body).unwrap();
+    let injected: Value = serde_json::from_slice(&injected.body).unwrap();
+    assert_eq!(standard, injected);
+    let include = standard["include"].as_array().unwrap();
+    assert!(include.contains(&json!("reasoning.encrypted_content")));
+    assert!(include.contains(&json!("message.output_text.logprobs")));
+    assert!(standard.get("provider_state").is_none());
+  }
+  let body: Value = serde_json::from_slice(&standard_requests[1].body).unwrap();
+  assert_eq!(body["input"][1]["encrypted_content"], "opaque-fixture");
+  for text in ["initial input", "next input", "current retrieval"] {
+    assert_eq!(body.to_string().matches(text).count(), 1);
+  }
+}
