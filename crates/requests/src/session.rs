@@ -35,9 +35,14 @@ use tokn_policy::{
 };
 use tokn_service::transport::{Request, ResponseHead, Transport};
 
+pub mod continuation;
 mod events;
+mod native_sse;
 mod response;
 
+pub use continuation::{
+  ContinuationError, ContinuationPolicy, ContinuationStatus as ContinuationOutcome, ProviderOrigin, ProviderState,
+};
 use events::Observer;
 pub use events::{Events, Lifecycle, StreamProgress};
 use response::{read_all, read_error_body};
@@ -63,6 +68,7 @@ pub enum ErrorKind {
   UpstreamStatus { status: u16, body: SmolStr },
   Stopped,
   Preparation(crate::preparation::PreparationError),
+  Continuation(ContinuationError),
 }
 #[derive(Debug)]
 pub struct Error {
@@ -173,6 +179,21 @@ struct Binding {
   credentials: StateCell<CredentialState>,
   cleartext: CleartextHttpPolicy,
 }
+
+impl Binding {
+  fn continuation_origin(&self, endpoint: Endpoint, model: &str) -> ProviderOrigin {
+    ProviderOrigin::new(
+      self.provider.as_str(),
+      self.driver.as_str(),
+      self.account.id.as_str(),
+      &self.base_url,
+      endpoint,
+      model,
+    )
+    .with_provider_account_id(self.account.provider_account_id.as_deref())
+  }
+}
+
 impl CandidateBinding for Binding {
   fn provider_id(&self) -> &ProviderId {
     &self.provider
@@ -193,6 +214,39 @@ impl CandidateBinding for Binding {
           .map(|endpoints| endpoints.contains(&endpoint))
       })
       .unwrap_or_else(|| native::supports_model_endpoint(self.driver.as_str(), model, endpoint, &self.base_url))
+  }
+}
+
+struct ContinuationBinding<'a> {
+  binding: &'a Binding,
+  required: Option<&'a ProviderOrigin>,
+  compatible: bool,
+}
+
+impl CandidateBinding for ContinuationBinding<'_> {
+  fn provider_id(&self) -> &ProviderId {
+    self.binding.provider_id()
+  }
+
+  fn driver_id(&self) -> &DriverId {
+    self.binding.driver_id()
+  }
+
+  fn supports(&self, model: &str, endpoint: Endpoint) -> bool {
+    self.matches(model, endpoint) && self.binding.supports(model, endpoint)
+  }
+
+  fn has_endpoint(&self, model: &str, endpoint: Endpoint) -> bool {
+    self.matches(model, endpoint) && self.binding.has_endpoint(model, endpoint)
+  }
+}
+
+impl ContinuationBinding<'_> {
+  fn matches(&self, model: &str, endpoint: Endpoint) -> bool {
+    self.compatible
+      && self
+        .required
+        .is_none_or(|origin| origin.model == model && origin.endpoint == endpoint)
   }
 }
 
@@ -390,6 +444,22 @@ pub struct RequestInput {
   pub content_encoding: Option<String>,
   pub method: &'static str,
   pub dry_run: bool,
+  /// Native continuation controls, carried outside the ordinary HTTP payload.
+  pub continuation: Option<ContinuationRequest>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ContinuationRequest {
+  pub state: Option<ProviderState>,
+  pub policy: ContinuationPolicy,
+  /// Fresh input in the inbound endpoint shape, after validating the covered history.
+  pub suffix: Option<Value>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContinuationResponse {
+  pub state: ProviderState,
+  pub outcome: ContinuationOutcome,
 }
 impl RequestInput {
   pub fn new(endpoint: Endpoint, body: Value, headers: HeaderMap, request_id: String) -> Self {
@@ -408,6 +478,7 @@ impl RequestInput {
       content_encoding,
       method: "POST",
       dry_run: false,
+      continuation: None,
     }
   }
 }
@@ -444,6 +515,7 @@ pub struct Resolved {
   model: SmolStr,
   wire_identity: WireIdentity,
   opaque: bool,
+  continuation_compatible: bool,
 }
 pub struct Converted {
   prepared: PreparedRequest,
@@ -461,6 +533,8 @@ pub struct Session<T: Transport, C: Clock, E: Events> {
   retry: RetryPolicy,
   terminal: bool,
   stage: Stage,
+  native_request: Option<Value>,
+  continuation_outcome: Option<ContinuationOutcome>,
 }
 impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
   pub fn new(state: Shared<ExecutionState>, input: RequestInput, transport: T, clock: C, events: E) -> Self {
@@ -474,6 +548,8 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
       retry: RetryPolicy::default(),
       terminal: false,
       stage: Stage::Extract,
+      native_request: None,
+      continuation_outcome: None,
     }
   }
   pub fn with_limits(mut self, limits: Limits) -> Self {
@@ -522,6 +598,119 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
       self.state.destinations[&resolved.provider].driver_id().as_str(),
       &resolved.wire_identity,
     )
+  }
+
+  fn continuation_error(stage: &'static str, error: ContinuationError) -> Error {
+    Error::new(stage, error).with_kind(ErrorKind::Continuation(error))
+  }
+
+  fn provider_origin(&self, resolved: &Resolved) -> ProviderOrigin {
+    let Target::Account { binding, .. } = resolved.target else {
+      unreachable!("native continuation requires account credentials")
+    };
+    let binding = &self.state.bindings[binding];
+    binding.continuation_origin(resolved.endpoint, resolved.model.as_str())
+  }
+
+  fn select_continuation_route(
+    &self,
+    route: &RoutePlan,
+    pool: &Pool,
+    extracted: &RequestInterpretation,
+    required: Option<&ProviderOrigin>,
+  ) -> Result<RouteSelection<usize>, Error> {
+    let request = SelectionRequest {
+      model: &extracted.model,
+      endpoint: self.input.endpoint,
+      allowed_providers: self.input.allowed_providers.as_ref(),
+    };
+    let now = self.observer().clock.now();
+    if required.is_none() {
+      return select_route(
+        route,
+        request,
+        pool.members.iter().map(|&index| (index, &self.state.bindings[index])),
+        |ranks| self.state.select(pool, now, extracted.session_id.as_deref(), ranks),
+      )
+      .map_err(|error| Error::new("resolve", error).with_kind(ErrorKind::InvalidRoute));
+    }
+    let bindings: Vec<_> = pool
+      .members
+      .iter()
+      .map(|&index| {
+        let binding = &self.state.bindings[index];
+        let compatible =
+          required.is_none_or(|origin| binding.continuation_origin(origin.endpoint, origin.model.as_str()) == *origin);
+        (
+          index,
+          ContinuationBinding {
+            binding,
+            required,
+            compatible,
+          },
+        )
+      })
+      .collect();
+    select_route(
+      route,
+      request,
+      bindings.iter().map(|(index, binding)| (*index, binding)),
+      |ranks| self.state.select(pool, now, extracted.session_id.as_deref(), ranks),
+    )
+    .map_err(|error| Error::new("resolve", error).with_kind(ErrorKind::InvalidRoute))
+  }
+
+  fn shape_managed_body(&self, resolved: &Resolved, body: &Value) -> Result<Value, Error> {
+    let Target::Account { binding, .. } = resolved.target else {
+      unreachable!("managed request requires an account")
+    };
+    let binding = &self.state.bindings[binding];
+    let metadata = binding
+      .models
+      .with(|models| models.get(&resolved.model).cloned())
+      .unwrap_or_default();
+    let body = crate::preparation::prepare_managed_body(
+      self.input.endpoint,
+      body,
+      crate::preparation::GenerationTarget {
+        endpoint: resolved.endpoint,
+        provider_id: binding.driver.as_str(),
+        model: &resolved.model,
+        reasoning_efforts: metadata.reasoning_efforts.as_deref(),
+        reasoning_supported: metadata.reasoning_supported,
+      },
+      self.input.generation_options.as_ref(),
+    )
+    .map_err(|error| Error::new("convert_request", &error).with_kind(ErrorKind::Preparation(error)))?;
+    let mut body = native::transform_body(
+      binding.driver.as_str(),
+      resolved.endpoint,
+      body,
+      metadata.reasoning_supported,
+    )
+    .map_err(|error| Error::new("convert_request", error))?;
+    if self.input.continuation.is_some() && resolved.endpoint == Endpoint::Responses {
+      let include = body
+        .as_object_mut()
+        .ok_or_else(|| {
+          Self::continuation_error(
+            "convert_request",
+            ContinuationError::InvalidState("native request is not an object"),
+          )
+        })?
+        .entry("include")
+        .or_insert_with(|| Value::Array(Vec::new()));
+      let include = include.as_array_mut().ok_or_else(|| {
+        Self::continuation_error(
+          "convert_request",
+          ContinuationError::InvalidState("Responses include must be an array"),
+        )
+      })?;
+      if !include.iter().any(|value| value == "reasoning.encrypted_content") {
+        include.push(Value::String("reasoning.encrypted_content".into()));
+      }
+    }
+    Ok(body)
   }
 }
 
@@ -673,6 +862,20 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
       .plan
       .route(profile.route())
       .ok_or_else(|| Error::new("resolve", "unknown route"))?;
+    if let Some(continuation) = &self.input.continuation {
+      if matches!(route, RoutePlan::Relay(_)) {
+        return Err(Self::continuation_error(
+          "resolve",
+          ContinuationError::Unsupported("native continuation requires a managed route"),
+        ));
+      }
+      if continuation.state.is_some() && continuation.suffix.is_none() {
+        return Err(Self::continuation_error(
+          "resolve",
+          ContinuationError::InvalidState("resuming native history requires an explicit fresh input suffix"),
+        ));
+      }
+    }
     if profile.api_binding().is_some_and(|binding| {
       !binding
         .endpoints()
@@ -703,6 +906,7 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
           model: SmolStr::new(&extracted.model),
           wire_identity: WireIdentity::None,
           opaque: true,
+          continuation_compatible: false,
         };
         self.emit_resolved(extracted, &resolved);
         return Ok(resolved);
@@ -716,18 +920,31 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
       .pools
       .get(pool_id)
       .ok_or_else(|| Error::new("resolve", "missing account pool"))?;
-    let now = self.observer().clock.now();
-    let selection = select_route(
-      route,
-      SelectionRequest {
-        model: &extracted.model,
-        endpoint: self.input.endpoint,
-        allowed_providers: self.input.allowed_providers.as_ref(),
-      },
-      pool.members.iter().map(|&index| (index, &self.state.bindings[index])),
-      |ranks| self.state.select(pool, now, extracted.session_id.as_deref(), ranks),
-    )
-    .map_err(|e| Error::new("resolve", e).with_kind(ErrorKind::InvalidRoute))?;
+    let required = self
+      .input
+      .continuation
+      .as_ref()
+      .and_then(|request| request.state.as_ref());
+    let mut selection = self.select_continuation_route(route, pool, extracted, required.map(ProviderState::origin))?;
+    let continuation_compatible = required.is_some() && matches!(selection, RouteSelection::Selected { .. });
+    if let Some(state) = required.filter(|_| !continuation_compatible) {
+      if self
+        .input
+        .continuation
+        .as_ref()
+        .is_some_and(|request| request.policy == ContinuationPolicy::AllowRestart)
+      {
+        state
+          .validate_restart()
+          .map_err(|error| Self::continuation_error("resolve", error))?;
+        selection = self.select_continuation_route(route, pool, extracted, None)?;
+      } else {
+        return Err(Self::continuation_error(
+          "resolve",
+          ContinuationError::Incompatible("no compatible provider binding is available"),
+        ));
+      }
+    }
     match selection {
       RouteSelection::Selected {
         binding,
@@ -744,6 +961,7 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
           model,
           wire_identity: profile.wire_identity().clone(),
           opaque: matches!(route, RoutePlan::Relay(_)),
+          continuation_compatible,
         };
         self.emit_resolved(extracted, &resolved);
         Ok(resolved)
@@ -801,6 +1019,8 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
     headers: &HeaderMap,
   ) -> Result<Converted, Error> {
     self.stage = Stage::ConvertRequest;
+    self.native_request = None;
+    self.continuation_outcome = None;
     let destination = &self.state.destinations[&resolved.provider];
     let driver = destination.driver_id().as_str().to_string();
     let base_url = destination.base_url().as_str().to_string();
@@ -829,28 +1049,17 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
       )
       .map_err(|error| Error::new("convert_request", error))?;
     } else {
-      let Target::Account { binding, .. } = resolved.target else {
-        unreachable!("managed request requires an account")
+      let source = if resolved.continuation_compatible {
+        self
+          .input
+          .continuation
+          .as_ref()
+          .and_then(|request| request.suffix.as_ref())
+          .unwrap_or(&self.input.body)
+      } else {
+        &self.input.body
       };
-      let metadata = self.state.bindings[binding]
-        .models
-        .with(|models| models.get(&resolved.model).cloned())
-        .unwrap_or_default();
-      shaped = crate::preparation::prepare_managed_body(
-        self.input.endpoint,
-        &self.input.body,
-        crate::preparation::GenerationTarget {
-          endpoint: resolved.endpoint,
-          provider_id: &driver,
-          model: &resolved.model,
-          reasoning_efforts: metadata.reasoning_efforts.as_deref(),
-          reasoning_supported: metadata.reasoning_supported,
-        },
-        self.input.generation_options.as_ref(),
-      )
-      .map_err(|error| Error::new("convert_request", &error).with_kind(ErrorKind::Preparation(error)))?;
-      shaped = native::transform_body(&driver, resolved.endpoint, shaped, metadata.reasoning_supported)
-        .map_err(|error| Error::new("convert_request", error))?;
+      shaped = self.shape_managed_body(resolved, source)?;
       let segments = native::operation_segments(&driver, resolved.endpoint, &base_url)
         .ok_or_else(|| Error::new("convert_request", "provider has no native path for this operation"))?;
       prepared = tokn_core::provider::prepare_request_with_policy(
@@ -864,6 +1073,30 @@ impl<T: Transport, C: Clock, E: Events> crate::driver::Session for Session<T, C,
       .map_err(|error| Error::new("convert_request", error))?;
     }
     crate::preparation::apply_compaction_priority(&driver, extracted.request_classification, &mut shaped);
+    if let Some(request) = &self.input.continuation {
+      let origin = self.provider_origin(resolved);
+      let outcome = match &request.state {
+        Some(state) if resolved.continuation_compatible => match continuation::replay(state, &origin, &shaped) {
+          Ok(body) => {
+            shaped = body;
+            ContinuationOutcome::Continued
+          }
+          Err(ContinuationError::Incompatible(_)) if request.policy == ContinuationPolicy::AllowRestart => {
+            state
+              .validate_restart()
+              .map_err(|error| Self::continuation_error("convert_request", error))?;
+            shaped = self.shape_managed_body(resolved, &self.input.body)?;
+            crate::preparation::apply_compaction_priority(&driver, extracted.request_classification, &mut shaped);
+            ContinuationOutcome::Restarted
+          }
+          Err(error) => return Err(Self::continuation_error("convert_request", error)),
+        },
+        Some(_) => ContinuationOutcome::Restarted,
+        None => ContinuationOutcome::Started,
+      };
+      self.native_request = Some(shaped.clone());
+      self.continuation_outcome = Some(outcome);
+    }
     let mut decoded = Bytes::from(serde_json::to_vec(&shaped).map_err(|error| Error::new("convert_request", error))?);
     prepared.body = if shaped == self.input.body {
       self.input.raw_body.clone()

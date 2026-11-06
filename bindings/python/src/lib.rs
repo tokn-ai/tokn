@@ -466,6 +466,8 @@ fn sdk_error(error: SdkError) -> PyErr {
     | SdkError::ReloadUnavailable => ConfigurationError::new_err(message),
     SdkError::LoadCredentials { .. } => AuthenticationError::new_err(message),
     SdkError::InvalidGenerateRequest { .. }
+    | SdkError::ProviderStateHistoryMismatch
+    | SdkError::Continuation { .. }
     | SdkError::BuildGenerateRequest { .. }
     | SdkError::Request { .. }
     | SdkError::UnexpectedStream

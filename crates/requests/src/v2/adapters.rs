@@ -462,7 +462,9 @@ pub fn pipeline_error(error: crate::session::Error, endpoint: tokn_core::Endpoin
     },
     ErrorKind::ProviderAccessDenied => RequestsError::ProviderAccessDenied,
     ErrorKind::NoAccount { model } => RequestsError::NoAccount { endpoint, model },
-    ErrorKind::InvalidRoute => RequestsError::InvalidRouteRequest { message: error.message },
+    ErrorKind::InvalidRoute | ErrorKind::Continuation(_) => {
+      RequestsError::InvalidRouteRequest { message: error.message }
+    }
     ErrorKind::UpstreamStatus { status, body } => RequestsError::UpstreamStatus {
       status,
       body: body.to_string(),

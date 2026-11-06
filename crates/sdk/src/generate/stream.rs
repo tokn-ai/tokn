@@ -133,7 +133,7 @@ pub(super) fn text_only(events: GenerateStream) -> TextStream {
     .boxed()
 }
 
-fn results_from_value(accumulator: &mut SseAccumulator, value: Value) -> Vec<Result<GenerateEvent>> {
+pub(super) fn results_from_value(accumulator: &mut SseAccumulator, value: Value) -> Vec<Result<GenerateEvent>> {
   let kind = value.get("type").and_then(Value::as_str).unwrap_or_default();
   let completion_reason = matches!(
     kind,

@@ -9,6 +9,7 @@ pub struct Response<T: Transport, C: Clock, E: Events> {
   pub headers: HeaderMap,
   pub body: ResponseBody<T, C, E>,
   pub opaque: bool,
+  pub continuation: Option<ContinuationResponse>,
 }
 pub enum ResponseBody<T: Transport, C: Clock, E: Events> {
   Buffered(Bytes),
@@ -58,6 +59,21 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
         head.headers.remove("content-length");
         head.headers.insert("content-type", "text/event-stream");
       }
+      let generation = self
+        .continuation_outcome
+        .map(|outcome| {
+          let request = self
+            .native_request
+            .take()
+            .ok_or_else(|| native_sse::invalid("native continuation request was not captured"))?;
+          NativeGeneration::new(
+            self.provider_origin(&resolved),
+            request,
+            outcome,
+            self.limits.max_response_bytes,
+          )
+        })
+        .transpose()?;
       self.emit_stage(Stage::ConvertResponse, || {
         StageEvent::ConvertResponse(ConvertedResponseSummary {
           status: head.status,
@@ -77,6 +93,7 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
         head.clone(),
         resolved.opaque,
         is_sse && (decoded || !head.headers.contains_key("content-encoding")),
+        generation,
       );
       self.terminal = true;
       return Ok(Response {
@@ -84,6 +101,7 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
         headers: head.headers,
         body: ResponseBody::Stream(alloc::boxed::Box::new(events)),
         opaque: resolved.opaque,
+        continuation: None,
       });
     }
     let (bytes, result) = read_buffered(&mut *body, self.limits.max_response_bytes).await;
@@ -120,8 +138,43 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
         headers: head.headers,
         body: ResponseBody::Buffered(bytes),
         opaque: true,
+        continuation: None,
       });
     }
+    let (bytes, continuation) = if let Some(outcome) = self.continuation_outcome {
+      let accumulated_sse =
+        tokn_convert::buffered::is_sse(head.headers.get("content-type").map(HeaderValue::as_str), &bytes);
+      let native_response = if accumulated_sse {
+        native_sse::decode(resolved.endpoint, &bytes, self.limits.max_event_bytes)?
+      } else {
+        serde_json::from_slice(&bytes).map_err(|_| {
+          Self::continuation_error(
+            "convert_response",
+            ContinuationError::InvalidState("native continuation requires a complete JSON response"),
+          )
+        })?
+      };
+      let native_request = self.native_request.as_ref().ok_or_else(|| {
+        Self::continuation_error(
+          "convert_response",
+          ContinuationError::InvalidState("native continuation request was not captured"),
+        )
+      })?;
+      let state = continuation::capture(self.provider_origin(&resolved), native_request, &native_response)
+        .map_err(|error| Self::continuation_error("convert_response", error))?;
+      let bytes = if accumulated_sse {
+        // Canonical projection must see the same complete native output that
+        // produced the checkpoint, including snapshot-only stream content.
+        head.headers.insert("content-type", "application/json");
+        head.headers.remove("content-length");
+        Bytes::from(serde_json::to_vec(&native_response).map_err(|error| Error::new("convert_response", error))?)
+      } else {
+        bytes
+      };
+      (bytes, Some(ContinuationResponse { state, outcome }))
+    } else {
+      (bytes, None)
+    };
     let response = tokn_convert::buffered::convert_response(
       resolved.endpoint,
       self.input.endpoint,
@@ -157,6 +210,7 @@ impl<T: Transport, C: Clock, E: Events> Session<T, C, E> {
       headers: head.headers,
       body: ResponseBody::Buffered(response.body_bytes),
       opaque: false,
+      continuation,
     })
   }
 }
@@ -261,6 +315,74 @@ pub struct EventStream<T: Transport, C: Clock, E: Events> {
   chunks: u64,
   last_progress: Duration,
   usage: tokn_core::usage::Usage,
+  generation: Option<NativeGeneration>,
+  completed_generation: Option<(Value, ContinuationResponse)>,
+}
+
+struct NativeGeneration {
+  origin: ProviderOrigin,
+  request: Value,
+  outcome: ContinuationOutcome,
+  assembler: Option<native_sse::Assembler>,
+  max_bytes: usize,
+}
+
+impl NativeGeneration {
+  fn new(
+    origin: ProviderOrigin,
+    request: Value,
+    outcome: ContinuationOutcome,
+    max_bytes: usize,
+  ) -> Result<Self, Error> {
+    if serialized_len(&request)? > max_bytes {
+      return Err(native_sse::invalid(
+        "native continuation request exceeds checkpoint byte limit",
+      ));
+    }
+    let assembler = Some(native_sse::Assembler::new(origin.endpoint, max_bytes));
+    Ok(Self {
+      origin,
+      request,
+      outcome,
+      assembler,
+      max_bytes,
+    })
+  }
+
+  fn push(&mut self, event: &SseEvent) -> Result<Option<(Value, ContinuationResponse)>, Error> {
+    let Some(assembler) = &mut self.assembler else {
+      return Ok(None);
+    };
+    if !assembler.push(event)? {
+      return Ok(None);
+    }
+    let response = self.assembler.take().expect("native assembler is present").finish()?;
+    let state = continuation::capture(self.origin.clone(), &self.request, &response)
+      .map_err(|source| Error::new("stream", source).with_kind(ErrorKind::Continuation(source)))?;
+    if serialized_len(&state)? > self.max_bytes {
+      return Err(native_sse::invalid(
+        "native continuation state exceeds checkpoint byte limit",
+      ));
+    }
+    let canonical = tokn_convert::convert_response(self.origin.endpoint, Endpoint::Responses, &response)
+      .map_err(|error| Error::new("stream", error))?;
+    if serialized_len(&canonical)? > self.max_bytes {
+      return Err(native_sse::invalid("completed generation exceeds byte limit"));
+    }
+    Ok(Some((
+      canonical,
+      ContinuationResponse {
+        state,
+        outcome: self.outcome,
+      },
+    )))
+  }
+}
+
+fn serialized_len(value: &impl serde::Serialize) -> Result<usize, Error> {
+  serde_json::to_vec(value)
+    .map(|bytes| bytes.len())
+    .map_err(|error| Error::new("stream", error))
 }
 
 struct StreamCapture {
@@ -301,6 +423,7 @@ impl<T: Transport, C: Clock, E: Events> EventStream<T, C, E> {
     head: ResponseHead,
     opaque: bool,
     inspect_opaque: bool,
+    generation: Option<NativeGeneration>,
   ) -> Self {
     let created_at = observer.clock.unix_seconds();
     let last_progress = observer.clock.now();
@@ -342,6 +465,8 @@ impl<T: Transport, C: Clock, E: Events> EventStream<T, C, E> {
       chunks: 0,
       last_progress,
       usage: Default::default(),
+      generation,
+      completed_generation: None,
     }
   }
 
@@ -392,6 +517,10 @@ impl<T: Transport, C: Clock, E: Events> EventStream<T, C, E> {
   }
 
   fn finish(&mut self, outcome: StreamOutcome, error: Option<&Error>) {
+    if outcome != StreamOutcome::Complete {
+      self.generation = None;
+      self.completed_generation = None;
+    }
     if !core::mem::take(&mut self.report_terminal) {
       return;
     }
@@ -450,8 +579,21 @@ impl<T: Transport, C: Clock, E: Events> EventStream<T, C, E> {
   }
 
   pub fn cancel(&mut self) {
+    self.generation = None;
+    self.completed_generation = None;
     self.processor.cancel();
     self.finish(StreamOutcome::Cancelled, None);
+  }
+
+  /// Take one complete canonical generation and its native checkpoint after
+  /// every translated terminal event has been delivered. Errors, cancellation,
+  /// and abandoning a stream never produce a completion checkpoint.
+  pub fn take_completed_generation(&mut self) -> Option<(Value, ContinuationResponse)> {
+    if self.processor.outcome() == Some(StreamOutcome::Complete) {
+      self.completed_generation.take()
+    } else {
+      None
+    }
   }
 
   /// Read a parsed event, applying managed endpoint conversion when configured.
@@ -576,6 +718,16 @@ impl<T: Transport, C: Clock, E: Events> EventStream<T, C, E> {
           continue;
         };
         let event = SseEvent::from(record);
+        let completed = self
+          .generation
+          .as_mut()
+          .map(|generation| generation.push(&event))
+          .transpose()?
+          .flatten();
+        if let Some(completed) = completed {
+          self.completed_generation = Some(completed);
+          self.generation = None;
+        }
         if let Some(value) = &event.json {
           self.observe_usage(value);
         }
@@ -593,3 +745,7 @@ impl<T: Transport, C: Clock, E: Events> Drop for EventStream<T, C, E> {
     self.cancel();
   }
 }
+
+#[cfg(all(test, feature = "std"))]
+#[path = "response_tests.rs"]
+mod tests;

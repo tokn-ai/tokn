@@ -3,6 +3,41 @@ extern crate alloc;
 mod scenarios;
 
 #[test]
+fn native_continuation_binds_upstream_account_without_binding_credentials() {
+  scenarios::native_continuation_binds_upstream_account_without_binding_credentials();
+}
+
+#[test]
+fn conversation_failed_generation_retries_exact_snapshot() {
+  scenarios::conversation_failed_generation_retries_exact_snapshot();
+}
+
+#[test]
+fn conversation_tool_steer_context_and_restore() {
+  scenarios::conversation_tool_steer_context_and_restore();
+}
+
+#[test]
+fn native_continuation_prefers_compatible_fallback() {
+  scenarios::native_continuation_prefers_compatible_fallback();
+}
+
+#[test]
+fn native_continuation_rechecks_route_after_retry() {
+  scenarios::native_continuation_rechecks_route_after_retry();
+}
+
+#[test]
+fn native_continuation_rejects_changed_history_and_settings() {
+  scenarios::native_continuation_rejects_changed_history_and_settings();
+}
+
+#[test]
+fn native_continuation_requires_explicit_restart() {
+  scenarios::native_continuation_requires_explicit_restart();
+}
+
+#[test]
 fn buffered_generation_round_trip() {
   scenarios::buffered_generation_round_trip();
 }

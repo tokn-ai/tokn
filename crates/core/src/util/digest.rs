@@ -1,5 +1,6 @@
+use alloc::string::String;
+use core::fmt::Write as _;
 use sha2::{Digest, Sha256};
-use std::fmt::Write as _;
 
 /// Return the lowercase hexadecimal SHA-256 digest of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {

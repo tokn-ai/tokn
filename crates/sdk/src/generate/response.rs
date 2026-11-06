@@ -4,6 +4,7 @@ use alloc::{
   vec::Vec,
 };
 
+use crate::{conversation::GenerationBinding, ContinuationStatus, ProviderState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(feature = "std")]
@@ -25,10 +26,65 @@ pub struct GenerateResponse {
   pub usage: Option<Usage>,
   /// Full canonical Responses payload after routing and endpoint conversion.
   pub raw: Value,
+  /// Native checkpoint for the next compatible generation.
+  pub provider_state: Option<ProviderState>,
+  pub continuation_status: ContinuationStatus,
+  pub(crate) generation_binding: Option<GenerationBinding>,
+  pub(crate) prepared_request_digest: Option<String>,
 }
 
 impl GenerateResponse {
-  pub(super) fn from_raw(http_status: u16, headers: HeaderMap, raw: Value) -> Self {
+  pub(super) fn finish(
+    request: &super::GenerateRequest,
+    status: u16,
+    headers: HeaderMap,
+    raw: Value,
+    continuation: Option<tokn_requests::session::ContinuationResponse>,
+  ) -> crate::Result<Self> {
+    let mut reply = Self::from_raw(status, headers, raw);
+    if let Some(continuation) = continuation {
+      reply.provider_state = Some(ProviderState::capture(request, &reply, continuation.state)?);
+      reply.continuation_status = continuation.outcome;
+    }
+    if request.generation_binding.is_some() {
+      reply.bind_prepared(request)?;
+    }
+    Ok(reply)
+  }
+
+  fn receipt(&self, request: &super::GenerateRequest) -> crate::Result<String> {
+    super::state::digest(&(
+      request,
+      self.http_status,
+      &self.status,
+      &self.finish_reason,
+      &self.text,
+      &self.tool_calls,
+      &self.provider_state,
+      self.continuation_status,
+    ))
+  }
+
+  pub(crate) fn bind_prepared(&mut self, request: &super::GenerateRequest) -> crate::Result<()> {
+    self.prepared_request_digest = Some(self.receipt(request)?);
+    self.generation_binding = request.generation_binding.clone();
+    Ok(())
+  }
+
+  pub(crate) fn matches_prepared(&self, request: &super::GenerateRequest) -> crate::Result<bool> {
+    Ok(
+      request.generation_binding.is_some()
+        && self.generation_binding == request.generation_binding
+        && self.prepared_request_digest.as_deref() == Some(self.receipt(request)?.as_str()),
+    )
+  }
+
+  /// Portable assistant history entry corresponding to this generation.
+  pub fn assistant_message(&self) -> super::Message {
+    super::Message::assistant_with_tool_calls(&self.text, self.tool_calls.clone())
+  }
+
+  pub(crate) fn from_raw(http_status: u16, headers: HeaderMap, raw: Value) -> Self {
     let tool_calls = output_tool_calls(&raw);
     Self {
       http_status,
@@ -45,6 +101,10 @@ impl GenerateResponse {
         .filter(|usage| usage.is_object())
         .map(Usage::from_value),
       raw,
+      provider_state: None,
+      continuation_status: ContinuationStatus::Started,
+      generation_binding: None,
+      prepared_request_digest: None,
     }
   }
 }

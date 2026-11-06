@@ -202,6 +202,75 @@ pipeline stages. Those remain implementation details and can evolve without
 breaking SDK consumers. Typed endpoint clients and raw JSON remain available
 when an exact endpoint wire shape is required.
 
+### Conversations
+
+`Conversation` manages one pending generation at a time. Give each conversation
+a stable application ID. `prepare` freezes its messages, settings and retrieved
+documents into an owned request. The client can send that request while the
+application queues further input. `commit` checks the response against the
+prepared request before advancing history and the provider checkpoint.
+
+```rust
+use tokn_sdk::{Conversation, GenerateRequest, RetrievedContext};
+
+let mut chat = Conversation::new("support-42")?;
+let settings = GenerateRequest::builder("smart");
+chat.submit_user("What does our warranty cover?")?;
+let document = RetrievedContext::new("warranty", "Repairs are covered for two years.")
+  .with_source_version("v3");
+let first = chat.prepare(settings.clone(), vec![document])?;
+let response = client.send(first.request()).await?;
+chat.commit(first, response)?;
+
+chat.submit_user("Does that cover labor?")?;
+let next = chat.prepare(settings.clone(), vec![])?;
+let response = client.send(next.request()).await?;
+chat.commit(next, response)?;
+```
+
+Commit an assistant's tool calls before executing them. Use
+`outstanding_tool_calls()` to find their IDs and `record_tool_result(id, result)`
+to record each outcome. User input submitted during generation or while calls
+are outstanding waits for the next preparation. Store the conversation after
+preparing a request and after recording tool results when recovery matters.
+Serde restores the pending request, including the exact document contents.
+`retry()` returns that snapshot for another buffered send. The application
+reconciles tool operations whose outcome was uncertain at shutdown.
+
+Managed routes replay native history on the originating backend, driver,
+account, model and endpoint. The default `RequireCompatible` policy also
+checks the native request settings. When `AccountConfig.provider_account_id` is
+supplied, a digest binds the upstream account identity too; otherwise the stable
+local account id defines this scope, and token refresh does not change it.
+Set `continuation_policy(ContinuationPolicy::AllowRestart)`
+on the request builder to allow a fresh generation from portable history on
+fallback. An actual restart returns `ContinuationStatus::Restarted`.
+Earlier retrieved documents can remain in a compatible native checkpoint.
+For an intentional fresh start with portable messages, use `restart_from_history()`.
+
+For live output in a standard build, `send_streaming` delivers events as they
+arrive and returns a complete response for `commit`. The callback can submit
+steering input to the conversation while the prepared generation is running.
+
+```rust
+chat.submit_user("Summarize the coverage in one sentence.")?;
+let request = chat.prepare(settings, vec![])?;
+let response = client.send_streaming(request.request(), |event| {
+  if let tokn_sdk::GenerateEvent::TextDelta { text } = event {
+    print!("{text}");
+  }
+}).await?;
+chat.commit(request, response)?;
+```
+
+Dropping the streaming future or receiving an error leaves the prepared
+request available for retry. A retry starts a new attempt from the last
+committed checkpoint. Only a completed native response advances history.
+Standalone buffered requests can opt in with `capture_provider_state(true)`
+and pass the returned state to a later builder alongside the matching history.
+Checkpoints use native item replay on managed routes. Use the typed endpoint
+clients for relay traffic and provider-managed conversation handles.
+
 ### Shared standard and embedded execution
 
 `Client<P>` owns the active configuration and `ExecutionState` snapshot: execution

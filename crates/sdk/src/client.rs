@@ -290,7 +290,7 @@ impl<P: ResponseAdapter> Client<P> {
     options: RequestOptions,
   ) -> Result<P::Response<'_>, P::Error> {
     let response = self
-      .run_session(endpoint, body, options, None)
+      .run_session(endpoint, body, options, None, None)
       .await
       .map_err(|error| P::execution_error(error, endpoint))?;
     Ok(P::finish_response(response))
@@ -318,6 +318,7 @@ impl<P: PlatformFactory> Client<P> {
     body: Value,
     options: RequestOptions,
     mut generation_options: Option<GenerationOptions>,
+    continuation: Option<session::ContinuationRequest>,
   ) -> Result<SessionResponse<'_, P>, session::Error> {
     let snapshot = self.snapshot.load();
     // Acquire external services before reading clocks. A local callback may
@@ -340,6 +341,7 @@ impl<P: PlatformFactory> Client<P> {
     let mut input = RequestInput::new(endpoint, body, options.inbound_headers(), request_id);
     input.profile = Some(profile);
     input.generation_options = generation_options;
+    input.continuation = continuation;
     session::Session::new(snapshot.execution.clone(), input, transport, clock, events)
       .with_limits(self.limits)
       .run()
