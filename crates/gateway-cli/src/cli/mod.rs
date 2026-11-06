@@ -32,7 +32,10 @@ mod v2_projection;
 pub use error::{Error, Result};
 
 #[derive(Parser, Debug)]
-#[command(name = "tokn-router", about = "GitHub Copilot -> OpenAI-compatible API")]
+#[command(
+  name = "tokn-router",
+  about = "Multi-provider LLM gateway exposing an OpenAI-compatible API"
+)]
 pub struct Cli {
   /// Path to config file (default: ~/.tokn/router/config.toml)
   #[arg(long, global = true)]

@@ -9,7 +9,5 @@ __pycache__/
 /bindings/typescript/_native.cjs
 /bindings/typescript/_native.d.ts
 /bindings/typescript/tokn_sdk.*.node
-/tmp/docker-trials/
-/tmp/docker-agent-tests/
-/tmp/release-python/
+/tmp/
 /scripts/node_modules/
