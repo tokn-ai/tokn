@@ -427,6 +427,33 @@ pub fn start_request_archive_worker(
   archive_after_days: i64,
   handlers: Vec<Box<dyn ArchiveEventHandler>>,
 ) -> Option<ArchiveRuntime> {
+  start_request_maintenance(requests_dir, archive_extension, archive_after_days, None, handlers)
+}
+
+/// Archive old request databases and prune those past the prune cutoff after verification.
+pub fn start_request_maintenance_worker(
+  requests_dir: PathBuf,
+  archive_extension: Option<&str>,
+  archive_after_days: i64,
+  prune_after_days: i64,
+  handlers: Vec<Box<dyn ArchiveEventHandler>>,
+) -> Option<ArchiveRuntime> {
+  start_request_maintenance(
+    requests_dir,
+    archive_extension,
+    archive_after_days,
+    Some(prune_after_days),
+    handlers,
+  )
+}
+
+fn start_request_maintenance(
+  requests_dir: PathBuf,
+  archive_extension: Option<&str>,
+  archive_after_days: i64,
+  prune_after_days: Option<i64>,
+  handlers: Vec<Box<dyn ArchiveEventHandler>>,
+) -> Option<ArchiveRuntime> {
   let Ok(handle) = tokio::runtime::Handle::try_current() else {
     tracing::warn!(path = %requests_dir.display(), "request db archival disabled: no tokio runtime");
     return None;
@@ -451,6 +478,7 @@ pub fn start_request_archive_worker(
           &dir,
           OffsetDateTime::now_utc().date(),
           archive_after_days,
+          prune_after_days,
           format,
           Some(&events),
           Some(scan_cancelled.as_ref()),
@@ -591,7 +619,7 @@ fn prune_request_dbs_once_with_progress(
         bytes_total,
       });
     };
-    let outcome = prune_request_db(&path, &archive, format, commit, &mut report_bytes);
+    let outcome = prune_request_db(&path, &archive, format, commit, None, &mut report_bytes);
     progress(PruneProgressEvent::FileFinished {
       path: path.clone(),
       file_index,
@@ -608,6 +636,7 @@ fn prune_request_db(
   archive: &Path,
   format: ArchiveFormat,
   commit: bool,
+  cancelled: Option<&AtomicBool>,
   progress: &mut impl FnMut(u64),
 ) -> PruneOutcome {
   let mut archive_file = match StableFile::open(archive) {
@@ -627,8 +656,13 @@ fn prune_request_db(
       };
     }
   };
+  if let Err(error) = check_request_db_sidecars(db) {
+    return PruneOutcome::Failed {
+      error: format!("verify request database {}: {error}", db.display()),
+    };
+  }
 
-  let archived_digest = match hash_archive(&mut archive_file, format, progress) {
+  let archived_digest = match hash_archive(&mut archive_file, format, cancelled, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -636,7 +670,7 @@ fn prune_request_db(
       };
     }
   };
-  let source_digest = match hash_file(&mut source_file, progress) {
+  let source_digest = match hash_file(&mut source_file, cancelled, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -655,7 +689,7 @@ fn prune_request_db(
     return PruneOutcome::Verified { sha256: source_sha256 };
   }
 
-  match hash_archive(&mut archive_file, format, progress) {
+  match hash_archive(&mut archive_file, format, cancelled, progress) {
     Ok(current_digest) if current_digest == archived_digest => {}
     Ok(_) => {
       return PruneOutcome::Failed {
@@ -668,7 +702,7 @@ fn prune_request_db(
       };
     }
   }
-  match hash_file(&mut source_file, progress) {
+  match hash_file(&mut source_file, cancelled, progress) {
     Ok(current_digest) if current_digest == source_digest => {}
     Ok(_) => {
       return PruneOutcome::Failed {
@@ -681,12 +715,12 @@ fn prune_request_db(
       };
     }
   }
-  if let Err(error) = archive_file.revalidate() {
-    return PruneOutcome::Failed {
-      error: format!("revalidate archive {} before deletion: {error}", archive.display()),
-    };
-  }
-  match remove_stable_file(source_file) {
+  let result = sync_archive_before_prune(&archive_file)
+    .and_then(|()| check_request_db_sidecars(db))
+    .and_then(|()| check_cancelled(cancelled))
+    .and_then(|()| archive_file.revalidate())
+    .and_then(|()| remove_stable_file(source_file));
+  match result {
     Ok(()) => PruneOutcome::Deleted { sha256: source_sha256 },
     Err(error) => PruneOutcome::Failed {
       error: format!("delete verified request database {}: {error}", db.display()),
@@ -694,21 +728,61 @@ fn prune_request_db(
   }
 }
 
-fn hash_file(file: &mut StableFile, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+fn hash_file(
+  file: &mut StableFile,
+  cancelled: Option<&AtomicBool>,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
   file.rewind()?;
-  let digest = hash_reader(&mut file.file, progress)?;
+  let digest = hash_reader(&mut file.file, cancelled, progress)?;
   file.revalidate()?;
   Ok(digest)
 }
 
-fn hash_archive(file: &mut StableFile, format: ArchiveFormat, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+fn hash_archive(
+  file: &mut StableFile,
+  format: ArchiveFormat,
+  cancelled: Option<&AtomicBool>,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
   file.rewind()?;
   let digest = match format {
-    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(&mut file.file)?, progress),
-    ArchiveFormat::Xz => hash_xz_archive(&mut file.file, progress),
+    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(&mut file.file)?, cancelled, progress),
+    ArchiveFormat::Xz => hash_xz_archive(&mut file.file, cancelled, progress),
   }?;
   file.revalidate()?;
   Ok(digest)
+}
+
+fn sync_archive_before_prune(archive: &StableFile) -> io::Result<()> {
+  // Sync the archive and its directory entry before removing the source on Unix.
+  #[cfg(unix)]
+  {
+    archive.file.sync_all()?;
+    let parent = archive.path.parent().filter(|path| !path.as_os_str().is_empty());
+    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+  }
+  #[cfg(not(unix))]
+  let _ = archive;
+  Ok(())
+}
+
+fn check_request_db_sidecars(db: &Path) -> io::Result<()> {
+  for suffix in ["-wal", "-journal"] {
+    let mut sidecar = db.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    match fs::symlink_metadata(&sidecar) {
+      Ok(_) => {
+        return Err(io::Error::new(
+          io::ErrorKind::InvalidInput,
+          format!("found SQLite {suffix} sidecar"),
+        ));
+      }
+      Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Ok(())
 }
 
 fn remove_stable_file(file: StableFile) -> io::Result<()> {
@@ -778,10 +852,15 @@ fn restore_quarantined_file(quarantine: &Path, original: &Path, cause: io::Error
   }
 }
 
-fn hash_reader(mut reader: impl Read, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+fn hash_reader(
+  mut reader: impl Read,
+  cancelled: Option<&AtomicBool>,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
   let mut digest = Sha256::new();
   let mut buffer = [0u8; 64 * 1024];
   loop {
+    check_cancelled(cancelled)?;
     let read = reader.read(&mut buffer)?;
     if read == 0 {
       break;
@@ -822,12 +901,20 @@ fn retention_cutoff(today: Date, retention_days: i64, operation: &str) -> io::Re
 }
 
 #[cfg(feature = "lzma")]
-fn hash_xz_archive(file: impl Read, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
-  hash_reader(lzma_rust2::XzReader::new(file, false), progress)
+fn hash_xz_archive(
+  file: impl Read,
+  cancelled: Option<&AtomicBool>,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
+  hash_reader(lzma_rust2::XzReader::new(file, false), cancelled, progress)
 }
 
 #[cfg(not(feature = "lzma"))]
-fn hash_xz_archive(_file: impl Read, _progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+fn hash_xz_archive(
+  _file: impl Read,
+  _cancelled: Option<&AtomicBool>,
+  _progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
   Err(io::Error::new(
     io::ErrorKind::Unsupported,
     "xz archive decompression requires the lzma feature",
@@ -841,24 +928,32 @@ pub fn archive_requests_once(
   archive_after_days: i64,
   format: ArchiveFormat,
 ) -> io::Result<ArchiveStats> {
-  archive_requests_once_with_events(dir, today, archive_after_days, format, None, None)
+  archive_requests_once_with_events(dir, today, archive_after_days, None, format, None, None)
 }
 
 fn archive_requests_once_with_events(
   dir: &Path,
   today: Date,
   archive_after_days: i64,
+  prune_after_days: Option<i64>,
   format: ArchiveFormat,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
 ) -> io::Result<ArchiveStats> {
   let cutoff = retention_cutoff(today, archive_after_days, "archive")?;
+  let prune_cutoff = prune_after_days.and_then(|days| match retention_cutoff(today, days, "prune") {
+    Ok(cutoff) => Some(cutoff),
+    Err(error) => {
+      tracing::warn!(path = %dir.display(), error = %error, "request db prune skipped");
+      None
+    }
+  });
   let _lock = match RequestMaintenanceLock::acquire(dir) {
     Ok(lock) => lock,
     Err(error) if error.kind() == io::ErrorKind::NotFound => return empty_archive_scan(dir, events),
     Err(error) => return Err(error),
   };
-  archive_requests_once_locked(dir, cutoff, format, events, cancelled)
+  archive_requests_once_locked(dir, cutoff, prune_cutoff, format, events, cancelled)
 }
 
 fn empty_archive_scan(dir: &Path, events: Option<&dyn ArchiveEmitter>) -> io::Result<ArchiveStats> {
@@ -877,6 +972,7 @@ fn empty_archive_scan(dir: &Path, events: Option<&dyn ArchiveEmitter>) -> io::Re
 fn archive_requests_once_locked(
   dir: &Path,
   cutoff: Date,
+  prune_cutoff: Option<Date>,
   format: ArchiveFormat,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
@@ -887,33 +983,53 @@ fn archive_requests_once_locked(
     check_cancelled(cancelled)?;
     let entry = entry?;
     let path = entry.path();
-    if !is_archivable_request_db(&path, cutoff) {
+    let Some(day) = request_db_day(&path).filter(|day| *day <= cutoff) else {
       continue;
-    }
+    };
 
     let archive = archive_path(&path, format);
-    let id = archive_id(&path);
     if archive.exists() {
       stats.skipped_existing += 1;
-      emit(events, ArchiveEvent::FileSkipped { path, archive });
-      continue;
+      emit(
+        events,
+        ArchiveEvent::FileSkipped {
+          path: path.clone(),
+          archive: archive.clone(),
+        },
+      );
+    } else {
+      let id = archive_id(&path);
+      match compress_db(&path, &archive, format, events, cancelled, &id) {
+        Ok(()) => stats.archived += 1,
+        Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
+        Err(err) => {
+          stats.failed += 1;
+          tracing::warn!(path = %path.display(), archive = %archive.display(), error = %err, "request db archive failed");
+          emit(
+            events,
+            ArchiveEvent::FileFailed {
+              id,
+              path,
+              archive,
+              error: err.to_string(),
+            },
+          );
+          continue;
+        }
+      }
     }
 
-    match compress_db(&path, &archive, format, events, cancelled, &id) {
-      Ok(()) => stats.archived += 1,
-      Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
-      Err(err) => {
-        stats.failed += 1;
-        emit(
-          events,
-          ArchiveEvent::FileFailed {
-            id,
-            path: path.clone(),
-            archive: archive.clone(),
-            error: err.to_string(),
-          },
-        );
-        tracing::warn!(path = %path.display(), archive = %archive.display(), error = %err, "request db archive failed");
+    if prune_cutoff.is_some_and(|cutoff| day <= cutoff) {
+      check_cancelled(cancelled)?;
+      let outcome = prune_request_db(&path, &archive, format, true, cancelled, &mut |_| {});
+      check_cancelled(cancelled)?;
+      match outcome {
+        PruneOutcome::Deleted { sha256 } => tracing::info!(
+          path = %path.display(), archive = %archive.display(), sha256, "pruned verified request db"
+        ),
+        outcome => tracing::warn!(
+          path = %path.display(), archive = %archive.display(), ?outcome, "request db retained during prune"
+        ),
       }
     }
   }
@@ -929,15 +1045,16 @@ fn archive_requests_once_locked(
 }
 
 fn is_archivable_request_db(path: &Path, cutoff: Date) -> bool {
+  request_db_day(path).is_some_and(|day| day <= cutoff)
+}
+
+fn request_db_day(path: &Path) -> Option<Date> {
   if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
     || path.extension().and_then(|v| v.to_str()) != Some("db")
   {
-    return false;
+    return None;
   }
-  let Some(stem) = path.file_stem().and_then(|v| v.to_str()) else {
-    return false;
-  };
-  parse_day(stem).is_some_and(|day| day <= cutoff)
+  parse_day(path.file_stem()?.to_str()?)
 }
 
 fn archive_path(path: &Path, format: ArchiveFormat) -> PathBuf {
@@ -980,10 +1097,10 @@ fn compress_db(
 
   let result = (|| {
     let mut input = BufReader::new(File::open(db)?);
-    let output = BufWriter::new(File::create(&temp)?);
+    let mut output = BufWriter::new(File::create(&temp)?);
     let mut buf = [0u8; 64 * 1024];
     let mut bytes_read = 0u64;
-    encode_archive(output, format, |encoder| {
+    encode_archive(&mut output, format, |encoder| {
       loop {
         check_cancelled(cancelled)?;
         let n = input.read(&mut buf)?;
@@ -1007,6 +1124,8 @@ fn compress_db(
     if fs::metadata(&temp)?.len() == 0 {
       return Err(io::Error::new(io::ErrorKind::WriteZero, "empty archive"));
     }
+    output.get_ref().sync_all()?;
+    drop(output);
     fs::rename(&temp, archive)
   })();
 
@@ -1091,7 +1210,7 @@ fn check_cancelled(cancelled: Option<&AtomicBool>) -> io::Result<()> {
   if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Relaxed)) {
     Err(io::Error::new(
       io::ErrorKind::Interrupted,
-      "archive compression cancelled",
+      "request database maintenance cancelled",
     ))
   } else {
     Ok(())
@@ -1192,6 +1311,57 @@ mod tests {
   }
 
   #[test]
+  fn maintenance_prunes_only_verified_databases_past_the_prune_cutoff() {
+    let dir = tempdir();
+    let format = ArchiveFormat::Zstd;
+    let today = date!(2026 - 05 - 11);
+    let existing = write_db(&dir, "2026-04-29.db", b"already archived");
+    let changed = write_db(&dir, "2026-04-30.db", b"initial contents");
+    archive_requests_once(&dir, today, 7, format).unwrap();
+    fs::write(&changed, b"updated database").unwrap();
+
+    let at_cutoff = write_db(&dir, "2026-05-01.db", b"archived this scan");
+    let within_retention = write_db(&dir, "2026-05-02.db", b"archive without pruning");
+    let journaled = write_db(&dir, "2026-04-28.db", b"database with a sidecar");
+    write_db(&dir, "2026-04-28.db-wal", b"uncheckpointed writes");
+
+    archive_requests_once_with_events(&dir, today, 7, Some(10), format, None, None).unwrap();
+
+    for (db, contents) in [
+      (existing, b"already archived".as_slice()),
+      (at_cutoff, b"archived this scan"),
+    ] {
+      assert!(!db.exists());
+      let mut decoded = Vec::new();
+      decode_archive(&archive_path(&db, format), format, &mut decoded);
+      assert_eq!(decoded, contents);
+    }
+    assert_eq!(fs::read(changed).unwrap(), b"updated database");
+    assert!(within_retention.exists());
+    assert!(archive_path(&within_retention, format).exists());
+    assert!(journaled.exists());
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
+  fn cancellation_during_prune_verification_retains_the_database() {
+    let dir = tempdir();
+    let format = archive_format();
+    let db = write_db(&dir, "2026-05-01.db", b"verified request database");
+    archive_requests_once(&dir, date!(2026 - 05 - 11), 7, format).unwrap();
+    let archive = archive_path(&db, format);
+    let cancelled = AtomicBool::new(false);
+
+    let outcome = prune_request_db(&db, &archive, format, true, Some(&cancelled), &mut |_| {
+      cancelled.store(true, Ordering::Relaxed);
+    });
+
+    assert!(matches!(outcome, PruneOutcome::Failed { .. }));
+    assert!(db.exists());
+    fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[test]
   fn skips_recent_non_daily_and_existing_archives() {
     let dir = tempdir();
     let format = archive_format();
@@ -1226,6 +1396,14 @@ mod tests {
       prune_error.to_string(),
       "prune retention cutoff is outside the supported date range"
     );
+
+    let db = write_db(&dir, "2026-05-01.db", b"archive despite an invalid prune cutoff");
+    let stats =
+      archive_requests_once_with_events(&dir, date!(2026 - 05 - 09), 7, Some(1_000_000_000), format, None, None)
+        .unwrap();
+    assert_eq!(stats.archived, 1);
+    assert!(db.exists());
+    fs::remove_dir_all(dir).unwrap();
   }
 
   #[test]
@@ -1538,6 +1716,7 @@ mod tests {
       &dir,
       date!(2026 - 05 - 09),
       7,
+      None,
       archive_format(),
       Some(emitter.as_ref()),
       None,
@@ -1569,9 +1748,16 @@ mod tests {
     write_db(&dir, "2026-05-01.db", &vec![b'x'; 1024 * 1024]);
     let cancelled = AtomicBool::new(true);
 
-    let err =
-      archive_requests_once_with_events(&dir, date!(2026 - 05 - 09), 7, archive_format(), None, Some(&cancelled))
-        .unwrap_err();
+    let err = archive_requests_once_with_events(
+      &dir,
+      date!(2026 - 05 - 09),
+      7,
+      None,
+      archive_format(),
+      None,
+      Some(&cancelled),
+    )
+    .unwrap_err();
 
     assert_eq!(err.kind(), io::ErrorKind::Interrupted);
     assert!(!dir

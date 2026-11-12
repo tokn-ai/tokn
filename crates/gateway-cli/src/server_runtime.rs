@@ -24,24 +24,17 @@ type EventBusParts = (
 
 /// Build the event bus and its persistence/progress handlers.
 pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
-  build_event_bus_with_archive_after_days(cfg, tokn_config::v2::DEFAULT_ARCHIVE_AFTER_DAYS as i64)
-}
-
-fn build_event_bus_with_archive_after_days(cfg: &Config, archive_after_days: i64) -> Result<EventBusParts> {
-  build_event_bus_with_request_options(
+  build_event_bus_with_retention(
     cfg,
-    tokn_persistence::requests::RequestPersistenceOptions {
-      record_request_bodies: cfg.db.record_request_bodies,
-      body_max_bytes: cfg.db.body_max_bytes,
-    },
-    archive_after_days,
+    tokn_config::v2::DEFAULT_ARCHIVE_AFTER_DAYS as i64,
+    Some(tokn_config::v2::DEFAULT_PRUNE_AFTER_DAYS as i64),
   )
 }
 
-fn build_event_bus_with_request_options(
+fn build_event_bus_with_retention(
   cfg: &Config,
-  request_options: tokn_persistence::requests::RequestPersistenceOptions,
   archive_after_days: i64,
+  prune_after_days: Option<i64>,
 ) -> Result<EventBusParts> {
   let capacity = cfg.db.write_queue_capacity.max(256);
   let bus = EventBus::new(capacity);
@@ -52,7 +45,13 @@ fn build_event_bus_with_request_options(
 
   if cfg.db.enabled {
     let paths = cfg.db.resolve_paths()?;
-    let request_handler = tokn_persistence::RequestEventHandler::with_options(paths.requests_dir, request_options)?;
+    let request_handler = tokn_persistence::RequestEventHandler::with_options(
+      paths.requests_dir,
+      tokn_persistence::RequestPersistenceOptions {
+        record_request_bodies: cfg.db.record_request_bodies,
+        body_max_bytes: cfg.db.body_max_bytes,
+      },
+    )?;
     let usage_handler = tokn_persistence::UsageEventHandler::new(paths.usage_db)?;
     handlers.push(Box::new(request_handler));
     handlers.push(Box::new(usage_handler));
@@ -77,12 +76,22 @@ fn build_event_bus_with_request_options(
 
   let archive_runtime = if cfg.db.enabled {
     let paths = cfg.db.resolve_paths()?;
-    crate::db::archive::start_request_archive_worker(
-      paths.requests_dir,
-      cfg.db.archive_extension.as_deref(),
-      archive_after_days,
-      archive_handlers,
-    )
+    let extension = cfg.db.archive_extension.as_deref();
+    match prune_after_days {
+      Some(prune_after_days) => crate::db::archive::start_request_maintenance_worker(
+        paths.requests_dir,
+        extension,
+        archive_after_days,
+        prune_after_days,
+        archive_handlers,
+      ),
+      None => crate::db::archive::start_request_archive_worker(
+        paths.requests_dir,
+        extension,
+        archive_after_days,
+        archive_handlers,
+      ),
+    }
   } else {
     None
   };
@@ -95,6 +104,17 @@ fn build_event_bus_with_request_options(
 /// This adapter remains in the CLI so the config and router crates stay free
 /// of database and progress-handler dependencies.
 pub fn build_v2_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
+  build_v2_event_bus_with_retention(persistence, Some(persistence.prune_after_days()))
+}
+
+pub fn build_smoke_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
+  build_v2_event_bus_with_retention(persistence, None)
+}
+
+fn build_v2_event_bus_with_retention(
+  persistence: &tokn_config::v2::PersistencePlan,
+  prune_after_days: Option<i64>,
+) -> Result<EventBusParts> {
   let mut cfg = Config::default();
   cfg.db.enabled = persistence.enabled();
   cfg.db.record_sessions = persistence.record_sessions();
@@ -108,7 +128,7 @@ pub fn build_v2_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Res
     cfg.db.sessions_db_path = Some(paths.sessions_db);
     cfg.db.requests_dir = Some(paths.requests_dir);
   }
-  build_event_bus_with_archive_after_days(&cfg, persistence.archive_after_days())
+  build_event_bus_with_retention(&cfg, persistence.archive_after_days(), prune_after_days)
 }
 
 /// Frontends own admission failures only. Worker event loops remain responsible
