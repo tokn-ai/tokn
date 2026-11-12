@@ -140,6 +140,9 @@ codegen-units = 1
 [profile.dev.package.lzma-rust2]
 opt-level = 3
 
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.dev.package.zstd]
 opt-level = 3
 
@@ -150,6 +153,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.lzma-rust2]
+opt-level = 3
+
+[profile.test.package.sha2]
 opt-level = 3
 
 [profile.test.package.zstd]

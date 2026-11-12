@@ -320,6 +320,13 @@ Requests rejected before the pipeline starts are also saved as failed records,
 including their request ID, status, error, timing, URL, and redacted headers.
 Rejected request bodies are omitted.
 
+With persistence enabled, the gateway scans request databases at startup and every six hours.
+By default, it compresses days at least 7 days old and prunes the original `.db`
+files at 10 days, after verifying that their SHA-256 hashes match the decompressed
+archives. Set `archive_after_days` and `prune_after_days` under
+`[service.persistence]` to change these cutoffs. `tokn-gateway requests prune`
+previews the eligible days. Add `--commit` to prune them manually.
+
 ### Inspect request history
 
 Open **Inspect** in [Tokn Desktop](apps/desktop/README.md) to browse persisted
@@ -327,7 +334,7 @@ requests and sessions. The inspector is part of the desktop app; the former
 `tokn-gateway inspect` command and standalone web server have been removed.
 It reads existing request-day databases, `sessions.db`, and `usage.db` through
 native commands without starting the gateway, opening a listener, or migrating
-databases.
+databases. To browse a pruned day, decompress its archive back to a `.db` file.
 
 The Sessions view reads its list, semantic node tree, and selected-node content
 only from `sessions.db`; opening it does not scan request history. Session and

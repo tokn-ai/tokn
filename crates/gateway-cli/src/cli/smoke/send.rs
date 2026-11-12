@@ -98,7 +98,8 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     );
   }
 
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
+  let (events, receiver, handlers, archive_runtime) =
+    crate::server_runtime::build_smoke_event_bus(service.persistence())?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
   let captured = Captured::install(&events);
   if args.format == OutputFormat::Text {
