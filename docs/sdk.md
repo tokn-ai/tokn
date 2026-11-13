@@ -148,7 +148,7 @@ provider wire controls without this SDK validation.
 The bundled catalogue includes effort metadata. The serving gateway refreshes
 upstream discovery every five minutes and models.dev daily by default, updating
 model IDs and metadata in memory while retaining the last successful data on
-refresh failure. `tokn-router update` also refreshes the disk cache for subsequent
+refresh failure. `tokn-gateway update` also refreshes the disk cache for subsequent
 processes. Embedded servers can opt into the same lifecycle with
 `LiveRuntime::start_model_refresh` and keep its guard until shutdown.
 
