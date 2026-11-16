@@ -25,7 +25,13 @@ pub enum InputItem {
 impl<'de> Deserialize<'de> for InputItem {
   fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
     let mut value = Value::deserialize(deserializer)?;
-    let kind = value.get("type").and_then(Value::as_str).map(str::to_owned);
+    let kind = match value.get("type") {
+      None => None,
+      Some(Value::String(kind)) => Some(kind.to_owned()),
+      // A present discriminator is not a typeless message. Keep unsupported
+      // representations intact for passthrough and conversion validation.
+      Some(_) => return Ok(InputItem::Other(value)),
+    };
     match kind.as_deref() {
       Some("reasoning") => serde_json::from_value(value)
         .map(InputItem::Reasoning)
@@ -234,4 +240,57 @@ pub struct OutputMessage {
   pub content: Vec<OutputContentPart>,
   #[serde(default, flatten)]
   pub extras: Extras,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  #[test]
+  fn input_item_preserves_non_string_discriminators() {
+    for kind in [
+      Value::Null,
+      json!(42),
+      json!(false),
+      json!({"kind":"message"}),
+      json!(["message"]),
+    ] {
+      let value = json!({
+        "type": kind,
+        "role": "user",
+        "content": "visible content",
+        "opaque": {"payload": "preserved"}
+      });
+      let item: InputItem = serde_json::from_value(value.clone()).unwrap();
+      assert!(matches!(&item, InputItem::Other(_)));
+      assert_eq!(serde_json::to_value(item).unwrap(), value);
+    }
+  }
+
+  #[test]
+  fn input_item_preserves_unknown_types_with_message_fields() {
+    let value = json!({
+      "type": "future_item",
+      "role": "assistant",
+      "content": "visible content",
+      "opaque": {"payload": "preserved"}
+    });
+    let item: InputItem = serde_json::from_value(value.clone()).unwrap();
+    assert!(matches!(&item, InputItem::Other(_)));
+    assert_eq!(serde_json::to_value(item).unwrap(), value);
+  }
+
+  #[test]
+  fn input_item_recognizes_explicit_and_typeless_messages() {
+    let message = json!({"role":"user", "content":"hello"});
+    for value in [
+      message.clone(),
+      json!({"type":"message", "role":"user", "content":"hello"}),
+    ] {
+      let item: InputItem = serde_json::from_value(value).unwrap();
+      assert!(matches!(&item, InputItem::Message(_)));
+      assert_eq!(serde_json::to_value(item).unwrap(), message);
+    }
+  }
 }
