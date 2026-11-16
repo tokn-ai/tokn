@@ -140,6 +140,58 @@ fn has_nonimage_native_history(from: Endpoint, body: &Value) -> bool {
   })
 }
 
+fn rejected_nonimage_native_history(from: Endpoint, body: &Value, error: &tokn_convert::error::ConvertError) -> bool {
+  if let tokn_convert::error::ConvertError::UnsupportedFeature { message } = error {
+    // Unknown top-level Responses items now fail before IR construction. Tie
+    // that rejection to an actual unsupported, non-image item in this request.
+    if from == Endpoint::Responses
+      && body["input"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+          item["type"].as_str().is_some_and(|kind| {
+            !matches!(
+              kind,
+              "message" | "reasoning" | "function_call" | "function_call_output" | "image_generation_call"
+            ) && endpoint(item).is_none()
+              && *message == format!("Responses input item type `{kind}` has no cross-endpoint representation")
+          })
+        })
+      })
+    {
+      return true;
+    }
+  }
+  native_history_rejection(error) && has_nonimage_native_history(from, body)
+}
+
+#[test]
+fn recorded_history_rejection_requires_a_matching_unsupported_item() {
+  let body = json!({"model":"history-test","input":[{"type":"compaction","encrypted_content":"opaque"}]});
+  let error = convert_request(Endpoint::Responses, Endpoint::ChatCompletions, &body).unwrap_err();
+  assert!(rejected_nonimage_native_history(Endpoint::Responses, &body, &error));
+  for input in [
+    json!([{"role":"user","content":"hello"}]),
+    json!([{"type":"custom_tool_call","name":"edit","input":"patch"}]),
+    json!([{"type":"input_image","image_url":"data:image/png;base64,aW1n"}]),
+  ] {
+    let other = json!({"model":"history-test","input":input});
+    assert!(!rejected_nonimage_native_history(Endpoint::Responses, &other, &error));
+  }
+  let wrong_error = tokn_convert::error::ConvertError::bad_shape("media", "invalid image");
+  assert!(!rejected_nonimage_native_history(
+    Endpoint::Responses,
+    &body,
+    &wrong_error
+  ));
+}
+
+#[test]
+fn recorded_history_rejection_still_recognizes_nested_native_content() {
+  let body =
+    json!({"model":"history-test","input":[{"role":"user","content":[{"type":"future_content","payload":"opaque"}]}]});
+  let error = convert_request(Endpoint::Responses, Endpoint::ChatCompletions, &body).unwrap_err();
+  assert!(rejected_nonimage_native_history(Endpoint::Responses, &body, &error));
+}
+
 fn check_image(report: &mut Report, part: &Value) {
   report.count("image_parts");
   let Some(from) = endpoint(part) else {
@@ -508,7 +560,6 @@ fn recorded_requests_preserve_image_payloads_and_order() {
     }
     let expected = signature(from, &images);
     report.check(expected.is_some(), "decode_recorded_request_images");
-    let native_nonimage_history = has_nonimage_native_history(from, body);
     for to in ENDPOINTS.into_iter().filter(|to| *to != from) {
       match convert_request(from, to, body) {
         Ok(converted) => {
@@ -525,7 +576,7 @@ fn recorded_requests_preserve_image_payloads_and_order() {
             "recorded_request_reverse_image_conversion",
           );
         }
-        Err(error) if native_nonimage_history && native_history_rejection(&error) => {
+        Err(error) if rejected_nonimage_native_history(from, body, &error) => {
           // Each actual image was independently verified above. Keep rejection
           // of unrelated provider-native history distinct from image failures.
           report.count("recorded_request_native_history_rejection");

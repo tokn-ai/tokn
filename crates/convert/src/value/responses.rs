@@ -446,9 +446,18 @@ fn input_to_messages(input: &Value) -> Result<(Vec<String>, Vec<IrMessage>)> {
   let mut messages = Vec::new();
   let mut pending_assistant: Option<IrMessage> = None;
   for item in arr {
-    // Dispatch on `type` for special items first; everything else falls
-    // through to role-based message handling.
-    match item.get("type").and_then(Value::as_str) {
+    if !item.is_object() {
+      return Err(ConvertError::bad_shape("input[]", "expected an object"));
+    }
+    let kind = match item.get("type") {
+      None => None,
+      Some(Value::String(kind)) if !kind.is_empty() => Some(kind.as_str()),
+      Some(_) => return Err(ConvertError::bad_shape("input[].type", "expected a nonempty string")),
+    };
+    // Only ordinary messages may omit the discriminator. Treating an unknown
+    // item as a message would discard fields such as custom-tool `input` or
+    // opaque compaction state before the destination can reject it.
+    match kind {
       Some("reasoning") => {
         if let Some(text) = reasoning_text_from_input_item(item) {
           push_assistant_part(&mut pending_assistant, ContentPart::Reasoning { text });
@@ -509,10 +518,15 @@ fn input_to_messages(input: &Value) -> Result<(Vec<String>, Vec<IrMessage>)> {
         );
         continue;
       }
-      _ => {}
+      Some("message") | None => {}
+      Some(kind) => {
+        return Err(crate::media::unsupported(format!(
+          "Responses input item type `{kind}` has no cross-endpoint representation"
+        )))
+      }
     }
     let message = input_item_to_message(item)?;
-    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let role = message.role.as_str();
     if matches!(role, "system" | "developer") {
       flush_pending_assistant(&mut messages, &mut pending_assistant);
       let text = text_from_parts(&message.content);
@@ -585,12 +599,24 @@ fn reasoning_text_from_input_item(item: &Value) -> Option<String> {
 }
 
 fn input_item_to_message(item: &Value) -> Result<IrMessage> {
-  let role = Role::from_wire(item.get("role").and_then(Value::as_str).unwrap_or("user"));
+  let role = match item.get("role").and_then(Value::as_str) {
+    Some(role @ ("system" | "developer" | "user" | "assistant")) => Role::from_wire(role),
+    _ => {
+      return Err(ConvertError::bad_shape(
+        "input[].role",
+        "expected system, developer, user, or assistant",
+      ))
+    }
+  };
   let content = match item.get("content") {
     Some(Value::String(s)) => vec![ContentPart::Text { text: s.clone() }],
     Some(Value::Array(parts)) => parts.iter().map(part_from_responses).collect::<Result<_>>()?,
-    Some(v) => vec![ContentPart::Raw { value: v.clone() }],
-    None => Vec::new(),
+    _ => {
+      return Err(ConvertError::bad_shape(
+        "input[].content",
+        "expected text or content parts",
+      ))
+    }
   };
   Ok(IrMessage {
     role,
