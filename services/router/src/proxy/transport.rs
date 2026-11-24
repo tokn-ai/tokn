@@ -380,11 +380,7 @@ async fn route_intercepted_request(
   *request.extensions_mut() = extensions;
 
   use tower::ServiceExt;
-  let response = router
-    .oneshot(request)
-    .await
-    .unwrap_or_else(|err| ApiError::bad_gateway(err.to_string()).into_response());
-  Ok(response)
+  router.oneshot(request).await
 }
 
 fn should_authenticate_proxy_request(state: &AppState, mode: RouteMode) -> bool {

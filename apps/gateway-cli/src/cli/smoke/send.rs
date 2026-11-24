@@ -164,10 +164,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     println!();
   }
 
-  let response = tokn_router::v2::router(state)
-    .oneshot(request)
-    .await
-    .context("execute v2 smoke request")?;
+  let response = tokn_router::v2::router(state).oneshot(request).await?;
   let status = response.status();
   let headers = response.headers().clone();
   let body = response.into_body();
