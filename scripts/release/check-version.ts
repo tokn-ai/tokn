@@ -234,14 +234,14 @@ function main(): void {
   // Fixtures keep their own version; their SDK dependency graph follows VERSION.
   for (const mode of ["no_std", "std"]) {
     checkLock(
-      `crates/sdk/tests/${mode}/Cargo.lock`,
+      `apps/sdk/tests/${mode}/Cargo.lock`,
       version,
       new Set(["tokn-sdk"]),
       new Set([`tokn-sdk-${mode.replace("_", "-")}-check`]),
     );
   }
   checkLock(
-    "crates/accounts/tests/no_std/Cargo.lock",
+    "services/accounts/tests/no_std/Cargo.lock",
     version,
     new Set(["tokn-accounts"]),
     new Set(["tokn-accounts-no-std-check"]),

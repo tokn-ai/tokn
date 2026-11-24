@@ -1,39 +1,24 @@
 [workspace]
 members = [
-  "crates/tokn",
-  "crates/mock-server",
-  "crates/core",
-  "crates/policy",
-  "crates/config",
-  "crates/legacy-config",
-  "crates/agent-migration",
-  "crates/auth",
-  "crates/access",
-  "crates/catalogue",
-  "crates/convert",
-  "crates/endpoint-core",
-  "crates/endpoint-macros",
-  "crates/endpoint-chat-completions",
-  "crates/endpoint-responses",
-  "crates/endpoint-messages",
-  "crates/headers",
-  "crates/router",
-  "crates/service",
-  "crates/sdk",
-  "crates/requests",
-  "crates/accounts",
-  "crates/gateway-cli",
-  "crates/persistence",
-  "crates/provider-copilot",
-  "crates/provider-deepseek",
-  "crates/provider-llama-cpp",
-  "crates/provider-openai",
-  "crates/provider-opencode",
-  "crates/provider-zai",
+  "core/*",
+  "providers/*",
+  "endpoints/*",
+  "services/*",
+  "apps/gateway-cli",
+  "apps/sdk",
+  "apps/tokn",
   "bindings/python",
   "bindings/typescript",
 ]
-default-members = ["crates/*"]
+default-members = [
+  "core/*",
+  "providers/*",
+  "endpoints/*",
+  "services/*",
+  "apps/gateway-cli",
+  "apps/sdk",
+  "apps/tokn",
+]
 resolver = "2"
 
 [workspace.package]
@@ -45,35 +30,39 @@ repository = "https://github.com/tokn-ai/tokn"
 license = "MIT"
 
 [workspace.dependencies]
-tokn = { version = "0.2.4", path = "crates/tokn" }
-tokn-mock-server = { version = "0.2.4", path = "crates/mock-server" }
-tokn-core = { version = "0.2.4", path = "crates/core", default-features = false }
-tokn-policy = { version = "0.2.4", path = "crates/policy", default-features = false }
-tokn-config = { package = "tokn-router-config", version = "0.2.4", path = "crates/config", default-features = false }
-tokn-router-legacy-config = { version = "0.2.4", path = "crates/legacy-config" }
-tokn-agent-migration = { version = "0.2.4", path = "crates/agent-migration" }
-tokn-auth = { version = "0.2.4", path = "crates/auth", default-features = false }
-tokn-access = { version = "0.2.4", path = "crates/access" }
-tokn-catalogue = { version = "0.2.4", path = "crates/catalogue", default-features = false }
-tokn-convert = { version = "0.2.4", path = "crates/convert", default-features = false }
-tokn-endpoint-core = { version = "0.2.4", path = "crates/endpoint-core", default-features = false }
-tokn-endpoint-macros = { version = "0.2.4", path = "crates/endpoint-macros" }
-tokn-endpoint-chat-completions = { version = "0.2.4", path = "crates/endpoint-chat-completions", default-features = false }
-tokn-endpoint-responses = { version = "0.2.4", path = "crates/endpoint-responses", default-features = false }
-tokn-endpoint-messages = { version = "0.2.4", path = "crates/endpoint-messages", default-features = false }
-tokn-headers = { version = "0.2.4", path = "crates/headers", default-features = false }
-tokn-router = { version = "0.2.4", path = "crates/router" }
-tokn-service = { version = "0.2.4", path = "crates/service", default-features = false }
-tokn-sdk = { version = "0.2.4", path = "crates/sdk" }
-tokn-requests = { version = "0.2.4", path = "crates/requests", default-features = false }
-tokn-persistence = { version = "0.2.4", path = "crates/persistence" }
-tokn-accounts = { version = "0.2.4", path = "crates/accounts", default-features = false }
-tokn-provider-copilot = { version = "0.2.4", path = "crates/provider-copilot", default-features = false }
-tokn-provider-deepseek = { version = "0.2.4", path = "crates/provider-deepseek", default-features = false }
-tokn-provider-llama-cpp = { version = "0.2.4", path = "crates/provider-llama-cpp", default-features = false }
-tokn-provider-openai = { version = "0.2.4", path = "crates/provider-openai", default-features = false }
-tokn-provider-opencode = { version = "0.2.4", path = "crates/provider-opencode", default-features = false }
-tokn-provider-zai = { version = "0.2.4", path = "crates/provider-zai", default-features = false }
+tokn-auth = { version = "0.2.4", path = "core/auth", default-features = false }
+tokn-catalogue = { version = "0.2.4", path = "core/catalogue", default-features = false }
+tokn-config = { package = "tokn-router-config", version = "0.2.4", path = "core/config", default-features = false }
+tokn-core = { version = "0.2.4", path = "core/core", default-features = false }
+tokn-headers = { version = "0.2.4", path = "core/headers", default-features = false }
+tokn-policy = { version = "0.2.4", path = "core/policy", default-features = false }
+tokn-service = { version = "0.2.4", path = "core/service", default-features = false }
+
+tokn-provider-copilot = { version = "0.2.4", path = "providers/copilot", default-features = false }
+tokn-provider-deepseek = { version = "0.2.4", path = "providers/deepseek", default-features = false }
+tokn-provider-llama-cpp = { version = "0.2.4", path = "providers/llama-cpp", default-features = false }
+tokn-provider-openai = { version = "0.2.4", path = "providers/openai", default-features = false }
+tokn-provider-opencode = { version = "0.2.4", path = "providers/opencode", default-features = false }
+tokn-provider-zai = { version = "0.2.4", path = "providers/zai", default-features = false }
+
+tokn-convert = { version = "0.2.4", path = "endpoints/convert", default-features = false }
+tokn-endpoint-chat-completions = { version = "0.2.4", path = "endpoints/chat-completions", default-features = false }
+tokn-endpoint-core = { version = "0.2.4", path = "endpoints/core", default-features = false }
+tokn-endpoint-macros = { version = "0.2.4", path = "endpoints/macros" }
+tokn-endpoint-messages = { version = "0.2.4", path = "endpoints/messages", default-features = false }
+tokn-endpoint-responses = { version = "0.2.4", path = "endpoints/responses", default-features = false }
+
+tokn-access = { version = "0.2.4", path = "services/access" }
+tokn-accounts = { version = "0.2.4", path = "services/accounts", default-features = false }
+tokn-agent-migration = { version = "0.2.4", path = "services/agent-migration" }
+tokn-mock-server = { version = "0.2.4", path = "services/mock-server" }
+tokn-persistence = { version = "0.2.4", path = "services/persistence" }
+tokn-requests = { version = "0.2.4", path = "services/requests", default-features = false }
+tokn-router = { version = "0.2.4", path = "services/router" }
+tokn-router-legacy-config = { version = "0.2.4", path = "services/legacy-config" }
+
+tokn = { version = "0.2.4", path = "apps/tokn" }
+tokn-sdk = { version = "0.2.4", path = "apps/sdk" }
 
 anyhow = "1"
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

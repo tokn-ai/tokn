@@ -414,7 +414,7 @@ fn legacy_mode(mode: RouteMode) -> &'static str {
 
 fn legacy_api_path(profile: &str) -> Result<String> {
   // Match the legacy runtime projection's RFC 3986 path-segment encoding in
-  // crates/legacy-config/src/v2/analysis.rs, including literal percent signs.
+  // services/legacy-config/src/v2/analysis.rs, including literal percent signs.
   anyhow::ensure!(
     profile != "." && profile != "..",
     "Profile `{profile}` has no valid API path"

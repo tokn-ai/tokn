@@ -1,0 +1,47 @@
+use anyhow::{anyhow, Result};
+
+pub mod api;
+mod cors;
+pub mod dispatch;
+pub mod frontend;
+mod ingress_record;
+#[cfg(unix)]
+pub mod ipc;
+pub mod pipeline;
+pub mod proxy;
+mod request_id;
+pub mod routing;
+pub mod server;
+pub mod v2;
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
+
+pub use tokn_accounts as accounts;
+pub use tokn_config as config;
+pub use tokn_convert as convert;
+pub use tokn_core::{db, provider, util};
+
+/// Read-only view of the router's intercept-host allow-list. Exposed so the
+/// `tokn-accounts` registry coverage test (now living in
+/// `services/router/tests/intercept_hosts_coverage.rs`) can verify that every
+/// descriptor host is intercepted without making the constant itself `pub`.
+pub fn proxy_intercept_hosts() -> &'static [&'static str] {
+  proxy::INTERCEPT_HOSTS
+}
+
+/// Complete default interception set used by the legacy forward proxy.
+pub fn proxy_default_intercept_hosts() -> impl Iterator<Item = &'static str> {
+  proxy::INTERCEPT_HOSTS
+    .iter()
+    .chain(proxy::EXTRA_INTERCEPT_HOSTS)
+    .copied()
+}
+
+pub fn install_rustls_crypto_provider() -> Result<()> {
+  rustls::crypto::ring::default_provider()
+    .install_default()
+    .map_err(|_| anyhow!("failed to install rustls ring crypto provider"))?;
+  Ok(())
+}

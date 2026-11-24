@@ -5,7 +5,11 @@ WORKDIR /app
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY bindings ./bindings
-COPY crates ./crates
+COPY apps ./apps
+COPY core ./core
+COPY endpoints ./endpoints
+COPY providers ./providers
+COPY services ./services
 
 RUN cargo build --locked --release --package tokn-gateway-cli --bin tokn-gateway
 

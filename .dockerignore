@@ -1,6 +1,7 @@
 .git
 .github
-target
+**/target
+apps/desktop
 nohup.out
 tmp
 **/node_modules
