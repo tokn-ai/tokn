@@ -41,7 +41,7 @@ disposable Codex, Claude Code, OpenCode, Pi, and DSH agent containers through Bu
 From this workspace:
 
 ```sh
-cargo install --path crates/gateway-cli
+cargo install --path apps/gateway-cli
 ```
 
 Or run directly during development:
@@ -983,8 +983,16 @@ validated routing configuration. Run `pnpm desktop` from that directory.
 
 ## Development
 
-This is a Rust workspace. The runtime entrypoint lives in
-`crates/gateway-cli`; `crates/router` owns the HTTP API/router/proxy wiring.
+| Directory | What lives here |
+| --- | --- |
+| `core/` | Shared types, policy, configuration, authentication, the model catalogue, and transport contracts. |
+| `providers/` | Upstream drivers for Copilot, DeepSeek, llama.cpp, OpenAI, OpenCode, and Z.AI. |
+| `endpoints/` | Chat Completions, Responses, and Messages schemas, shared endpoint types and macros, and cross-endpoint conversion. |
+| `services/` | Account management, request execution, gateway routing and proxying, and SQLite persistence. |
+| `apps/` | The gateway CLI entry point (`gateway-cli`), desktop app (`desktop`), Rust SDK (`sdk`), and Rust re-export crate (`tokn`). |
+
+The Python and TypeScript SDK bindings live in `bindings/`. The desktop app
+has its own Cargo workspace under `apps/desktop/src-tauri`.
 
 ```sh
 cargo fmt --all

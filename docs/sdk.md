@@ -685,13 +685,13 @@ time. Standard builds re-export the original upstream types; embedded builds
 use local static/inline/`Rc` storage. The local backend supports single-threaded,
 non-atomic targets and is intentionally neither `Send` nor `Sync`.
 
-`crates/sdk/tests/interpretation_parity.rs` constructs clients with standard and
+`apps/sdk/tests/interpretation_parity.rs` constructs clients with standard and
 custom adapters from the same in-memory rules and accounts, using controlled
 upstream responses: stream mode, initiator headers, session aliases, option
 precedence, and account affinity. Extraction-stage
 comparisons also cover request purpose across all three APIs and missing-model
 behavior. These checks establish interpretation parity, not full stage parity.
-`crates/requests/tests/injected_event_parity.rs` compares usage and terminal
+`services/requests/tests/injected_event_parity.rs` compares usage and terminal
 events across all nine upstream/requested API pairs for buffered JSON,
 buffered SSE, and live SSE, including conversion failure and cancellation.
 
@@ -701,8 +701,8 @@ buffered generation, and suspended stream reads. The latter is compiled for both
 targets below:
 
 ```sh
-cargo test --locked --manifest-path crates/sdk/tests/std/Cargo.toml
-cargo test --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml
-cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv6m-none-eabi
-cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target thumbv7em-none-eabihf --release
+cargo test --locked --manifest-path apps/sdk/tests/std/Cargo.toml
+cargo test --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml
+cargo build --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml --target thumbv6m-none-eabi
+cargo build --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml --target thumbv7em-none-eabihf --release
 ```

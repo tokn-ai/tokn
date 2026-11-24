@@ -245,8 +245,8 @@ jobs:
               "Cargo.toml",
               "pyproject.toml",
               "bindings/python/Cargo.toml",
-              "crates/sdk/Cargo.toml",
-              "crates/catalogue/vendor/models.dev.json",
+              "apps/sdk/Cargo.toml",
+              "core/catalogue/vendor/models.dev.json",
             ):
               assert f"{root}/{path}" in names, path
             project = tomllib.load(archive.extractfile(f"{root}/pyproject.toml"))

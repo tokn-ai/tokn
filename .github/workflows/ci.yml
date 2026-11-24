@@ -143,29 +143,29 @@ jobs:
         with:
           workspaces: |
             .
-            crates/sdk/tests/no_std
-            crates/accounts/tests/no_std
+            apps/sdk/tests/no_std
+            services/accounts/tests/no_std
 
       - name: Test isolated alloc-only consumer
         run: |
-          cargo fmt --manifest-path crates/sdk/tests/no_std/Cargo.toml -- --check
-          cargo clippy --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml
+          cargo fmt --manifest-path apps/sdk/tests/no_std/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml
           cargo test --locked -p tokn-sdk --no-default-features --lib
           cargo test --locked -p tokn-core --no-default-features
           cargo test --locked -p tokn-accounts --no-default-features
           cargo test --locked -p tokn-convert --no-default-features --lib
-          cargo fmt --manifest-path crates/accounts/tests/no_std/Cargo.toml -- --check
-          cargo clippy --locked --manifest-path crates/accounts/tests/no_std/Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path crates/accounts/tests/no_std/Cargo.toml
+          cargo fmt --manifest-path services/accounts/tests/no_std/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path services/accounts/tests/no_std/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path services/accounts/tests/no_std/Cargo.toml
 
       - name: Build SDK and consumer for bare metal
         run: |
           for target in thumbv6m-none-eabi thumbv7em-none-eabihf; do
             cargo build --locked -p tokn-sdk --lib --no-default-features --target "$target"
-            cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target"
-            cargo build --locked --manifest-path crates/sdk/tests/no_std/Cargo.toml --target "$target" --release
-            cargo build --locked --manifest-path crates/accounts/tests/no_std/Cargo.toml --target "$target"
+            cargo build --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml --target "$target"
+            cargo build --locked --manifest-path apps/sdk/tests/no_std/Cargo.toml --target "$target" --release
+            cargo build --locked --manifest-path services/accounts/tests/no_std/Cargo.toml --target "$target"
           done
 
   sdk-std:
@@ -183,13 +183,13 @@ jobs:
       - name: Cache isolated consumer
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/sdk/tests/std
+          workspaces: apps/sdk/tests/std
 
       - name: Test isolated default-feature consumer
         run: |
-          cargo fmt --manifest-path crates/sdk/tests/std/Cargo.toml -- --check
-          cargo clippy --locked --manifest-path crates/sdk/tests/std/Cargo.toml --all-targets -- -D warnings
-          cargo test --locked --manifest-path crates/sdk/tests/std/Cargo.toml
+          cargo fmt --manifest-path apps/sdk/tests/std/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path apps/sdk/tests/std/Cargo.toml --all-targets -- -D warnings
+          cargo test --locked --manifest-path apps/sdk/tests/std/Cargo.toml
 
   test:
     runs-on: ${{ matrix.os }}
