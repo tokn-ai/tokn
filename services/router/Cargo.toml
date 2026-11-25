@@ -43,7 +43,6 @@ rcgen = { workspace = true }
 reqwest = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -60,5 +59,6 @@ time = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+rustls-pemfile = { workspace = true }
 tempfile = "3"
 tokn-persistence = { workspace = true }
