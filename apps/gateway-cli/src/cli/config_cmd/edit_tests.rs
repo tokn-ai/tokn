@@ -28,6 +28,33 @@ fn unset_key(path: &Path, key: &str) -> Result<()> {
 }
 
 #[test]
+fn model_score_edits_report_the_first_fragment_contributing_the_pattern() {
+  let directory = tempfile::tempdir().unwrap();
+  let path = directory.path().join("config.toml");
+  let original = "[model_scores.'gpt-*']\nopenai = 1\n";
+  std::fs::write(&path, original).unwrap();
+  let fragments = paths::config_fragment_dir(&path);
+  std::fs::create_dir(&fragments).unwrap();
+  std::fs::write(fragments.join("z.toml"), "[model_scores.'gpt-*']\nopenai = 9\n").unwrap();
+  let first = fragments.join("a.toml");
+  std::fs::write(&first, "[model_scores.'gpt-*']\ncodex = 2\n").unwrap();
+
+  let key = "model_scores.gpt-*.openai";
+  let expected = format!("{key} is managed by {}; edit that fragment instead", first.display());
+  let get = cmd_get(
+    &path,
+    GetArgs {
+      key: key.into(),
+      account: None,
+    },
+  );
+  assert_eq!(get.unwrap_err().to_string(), expected);
+  assert_eq!(set_key(&path, key, "3", false).unwrap_err().to_string(), expected);
+  assert_eq!(unset_key(&path, key).unwrap_err().to_string(), expected);
+  assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+}
+
+#[test]
 fn init_template_nested_values_can_be_read_and_updated() {
   let directory = tempfile::tempdir().unwrap();
   let path = directory.path().join("config.toml");

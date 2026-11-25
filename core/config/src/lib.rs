@@ -11,6 +11,8 @@ pub mod error;
 #[cfg(feature = "std")]
 mod file_identity;
 #[cfg(feature = "std")]
+pub mod files;
+#[cfg(feature = "std")]
 pub mod paths;
 #[cfg(feature = "std")]
 mod schema;

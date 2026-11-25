@@ -12,6 +12,18 @@ pub(crate) enum SchemaMarkerError {
   Unsupported(i64),
 }
 
+impl SchemaMarkerError {
+  pub(crate) fn at_path(self, path: &std::path::Path) -> crate::Error {
+    match self {
+      Self::NonInteger => crate::Error::InvalidSchemaVersion { path: path.to_owned() },
+      Self::Unsupported(found) => crate::Error::UnsupportedSchemaVersion {
+        path: path.to_owned(),
+        found,
+      },
+    }
+  }
+}
+
 pub(crate) fn detect_toml(document: &toml::Value) -> Result<ConfigSchema, SchemaMarkerError> {
   classify(
     document

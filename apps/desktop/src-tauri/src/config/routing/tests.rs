@@ -214,15 +214,17 @@ fn overview_uses_captured_bytes_when_live_files_change() {
   let path = directory.path().join("config.toml");
   let contents = "[defaults]\naccounts = ['captured-account']\n";
   let overlay_path = directory.path().join("config.d/codex-cli.toml");
-  let overlays = vec![(
-    overlay_path.clone(),
-    b"[profiles.coding]\nagent_id = 'codex-cli'\naccounts = ['captured-profile']\n".to_vec(),
-  )];
-  std::fs::write(&path, "this is not the captured configuration").unwrap();
   std::fs::create_dir(overlay_path.parent().unwrap()).unwrap();
+  std::fs::write(
+    &overlay_path,
+    "[profiles.coding]\nagent_id = 'codex-cli'\naccounts = ['captured-profile']\n",
+  )
+  .unwrap();
+  let fragments = ConfigFragments::read(&path, ConfigSchema::Legacy).unwrap();
+  std::fs::write(&path, "this is not the captured configuration").unwrap();
   std::fs::write(&overlay_path, "this is not the captured fragment").unwrap();
   let document: DocumentMut = contents.parse().unwrap();
-  let overview = summarize(&path, contents, &document, &overlays, ConfigSchema::Legacy).unwrap();
+  let overview = summarize(&path, contents, &document, &fragments, ConfigSchema::Legacy).unwrap();
   assert_eq!(
     value(&overview.profiles[0].fields, "Account selection"),
     "captured-account"
@@ -283,6 +285,29 @@ fn invalid_legacy_overlay_keeps_the_primary_editor_available() {
   assert!(error.contains("agent_id"));
   assert!(document.routing_toml.contains("primary-account"));
   assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+}
+
+#[test]
+fn malformed_fragment_errors_hide_source_lines_on_read_and_save() {
+  let directory = tempfile::tempdir().unwrap();
+  let path = directory.path().join("config.toml");
+  let primary = "[defaults]\naccounts = ['primary-account']\n";
+  std::fs::write(&path, primary).unwrap();
+  let fragments = directory.path().join("config.d");
+  std::fs::create_dir(&fragments).unwrap();
+  let fragment = fragments.join("scores.toml");
+  std::fs::write(&fragment, "key = 'private-fragment-value' invalid\n").unwrap();
+
+  let document = super::super::read_at(&path).unwrap();
+  let read_error = document.overview_error.expect("malformed fragment");
+  let save_error = super::super::save_at(&path, &document.revision, "")
+    .err()
+    .expect("malformed fragment must block saves");
+  for error in [read_error, format!("{save_error:#}")] {
+    assert!(error.contains(&fragment.display().to_string()));
+    assert!(!error.contains("private-fragment-value"));
+  }
+  assert_eq!(std::fs::read_to_string(path).unwrap(), primary);
 }
 
 #[test]

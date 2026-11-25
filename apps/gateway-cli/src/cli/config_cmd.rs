@@ -9,6 +9,7 @@ use inquire::{Confirm, Text};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tokn_auth::AuthStore;
+use tokn_config::files::{fragment_paths, ConfigFragments};
 use tokn_config::RouteMode;
 use toml_edit::{value, Array, DocumentMut, Item, Value as EditValue};
 
@@ -172,11 +173,8 @@ pub async fn run(cfg_path: Option<PathBuf>, args: ConfigArgs) -> Result<()> {
 // --- get ---------------------------------------------------------------
 
 fn cmd_get(path: &std::path::Path, args: GetArgs) -> Result<()> {
-  let schema = crate::config::detect_config_schema(path)?;
-  reject_v2_account_selector(schema, args.account.as_deref())?;
-  let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   let doc = load_doc(path)?;
+  let segments = primary_key_segments(path, &doc, args.account.as_deref(), &args.key)?;
   match lookup(&doc, &segments) {
     Some(item) => {
       print!("{}", render_item(item));
@@ -209,12 +207,9 @@ fn render_item(item: &Item) -> String {
 // --- set ---------------------------------------------------------------
 
 fn cmd_set(path: &std::path::Path, args: SetArgs) -> Result<()> {
-  let schema = crate::config::detect_config_schema(path)?;
-  reject_v2_account_selector(schema, args.account.as_deref())?;
-  let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   #[allow(clippy::result_large_err)]
   crate::config::edit_primary_in_place(path, |doc| {
+    let segments = primary_key_segments(path, doc, args.account.as_deref(), &args.key)?;
     if args.add {
       append_array(doc, &segments, &args.value)?;
     } else {
@@ -279,12 +274,9 @@ fn append_array(doc: &mut DocumentMut, segments: &[String], raw: &str) -> Result
 // --- unset -------------------------------------------------------------
 
 fn cmd_unset(path: &std::path::Path, args: UnsetArgs) -> Result<()> {
-  let schema = crate::config::detect_config_schema(path)?;
-  reject_v2_account_selector(schema, args.account.as_deref())?;
-  let segments = key_segments(args.account.as_deref(), &args.key);
-  ensure_root_key_is_not_fragment_managed(path, schema, &segments)?;
   #[allow(clippy::result_large_err)]
   crate::config::edit_primary_in_place(path, |doc| {
+    let segments = primary_key_segments(path, doc, args.account.as_deref(), &args.key)?;
     if !remove(doc, &segments) {
       return Err(anyhow::anyhow!("key not found: {}", args.key).into());
     }
@@ -328,21 +320,13 @@ fn cmd_edit(path: &std::path::Path) -> Result<()> {
 }
 
 fn print_fragment_editor_note(path: &std::path::Path) {
-  let fragment_dir = paths::config_fragment_dir(path);
-  let has_fragments = fragment_dir.is_dir()
-    && std::fs::read_dir(&fragment_dir)
-      .ok()
-      .into_iter()
-      .flatten()
-      .filter_map(Result::ok)
-      .map(|entry| entry.path())
-      .any(|entry| entry.is_file() && entry.extension().is_some_and(|extension| extension == "toml"));
+  let has_fragments = fragment_paths(path).is_ok_and(|paths| !paths.is_empty());
   let agent_config = tokn_agent_migration::agent_config_path(path);
   if has_fragments || agent_config.is_file() {
     eprintln!(
       "note: agent integration intent is managed in {}; runtime overlays are under {}; this editor changes only {}",
       agent_config.display(),
-      fragment_dir.display(),
+      paths::config_fragment_dir(path).display(),
       path.display()
     );
   }
@@ -681,11 +665,14 @@ fn key_segments(account: Option<&str>, key: &str) -> Vec<String> {
   out
 }
 
-fn reject_v2_account_selector(schema: ConfigSchema, account: Option<&str>) -> Result<()> {
+fn primary_key_segments(path: &Path, doc: &DocumentMut, account: Option<&str>, key: &str) -> Result<Vec<String>> {
+  let schema = tokn_config::detect_edit_config_schema(doc, path)?;
   if schema == ConfigSchema::V2 && account.is_some() {
     bail!("`--account` addresses legacy inline accounts; v2 accounts are managed by `tokn-router account`");
   }
-  Ok(())
+  let segments = key_segments(account, key);
+  ensure_root_key_is_not_fragment_managed(path, doc, schema, &segments)?;
+  Ok(segments)
 }
 
 /// The generic config editor operates on the primary TOML source. Runtime
@@ -693,6 +680,7 @@ fn reject_v2_account_selector(schema: ConfigSchema, account: Option<&str>) -> Re
 /// keys would report a change that has no runtime effect.
 fn ensure_root_key_is_not_fragment_managed(
   path: &std::path::Path,
+  doc: &DocumentMut,
   schema: ConfigSchema,
   segments: &[String],
 ) -> Result<()> {
@@ -715,38 +703,34 @@ fn ensure_root_key_is_not_fragment_managed(
       );
     }
   }
-  let loaded = Config::load_with_sources(Some(path))?;
-  for fragment_path in &loaded.sources.fragments {
-    let fragment = load_doc(fragment_path)?;
-    let managed = fragment
-      .get(section)
-      .and_then(Item::as_table_like)
-      .and_then(|items| items.get(name))
-      .is_some();
-    if managed {
-      if section == "model_scores" {
-        bail!(
-          "{} is managed by {}; edit that fragment instead",
-          segments.join("."),
-          fragment_path.display()
-        );
-      }
+  let fragments = ConfigFragments::read(path, schema)?;
+  let loaded = fragments.parse_legacy(&doc.to_string())?;
+  if let Some(fragment_path) = loaded.fragment_source(section, name) {
+    if section == "model_scores" {
       bail!(
-        "{} is managed by {}; use `agent link`, `agent sync`, or `agent unlink` instead",
+        "{} is managed by {}; edit that fragment instead",
         segments.join("."),
         fragment_path.display()
       );
     }
+    bail!(
+      "{} is managed by {}; use `agent link`, `agent sync`, or `agent unlink` instead",
+      segments.join("."),
+      fragment_path.display()
+    );
   }
   Ok(())
 }
 
 fn load_doc(path: &std::path::Path) -> Result<DocumentMut> {
-  if !path.exists() {
-    return Ok(DocumentMut::new());
-  }
-  let raw = std::fs::read_to_string(path)?;
-  raw.parse().context("invalid TOML")
+  let raw = match std::fs::read_to_string(path) {
+    Ok(raw) => raw,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(DocumentMut::new()),
+    Err(error) => return Err(error).with_context(|| format!("read config `{}`", path.display())),
+  };
+  raw
+    .parse()
+    .with_context(|| format!("parse config `{}`", path.display()))
 }
 
 #[cfg(test)]
@@ -940,12 +924,10 @@ client_auth = "none"
     let path = directory.path().join("config.toml");
     write_v2_config(&path);
 
-    assert!(ensure_root_key_is_not_fragment_managed(
-      &path,
-      ConfigSchema::V2,
-      &["profiles".into(), "default".into(), "route".into()],
-    )
-    .is_ok());
+    let fragment_dir = paths::config_fragment_dir(&path);
+    std::fs::create_dir(&fragment_dir).unwrap();
+    std::fs::write(fragment_dir.join("ignored.toml"), "invalid TOML").unwrap();
+    assert!(primary_key_segments(&path, &load_doc(&path).unwrap(), None, "profiles.default.route").is_ok());
     print_fragment_editor_note(&path);
   }
 
@@ -1103,8 +1085,10 @@ agents:
     )
     .unwrap();
 
+    let doc = load_doc(&root).unwrap();
     let err = ensure_root_key_is_not_fragment_managed(
       &root,
+      &doc,
       ConfigSchema::Legacy,
       &["agents".into(), "opencode".into(), "mode".into()],
     )
@@ -1114,6 +1098,7 @@ agents:
     assert!(err.contains("agent link"));
     assert!(ensure_root_key_is_not_fragment_managed(
       &root,
+      &doc,
       ConfigSchema::Legacy,
       &["profiles".into(), "other".into(), "mode".into()],
     )
@@ -1128,6 +1113,7 @@ opencode-go = 100
     .unwrap();
     let err = ensure_root_key_is_not_fragment_managed(
       &root,
+      &doc,
       ConfigSchema::Legacy,
       &["model_scores".into(), "gpt-5.6-luna".into(), "opencode-go".into()],
     )

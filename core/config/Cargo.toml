@@ -46,6 +46,10 @@ tracing = { workspace = true, optional = true }
 tempfile = { version = "3", optional = true }
 
 [[test]]
+name = "config_files"
+required-features = ["std"]
+
+[[test]]
 name = "v2_compile"
 required-features = ["std"]
 
