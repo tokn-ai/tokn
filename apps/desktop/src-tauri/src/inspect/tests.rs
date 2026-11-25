@@ -102,7 +102,7 @@ async fn get_response(requests_dir: &std::path::Path, sessions_db: &std::path::P
     }
   };
   let result = dispatch(
-    InspectState {
+    DbPaths {
       requests_dir: requests_dir.into(),
       sessions_db: sessions_db.into(),
       usage_db: sessions_db.with_file_name("usage.db"),

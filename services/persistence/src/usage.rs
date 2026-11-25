@@ -3,12 +3,14 @@ use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::stage::{
   ConvertedResponseSummary, ExtractedSummary, ResolvedSummary, SentSummary, Stage, StageEvent,
 };
 use tokn_core::request_event::{RecordEvent, RequestEndpoint, RequestEventPayload};
+use tokn_core::util::now_unix_ms;
 
 #[derive(Default)]
 struct PendingUsageRecord {
@@ -101,6 +103,14 @@ pub struct UsageDb {
   conn: Connection,
 }
 
+#[derive(Debug, snafu::Snafu)]
+pub enum SummaryError {
+  #[snafu(display("usage summary window exceeds the supported range of milliseconds"))]
+  WindowTooLarge,
+  #[snafu(transparent)]
+  Database { source: crate::Error },
+}
+
 impl UsageDb {
   /// Open an existing usage database without migrations or writes.
   /// Summary queries require the current usage schema; older schemas report
@@ -170,6 +180,17 @@ impl UsageDb {
       ],
     )?;
     Ok(())
+  }
+
+  /// Summarize requests since the start of a window relative to the current time.
+  pub fn summary_for_window(
+    &self,
+    window: Duration,
+    account: Option<&str>,
+    provider: Option<&str>,
+  ) -> Result<Vec<RowSummary>, SummaryError> {
+    let millis = i64::try_from(window.as_millis()).map_err(|_| SummaryError::WindowTooLarge)?;
+    Ok(self.summary(now_unix_ms().saturating_sub(millis), account, provider)?)
   }
 
   /// Summarize requests since a Unix timestamp in milliseconds.
@@ -609,6 +630,31 @@ mod tests {
     assert_eq!(rows[0].account, None);
     assert_eq!(rows[0].provider, None);
     assert_eq!(rows[0].input_tokens, 12);
+  }
+
+  #[test]
+  fn summary_window_applies_duration_and_filters_and_rejects_overflow() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(BOOTSTRAP).unwrap();
+    let now = now_unix_ms();
+    conn
+      .execute(
+        "INSERT INTO requests (ts, account_id, provider_id, model) VALUES
+         (?1, 'a', 'p', 'recent'), (?2, 'a', 'p', 'old'),
+         (?1, 'b', 'p', 'other account'), (?1, 'a', 'q', 'other provider')",
+        params![now, now - 7_200_000],
+      )
+      .unwrap();
+    let db = UsageDb { conn };
+    let rows = db
+      .summary_for_window(Duration::from_secs(3600), Some("a"), Some("p"))
+      .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].model, "recent");
+    assert!(matches!(
+      db.summary_for_window(Duration::MAX, None, None),
+      Err(SummaryError::WindowTooLarge)
+    ));
   }
 
   #[test]
