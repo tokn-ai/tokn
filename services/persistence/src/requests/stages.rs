@@ -11,7 +11,7 @@
 //! `request_id → day` index used to route updates to the correct file.
 
 use super::{composite_request_id, RequestsDb};
-use crate::archive::RequestMaintenanceLock;
+use crate::request_files::RequestMaintenanceLock;
 use crate::{headers_json, Result};
 use rusqlite::params;
 use serde_json::{Map, Value};

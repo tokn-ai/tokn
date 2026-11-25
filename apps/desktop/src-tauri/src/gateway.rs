@@ -129,7 +129,7 @@ impl Gateway {
       .await
       .context("Listener is already in use; the desktop app will not replace it")?;
     drop(guard);
-    tokn_gateway_lifecycle::supervise(&mut command);
+    tokn_gateway::supervision::supervise(&mut command);
     let mut process = command
       .arg("--config")
       .arg(config_path)
@@ -142,7 +142,7 @@ impl Gateway {
     *self.last_error.lock().await = None;
     let managed = child.insert(ManagedGateway::new(process)?);
     let ready = async {
-      tokn_gateway_lifecycle::wait_ready(&mut stdout)
+      tokn_gateway::supervision::wait_ready(&mut stdout)
         .await
         .context("Waiting for the bundled worker to register")?;
       anyhow::ensure!(healthy(address).await, "The bundled gateway failed its health check");
@@ -153,7 +153,7 @@ impl Gateway {
       .context("Gateway startup timed out")
       .and_then(|result| result)
     {
-      let exit = tokn_gateway_lifecycle::stop(&mut managed.process).await?;
+      let exit = tokn_gateway::supervision::stop(&mut managed.process).await?;
       let message = format!("{error:#}. {}", managed.exit_error(exit).await);
       *child = None;
       *self.last_error.lock().await = Some(message.clone());
@@ -165,7 +165,7 @@ impl Gateway {
   pub async fn stop(&self) -> Result<()> {
     let mut child = self.child.lock().await;
     if let Some(managed) = child.as_mut() {
-      tokn_gateway_lifecycle::stop(&mut managed.process).await?;
+      tokn_gateway::supervision::stop(&mut managed.process).await?;
       *child = None;
     }
     Ok(())

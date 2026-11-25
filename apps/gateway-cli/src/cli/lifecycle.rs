@@ -1,29 +1,14 @@
-//! Stable listener discovery, worker promotion, and process ownership.
+//! CLI adapters for the Unix gateway frontend and worker lifecycle.
 use super::rollout::{default_duration, default_policy, RolloutArgs};
 use super::serve::{self, ServeArgs};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::fs::OpenOptions;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
-use tokio::task::JoinSet;
 use tokn_core::util::shutdown::ShutdownSignal;
-use tokn_gateway_lifecycle::{FrontendOwner, ParentLease};
-use tokn_router::ipc::{WorkerEndpoint, WorkerPool};
-use tokn_router::routing::{AbTestStatus, RolloutPolicy, RoutingControl};
-
-// Optional capabilities extend control v2 without excluding older worker binaries.
-const CONTROL_PROTOCOL_VERSION: u32 = 2;
-const START_TIMEOUT: Duration = Duration::from_secs(15);
-const MESSAGE_LIMIT: u64 = 64 * 1024;
+use tokn_gateway::control::{self, FrontendInfo};
+use tokn_router::routing::RolloutPolicy;
 
 #[derive(Subcommand, Debug)]
 pub enum WorkerCmd {
@@ -46,264 +31,9 @@ pub struct WorkerArgs {
   no_proxy: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct FrontendInfo {
-  protocol_version: u32,
-  #[serde(default)]
-  supports_ab_test: bool,
-  #[serde(default)]
-  supports_ab_test_status: bool,
-  #[serde(default)]
-  capabilities: Vec<String>,
-  frontend_pid: u32,
-  args: ServeArgs,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
-enum ControlRequest {
-  Inspect,
-  AbTestStatus,
-  Retire,
-  Register {
-    worker_id: String,
-    socket_path: PathBuf,
-    candidate: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    ab_test: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    rollout_policy: Option<RolloutPolicy>,
-  },
-}
-
-fn is_false(value: &bool) -> bool {
-  !*value
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-enum ControlReply {
-  Info { info: FrontendInfo },
-  AbTest { ab_test: Option<AbTestStatus> },
-  Registered,
-  Retired,
-  Stopping,
-  Error { message: String },
-}
-
 fn runtime_dir(config: Option<&Path>) -> Result<PathBuf> {
   let config = tokn_config::load_config(config)?;
-  tokn_gateway_lifecycle::runtime_dir(config.path())
-}
-
-async fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
-  let mut bytes = serde_json::to_vec(message)?;
-  anyhow::ensure!(bytes.len() < MESSAGE_LIMIT as usize, "control message exceeds limit");
-  bytes.push(b'\n');
-  stream.write_all(&bytes).await?;
-  Ok(())
-}
-
-async fn read_message<T: DeserializeOwned>(stream: &mut BufReader<UnixStream>) -> Result<T> {
-  read_buffered_message(stream, &mut Vec::new()).await
-}
-
-async fn read_buffered_message<T: DeserializeOwned>(
-  stream: &mut BufReader<UnixStream>,
-  bytes: &mut Vec<u8>,
-) -> Result<T> {
-  let remaining = MESSAGE_LIMIT.saturating_sub(bytes.len() as u64);
-  let read = stream.take(remaining + 1).read_until(b'\n', bytes).await?;
-  anyhow::ensure!(read > 0, "frontend control connection closed");
-  anyhow::ensure!(
-    bytes.len() as u64 <= MESSAGE_LIMIT && bytes.last() == Some(&b'\n'),
-    "invalid control message length"
-  );
-  let message = serde_json::from_slice(bytes)?;
-  bytes.clear();
-  Ok(message)
-}
-
-async fn read_ab_test_status(path: &Path) -> Result<Option<AbTestStatus>> {
-  tokio::time::timeout(Duration::from_secs(1), async {
-    let mut stream = UnixStream::connect(path).await?;
-    write_message(&mut stream, &ControlRequest::AbTestStatus).await?;
-    match read_message(&mut BufReader::new(stream)).await? {
-      ControlReply::AbTest { ab_test } => Ok(ab_test),
-      _ => anyhow::bail!("invalid frontend A/B status response"),
-    }
-  })
-  .await
-  .context("frontend A/B status timed out")?
-}
-
-async fn inspect(path: &Path) -> Result<FrontendInfo> {
-  tokio::time::timeout(Duration::from_secs(2), async {
-    let mut stream = UnixStream::connect(path).await?;
-    write_message(&mut stream, &ControlRequest::Inspect).await?;
-    match read_message(&mut BufReader::new(stream)).await? {
-      ControlReply::Info { info } => {
-        anyhow::ensure!(
-          info.protocol_version == CONTROL_PROTOCOL_VERSION,
-          "incompatible frontend control protocol; restart the frontend with this gateway version"
-        );
-        Ok(info)
-      }
-      _ => anyhow::bail!("frontend did not return discovery information"),
-    }
-  })
-  .await
-  .context("frontend discovery timed out")?
-}
-
-struct OwnedSocket {
-  path: PathBuf,
-  device: u64,
-  inode: u64,
-}
-impl Drop for OwnedSocket {
-  fn drop(&mut self) {
-    if let Ok(metadata) = std::fs::symlink_metadata(&self.path) {
-      if metadata.dev() == self.device && metadata.ino() == self.inode {
-        let _ = std::fs::remove_file(&self.path);
-      }
-    }
-  }
-}
-
-struct Registration {
-  pool: Arc<WorkerPool>,
-  worker_id: String,
-}
-impl Drop for Registration {
-  fn drop(&mut self) {
-    self.pool.disconnect(&self.worker_id);
-  }
-}
-
-async fn connection(
-  stream: UnixStream,
-  info: Arc<FrontendInfo>,
-  pool: Arc<WorkerPool>,
-  owner: Option<Arc<FrontendOwner>>,
-  mut stop: watch::Receiver<bool>,
-) -> Result<()> {
-  let mut stream = BufReader::new(stream);
-  let request = tokio::time::timeout(Duration::from_secs(5), read_message(&mut stream)).await??;
-  match request {
-    ControlRequest::Retire => anyhow::bail!("register before retiring a worker"),
-    ControlRequest::AbTestStatus => {
-      let ab_test = pool.status().ab_test;
-      write_message(stream.get_mut(), &ControlReply::AbTest { ab_test }).await
-    }
-    ControlRequest::Inspect => write_message(stream.get_mut(), &ControlReply::Info { info: (*info).clone() }).await,
-    ControlRequest::Register {
-      worker_id,
-      socket_path,
-      candidate,
-      ab_test,
-      rollout_policy,
-    } => {
-      let endpoint = WorkerEndpoint {
-        worker_id: worker_id.clone(),
-        socket_path,
-        weight: 1,
-      };
-      anyhow::ensure!(
-        !(candidate && (ab_test || rollout_policy.is_some())),
-        "--candidate and --ab-test are mutually exclusive"
-      );
-      let register = async {
-        if ab_test || rollout_policy.is_some() {
-          pool
-            .register_rollout(
-              endpoint,
-              rollout_policy.unwrap_or_else(|| default_policy(default_duration())),
-            )
-            .await
-        } else if candidate {
-          pool.register_candidate(endpoint).await
-        } else {
-          pool.register(endpoint).await
-        }
-      };
-      let result = match owner {
-        Some(owner) => owner.register(stream.get_ref().peer_cred()?.pid(), register).await,
-        None => register.await,
-      };
-      if let Err(error) = result {
-        return write_message(
-          stream.get_mut(),
-          &ControlReply::Error {
-            message: format!("{error:#}"),
-          },
-        )
-        .await;
-      }
-      let _registration = Registration {
-        pool: pool.clone(),
-        worker_id: worker_id.clone(),
-      };
-      write_message(stream.get_mut(), &ControlReply::Registered).await?;
-      tracing::info!(%worker_id, candidate, "worker registered with frontend");
-      loop {
-        let reply = tokio::select! {
-          result = pool.wait_retired(&worker_id) => { result?; ControlReply::Retired }
-          _ = stop.changed() => ControlReply::Stopping,
-          request = read_message::<ControlRequest>(&mut stream) => {
-            match request {
-              Ok(ControlRequest::Retire) => {
-                pool.retire(&worker_id)?;
-                tracing::info!(%worker_id, main_worker_id = ?pool.status().main_worker_id, "worker exiting; main worker reassigned");
-                continue;
-              }
-              Err(_) => return Ok(()),
-              _ => anyhow::bail!("unexpected registered-worker command"),
-            }
-          }
-        };
-        return write_message(stream.get_mut(), &reply).await;
-      }
-    }
-  }
-}
-
-async fn serve_control(
-  listener: UnixListener,
-  info: FrontendInfo,
-  pool: Arc<WorkerPool>,
-  owner: Option<Arc<FrontendOwner>>,
-  mut stop: watch::Receiver<bool>,
-) -> Result<()> {
-  let info = Arc::new(info);
-  let mut tasks = JoinSet::new();
-  let mut ramp_tick = tokio::time::interval(Duration::from_secs(1));
-  ramp_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-  loop {
-    tokio::select! {
-      biased;
-      _ = stop.changed() => break,
-      _ = ramp_tick.tick() => pool.advance_ab_test(),
-      result = tasks.join_next(), if !tasks.is_empty() => {
-        if let Some(Err(error)) = result { tracing::warn!(%error, "frontend control task failed"); }
-      }
-      accepted = listener.accept() => {
-        let (stream, _) = accepted?;
-        let info = info.clone();
-        let pool = pool.clone();
-        let stop = stop.clone();
-        let owner = owner.clone();
-        tasks.spawn(async move {
-          if let Err(error) = connection(stream, info, pool, owner, stop).await {
-            tracing::debug!(%error, "frontend control connection ended");
-          }
-        });
-      }
-    }
-  }
-  tasks.abort_all();
-  while tasks.join_next().await.is_some() {}
-  Ok(())
+  tokn_gateway::supervision::runtime_dir(config.path())
 }
 
 pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
@@ -314,15 +44,8 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     "--ab-test belongs to serve or worker start, not frontend"
   );
   let dir = runtime_dir(config.as_deref())?;
-  let path = dir.join("frontend.sock");
-  let lease = ParentLease::from_stdin()?;
-  let owner = lease
-    .as_ref()
-    .map(|_| FrontendOwner::for_launch().map(Arc::new))
-    .transpose()?;
   let (source, loaded) = serve::load_runtime(config, args.clone())?;
-  let (plan, service) = loaded.compiled.into_parts();
-  let pool = Arc::new(WorkerPool::empty(&plan)?);
+  let plan = loaded.compiled.gateway();
   let needs_access = plan
     .listeners()
     .values()
@@ -342,83 +65,19 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   } else {
     None
   };
-  let (events, receiver, handlers, archive) = crate::server_runtime::build_v2_ingress_event_bus(service.persistence())?;
-  let mut frontend =
-    tokn_router::frontend::Frontend::new_with_events(plan, service, access, pool.dispatcher(), events.clone())?;
-  if let Some(bind) = bind_override {
-    frontend = frontend.with_bind_override(bind)?;
-  }
-  let handle = frontend.reload_handle();
-  let reload_pool = pool.clone();
-  let reloader = tokn_router::v2::AdminReloader::new(move || {
-    let source = source.clone();
-    let handle = handle.clone();
-    let pool = reload_pool.clone();
-    async move {
-      let (loaded, revision) = tokio::task::spawn_blocking(move || source.split_candidate())
-        .await
-        .map_err(|error| tokn_router::v2::ReloadError::Invalid(error.to_string()))??;
-      let (plan, service) = loaded.compiled.into_parts();
-      pool.reload(&handle, plan, &service, &revision).await
-    }
-  });
-  let frontend = frontend
-    .with_routing_control(pool.clone())
-    .with_admin_reloader(reloader);
-  let frontend = frontend.bind().await?;
-  let listener = UnixListener::bind(&path).with_context(|| {
-    format!(
-      "bind frontend control socket {}; another frontend may already be running",
-      path.display()
-    )
-  })?;
-  let metadata = std::fs::symlink_metadata(&path)?;
-  let _socket = OwnedSocket {
-    path: path.clone(),
-    device: metadata.dev(),
-    inode: metadata.ino(),
-  };
-  std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
-  let (stop_tx, mut stop_rx) = watch::channel(false);
-  let control = serve_control(
-    listener,
-    FrontendInfo {
-      protocol_version: CONTROL_PROTOCOL_VERSION,
-      supports_ab_test: true,
-      supports_ab_test_status: true,
-      capabilities: vec!["rollout_policy_v1".into()],
-      frontend_pid: std::process::id(),
+  let gateway = tokn_gateway::frontend::Gateway::bind(&dir, loaded.compiled, bind_override, access, move || {
+    let (loaded, revision) = source.split_candidate()?;
+    Ok((loaded.compiled, revision))
+  })
+  .await?;
+  gateway
+    .serve(
       args,
-    },
-    pool,
-    owner.clone(),
-    stop_rx.clone(),
-  );
-  let public = frontend.serve(async move {
-    let _ = stop_rx.changed().await;
-  });
-  let released = async {
-    match (owner, lease) {
-      (Some(owner), Some(lease)) => owner.released(lease).await,
-      _ => std::future::pending().await,
-    }
-  };
-  let stopping = async {
-    tokio::select! { result = shutdown.wait() => result, result = released => result }
-  };
-  tokio::pin!(control, public);
-  tracing::info!(control_socket = %path.display(), "frontend starting; waiting for workers");
-  let result = tokio::select! {
-    result = &mut public => { let _ = stop_tx.send(true); result.and(control.await) }
-    result = &mut control => { let _ = stop_tx.send(true); result.and(public.await) }
-    result = stopping => {
-      let _ = stop_tx.send(true);
-      result.map_err(anyhow::Error::from).and(public.await).and(control.await)
-    }
-  };
-  let cleanup = crate::server_runtime::finish_events(&events, archive).await;
-  result.and(cleanup)
+      default_policy(default_duration()),
+      crate::server_runtime::maintenance_handlers(),
+      shutdown.wait(),
+    )
+    .await
 }
 
 pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
@@ -426,11 +85,11 @@ pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
   let WorkerCmd::Start(args) = command;
   let discovery = args.frontend_config.as_deref().or(config.as_deref());
   let dir = runtime_dir(discovery)?;
-  let control_path = dir.join("frontend.sock");
+  let control_path = control::control_socket_path(&dir);
   let info = tokio::select! {
     biased;
     result = shutdown.recv() => return result.map_err(Into::into),
-    result = inspect(&control_path) => result.context(
+    result = control::inspect(&control_path) => result.context(
       "no compatible frontend; run `tokn-gateway frontend --with-proxy` or `tokn-gateway serve --with-proxy` first",
     )?,
   };
@@ -451,7 +110,7 @@ struct WorkerRegistration {
 async fn start_worker(
   config: Option<PathBuf>,
   dir: PathBuf,
-  info: FrontendInfo,
+  info: FrontendInfo<ServeArgs>,
   registration: WorkerRegistration,
   mut shutdown: ShutdownSignal,
   supervisor: Option<oneshot::Receiver<()>>,
@@ -461,32 +120,17 @@ async fn start_worker(
     rollout_policy,
     no_proxy,
   } = registration;
-  let ab_test = rollout_policy.is_some();
-  let rollout_policy = if info
-    .capabilities
-    .iter()
-    .any(|capability| capability == "rollout_policy_v1")
-  {
-    rollout_policy
-  } else {
-    anyhow::ensure!(
-      rollout_policy
-        .as_ref()
-        .is_none_or(|policy| *policy == default_policy(default_duration())),
-      "this frontend cannot execute custom rollout policies; restart it with a version supporting rollout_policy_v1"
-    );
-    None
-  };
-  anyhow::ensure!(
-    !ab_test || info.supports_ab_test,
-    "this frontend does not support --ab-test; restart it with a gateway version supporting automatic A/B ramps"
-  );
-  let worker_id = uuid::Uuid::new_v4().simple().to_string();
-  let socket_path = dir.join(format!("w-{worker_id}.sock"));
-  let expected_frontend = supervisor.as_ref().map(|_| info.frontend_pid);
-  let supports_ab_test_status = info.supports_ab_test_status;
+  let supervised = supervisor.is_some();
+  let attachment = info.worker_attachment(
+    &dir,
+    candidate,
+    rollout_policy,
+    &default_policy(default_duration()),
+    supervised,
+  )?;
+  let worker_id = attachment.worker_id().to_owned();
   let mut args = info.args;
-  args.worker_socket = Some(socket_path.clone());
+  args.worker_socket = Some(attachment.socket_path().to_owned());
   args.no_proxy |= no_proxy;
   let (source, mut loaded) = serve::load_runtime(config, args)?;
   // Public binding consent is consumed during projection; this process only binds IPC.
@@ -494,107 +138,13 @@ async fn start_worker(
   loaded.args.host = None;
   loaded.args.port = None;
   let (stop_tx, mut stop_rx) = watch::channel(false);
-  let server = serve::run_loaded(source, loaded, async move {
+  let server = serve::run_loaded(source, loaded, info.maintenance_requests_dir.as_deref(), async move {
     let _ = stop_rx.changed().await;
     Ok(())
   });
   tokio::pin!(server);
-  // Poll only during startup. A long-lived control connection owns registration
-  // and delivers retirement without polling or observing idle CONNECT tunnels.
-  let (retire_tx, mut retire_rx) = watch::channel(false);
-  let attach = async {
-    tokio::time::timeout(START_TIMEOUT, async {
-      loop {
-        if *retire_rx.borrow() {
-          return Ok::<(), anyhow::Error>(());
-        }
-        match UnixStream::connect(&socket_path).await {
-          Ok(stream) => {
-            drop(stream);
-            return Ok::<(), anyhow::Error>(());
-          }
-          Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tokio::time::sleep(Duration::from_millis(10)).await
-          }
-          Err(error) => return Err(error.into()),
-        }
-      }
-    })
-    .await
-    .context("worker socket startup timed out")??;
-    if *retire_rx.borrow() {
-      return Ok(());
-    }
-    let mut stream = UnixStream::connect(dir.join("frontend.sock")).await?;
-    if let Some(pid) = expected_frontend {
-      anyhow::ensure!(
-        stream.peer_cred()?.pid().and_then(|peer| u32::try_from(peer).ok()) == Some(pid),
-        "frontend was replaced during supervised startup"
-      );
-    }
-    write_message(
-      &mut stream,
-      &ControlRequest::Register {
-        worker_id: worker_id.clone(),
-        socket_path,
-        candidate,
-        ab_test,
-        rollout_policy,
-      },
-    )
-    .await?;
-    let mut stream = BufReader::new(stream);
-    match tokio::time::timeout(START_TIMEOUT, read_message(&mut stream)).await?? {
-      ControlReply::Registered => {}
-      ControlReply::Error { message } => anyhow::bail!(message),
-      _ => anyhow::bail!("invalid frontend registration response"),
-    }
-    if expected_frontend.is_some() {
-      tokn_gateway_lifecycle::notify_ready()?;
-    }
-    tracing::info!(%worker_id, "worker started; frontend owns traffic assignment");
-    let mut retirement_sent = false;
-    let mut reply_buffer = Vec::new();
-    let mut status_tick = tokio::time::interval(Duration::from_secs(5));
-    status_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let control_path = dir.join("frontend.sock");
-    loop {
-      if !retirement_sent && *retire_rx.borrow() {
-        write_message(stream.get_mut(), &ControlRequest::Retire).await?;
-        retirement_sent = true;
-      }
-      let status_update = async {
-        status_tick.tick().await;
-        read_ab_test_status(&control_path).await
-      };
-      let reply = tokio::select! {
-        status = status_update, if supports_ab_test_status => {
-          match status {
-            Ok(status) => crate::progress::set_ab_test_status(status),
-            Err(error) => {
-              crate::progress::set_ab_test_status(None);
-              tracing::debug!(%error, "frontend A/B banner status unavailable");
-            }
-          }
-          continue;
-        }
-        reply = read_buffered_message(&mut stream, &mut reply_buffer) => reply,
-        result = retire_rx.changed(), if !retirement_sent => { result?; continue; }
-      };
-      match reply {
-        Ok(ControlReply::Retired) => {
-          tracing::info!(%worker_id, "worker drained; exiting");
-          return Ok(());
-        }
-        Ok(ControlReply::Stopping) => return Ok(()),
-        Ok(_) => anyhow::bail!("unexpected frontend lifecycle message"),
-        Err(error) => {
-          tracing::warn!(%error, "frontend disconnected; stopping worker");
-          return Ok(());
-        }
-      }
-    }
-  };
+  let (retire_tx, retire_rx) = watch::channel(false);
+  let attach = attachment.attach(retire_rx, crate::progress::set_ab_test_status);
   tokio::pin!(attach);
   let mut attachment_done = false;
   let mut attachment_result = Ok(());
@@ -611,7 +161,9 @@ async fn start_worker(
   loop {
     tokio::select! {
       biased;
-      result = shutdown.recv() => {
+      // The supervisor coordinates termination with frontend drain. An
+      // independently launched worker handles its own shutdown signals.
+      result = shutdown.recv(), if !supervised => {
         result?;
         if interrupted {
           eprintln!("Second shutdown signal received; exiting immediately.");
@@ -641,27 +193,8 @@ async fn start_worker(
 
 pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let mut shutdown = ShutdownSignal::new()?;
-  let mut parent = ParentLease::from_stdin()?;
-  let mut owned = None;
   let dir = runtime_dir(config.as_deref())?;
-  let control_path = dir.join("frontend.sock");
-  let info = if control_path.exists() {
-    anyhow::ensure!(
-      parent.is_none(),
-      "a frontend already owns this configuration; supervised startup will not replace it"
-    );
-    tokio::select! {
-      biased;
-      result = shutdown.recv() => return result.map_err(Into::into),
-      result = inspect(&control_path) => result.context(
-        "frontend socket exists but is unavailable; stop its owner or remove the stale socket before restarting",
-      )?,
-    }
-  } else {
-    anyhow::ensure!(
-      !args.rollout.ab_test,
-      "--ab-test requires an existing frontend with one active baseline worker"
-    );
+  let launch = control::discover_or_launch::<ServeArgs>(&dir, args.rollout.ab_test, shutdown.recv(), || {
     // Validate all configuration before spawning an independently owned process.
     let _ = serve::load_runtime(config.clone(), args.clone())?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -691,70 +224,11 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     if args.no_proxy {
       command.arg("--no-proxy");
     }
-    let log = OpenOptions::new()
-      .create(true)
-      .append(true)
-      .open(dir.join("frontend.log"))?;
-    if parent.is_some() {
-      tokn_gateway_lifecycle::supervise_frontend(&mut command);
-    } else {
-      command.stdin(Stdio::null()).stdout(log.try_clone()?);
-    }
-    command.stderr(log).process_group(0);
-    let mut child = command.spawn().context("start frontend process")?;
-    let ready = {
-      let startup = async {
-        tokio::time::timeout(START_TIMEOUT, async {
-          loop {
-            if let Ok(info) = inspect(&control_path).await {
-              anyhow::ensure!(
-                Some(info.frontend_pid) == child.id(),
-                "another frontend claimed the configuration during startup"
-              );
-              return Ok(info);
-            }
-            if let Some(status) = child.try_wait()? {
-              anyhow::bail!("frontend exited ({status}); see {}", dir.join("frontend.log").display());
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-          }
-        })
-        .await
-        .context("frontend startup timed out")
-        .and_then(|result| result)
-      };
-      tokio::select! {
-        biased;
-        _ = shutdown.recv() => Err(anyhow::anyhow!("frontend startup interrupted")),
-        _ = async { match parent.as_mut() {
-          Some(lease) => lease.closed().await,
-          None => std::future::pending().await,
-        }} => Err(anyhow::anyhow!("frontend supervisor closed during startup")),
-        result = startup => result,
-      }
-    };
-    match ready {
-      Ok(info) => {
-        tracing::info!(frontend_pid = info.frontend_pid, log = %dir.join("frontend.log").display(), "started independent frontend");
-        if parent.is_some() {
-          owned = Some(child);
-        }
-        info
-      }
-      Err(error) => {
-        if parent.is_some() {
-          // No worker from this launcher has registered yet. The frontend
-          // rejects external registration until that first admission succeeds.
-          drop(child.stdin.take());
-          if tokio::time::timeout(START_TIMEOUT, child.wait()).await.is_err() {
-            let _ = child.kill().await;
-          }
-        } else {
-          let _ = child.kill().await;
-        }
-        return Err(error);
-      }
-    }
+    Ok(command)
+  })
+  .await?;
+  let Some(control::FrontendLaunch { info, owned }) = launch else {
+    return Ok(());
   };
   anyhow::ensure!(
     !args.with_proxy || info.args.with_proxy,
@@ -766,9 +240,9 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     rollout_policy: args.rollout.policy()?,
     no_proxy: args.no_proxy,
   };
-  if let (Some(frontend), Some(parent)) = (owned, parent) {
+  if let Some((frontend, parent)) = owned {
     let stop = ShutdownSignal::new()?;
-    return tokn_gateway_lifecycle::serve_owned(
+    return tokn_gateway::supervision::serve_owned(
       frontend,
       parent,
       move |release| start_worker(config, dir, info, registration, shutdown, Some(release)),
@@ -785,77 +259,16 @@ mod tests {
   use crate::cli::{Cli, Cmd};
   use clap::Parser;
 
-  #[tokio::test]
-  async fn banner_status_reads_active_and_cancelled_experiments_over_control_socket() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("frontend.sock");
-    let listener = UnixListener::bind(&path).unwrap();
-    let server = tokio::spawn(async move {
-      for ab_test in [
-        Some(AbTestStatus {
-          baseline_worker_id: "old".into(),
-          worker_id: "new".into(),
-          elapsed_seconds: 12 * 3600,
-          duration_seconds: 24 * 3600,
-          traffic_percent: 50,
-          rollout_policy: None,
-        }),
-        None,
-      ] {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut stream = BufReader::new(stream);
-        assert!(matches!(
-          read_message::<ControlRequest>(&mut stream).await.unwrap(),
-          ControlRequest::AbTestStatus
-        ));
-        write_message(stream.get_mut(), &ControlReply::AbTest { ab_test })
-          .await
-          .unwrap();
-      }
-    });
-    let status = read_ab_test_status(&path).await.unwrap().unwrap();
-    assert_eq!(status.traffic_percent, 50);
-    assert_eq!(status.elapsed_seconds, 12 * 3600);
-    assert!(read_ab_test_status(&path).await.unwrap().is_none());
-    server.await.unwrap();
-  }
-
   #[test]
-  fn optional_ab_capability_preserves_control_v2_compatibility() {
-    let info = FrontendInfo {
-      protocol_version: CONTROL_PROTOCOL_VERSION,
-      supports_ab_test: true,
-      supports_ab_test_status: true,
-      capabilities: vec!["rollout_policy_v1".into()],
-      frontend_pid: 123,
-      args: ServeArgs::default(),
-    };
-    let mut legacy_info = serde_json::to_value(info).unwrap();
-    legacy_info.as_object_mut().unwrap().remove("supports_ab_test");
-    legacy_info.as_object_mut().unwrap().remove("supports_ab_test_status");
-    legacy_info.as_object_mut().unwrap().remove("capabilities");
-    legacy_info["args"].as_object_mut().unwrap().remove("ab_test");
-    let decoded: FrontendInfo = serde_json::from_value(legacy_info).unwrap();
-    assert!(!decoded.supports_ab_test);
-    assert!(!decoded.supports_ab_test_status);
-    assert!(!decoded.args.rollout.ab_test);
-    assert!(decoded.capabilities.is_empty());
-    let register = ControlRequest::Register {
-      worker_id: "fixture".into(),
-      socket_path: "/tmp/fixture.sock".into(),
-      candidate: false,
-      ab_test: false,
-      rollout_policy: None,
-    };
-    let legacy_message = serde_json::to_value(register).unwrap();
-    assert!(
-      legacy_message.get("ab_test").is_none(),
-      "normal registration must stay readable by v2 frontends"
-    );
-    let ControlRequest::Register { ab_test, .. } = serde_json::from_value(legacy_message).unwrap() else {
-      panic!("registration");
-    };
-    assert!(!ab_test, "new frontends must accept older worker registration messages");
+  fn serving_settings_from_older_frontends_default_rollout_options() {
+    let mut args = serde_json::to_value(ServeArgs::default()).unwrap();
+    args.as_object_mut().unwrap().remove("ab_test");
+    let info: FrontendInfo<ServeArgs> = serde_json::from_value(serde_json::json!({
+      "protocol_version": 2, "frontend_pid": 42, "args": args,
+    }))
+    .unwrap();
+    assert!(!info.args.rollout.ab_test);
+    assert!(info.maintenance_requests_dir.is_none());
   }
 
   #[test]

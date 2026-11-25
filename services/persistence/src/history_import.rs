@@ -8,7 +8,7 @@
 //! A single DELETE-journal transaction covers every destination database (at most
 //! eleven files). Dry runs execute the same checks and writes, then roll back.
 
-use crate::{archive::RequestMaintenanceLock, DbPaths};
+use crate::{request_files::RequestMaintenanceLock, DbPaths};
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

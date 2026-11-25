@@ -7,7 +7,7 @@ use clap::Args;
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::watch;
 use tokn_core::event::EventBus;
@@ -297,10 +297,18 @@ fn log_projection_warnings(config_path: &std::path::Path, warnings: &[V2Projecti
 
 async fn run_v2_runtime(source: RuntimeSource, loaded: LoadedRuntime) -> Result<()> {
   let shutdown = ShutdownSignal::new().context("install shutdown signal handlers")?;
-  run_loaded(source, loaded, async { shutdown.wait().await.map_err(Into::into) }).await
+  run_loaded(source, loaded, None, async {
+    shutdown.wait().await.map_err(Into::into)
+  })
+  .await
 }
 
-pub(super) async fn run_loaded<F>(source: RuntimeSource, loaded: LoadedRuntime, shutdown: F) -> Result<()>
+pub(super) async fn run_loaded<F>(
+  source: RuntimeSource,
+  loaded: LoadedRuntime,
+  frontend_maintenance_dir: Option<&Path>,
+  shutdown: F,
+) -> Result<()>
 where
   F: Future<Output = Result<()>> + Send,
 {
@@ -317,7 +325,14 @@ where
     .values()
     .any(|listener| listener.client_auth() == tokn_policy::ClientAuthPlan::LocalKeys);
   let access = crate::server_runtime::load_access_store(needs_access)?;
-  let (events, receiver, handlers, archive_runtime) = crate::server_runtime::build_v2_event_bus(service.persistence())?;
+  // Replacements share the gateway's maintenance worker. A worker configured
+  // with its own history directory still needs to maintain that database.
+  let run_maintenance = match frontend_maintenance_dir {
+    Some(dir) => tokn_maintenance::maintenance_requests_dir(service.persistence())?.as_deref() != Some(dir),
+    None => true,
+  };
+  let (events, receiver, handlers, archive_runtime) =
+    crate::server_runtime::build_v2_event_bus(service.persistence(), run_maintenance)?;
   let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
   let result = async {
     let states = if args.worker_socket.is_some() {
@@ -353,7 +368,7 @@ where
     result
   }
   .await;
-  let cleanup = crate::server_runtime::finish_events(&events, archive_runtime).await;
+  let cleanup = tokn_gateway::finish_events(&events, archive_runtime).await;
   result.and(cleanup)
 }
 

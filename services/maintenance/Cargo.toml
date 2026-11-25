@@ -1,0 +1,30 @@
+[package]
+name = "tokn-maintenance"
+version.workspace = true
+edition.workspace = true
+description = "Archive, verification and retention jobs for gateway request history"
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = ["lzma"]
+lzma = ["dep:lzma-rust2", "tokn-persistence/lzma"]
+
+[dependencies]
+anyhow = { workspace = true }
+tokn-config = { workspace = true, features = ["std"] }
+tokn-persistence = { workspace = true }
+lzma-rust2 = { workspace = true, optional = true }
+sha2 = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tokn-core = { workspace = true, features = ["std"] }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }

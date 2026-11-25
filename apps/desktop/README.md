@@ -56,6 +56,8 @@ builds do not require WebKit/GTK or other desktop libraries.
   load headers and bodies, and browse semantic session trees and usage. The
   existing Lit components run inside the desktop shell with isolated styles;
   native Tauri commands replace the old HTTP API. No inspector listener runs.
+  Activity reads live daily databases first. After pruning, it can browse
+  Zstandard and XZ archives offline using private temporary SQLite snapshots.
   Missing, unavailable and older databases retain their existing error states;
   opening Activity never creates or migrates a database.
 

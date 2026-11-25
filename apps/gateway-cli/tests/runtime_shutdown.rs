@@ -49,6 +49,86 @@ fn frontend(home: &Path, config: &Path) -> Child {
 }
 
 #[tokio::test]
+async fn gateway_maintains_history_across_worker_lifetimes_and_viewer_reads_it_offline() {
+  let home = tempfile::tempdir().unwrap();
+  let address = free_address();
+  let day = "2001-01-01";
+  let history = |name: &str| {
+    let root = home.path().join(name);
+    let requests = root.join("requests");
+    fs::create_dir_all(&requests).unwrap();
+    let db = tokn_persistence::requests::open_day_db(&requests.join(format!("{day}.db"))).unwrap();
+    db.execute(
+      "INSERT INTO request_connection (request_id, ts, endpoint, status) VALUES (?1, 978307200000, 'responses', 200)",
+      [name],
+    )
+    .unwrap();
+    let path = root.join("config.toml");
+    let source = format!(
+      "schema_version = 2\n[defaults]\n[listeners.api]\nkind = 'llm_api'\nbind = '{address}'\nclient_auth = 'none'\n"
+    );
+    let mut raw = v2::decode(&source, &path).unwrap();
+    raw.service.logging.target = tokn_config::LogTarget::Stderr;
+    raw.service.persistence.requests_dir = Some(requests.clone());
+    raw.service.persistence.usage_db_path = Some(root.join("usage.db"));
+    raw.service.persistence.sessions_db_path = Some(root.join("sessions.db"));
+    raw.service.persistence.archive_extension = Some("zstd".into());
+    raw.service.models.enabled = false;
+    fs::write(&path, toml::to_string(&raw).unwrap()).unwrap();
+    (path, requests)
+  };
+  let wait_for_prune = |dir: std::path::PathBuf, log: std::path::PathBuf| async move {
+    tokio::time::timeout(WAIT, async {
+      while dir.join(format!("{day}.db")).exists() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+      }
+    })
+    .await
+    .unwrap_or_else(|_| {
+      panic!(
+        "maintenance did not prune the archived day: {}",
+        fs::read_to_string(log).unwrap()
+      )
+    });
+    assert!(dir.join(format!("{day}.db.zstd")).is_file());
+  };
+
+  let (config, gateway_db) = history("gateway");
+  let mut frontend = frontend(home.path(), &config);
+  ready_frontend(&mut frontend, address, home.path()).await;
+  wait_for_prune(gateway_db.clone(), home.path().join("frontend-stderr.log")).await;
+  assert_eq!(workers(address).await["workers"].as_array().unwrap().len(), 0);
+
+  let (candidate, worker_db) = history("worker");
+  let mut worker = start_command(
+    home.path(),
+    &candidate,
+    &["worker", "start", "--frontend-config", config.to_str().unwrap()],
+    "stderr.log",
+  );
+  ready(&mut worker, address, home.path()).await;
+  wait_for_prune(worker_db.clone(), home.path().join("stderr.log")).await;
+  signal(&frontend, "-TERM");
+  assert!(tokio::time::timeout(WAIT, frontend.wait())
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
+  assert_clean_exit(&mut worker, home.path()).await;
+
+  for (dir, id) in [(gateway_db, "gateway"), (worker_db, "worker")] {
+    let options = tokn_viewer::RequestListOptions {
+      day: Some(day.into()),
+      ..Default::default()
+    };
+    let page = tokn_viewer::list_requests(&dir, &options).unwrap();
+    assert_eq!(page.requests.len(), 1);
+    assert_eq!(page.requests[0].request_id, id);
+    assert!(!dir.join(format!("{day}.db")).exists());
+  }
+}
+
+#[tokio::test]
 async fn shared_frontend_reloads_routes_and_accepts_replacement_workers() {
   let home = tempfile::tempdir().unwrap();
   let path = home.path().join("config.toml");
@@ -762,4 +842,78 @@ enabled = false
   assert!(tokio::time::timeout(WAIT, new.wait()).await.unwrap().unwrap().success());
   wait_for_closed_listener(address).await;
   wait_for_closed_listener(proxy).await;
+}
+
+#[tokio::test]
+async fn frontend_shutdown_finishes_admitted_upload_before_retiring_worker() {
+  for supervised in [false, true] {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let address = free_address();
+    fs::write(&path, format!(
+      "schema_version = 2\n[defaults]\n[listeners.api]\nkind = 'llm_api'\nbind = '{address}'\nclient_auth = 'none'\n[service.persistence]\nenabled = false\n[service.models]\nenabled = false\n"
+    )).unwrap();
+
+    let (mut gateway, mut separate_worker) = if supervised {
+      let mut command = Command::new(env!("CARGO_BIN_EXE_tokn-gateway"));
+      command
+        .arg("--config")
+        .arg(&path)
+        .arg("serve")
+        .env("HOME", home.path())
+        .stderr(fs::File::create(home.path().join("stderr.log")).unwrap())
+        .kill_on_drop(true);
+      tokn_gateway::supervision::supervise(&mut command);
+      let mut child = command.spawn().unwrap();
+      tokio::time::timeout(
+        WAIT,
+        tokn_gateway::supervision::wait_ready(child.stdout.as_mut().unwrap()),
+      )
+      .await
+      .unwrap()
+      .unwrap();
+      (child, None)
+    } else {
+      let mut gateway = frontend(home.path(), &path);
+      ready_frontend(&mut gateway, address, home.path()).await;
+      let mut worker = start(home.path(), &path);
+      ready(&mut worker, address, home.path()).await;
+      (gateway, Some(worker))
+    };
+
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    stream.write_all(format!(
+      "GET /v1/providers HTTP/1.1\r\nHost: {address}\r\nContent-Length: 2\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+    ).as_bytes()).await.unwrap();
+    // Hyper acknowledges Expect when the ingress handler starts reading the
+    // body. That request still needs its first IPC dispatch after shutdown.
+    let expected = b"HTTP/1.1 100 Continue\r\n\r\n";
+    let mut interim = vec![0; expected.len()];
+    tokio::time::timeout(WAIT, stream.read_exact(&mut interim))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(interim.eq_ignore_ascii_case(expected));
+    if supervised {
+      drop(gateway.stdin.take());
+    } else {
+      signal(&gateway, "-TERM");
+    }
+    wait_for_closed_listener(address).await;
+    stream.write_all(b"{}").await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(WAIT, stream.read_to_string(&mut response))
+      .await
+      .unwrap()
+      .unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(tokio::time::timeout(WAIT, gateway.wait())
+      .await
+      .unwrap()
+      .unwrap()
+      .success());
+    if let Some(worker) = separate_worker.as_mut() {
+      assert_clean_exit(worker, home.path()).await;
+    }
+  }
 }

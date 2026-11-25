@@ -2,7 +2,7 @@
 name = "tokn-persistence"
 version.workspace = true
 edition.workspace = true
-description = "Persistence layer (sqlite writers, migrations, archival) for the tokn-router workspace"
+description = "Persistence layer (SQLite writers, migrations, and database access) for the tokn-router workspace"
 documentation.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -15,7 +15,6 @@ lzma = ["dep:lzma-rust2"]
 [dependencies]
 tokn-core = { workspace = true, features = ["std"] }
 tokn-headers = { workspace = true, features = ["std"] }
-base64 = "0.22"
 bytes = { workspace = true }
 flate2 = { workspace = true }
 rusqlite = { workspace = true }

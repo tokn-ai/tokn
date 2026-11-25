@@ -92,7 +92,7 @@ struct TestFrontend {
 
 impl TestFrontend {
   fn capture(config: &Path) -> Self {
-    let socket = tokn_gateway_lifecycle::runtime_dir(config)
+    let socket = tokn_gateway::supervision::runtime_dir(config)
       .unwrap()
       .join("frontend.sock");
     let (_, pid) = Self::peer(&socket).unwrap();

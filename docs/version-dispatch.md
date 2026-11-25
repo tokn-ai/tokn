@@ -122,6 +122,9 @@ requests_dir = "/path/to/candidate/requests"
 ```
 
 Changing the config filename alone does not isolate the default database paths.
+The frontend maintains its configured request history directory while workers
+come and go. A worker that uses a different request directory runs maintenance
+for its own data. Older frontends delegate maintenance to their workers.
 For temporary experiments, persistence may instead be disabled explicitly.
 
 ## A/B experiments

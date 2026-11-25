@@ -21,7 +21,8 @@ use semantic::{request_messages_from_json, response_messages_from_body};
 
 const BOOTSTRAP: &str = include_str!("../schemas/snapshot/sessions/v0.2.1.sql");
 const REQUESTS_TS_MILLIS_SCHEMA_VERSION: u32 = 8;
-const MIGRATIONS: &[migrate::Migration] = &[
+/// Versioned schema migrations, starting with the original database layout.
+pub const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
     version: 1,
     name: "initial",

@@ -1,14 +1,11 @@
 //! Desktop-only inspector queries. All reads use the existing read-only viewer APIs.
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokn_persistence::viewer::{
-  get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_request_payload,
-  RequestCursor, RequestPayloadField,
-};
-use tokn_persistence::{
-  get_request, get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day,
-  list_latest_requests, list_request_days, list_request_url_paths, list_requests, list_sessions_from_db, DbPaths,
-  RequestListOptions,
+use tokn_viewer::{
+  get_request, get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_request_payload,
+  get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day, list_latest_requests,
+  list_request_days, list_request_url_paths, list_requests, list_sessions_from_db, DbPaths, RequestCursor,
+  RequestListOptions, RequestPayloadField,
 };
 
 fn deserialize_row_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
@@ -413,18 +410,18 @@ async fn session_usage(usage_db: PathBuf, query: SessionDetailQuery) -> Result<s
   json_response(usage)
 }
 
-fn session_database_error(error: tokn_persistence::Error) -> ApiError {
+fn session_database_error(error: tokn_viewer::Error) -> ApiError {
   match error {
-    tokn_persistence::Error::UnsupportedSessionSchema { .. } => ApiError::unavailable_message(
+    tokn_viewer::Error::UnsupportedSessionSchema { .. } => ApiError::unavailable_message(
       "sessions database requires migration; migrate the selected database before opening the sessions view",
     ),
     _ => ApiError::unavailable("session database"),
   }
 }
 
-fn usage_database_error(error: tokn_persistence::Error) -> ApiError {
+fn usage_database_error(error: tokn_viewer::Error) -> ApiError {
   match error {
-    tokn_persistence::Error::UnsupportedUsageSchema { .. } => ApiError::unavailable_message(
+    tokn_viewer::Error::UnsupportedUsageSchema { .. } => ApiError::unavailable_message(
       "usage database requires migration; migrate the selected database before opening session usage",
     ),
     _ => ApiError::unavailable("usage database"),

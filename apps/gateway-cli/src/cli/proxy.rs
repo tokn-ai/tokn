@@ -235,7 +235,7 @@ async fn start(cfg_path: Option<PathBuf>, args: StartArgs) -> Result<()> {
     .await
   }
   .await;
-  let cleanup = crate::server_runtime::finish_events(&events, archive_runtime).await;
+  let cleanup = tokn_gateway::finish_events(&events, archive_runtime).await;
   result.and(cleanup)
 }
 

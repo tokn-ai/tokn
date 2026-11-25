@@ -116,9 +116,7 @@ impl UsageDb {
   /// Summary queries require the current usage schema; older schemas report
   /// an error rather than being upgraded by a read-only viewer.
   pub fn open_readonly(path: &Path) -> Result<Self> {
-    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.busy_timeout(std::time::Duration::from_millis(2_500))?;
-    conn.execute_batch("PRAGMA query_only = ON;")?;
+    let conn = crate::open_readonly(path, std::time::Duration::from_millis(2_500))?;
     Ok(Self { conn })
   }
 
