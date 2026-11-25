@@ -25,6 +25,7 @@ resolver = "2"
 version = "0.2.4"
 edition = "2021"
 documentation = "https://docs.rs/tokn-router"
+homepage = "https://tokn-ai.dev"
 repository = "https://github.com/tokn-ai/tokn"
 license = "MIT"
 

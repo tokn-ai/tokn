@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Routing, relay, and proxy orchestration across providers for tokn gateway"
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

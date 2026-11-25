@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Typed request-routing and execution policies for tokn"
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

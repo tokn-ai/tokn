@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Persistence layer (sqlite writers, migrations, archival) for the tokn-router workspace"
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

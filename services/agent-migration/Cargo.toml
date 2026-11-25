@@ -3,6 +3,7 @@ name = "tokn-agent-migration"
 version.workspace = true
 edition.workspace = true
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 description = "Agent credential and config migration helpers for the tokn-router workspace"
 license.workspace = true

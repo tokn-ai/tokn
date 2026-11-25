@@ -9,6 +9,7 @@
   "libc": ["glibc"],
   "engines": { "node": ">=22.0.0" },
   "publishConfig": { "access": "public", "registry": "https://registry.npmjs.org" },
+  "homepage": "https://tokn-ai.dev",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tokn-ai/tokn.git",

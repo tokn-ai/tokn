@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Legacy location and schema migration helpers for tokn-router config"
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

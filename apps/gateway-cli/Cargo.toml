@@ -4,6 +4,7 @@ default-run = "tokn-gateway"
 version.workspace = true
 edition.workspace = true
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 description = "CLI and local gateway runtime for serving OpenAI-compatible APIs via tokn"
 license.workspace = true

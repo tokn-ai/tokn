@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 description = "Procedural macros used by tokn endpoint schema crates"
 documentation.workspace = true
+homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

@@ -59,6 +59,7 @@
       "x86_64-unknown-linux-gnu"
     ]
   },
+  "homepage": "https://tokn-ai.dev",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/tokn-ai/tokn.git",
