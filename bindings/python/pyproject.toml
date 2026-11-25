@@ -27,7 +27,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/tokn-ai/tokn"
+Homepage = "https://tokn-ai.dev"
 Repository = "https://github.com/tokn-ai/tokn"
 Issues = "https://github.com/tokn-ai/tokn/issues"
 

@@ -20,7 +20,6 @@ std = [
   "dep:tokn-auth",
   "dep:tokn-catalogue",
   "dep:async-trait",
-  "dep:axum",
   "dep:bytes",
   "dep:reqwest",
   "dep:snafu",
@@ -35,7 +34,6 @@ tokn-auth = { workspace = true, optional = true }
 tokn-catalogue = { workspace = true, optional = true }
 tokn-headers = { workspace = true, default-features = false }
 async-trait = { workspace = true, optional = true }
-axum = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 serde = { workspace = true }

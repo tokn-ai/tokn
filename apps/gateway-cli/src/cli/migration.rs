@@ -7,7 +7,6 @@
 use crate::db::{migrate, requests, requests::RequestsDb, sessions::SessionsDb, usage::UsageDb};
 use anyhow::Result;
 use clap::Args;
-use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 #[derive(Args, Debug)]
@@ -57,47 +56,22 @@ pub async fn run(cfg_path: Option<PathBuf>, args: MigrationArgs) -> Result<()> {
 }
 
 fn print_status(label: &str, path: &Path, latest: u32) -> Result<()> {
-  let current = inspect(path)?;
-  let backup = inspect(&migrate::backup_path(path))?;
+  let status = migrate::status(path)?;
   println!(
     "{:<8} {:<48} current={} rows={} bak_current={} bak_rows={} latest={}",
     label,
     path.display(),
-    version_text(current.version),
-    count_text(current.rows),
-    version_text(backup.version),
-    count_text(backup.rows),
+    value_text(status.current.map(|db| db.version)),
+    value_text(status.current.map(|db| db.rows)),
+    value_text(status.backup.map(|db| db.version)),
+    value_text(status.backup.map(|db| db.rows)),
     latest,
   );
   Ok(())
 }
 
-fn inspect(path: &Path) -> Result<DbInfo> {
-  if !path.exists() {
-    return Ok(DbInfo {
-      version: None,
-      rows: None,
-    });
-  }
-  let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-  Ok(DbInfo {
-    version: Some(migrate::read_current_version(&conn)?),
-    rows: Some(migrate::user_row_count(&conn)?),
-  })
-}
-
-fn version_text(v: Option<u32>) -> String {
-  v.map(|v| v.to_string()).unwrap_or_else(|| "missing".to_string())
-}
-
-fn count_text(v: Option<u64>) -> String {
-  v.map(|v| v.to_string()).unwrap_or_else(|| "missing".to_string())
-}
-
-#[derive(Debug)]
-struct DbInfo {
-  version: Option<u32>,
-  rows: Option<u64>,
+fn value_text(value: Option<impl ToString>) -> String {
+  value.map(|value| value.to_string()).unwrap_or_else(|| "missing".into())
 }
 
 fn apply_one(label: &str, path: &Path, open: impl FnOnce(&Path) -> crate::db::Result<()>) -> Result<()> {
@@ -110,14 +84,12 @@ fn apply_one(label: &str, path: &Path, open: impl FnOnce(&Path) -> crate::db::Re
 }
 
 fn rollback_one(label: &str, path: &Path) -> Result<()> {
-  let bak = migrate::backup_path(path);
-  if !bak.exists() {
-    println!("{label}: {} (no backup, skipped)", path.display());
-    return Ok(());
-  }
-  let restored = migrate::rollback(path)?;
-  if restored {
-    println!("{label}: {} rolled back from {}", path.display(), bak.display());
+  if migrate::rollback(path)? {
+    println!(
+      "{label}: {} rolled back from {}",
+      path.display(),
+      migrate::backup_path(path).display()
+    );
   } else {
     println!("{label}: {} (no backup, skipped)", path.display());
   }

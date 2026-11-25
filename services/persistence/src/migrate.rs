@@ -116,6 +116,39 @@ pub fn latest_version(migrations: &[Migration]) -> u32 {
   migrations.last().map(|m| m.version).unwrap_or(0)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DatabaseStatus {
+  pub version: u32,
+  pub rows: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct MigrationStatus {
+  pub current: Option<DatabaseStatus>,
+  pub backup: Option<DatabaseStatus>,
+}
+
+/// Read the migration version and total user rows in each existing file.
+/// Missing databases and backups are reported independently.
+pub fn status(path: &Path) -> Result<MigrationStatus> {
+  Ok(MigrationStatus {
+    current: database_status(path)?,
+    backup: database_status(&backup_path(path))?,
+  })
+}
+
+fn database_status(path: &Path) -> Result<Option<DatabaseStatus>> {
+  if !path.try_exists()? {
+    return Ok(None);
+  }
+  let mut conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+  let snapshot = conn.transaction()?;
+  Ok(Some(DatabaseStatus {
+    version: read_current_version(&snapshot)?,
+    rows: user_row_count(&snapshot)?,
+  }))
+}
+
 pub fn read_current_version(conn: &Connection) -> Result<u32> {
   if !table_exists(conn, "schema_migrations")? {
     return Ok(0);
@@ -247,6 +280,49 @@ mod tests {
         sql: M2,
       },
     ]
+  }
+
+  #[test]
+  fn status_reads_current_and_legacy_backup_without_creating_or_modifying_files() {
+    let dir = tempdir();
+    let path = dir.join("t.db");
+    let backup = backup_path(&path);
+    assert_eq!(
+      status(&path).unwrap(),
+      MigrationStatus {
+        current: None,
+        backup: None
+      }
+    );
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+    Connection::open(&backup)
+      .unwrap()
+      .execute_batch("CREATE TABLE old_data (x INTEGER); INSERT INTO old_data VALUES (1), (2);")
+      .unwrap();
+    let backup_bytes = std::fs::read(&backup).unwrap();
+    let legacy = Some(DatabaseStatus { version: 0, rows: 2 });
+    assert_eq!(
+      status(&path).unwrap(),
+      MigrationStatus {
+        current: None,
+        backup: legacy
+      }
+    );
+    assert!(!path.exists());
+
+    {
+      let mut conn = Connection::open(&path).unwrap();
+      apply(&mut conn, &path, "test", Bootstrap { sql: BOOTSTRAP }, &migs()).unwrap();
+      conn.execute("INSERT INTO foo (x) VALUES (1)", []).unwrap();
+    }
+    let current_bytes = std::fs::read(&path).unwrap();
+    let report = status(&path).unwrap();
+    assert_eq!(report.current, Some(DatabaseStatus { version: 2, rows: 1 }));
+    assert_eq!(report.backup, legacy);
+    assert_eq!(std::fs::read(&path).unwrap(), current_bytes);
+    assert_eq!(std::fs::read(&backup).unwrap(), backup_bytes);
+    std::fs::remove_dir_all(dir).unwrap();
   }
 
   #[test]

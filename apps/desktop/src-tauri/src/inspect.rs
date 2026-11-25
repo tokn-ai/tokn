@@ -7,16 +7,9 @@ use tokn_persistence::viewer::{
 };
 use tokn_persistence::{
   get_request, get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day,
-  list_latest_requests, list_request_days, list_request_url_paths, list_requests, list_sessions_from_db,
+  list_latest_requests, list_request_days, list_request_url_paths, list_requests, list_sessions_from_db, DbPaths,
   RequestListOptions,
 };
-
-#[derive(Clone)]
-struct InspectState {
-  requests_dir: PathBuf,
-  sessions_db: PathBuf,
-  usage_db: PathBuf,
-}
 
 fn deserialize_row_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
   Option::<String>::deserialize(deserializer)?
@@ -197,49 +190,40 @@ pub async fn inspect_query(query: InspectQuery) -> Result<serde_json::Value, Api
   .await
   .map_err(ApiError::internal)?
   .map_err(ApiError::internal)?;
-  dispatch(
-    InspectState {
-      requests_dir: paths.requests_dir,
-      sessions_db: paths.sessions_db,
-      usage_db: paths.usage_db,
-    },
-    query,
-  )
-  .await
+  dispatch(paths, query).await
 }
 
-async fn dispatch(state: InspectState, query: InspectQuery) -> Result<serde_json::Value, ApiError> {
+async fn dispatch(paths: DbPaths, query: InspectQuery) -> Result<serde_json::Value, ApiError> {
   match query {
-    InspectQuery::Info => info(state).await,
-    InspectQuery::RequestDays => request_days(state).await,
-    InspectQuery::RequestUrlPaths(query) => request_url_paths(state, query).await,
-    InspectQuery::Requests(query) => requests(state, query).await,
-    InspectQuery::LatestRequests(query) => latest_requests(state, query).await,
-    InspectQuery::Request(query) => request_detail(state, query).await,
-    InspectQuery::RequestPayload(query) => request_payload(state, query).await,
-    InspectQuery::RequestLlmSummary(query) => request_llm_summary(state, query).await,
-    InspectQuery::RequestLlmMessage(query) => request_llm_message(state, query).await,
-    InspectQuery::RequestLlmToolDefinition(query) => request_llm_tool_definition(state, query).await,
-    InspectQuery::Sessions(query) => sessions(state, query).await,
-    InspectQuery::Session(query) => session_detail(state, query).await,
-    InspectQuery::SessionUsage(query) => session_usage(state, query).await,
-    InspectQuery::SessionNode(query) => session_node_detail(state, query).await,
+    InspectQuery::Info => info(paths).await,
+    InspectQuery::RequestDays => request_days(paths.requests_dir).await,
+    InspectQuery::RequestUrlPaths(query) => request_url_paths(paths.requests_dir, query).await,
+    InspectQuery::Requests(query) => requests(paths.requests_dir, query).await,
+    InspectQuery::LatestRequests(query) => latest_requests(paths.requests_dir, query).await,
+    InspectQuery::Request(query) => request_detail(paths.requests_dir, query).await,
+    InspectQuery::RequestPayload(query) => request_payload(paths.requests_dir, query).await,
+    InspectQuery::RequestLlmSummary(query) => request_llm_summary(paths.requests_dir, query).await,
+    InspectQuery::RequestLlmMessage(query) => request_llm_message(paths.requests_dir, query).await,
+    InspectQuery::RequestLlmToolDefinition(query) => request_llm_tool_definition(paths.requests_dir, query).await,
+    InspectQuery::Sessions(query) => sessions(paths.sessions_db, query).await,
+    InspectQuery::Session(query) => session_detail(paths.sessions_db, query).await,
+    InspectQuery::SessionUsage(query) => session_usage(paths.usage_db, query).await,
+    InspectQuery::SessionNode(query) => session_node_detail(paths.sessions_db, query).await,
   }
 }
 
-async fn info(state: InspectState) -> Result<serde_json::Value, ApiError> {
+async fn info(paths: DbPaths) -> Result<serde_json::Value, ApiError> {
   json_response(ViewerInfo {
-    requests_dir: state.requests_dir.display().to_string(),
-    sessions_db: state.sessions_db.display().to_string(),
-    usage_db: state.usage_db.display().to_string(),
+    requests_dir: paths.requests_dir.display().to_string(),
+    sessions_db: paths.sessions_db.display().to_string(),
+    usage_db: paths.usage_db.display().to_string(),
   })
 }
 
 fn json_response<T: Serialize>(body: T) -> Result<serde_json::Value, ApiError> {
   serde_json::to_value(body).map_err(ApiError::internal)
 }
-async fn request_days(state: InspectState) -> Result<serde_json::Value, ApiError> {
-  let requests_dir = state.requests_dir;
+async fn request_days(requests_dir: PathBuf) -> Result<serde_json::Value, ApiError> {
   let days = tokio::task::spawn_blocking(move || list_request_days(&requests_dir))
     .await
     .map_err(ApiError::internal)?
@@ -247,9 +231,8 @@ async fn request_days(state: InspectState) -> Result<serde_json::Value, ApiError
   json_response(days)
 }
 
-async fn request_url_paths(state: InspectState, query: RequestDayQuery) -> Result<serde_json::Value, ApiError> {
+async fn request_url_paths(requests_dir: PathBuf, query: RequestDayQuery) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let paths = tokio::task::spawn_blocking(move || list_request_url_paths(&requests_dir, &day))
     .await
@@ -258,7 +241,7 @@ async fn request_url_paths(state: InspectState, query: RequestDayQuery) -> Resul
   json_response(paths)
 }
 
-async fn requests(state: InspectState, query: RequestsQuery) -> Result<serde_json::Value, ApiError> {
+async fn requests(requests_dir: PathBuf, query: RequestsQuery) -> Result<serde_json::Value, ApiError> {
   if let Some(day) = query.day.as_deref() {
     validate_request_day(day)?;
   }
@@ -269,7 +252,6 @@ async fn requests(state: InspectState, query: RequestsQuery) -> Result<serde_jso
     }
   }
   let selected_day = query.day.is_some();
-  let requests_dir = state.requests_dir;
   let mut options: RequestListOptions = query.into();
   options.cursor = cursor;
   let requests = tokio::task::spawn_blocking(move || list_requests(&requests_dir, &options))
@@ -285,8 +267,7 @@ async fn requests(state: InspectState, query: RequestsQuery) -> Result<serde_jso
   json_response(requests)
 }
 
-async fn latest_requests(state: InspectState, query: RequestPageQuery) -> Result<serde_json::Value, ApiError> {
-  let requests_dir = state.requests_dir;
+async fn latest_requests(requests_dir: PathBuf, query: RequestPageQuery) -> Result<serde_json::Value, ApiError> {
   let limit = query.limit;
   let cursor = parse_request_cursor(query.cursor.as_deref())?;
   let requests = tokio::task::spawn_blocking(move || list_latest_requests(&requests_dir, limit, cursor))
@@ -303,9 +284,8 @@ fn parse_request_cursor(cursor: Option<&str>) -> Result<Option<RequestCursor>, A
     .map_err(|_| ApiError::bad_request("cursor is malformed or unsupported"))
 }
 
-async fn request_detail(state: InspectState, query: RequestDetailQuery) -> Result<serde_json::Value, ApiError> {
+async fn request_detail(requests_dir: PathBuf, query: RequestDetailQuery) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let request_id = query.request_id;
   let row_id = query.row_id;
@@ -317,13 +297,12 @@ async fn request_detail(state: InspectState, query: RequestDetailQuery) -> Resul
   json_response(request)
 }
 
-async fn request_payload(state: InspectState, query: RequestPayloadQuery) -> Result<serde_json::Value, ApiError> {
+async fn request_payload(requests_dir: PathBuf, query: RequestPayloadQuery) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
   let field = query
     .field
     .parse::<RequestPayloadField>()
     .map_err(|_| ApiError::bad_request("field is not a supported request payload field"))?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let request_id = query.request_id;
   let row_id = query.row_id;
@@ -336,9 +315,8 @@ async fn request_payload(state: InspectState, query: RequestPayloadQuery) -> Res
   json_response(payload)
 }
 
-async fn request_llm_summary(state: InspectState, query: RequestDetailQuery) -> Result<serde_json::Value, ApiError> {
+async fn request_llm_summary(requests_dir: PathBuf, query: RequestDetailQuery) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let request_id = query.request_id;
   let row_id = query.row_id;
@@ -350,9 +328,8 @@ async fn request_llm_summary(state: InspectState, query: RequestDetailQuery) -> 
   json_response(summary)
 }
 
-async fn request_llm_message(state: InspectState, query: RequestLlmItemQuery) -> Result<serde_json::Value, ApiError> {
+async fn request_llm_message(requests_dir: PathBuf, query: RequestLlmItemQuery) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let request_id = query.request_id;
   let row_id = query.row_id;
@@ -367,11 +344,10 @@ async fn request_llm_message(state: InspectState, query: RequestLlmItemQuery) ->
 }
 
 async fn request_llm_tool_definition(
-  state: InspectState,
+  requests_dir: PathBuf,
   query: RequestLlmItemQuery,
 ) -> Result<serde_json::Value, ApiError> {
   validate_request_day(&query.day)?;
-  let requests_dir = state.requests_dir;
   let day = query.day;
   let request_id = query.request_id;
   let row_id = query.row_id;
@@ -394,8 +370,7 @@ fn validate_request_day(day: &str) -> Result<(), ApiError> {
   }
 }
 
-async fn sessions(state: InspectState, query: LimitQuery) -> Result<serde_json::Value, ApiError> {
-  let sessions_db = state.sessions_db;
+async fn sessions(sessions_db: PathBuf, query: LimitQuery) -> Result<serde_json::Value, ApiError> {
   let limit = query.limit;
   let sessions = tokio::task::spawn_blocking(move || list_sessions_from_db(&sessions_db, limit))
     .await
@@ -404,8 +379,7 @@ async fn sessions(state: InspectState, query: LimitQuery) -> Result<serde_json::
   json_response(sessions)
 }
 
-async fn session_detail(state: InspectState, query: SessionDetailQuery) -> Result<serde_json::Value, ApiError> {
-  let sessions_db = state.sessions_db;
+async fn session_detail(sessions_db: PathBuf, query: SessionDetailQuery) -> Result<serde_json::Value, ApiError> {
   let session_id = query.session_id;
   let limit = query.limit;
   let session = tokio::task::spawn_blocking(move || get_session_from_db(&sessions_db, &session_id, limit))
@@ -417,10 +391,9 @@ async fn session_detail(state: InspectState, query: SessionDetailQuery) -> Resul
 }
 
 async fn session_node_detail(
-  state: InspectState,
+  sessions_db: PathBuf,
   query: SessionNodeDetailQuery,
 ) -> Result<serde_json::Value, ApiError> {
-  let sessions_db = state.sessions_db;
   let session_id = query.session_id;
   let node_id = query.node_id;
   let node = tokio::task::spawn_blocking(move || get_session_node_from_db(&sessions_db, &session_id, &node_id))
@@ -431,8 +404,7 @@ async fn session_node_detail(
   json_response(node)
 }
 
-async fn session_usage(state: InspectState, query: SessionDetailQuery) -> Result<serde_json::Value, ApiError> {
-  let usage_db = state.usage_db;
+async fn session_usage(usage_db: PathBuf, query: SessionDetailQuery) -> Result<serde_json::Value, ApiError> {
   let session_id = query.session_id;
   let usage = tokio::task::spawn_blocking(move || get_session_usage(&usage_db, &session_id))
     .await

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 #[derive(Serialize)]
 pub struct UsageSummary {
@@ -18,10 +18,9 @@ pub fn usage() -> Result<Vec<UsageSummary>> {
   if !path.exists() {
     return Ok(Vec::new());
   }
-  let since = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64 - 86_400_000;
   Ok(
     tokn_persistence::UsageDb::open_readonly(&path)?
-      .summary(since, None, None)?
+      .summary_for_window(Duration::from_secs(24 * 60 * 60), None, None)?
       .into_iter()
       .map(|row| UsageSummary {
         account: row.account,

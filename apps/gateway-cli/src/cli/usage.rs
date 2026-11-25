@@ -2,7 +2,6 @@ use crate::db::UsageDb;
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
-use std::time::Duration;
 
 #[derive(Args, Debug)]
 pub struct UsageArgs {
@@ -24,11 +23,8 @@ pub async fn run(cfg_path: Option<PathBuf>, args: UsageArgs) -> Result<()> {
   let path = config.persistence().resolve_paths()?.usage_db;
   let db = UsageDb::open(&path)?;
 
-  let since: Duration = humantime::parse_duration(&args.since)?;
-  let now_ms = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
-  let since_ts = i64::try_from(now_ms)?.saturating_sub(i64::try_from(since.as_millis())?);
-
-  let rows = db.summary(since_ts, args.account.as_deref(), args.provider.as_deref())?;
+  let since = humantime::parse_duration(&args.since)?;
+  let rows = db.summary_for_window(since, args.account.as_deref(), args.provider.as_deref())?;
   if rows.is_empty() {
     println!("(no requests in window)");
     return Ok(());
