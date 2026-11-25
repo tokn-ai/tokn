@@ -5,17 +5,18 @@ use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::watch;
+use tokio::process::Command;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinSet;
 use tokn_core::util::shutdown::ShutdownSignal;
+use tokn_gateway_lifecycle::{FrontendOwner, ParentLease};
 use tokn_router::ipc::{WorkerEndpoint, WorkerPool};
 use tokn_router::routing::{AbTestStatus, RolloutPolicy, RoutingControl};
 
@@ -90,30 +91,9 @@ enum ControlReply {
   Error { message: String },
 }
 
-/// Use a short path for macOS Unix sockets. Configuration identity is stable
-/// across binary versions, and explicit config paths keep test homes isolated.
 fn runtime_dir(config: Option<&Path>) -> Result<PathBuf> {
-  let loaded = tokn_config::load_config(config)?;
-  let config_path = std::fs::canonicalize(loaded.path())?;
-  let mut hash = 0xcbf29ce484222325_u64;
-  for byte in config_path.as_os_str().as_encoded_bytes() {
-    hash = (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
-  }
-  // SAFETY: geteuid has no preconditions and does not modify process state.
-  let uid = unsafe { libc::geteuid() };
-  let path = PathBuf::from(format!("/tmp/tokn-gateway-{uid}-{hash:016x}"));
-  match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-    Ok(()) => {}
-    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-    Err(error) => return Err(error.into()),
-  }
-  let metadata = std::fs::symlink_metadata(&path)?;
-  anyhow::ensure!(
-    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0,
-    "frontend runtime directory {} must be owned by this user and private (0700)",
-    path.display()
-  );
-  Ok(path)
+  let config = tokn_config::load_config(config)?;
+  tokn_gateway_lifecycle::runtime_dir(config.path())
 }
 
 async fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> Result<()> {
@@ -205,6 +185,7 @@ async fn connection(
   stream: UnixStream,
   info: Arc<FrontendInfo>,
   pool: Arc<WorkerPool>,
+  owner: Option<Arc<FrontendOwner>>,
   mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
   let mut stream = BufReader::new(stream);
@@ -232,17 +213,23 @@ async fn connection(
         !(candidate && (ab_test || rollout_policy.is_some())),
         "--candidate and --ab-test are mutually exclusive"
       );
-      let result = if ab_test || rollout_policy.is_some() {
-        pool
-          .register_rollout(
-            endpoint,
-            rollout_policy.unwrap_or_else(|| default_policy(default_duration())),
-          )
-          .await
-      } else if candidate {
-        pool.register_candidate(endpoint).await
-      } else {
-        pool.register(endpoint).await
+      let register = async {
+        if ab_test || rollout_policy.is_some() {
+          pool
+            .register_rollout(
+              endpoint,
+              rollout_policy.unwrap_or_else(|| default_policy(default_duration())),
+            )
+            .await
+        } else if candidate {
+          pool.register_candidate(endpoint).await
+        } else {
+          pool.register(endpoint).await
+        }
+      };
+      let result = match owner {
+        Some(owner) => owner.register(stream.get_ref().peer_cred()?.pid(), register).await,
+        None => register.await,
       };
       if let Err(error) = result {
         return write_message(
@@ -285,6 +272,7 @@ async fn serve_control(
   listener: UnixListener,
   info: FrontendInfo,
   pool: Arc<WorkerPool>,
+  owner: Option<Arc<FrontendOwner>>,
   mut stop: watch::Receiver<bool>,
 ) -> Result<()> {
   let info = Arc::new(info);
@@ -304,8 +292,9 @@ async fn serve_control(
         let info = info.clone();
         let pool = pool.clone();
         let stop = stop.clone();
+        let owner = owner.clone();
         tasks.spawn(async move {
-          if let Err(error) = connection(stream, info, pool, stop).await {
+          if let Err(error) = connection(stream, info, pool, owner, stop).await {
             tracing::debug!(%error, "frontend control connection ended");
           }
         });
@@ -326,7 +315,12 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   );
   let dir = runtime_dir(config.as_deref())?;
   let path = dir.join("frontend.sock");
-  let (_, loaded) = serve::load_runtime(config, args.clone())?;
+  let lease = ParentLease::from_stdin()?;
+  let owner = lease
+    .as_ref()
+    .map(|_| FrontendOwner::for_launch().map(Arc::new))
+    .transpose()?;
+  let (source, loaded) = serve::load_runtime(config, args.clone())?;
   let (plan, service) = loaded.compiled.into_parts();
   let pool = Arc::new(WorkerPool::empty(&plan)?);
   let needs_access = plan
@@ -350,11 +344,27 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   };
   let (events, receiver, handlers, archive) = crate::server_runtime::build_v2_ingress_event_bus(service.persistence())?;
   let mut frontend =
-    tokn_router::frontend::Frontend::new_with_events(plan, service, access, pool.clone(), events.clone())?;
+    tokn_router::frontend::Frontend::new_with_events(plan, service, access, pool.dispatcher(), events.clone())?;
   if let Some(bind) = bind_override {
     frontend = frontend.with_bind_override(bind)?;
   }
-  let frontend = frontend.with_routing_control(pool.clone());
+  let handle = frontend.reload_handle();
+  let reload_pool = pool.clone();
+  let reloader = tokn_router::v2::AdminReloader::new(move || {
+    let source = source.clone();
+    let handle = handle.clone();
+    let pool = reload_pool.clone();
+    async move {
+      let (loaded, revision) = tokio::task::spawn_blocking(move || source.split_candidate())
+        .await
+        .map_err(|error| tokn_router::v2::ReloadError::Invalid(error.to_string()))??;
+      let (plan, service) = loaded.compiled.into_parts();
+      pool.reload(&handle, plan, &service, &revision).await
+    }
+  });
+  let frontend = frontend
+    .with_routing_control(pool.clone())
+    .with_admin_reloader(reloader);
   let frontend = frontend.bind().await?;
   let listener = UnixListener::bind(&path).with_context(|| {
     format!(
@@ -382,17 +392,27 @@ pub async fn frontend(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       args,
     },
     pool,
+    owner.clone(),
     stop_rx.clone(),
   );
   let public = frontend.serve(async move {
     let _ = stop_rx.changed().await;
   });
+  let released = async {
+    match (owner, lease) {
+      (Some(owner), Some(lease)) => owner.released(lease).await,
+      _ => std::future::pending().await,
+    }
+  };
+  let stopping = async {
+    tokio::select! { result = shutdown.wait() => result, result = released => result }
+  };
   tokio::pin!(control, public);
   tracing::info!(control_socket = %path.display(), "frontend starting; waiting for workers");
   let result = tokio::select! {
     result = &mut public => { let _ = stop_tx.send(true); result.and(control.await) }
     result = &mut control => { let _ = stop_tx.send(true); result.and(public.await) }
-    result = shutdown.wait() => {
+    result = stopping => {
       let _ = stop_tx.send(true);
       result.map_err(anyhow::Error::from).and(public.await).and(control.await)
     }
@@ -419,7 +439,7 @@ pub async fn worker(config: Option<PathBuf>, command: WorkerCmd) -> Result<()> {
     rollout_policy: args.rollout.policy()?,
     no_proxy: args.no_proxy,
   };
-  start_worker(config, dir, info, registration, shutdown).await
+  start_worker(config, dir, info, registration, shutdown, None).await
 }
 
 struct WorkerRegistration {
@@ -434,6 +454,7 @@ async fn start_worker(
   info: FrontendInfo,
   registration: WorkerRegistration,
   mut shutdown: ShutdownSignal,
+  supervisor: Option<oneshot::Receiver<()>>,
 ) -> Result<()> {
   let WorkerRegistration {
     candidate,
@@ -462,6 +483,7 @@ async fn start_worker(
   );
   let worker_id = uuid::Uuid::new_v4().simple().to_string();
   let socket_path = dir.join(format!("w-{worker_id}.sock"));
+  let expected_frontend = supervisor.as_ref().map(|_| info.frontend_pid);
   let supports_ab_test_status = info.supports_ab_test_status;
   let mut args = info.args;
   args.worker_socket = Some(socket_path.clone());
@@ -504,6 +526,12 @@ async fn start_worker(
       return Ok(());
     }
     let mut stream = UnixStream::connect(dir.join("frontend.sock")).await?;
+    if let Some(pid) = expected_frontend {
+      anyhow::ensure!(
+        stream.peer_cred()?.pid().and_then(|peer| u32::try_from(peer).ok()) == Some(pid),
+        "frontend was replaced during supervised startup"
+      );
+    }
     write_message(
       &mut stream,
       &ControlRequest::Register {
@@ -520,6 +548,9 @@ async fn start_worker(
       ControlReply::Registered => {}
       ControlReply::Error { message } => anyhow::bail!(message),
       _ => anyhow::bail!("invalid frontend registration response"),
+    }
+    if expected_frontend.is_some() {
+      tokn_gateway_lifecycle::notify_ready()?;
     }
     tracing::info!(%worker_id, "worker started; frontend owns traffic assignment");
     let mut retirement_sent = false;
@@ -568,6 +599,15 @@ async fn start_worker(
   let mut attachment_done = false;
   let mut attachment_result = Ok(());
   let mut interrupted = false;
+  let released = async {
+    match supervisor {
+      Some(lease) => {
+        let _ = lease.await;
+      }
+      None => std::future::pending().await,
+    }
+  };
+  tokio::pin!(released);
   loop {
     tokio::select! {
       biased;
@@ -579,6 +619,10 @@ async fn start_worker(
         }
         interrupted = true;
         tracing::info!(%worker_id, "retiring worker; waiting for existing requests (Ctrl+C again forces exit)");
+        let _ = retire_tx.send(true);
+      }
+      _ = &mut released, if !interrupted => {
+        interrupted = true;
         let _ = retire_tx.send(true);
       }
       result = &mut server => {
@@ -597,9 +641,15 @@ async fn start_worker(
 
 pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
   let mut shutdown = ShutdownSignal::new()?;
+  let mut parent = ParentLease::from_stdin()?;
+  let mut owned = None;
   let dir = runtime_dir(config.as_deref())?;
   let control_path = dir.join("frontend.sock");
   let info = if control_path.exists() {
+    anyhow::ensure!(
+      parent.is_none(),
+      "a frontend already owns this configuration; supervised startup will not replace it"
+    );
     tokio::select! {
       biased;
       result = shutdown.recv() => return result.map_err(Into::into),
@@ -645,17 +695,22 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       .create(true)
       .append(true)
       .open(dir.join("frontend.log"))?;
-    command
-      .stdin(Stdio::null())
-      .stdout(log.try_clone()?)
-      .stderr(log)
-      .process_group(0);
+    if parent.is_some() {
+      tokn_gateway_lifecycle::supervise_frontend(&mut command);
+    } else {
+      command.stdin(Stdio::null()).stdout(log.try_clone()?);
+    }
+    command.stderr(log).process_group(0);
     let mut child = command.spawn().context("start frontend process")?;
     let ready = {
       let startup = async {
         tokio::time::timeout(START_TIMEOUT, async {
           loop {
             if let Ok(info) = inspect(&control_path).await {
+              anyhow::ensure!(
+                Some(info.frontend_pid) == child.id(),
+                "another frontend claimed the configuration during startup"
+              );
               return Ok(info);
             }
             if let Some(status) = child.try_wait()? {
@@ -670,18 +725,33 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
       };
       tokio::select! {
         biased;
-        result = shutdown.recv() => return result.map_err(Into::into),
+        _ = shutdown.recv() => Err(anyhow::anyhow!("frontend startup interrupted")),
+        _ = async { match parent.as_mut() {
+          Some(lease) => lease.closed().await,
+          None => std::future::pending().await,
+        }} => Err(anyhow::anyhow!("frontend supervisor closed during startup")),
         result = startup => result,
       }
     };
     match ready {
       Ok(info) => {
         tracing::info!(frontend_pid = info.frontend_pid, log = %dir.join("frontend.log").display(), "started independent frontend");
+        if parent.is_some() {
+          owned = Some(child);
+        }
         info
       }
       Err(error) => {
-        let _ = child.kill();
-        let _ = child.wait();
+        if parent.is_some() {
+          // No worker from this launcher has registered yet. The frontend
+          // rejects external registration until that first admission succeeds.
+          drop(child.stdin.take());
+          if tokio::time::timeout(START_TIMEOUT, child.wait()).await.is_err() {
+            let _ = child.kill().await;
+          }
+        } else {
+          let _ = child.kill().await;
+        }
         return Err(error);
       }
     }
@@ -696,7 +766,17 @@ pub async fn serve(config: Option<PathBuf>, args: ServeArgs) -> Result<()> {
     rollout_policy: args.rollout.policy()?,
     no_proxy: args.no_proxy,
   };
-  start_worker(config, dir, info, registration, shutdown).await
+  if let (Some(frontend), Some(parent)) = (owned, parent) {
+    let stop = ShutdownSignal::new()?;
+    return tokn_gateway_lifecycle::serve_owned(
+      frontend,
+      parent,
+      move |release| start_worker(config, dir, info, registration, shutdown, Some(release)),
+      stop.wait(),
+    )
+    .await;
+  }
+  start_worker(config, dir, info, registration, shutdown, None).await
 }
 
 #[cfg(test)]

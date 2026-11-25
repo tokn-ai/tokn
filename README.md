@@ -670,16 +670,13 @@ affinity TTL. For example, legacy TTL `1800` and tombstone `7200` become v2 TTL
 Zero TTL disables v2 affinity and requires zero extra retention; legacy zero
 TTL with a nonzero tombstone is rejected rather than silently losing retention.
 
-Every loopback-bound v2 `llm_api` listener exposes the local control endpoint
-`POST /admin/config/reload`. It is deliberately absent from non-loopback
-listeners because ordinary client keys do not grant gateway-administration
-capability. The endpoint re-reads the selected config plus `auth.yaml` and
-`auth.d`; for an unversioned legacy config it also merges fragments and repeats
-the in-memory v2 projection with the original `serve` flags. Listener
-client authentication does not apply to this control endpoint: ordinary client
-keys neither grant nor gate gateway administration. Every call must include
-`x-tokn-admin: reload`; this explicit non-simple header prevents ambient browser
-requests from triggering a reload on a loopback listener:
+Each loopback-bound `llm_api` listener exposes `POST /admin/config/reload`
+whether you run `tokn-gateway serve` or start the frontend and worker separately.
+Reload re-reads the selected config, `auth.yaml`, and `auth.d`. For an unversioned
+legacy config, it also merges fragments and repeats the in-memory v2 projection
+with the original launch flags. Ordinary client keys do not authorize gateway
+administration. Every reload requires the explicit `x-tokn-admin: reload`
+header to prevent ambient browser requests from triggering it.
 
 ```sh
 curl -X POST http://127.0.0.1:4141/admin/config/reload \
@@ -689,9 +686,16 @@ curl -X POST http://127.0.0.1:4141/admin/config/reload \
 A successful reload replaces routes, bindings, profiles, retry policies,
 providers, account pools, accounts, discovery data, and forward-proxy routing
 rules as one generation across every listener. Requests already admitted keep
-their previous generation; later requests use the new generation. Invalid
-configuration returns `422`, and a change that needs a restart returns `409`;
-either failure leaves the active generation untouched.
+their previous generation. Invalid configuration returns `422`. The frontend
+returns `409` for restart-only changes or when it cannot apply one configuration
+to both processes. Both responses leave the active generation untouched.
+If the worker loses its acknowledgment connection after publication, the frontend
+returns `503` and identifies the generation it published. Check worker status
+before retrying.
+
+For a live reload, the frontend needs one current worker that supports reload
+and reads the same configuration and credentials. During an A/B rollout, finish
+the rollout and let previous workers drain before applying the edit.
 
 Listener ids, kinds, bind addresses, client authentication, and proxy TLS/CA
 settings require a restart. Service-level outbound transport, request limits,
@@ -934,6 +938,10 @@ previous workers exit after their pending requests and streams drain.
 Persistent intercepted CONNECT connections stay open across switches.
 Ctrl-C marks the attached worker exiting and promotes an available stale worker;
 existing requests finish before exit. Press Ctrl-C again to exit immediately.
+
+Tokn Desktop also runs `tokn-gateway serve`. Stop retires the app's worker and
+releases the frontend's listening ports when Desktop owns it exclusively. If an
+independent worker has joined, the frontend stays up to serve it.
 
 Use `worker start --ab-test` or `serve --ab-test` to ramp a new worker from
 10% toward 90% over 24 hours, then switch to 100% and drain the baseline.

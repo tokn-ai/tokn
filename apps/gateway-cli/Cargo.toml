@@ -70,6 +70,9 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+tokn-gateway-lifecycle = { workspace = true }
+
 [dev-dependencies]
 rusqlite = { workspace = true }
 tempfile = "3"

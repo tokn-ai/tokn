@@ -1,18 +1,53 @@
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
-use std::{collections::VecDeque, net::SocketAddr, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+  collections::VecDeque,
+  net::SocketAddr,
+  path::PathBuf,
+  process::{ExitStatus, Stdio},
+  time::Duration,
+};
 use tauri::{Emitter, Manager};
 use tokio::{
   io::AsyncReadExt,
   process::{Child, Command},
   sync::Mutex,
+  task::JoinHandle,
 };
 
 #[derive(Default)]
 pub struct Gateway {
-  child: Mutex<Option<Child>>,
+  child: Mutex<Option<ManagedGateway>>,
   last_error: Mutex<Option<String>>,
-  stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+}
+
+struct ManagedGateway {
+  process: Child,
+  stderr_tail: JoinHandle<Vec<u8>>,
+}
+
+impl ManagedGateway {
+  fn new(mut process: Child) -> Result<Self> {
+    let mut stderr = process.stderr.take().context("Missing bundled gateway stderr")?;
+    let stderr_tail = tokio::spawn(async move {
+      let mut buffer = [0u8; 1024];
+      let mut tail = VecDeque::new();
+      while let Ok(count) = stderr.read(&mut buffer).await {
+        if count == 0 {
+          break;
+        }
+        tail.extend(&buffer[..count]);
+        tail.drain(..tail.len().saturating_sub(8192));
+      }
+      tail.into()
+    });
+    Ok(Self { process, stderr_tail })
+  }
+
+  async fn exit_error(&mut self, exit: ExitStatus) -> String {
+    let bytes = (&mut self.stderr_tail).await.unwrap_or_default();
+    format!("Gateway exited ({exit}). {}", String::from_utf8_lossy(&bytes))
+  }
 }
 
 #[derive(Clone, Serialize)]
@@ -45,16 +80,15 @@ async fn healthy(address: SocketAddr) -> bool {
 }
 
 impl Gateway {
-  async fn exit_error(&self, exit: std::process::ExitStatus) -> String {
-    let tail: Vec<u8> = self.stderr_tail.lock().await.iter().copied().collect();
-    format!("Gateway exited ({exit}). {}", String::from_utf8_lossy(&tail))
-  }
-
   pub async fn status(&self, address: SocketAddr) -> Result<GatewayStatus> {
     let mut child = self.child.lock().await;
-    if let Some(process) = child.as_mut() {
-      if let Some(exit) = process.try_wait()? {
-        *self.last_error.lock().await = Some(self.exit_error(exit).await);
+    if let Some(managed) = child.as_mut() {
+      if let Some(exit) = managed.process.try_wait()? {
+        *self.last_error.lock().await = if exit.success() {
+          None
+        } else {
+          Some(managed.exit_error(exit).await)
+        };
         *child = None;
       }
     }
@@ -77,15 +111,15 @@ impl Gateway {
       }
       .into(),
       address: address.to_string(),
-      pid: child.as_ref().and_then(Child::id),
+      pid: child.as_ref().and_then(|managed| managed.process.id()),
       last_error: self.last_error.lock().await.clone(),
     })
   }
 
-  pub async fn start(&self, executable: PathBuf, config_path: PathBuf, address: SocketAddr) -> Result<()> {
+  pub async fn start(&self, mut command: Command, config_path: PathBuf, address: SocketAddr) -> Result<()> {
     let mut child = self.child.lock().await;
-    if let Some(process) = child.as_mut() {
-      if process.try_wait()?.is_none() {
+    if let Some(managed) = child.as_mut() {
+      if managed.process.try_wait()?.is_none() {
         bail!("An app-managed gateway is already running");
       }
       *child = None;
@@ -95,77 +129,43 @@ impl Gateway {
       .await
       .context("Listener is already in use; the desktop app will not replace it")?;
     drop(guard);
-    let mut process = Command::new(executable)
+    tokn_gateway_lifecycle::supervise(&mut command);
+    let mut process = command
       .arg("--config")
       .arg(config_path)
       .arg("serve")
-      .stdin(Stdio::null())
-      .stdout(Stdio::null())
       .stderr(Stdio::piped())
       .kill_on_drop(true)
       .spawn()
       .context("Starting the bundled gateway")?;
-    self.stderr_tail.lock().await.clear();
-    if let Some(mut stderr) = process.stderr.take() {
-      let tail = self.stderr_tail.clone();
-      tokio::spawn(async move {
-        let mut buffer = [0u8; 1024];
-        while let Ok(count) = stderr.read(&mut buffer).await {
-          if count == 0 {
-            break;
-          }
-          let mut tail = tail.lock().await;
-          tail.extend(&buffer[..count]);
-          while tail.len() > 8192 {
-            tail.pop_front();
-          }
-        }
-      });
-    }
+    let mut stdout = process.stdout.take().context("Missing gateway readiness pipe")?;
     *self.last_error.lock().await = None;
-    *child = Some(process);
-    // A successful spawn alone is not a successful start. Surface early exit
-    // and readiness failure to the action that initiated startup.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-      if let Some(exit) = child.as_mut().context("Missing gateway child")?.try_wait()? {
-        *child = None;
-        let message = self.exit_error(exit).await;
-        *self.last_error.lock().await = Some(message.clone());
-        bail!(message);
-      }
-      if healthy(address).await {
-        return Ok(());
-      }
-      if tokio::time::Instant::now() >= deadline {
-        // Keep ownership so Stop and app exit can still terminate a gateway
-        // that is alive but never became healthy.
-        let message = "Gateway is still starting after 20 seconds. Check its logs or stop it before retrying.";
-        *self.last_error.lock().await = Some(message.into());
-        bail!(message);
-      }
-      tokio::time::sleep(Duration::from_millis(250)).await;
+    let managed = child.insert(ManagedGateway::new(process)?);
+    let ready = async {
+      tokn_gateway_lifecycle::wait_ready(&mut stdout)
+        .await
+        .context("Waiting for the bundled worker to register")?;
+      anyhow::ensure!(healthy(address).await, "The bundled gateway failed its health check");
+      Ok::<_, anyhow::Error>(())
+    };
+    if let Err(error) = tokio::time::timeout(Duration::from_secs(20), ready)
+      .await
+      .context("Gateway startup timed out")
+      .and_then(|result| result)
+    {
+      let exit = tokn_gateway_lifecycle::stop(&mut managed.process).await?;
+      let message = format!("{error:#}. {}", managed.exit_error(exit).await);
+      *child = None;
+      *self.last_error.lock().await = Some(message.clone());
+      bail!(message);
     }
+    Ok(())
   }
 
   pub async fn stop(&self) -> Result<()> {
     let mut child = self.child.lock().await;
-    if let Some(process) = child.as_mut() {
-      if process.try_wait()?.is_none() {
-        let pid = process.id().context("Gateway has no process ID")?;
-        // Keep the Child unreaped and the lock held until termination, so an
-        // unrelated process can never inherit this PID before the signal.
-        nix::sys::signal::kill(
-          nix::unistd::Pid::from_raw(pid as i32),
-          nix::sys::signal::Signal::SIGTERM,
-        )?;
-        match tokio::time::timeout(Duration::from_secs(40), process.wait()).await {
-          Ok(result) => {
-            result?;
-          }
-          Err(_) => process.kill().await?,
-        }
-      }
+    if let Some(managed) = child.as_mut() {
+      tokn_gateway_lifecycle::stop(&mut managed.process).await?;
       *child = None;
     }
     Ok(())
@@ -191,11 +191,33 @@ pub async fn reload(address: SocketAddr) -> Result<String> {
     .send()
     .await?;
   let status = response.status();
+  if status == reqwest::StatusCode::NOT_FOUND {
+    bail!(
+      "Saved on disk. Local reload is unavailable on this gateway (404). Use its process manager to apply the changes."
+    );
+  }
   let body = response.text().await?;
-  if !status.is_success() {
+  if status != reqwest::StatusCode::OK {
     bail!("Saved on disk, but gateway reload returned {status}: {body}");
   }
-  Ok("Gateway reloaded. Routing changes are now active.".into())
+  confirmed_reload(&body)
+}
+
+fn confirmed_reload(body: &str) -> Result<String> {
+  #[derive(serde::Deserialize)]
+  struct ReloadReport {
+    status: String,
+    generation: std::num::NonZeroU64,
+  }
+
+  let report = serde_json::from_str::<ReloadReport>(body)
+    .ok()
+    .filter(|report| report.status == "reloaded")
+    .context("Saved on disk. The gateway did not confirm an active configuration generation.")?;
+  Ok(format!(
+    "Gateway reloaded. Configuration generation {} is active.",
+    report.generation
+  ))
 }
 
 pub fn monitor(app: tauri::AppHandle) {
@@ -220,76 +242,4 @@ pub fn monitor(app: tauri::AppHandle) {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  #[tokio::test]
-  #[ignore = "requires TOKN_DESKTOP_TEST_GATEWAY and loopback sockets"]
-  async fn bundled_gateway_start_reload_stop() {
-    let executable = std::env::var_os("TOKN_DESKTOP_TEST_GATEWAY").expect("gateway binary path");
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("config.toml");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let source = format!(
-      r#"schema_version = 2
-[defaults]
-[listeners.local]
-kind = "llm_api"
-bind = "{address}"
-client_auth = "none"
-[service.persistence]
-enabled = false
-usage_db_path = "{}/usage.db"
-sessions_db_path = "{}/sessions.db"
-requests_dir = "{}/requests"
-[service.logging]
-target = "stderr"
-[service.models]
-enabled = false
-"#,
-      dir.path().display(),
-      dir.path().display(),
-      dir.path().display()
-    );
-    std::fs::write(&config, source).unwrap();
-    drop(listener);
-    let gateway = Gateway::default();
-    gateway.start(executable.into(), config.clone(), address).await.unwrap();
-    assert_eq!(gateway.status(address).await.unwrap().ownership, "managed");
-    let document = crate::config::read_at(&config).unwrap();
-    crate::config::save_at(
-      &config,
-      &document.revision,
-      "[defaults]\n[model_scores.\"gpt-*\"]\ncodex = 10\n",
-    )
-    .unwrap();
-    let reload_result = reload(address).await;
-    gateway.stop().await.unwrap();
-    assert!(reload_result.is_ok(), "{reload_result:?}");
-    assert!(!healthy(address).await);
-    assert_eq!(gateway.status(address).await.unwrap().ownership, "none");
-  }
-
-  #[tokio::test]
-  async fn refuses_an_external_listener_and_stop_does_not_close_it() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let gateway = Gateway::default();
-    assert!(gateway
-      .start("/nonexistent".into(), "/nonexistent".into(), address)
-      .await
-      .is_err());
-    gateway.stop().await.unwrap();
-    assert!(tokio::net::TcpStream::connect(address).await.is_ok());
-  }
-  #[tokio::test]
-  async fn stops_and_reaps_owned_process() {
-    let process = Command::new("/bin/sleep").arg("60").kill_on_drop(true).spawn().unwrap();
-    let gateway = Gateway {
-      child: Mutex::new(Some(process)),
-      ..Gateway::default()
-    };
-    gateway.stop().await.unwrap();
-    assert!(gateway.child.lock().await.is_none());
-  }
-}
+mod tests;

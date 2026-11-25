@@ -47,9 +47,9 @@ builds do not require WebKit/GTK or other desktop libraries.
   back to the list. If the summary fails, the loaded TOML remains available in the editor.
   Save validates the complete candidate with the existing configuration
   validator (including legacy fragments) and uses a locked, atomic replacement with a revision check.
-  Unrelated sections and their comments are retained. Apply separately calls
-  the local admin reload endpoint; reload failure leaves the saved file in
-  place and reports that the running configuration has not changed. Runtime
+  Unrelated sections and their comments are retained. Apply calls the local admin
+  reload endpoint. If the gateway cannot confirm the reload, the app reports the
+  error and keeps the saved file. Runtime
   linking can reject a configuration accepted by the structural compiler.
 - **Activity:** the request/session inspector. Browse UTC request days,
   paginate and filter requests, inspect messages and tool definitions, lazily
@@ -74,13 +74,22 @@ revision checks; the editor lists them because their profiles/scores can overrid
 primary settings. Fragment editing remains in the CLI. Use the CLI to initialize
 a workspace first. Config errors appear in the app.
 
-A gateway already running outside the app can be viewed and reloaded but cannot
-be stopped by the app. Closing/quitting gracefully stops the child owned by the
-app, allowing up to 40 seconds for shutdown before terminating it. Unexpected
-app termination uses child kill-on-drop when Rust cleanup runs; force-killing
-the desktop process can still leave a child, which will be treated as external
-on the next launch. Gateway logs use the configuration's existing logging setup; a bounded 8 KiB
-stderr tail is shown when the managed child exits.
+The app starts its bundled gateway with `serve` and reports readiness once the
+worker registers with its frontend and the API passes a health check. Stop and
+Quit close the supervision pipe so the gateway drains its worker and shuts down
+the frontend it started. An unexpected desktop exit also closes the pipe.
+Desktop leaves an existing frontend and its workers under their original owner's
+control. If an externally started worker takes over the desktop frontend, the
+app's worker retires and Overview reports external ownership. The frontend and
+replacement worker continue serving after Desktop stops or quits.
+When an external candidate is attached, Stop retires the desktop worker and the
+frontend continues serving through the candidate.
+Apply uses the loopback reload endpoint on managed and external gateways.
+A frontend with one active worker can reload from a shared configuration source.
+During a rollout, or after a restart-only change, the frontend reports a conflict.
+If an older gateway lacks the endpoint, apply saved changes through its process
+manager. Gateway logs use the configuration's existing logging setup. Desktop
+shows the last 8 KiB of stderr when the managed gateway exits unexpectedly.
 The webview has no shell or filesystem plugin permissions.
 
 ## Isolated local testing
@@ -104,7 +113,8 @@ checks need permission to bind loopback sockets for process ownership tests.
 Manually check start/stop, external ownership, invalid/stale routing edits,
 reload failure, request filters, lazy payloads, session trees and empty/unavailable databases before release.
 
-To exercise the real bundled gateway on a temporary listener (no inference calls):
+To exercise the real frontend and worker on temporary listeners, including Apply,
+port release, abrupt termination and external worker takeover:
 
 ```sh
 TOKN_DESKTOP_TEST_GATEWAY="$(pwd)/../../target/debug/tokn-gateway" \

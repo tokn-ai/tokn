@@ -48,6 +48,67 @@ fn frontend(home: &Path, config: &Path) -> Child {
   start_command(home, config, &["frontend"], "frontend-stderr.log")
 }
 
+#[tokio::test]
+async fn shared_frontend_reloads_routes_and_accepts_replacement_workers() {
+  let home = tempfile::tempdir().unwrap();
+  let path = home.path().join("config.toml");
+  let address = free_address();
+  let original = format!(
+    "schema_version = 2\n[defaults]\n[listeners.api]\nkind = 'llm_api'\nbind = '{address}'\nclient_auth = 'none'\n[service.persistence]\nenabled = false\n[service.models]\nenabled = false\n"
+  );
+  fs::write(&path, &original).unwrap();
+  let mut frontend = frontend(home.path(), &path);
+  ready_frontend(&mut frontend, address, home.path()).await;
+  let mut worker = start(home.path(), &path);
+  ready(&mut worker, address, home.path()).await;
+  let client = reqwest::Client::builder().no_proxy().timeout(WAIT).build().unwrap();
+  let reload = || client.post(format!("http://{address}/admin/config/reload"));
+  let new_profile = || client.get(format!("http://{address}/team/v1/providers"));
+
+  assert_eq!(reload().send().await.unwrap().status(), 403);
+  assert_eq!(new_profile().send().await.unwrap().status(), 404);
+  let updated = format!("{original}\n[profiles.team]\nroute = 'default'\n");
+  fs::write(&path, &updated).unwrap();
+  let response = reload().header("x-tokn-admin", "reload").send().await.unwrap();
+  let status = response.status();
+  let report: serde_json::Value = response.json().await.unwrap();
+  assert_eq!(status, 200, "{report}");
+  assert_eq!(report["status"], "reloaded");
+  assert_eq!(new_profile().send().await.unwrap().status(), 200);
+
+  fs::write(&path, "[malformed").unwrap();
+  assert_eq!(
+    reload().header("x-tokn-admin", "reload").send().await.unwrap().status(),
+    422
+  );
+  fs::write(
+    &path,
+    updated.replace("client_auth = 'none'", "client_auth = 'local_keys'"),
+  )
+  .unwrap();
+  assert_eq!(
+    reload().header("x-tokn-admin", "reload").send().await.unwrap().status(),
+    409
+  );
+  assert_eq!(new_profile().send().await.unwrap().status(), 200);
+
+  fs::write(&path, &updated).unwrap();
+  let mut replacement = start_command(home.path(), &path, &["worker", "start"], "replacement.log");
+  assert_clean_exit(&mut worker, home.path()).await;
+  assert_eq!(new_profile().send().await.unwrap().status(), 200);
+  signal(&frontend, "-TERM");
+  assert!(tokio::time::timeout(WAIT, frontend.wait())
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
+  assert!(tokio::time::timeout(WAIT, replacement.wait())
+    .await
+    .unwrap()
+    .unwrap()
+    .success());
+}
+
 async fn ready_frontend(child: &mut Child, address: SocketAddr, home: &Path) {
   tokio::time::timeout(WAIT, async {
     while TcpStream::connect(address).await.is_err() {
@@ -667,6 +728,22 @@ enabled = false
   let frontend = IndependentFrontend(frontend_pid);
   ready(&mut old, address, home.path()).await;
   assert!(TcpStream::connect(proxy).await.is_ok());
+  auth.upsert(toml::from_str("id = 'second-fixture'\nprovider = 'openai'\napi_key = 'test-only'").unwrap());
+  auth.save().unwrap();
+  let reload = reqwest::Client::builder()
+    .no_proxy()
+    .timeout(WAIT)
+    .build()
+    .unwrap()
+    .post(format!("http://{address}/admin/config/reload"))
+    .header("x-tokn-admin", "reload")
+    .send()
+    .await
+    .unwrap();
+  let status = reload.status();
+  let report: serde_json::Value = reload.json().await.unwrap();
+  assert_eq!(status, 200, "{report}");
+  assert_eq!(report["accounts"], 2);
   let old_id = workers(address).await["workers"][0]["worker_id"]
     .as_str()
     .unwrap()

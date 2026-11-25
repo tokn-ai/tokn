@@ -1,0 +1,14 @@
+[package]
+name = "tokn-gateway-lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+repository.workspace = true
+description = "Parent process supervision for Tokn gateways"
+
+[target.'cfg(unix)'.dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }

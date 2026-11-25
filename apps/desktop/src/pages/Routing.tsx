@@ -72,10 +72,7 @@ export function Routing() {
       case "applied":
         return ["Gateway reloaded", "The last reload completed successfully."];
       case "unconfirmed":
-        return [
-          "Saved · apply unconfirmed",
-          "The saved file remains on disk. Retry to confirm apply.",
-        ];
+        return ["Saved · apply unconfirmed", "The saved file remains on disk."];
       case "unknown":
         return ["Saved on disk", "Runtime configuration has not been checked."];
     }

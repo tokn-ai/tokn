@@ -123,7 +123,9 @@ impl Cli {
       Cmd::Agent(c) => agent::run(cfg_path, c).await,
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
-      Cmd::Serve(a) => serve::run(cfg_path, a).await,
+      #[cfg(unix)]
+      Cmd::Serve(args) if args.worker_socket.is_none() => lifecycle::serve(cfg_path, args).await,
+      Cmd::Serve(args) => serve::run_direct(cfg_path, args).await,
       #[cfg(unix)]
       Cmd::Frontend(a) => lifecycle::frontend(cfg_path, a).await,
       #[cfg(unix)]

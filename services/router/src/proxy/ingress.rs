@@ -1,6 +1,6 @@
 //! A transport snapshot independent of whether execution is local or remote.
 
-use crate::frontend::ProxyIngress;
+use crate::frontend::{LiveProxyIngress, ProxyIngress};
 use crate::v2::{ForwardProxyState, InboundConnectionInfo, LiveForwardProxyState, ProxyAuthenticationError};
 use axum::extract::Request;
 use axum::http::HeaderMap;
@@ -12,7 +12,7 @@ use tokn_policy::{ClientAuthPlan, ConnectAction, ForwardProxyListenerPlan, Ingre
 #[derive(Clone)]
 pub(crate) enum IngressSource {
   Local(LiveForwardProxyState),
-  Remote(Arc<ProxyIngress>),
+  Remote(LiveProxyIngress),
 }
 
 impl From<LiveForwardProxyState> for IngressSource {
@@ -25,7 +25,7 @@ impl IngressSource {
   pub(crate) fn current(&self) -> IngressState {
     match self {
       Self::Local(state) => IngressState::Local(state.current()),
-      Self::Remote(state) => IngressState::Remote(state.clone()),
+      Self::Remote(state) => IngressState::Remote(state.current()),
     }
   }
 }

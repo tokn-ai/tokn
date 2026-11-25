@@ -24,7 +24,7 @@ pub async fn start_gateway(state: tauri::State<'_, Gateway>) -> Result<(), Strin
   let (executable, path, address) =
     blocking(|| Ok((gateway::executable()?, config::path()?, config::address()?))).await?;
   state
-    .start(executable, path, address)
+    .start(tokio::process::Command::new(executable), path, address)
     .await
     .map_err(|error| format!("{error:#}"))
 }

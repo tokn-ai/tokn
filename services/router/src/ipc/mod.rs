@@ -3,12 +3,14 @@
 
 mod pool;
 mod protocol;
+mod reload;
 mod transport;
 
 pub use pool::{WorkerEndpoint, WorkerPool};
 pub(crate) use protocol::auth_name;
 pub use protocol::{ApiAdmission, WorkerInfo, WorkerListener, PROTOCOL_VERSION};
-pub use transport::serve_worker;
+pub use reload::WorkerReload;
+pub use transport::{serve_reloadable_worker, serve_worker};
 
 #[cfg(test)]
 mod tests;

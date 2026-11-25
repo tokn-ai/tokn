@@ -22,15 +22,15 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 toml_edit = "0.25"
 sha2 = "0.10"
-nix = { version = "0.30", features = ["signal"] }
 tokn-config = { package = "tokn-router-config", path = "../../../core/config" }
+tokn-gateway-lifecycle = { path = "../../../services/gateway-lifecycle" }
 tokn-accounts = { path = "../../../services/accounts" }
 tokn-auth = { path = "../../../core/auth" }
 tokn-persistence = { path = "../../../services/persistence" }
 tokn-policy = { path = "../../../core/policy" }
 
-tempfile = "3"
-
 [dev-dependencies]
+nix = { version = "0.30", features = ["signal"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
 url = "2"

@@ -2966,6 +2966,7 @@ dependencies = [
  "tokn-catalogue",
  "tokn-convert",
  "tokn-core",
+ "tokn-gateway-lifecycle",
  "tokn-headers",
  "tokn-mock-server",
  "tokn-persistence",
@@ -2986,6 +2987,15 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "tokn-gateway-lifecycle"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tokio",
 ]
 
 [[package]]
