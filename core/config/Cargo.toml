@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Configuration loading and path resolution for tokn"
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
@@ -15,7 +14,6 @@ name = "tokn_config"
 default = ["std"]
 std = [
   "tokn-core/std",
-  "tokn-headers/std",
   "tokn-policy/std",
   "serde/std",
   "serde_json/std",
@@ -34,7 +32,6 @@ std = [
 
 [dependencies]
 tokn-core = { workspace = true }
-tokn-headers = { workspace = true }
 tokn-policy = { workspace = true }
 anyhow = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

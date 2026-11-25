@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Rust SDK for configured LLM routing with standard and embedded platform services"
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

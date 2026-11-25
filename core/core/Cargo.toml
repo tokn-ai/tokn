@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Core types, traits, provider contracts, and shared utilities for tokn"
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

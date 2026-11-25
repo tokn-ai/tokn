@@ -25,7 +25,6 @@ resolver = "2"
 version = "0.2.4"
 edition = "2021"
 documentation = "https://docs.rs/tokn-router"
-homepage = "https://github.com/tokn-ai/tokn"
 repository = "https://github.com/tokn-ai/tokn"
 license = "MIT"
 
@@ -61,7 +60,6 @@ tokn-requests = { version = "0.2.4", path = "services/requests", default-feature
 tokn-router = { version = "0.2.4", path = "services/router" }
 tokn-router-legacy-config = { version = "0.2.4", path = "services/legacy-config" }
 
-tokn = { version = "0.2.4", path = "apps/tokn" }
 tokn-sdk = { version = "0.2.4", path = "apps/sdk" }
 
 anyhow = "1"
@@ -88,7 +86,6 @@ indicatif = "0.18"
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
 jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 libc = "0.2"
-notify = "8"
 parking_lot = "0.12"
 rcgen = { version = "0.14", features = ["crypto", "pem"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "http2", "socks", "gzip", "brotli", "deflate", "zstd", "form"] }

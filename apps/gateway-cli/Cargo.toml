@@ -4,7 +4,6 @@ default-run = "tokn-gateway"
 version.workspace = true
 edition.workspace = true
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 description = "CLI and local gateway runtime for serving OpenAI-compatible APIs via tokn"
 license.workspace = true
@@ -53,11 +52,9 @@ humantime = { workspace = true }
 indicatif = { workspace = true }
 libc = { workspace = true }
 inquire = { workspace = true }
-notify = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
 rpassword = { workspace = true }
-rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 snafu = { workspace = true }
@@ -73,5 +70,6 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 tempfile = "3"
 tokn-mock-server = { workspace = true }

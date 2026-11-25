@@ -4,6 +4,11 @@
 //! workspace mock server or other internal crates here could hide missing SDK
 //! dependency features through Cargo feature unification.
 
+const _: () = {
+  const fn assert_send_sync<T: Send + Sync>() {}
+  assert_send_sync::<tokn_sdk::Client>();
+};
+
 #[cfg(test)]
 mod tests {
   use std::{
@@ -24,8 +29,6 @@ mod tests {
   use tokn_sdk::{
     chat_completions::ChatRequest, Client, Error, Event, RequestEventPayload, RequestOptions, StageEvent, StdPlatform,
   };
-
-  fn assert_send_sync<T: Send + Sync>() {}
 
   fn assert_send<T: Send>(value: T) -> T {
     value
@@ -224,7 +227,6 @@ mod tests {
 
   #[test]
   fn default_client_sends_buffered_and_streaming_requests() {
-    assert_send_sync::<Client>();
     let mut fixture = Fixture::start();
     let runtime = tokio::runtime::Builder::new_current_thread()
       .enable_all()

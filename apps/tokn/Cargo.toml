@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Unified wrapper crate that re-exports the tokn Rust workspace crates"
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 

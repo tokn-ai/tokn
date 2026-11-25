@@ -377,7 +377,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokn-core",
- "tokn-headers",
  "tokn-policy",
 ]
 

@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 description = "Config-independent HTTP and Tower service contracts for tokn"
 documentation.workspace = true
-homepage.workspace = true
 repository.workspace = true
 license.workspace = true
 
