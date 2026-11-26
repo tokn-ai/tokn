@@ -15,12 +15,8 @@ pub struct UsageSummary {
 
 pub fn usage() -> Result<Vec<UsageSummary>> {
   let path = crate::config::load()?.persistence().resolve_paths()?.usage_db;
-  if !path.exists() {
-    return Ok(Vec::new());
-  }
   Ok(
-    tokn_persistence::UsageDb::open_readonly(&path)?
-      .summary_for_window(Duration::from_secs(24 * 60 * 60), None, None)?
+    tokn_viewer::usage_summary(&path, Duration::from_secs(24 * 60 * 60), None, None)?
       .into_iter()
       .map(|row| UsageSummary {
         account: row.account,

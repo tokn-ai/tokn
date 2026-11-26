@@ -4252,11 +4252,22 @@ dependencies = [
  "tokio",
  "tokn-accounts",
  "tokn-auth",
+ "tokn-gateway-service",
  "tokn-persistence",
  "tokn-policy",
  "tokn-router-config",
+ "tokn-viewer",
  "toml_edit 0.25.13+spec-1.1.0",
  "url",
+]
+
+[[package]]
+name = "tokn-gateway-service"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tokio",
 ]
 
 [[package]]
@@ -4273,7 +4284,6 @@ dependencies = [
 name = "tokn-persistence"
 version = "0.2.4"
 dependencies = [
- "base64 0.22.1",
  "bytes",
  "flate2",
  "libc",
@@ -4428,6 +4438,23 @@ dependencies = [
  "toml 1.1.6+spec-1.1.0",
  "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
+]
+
+[[package]]
+name = "tokn-viewer"
+version = "0.2.4"
+dependencies = [
+ "base64 0.22.1",
+ "flate2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "tokn-core",
+ "tokn-persistence",
+ "tracing",
+ "zstd",
 ]
 
 [[package]]

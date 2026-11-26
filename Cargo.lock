@@ -2966,7 +2966,9 @@ dependencies = [
  "tokn-catalogue",
  "tokn-convert",
  "tokn-core",
+ "tokn-gateway-service",
  "tokn-headers",
+ "tokn-maintenance",
  "tokn-mock-server",
  "tokn-persistence",
  "tokn-policy",
@@ -2978,6 +2980,7 @@ dependencies = [
  "tokn-router",
  "tokn-router-config",
  "tokn-router-legacy-config",
+ "tokn-viewer",
  "toml",
  "toml_edit",
  "tower",
@@ -2989,6 +2992,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokn-gateway-service"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "libc",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokn-access",
+ "tokn-core",
+ "tokn-headers",
+ "tokn-maintenance",
+ "tokn-persistence",
+ "tokn-router",
+ "tokn-router-config",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tokn-headers"
 version = "0.2.4"
 dependencies = [
@@ -2996,6 +3021,25 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokn-core",
+]
+
+[[package]]
+name = "tokn-maintenance"
+version = "0.2.4"
+dependencies = [
+ "anyhow",
+ "lzma-rust2",
+ "parking_lot",
+ "rusqlite",
+ "sha2",
+ "time",
+ "tokio",
+ "tokn-core",
+ "tokn-persistence",
+ "tokn-router-config",
+ "tracing",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -3018,7 +3062,6 @@ dependencies = [
 name = "tokn-persistence"
 version = "0.2.4"
 dependencies = [
- "base64",
  "bytes",
  "flate2",
  "libc",
@@ -3365,6 +3408,27 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokn-sdk",
+]
+
+[[package]]
+name = "tokn-viewer"
+version = "0.2.4"
+dependencies = [
+ "base64",
+ "bytes",
+ "flate2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tempfile",
+ "time",
+ "tokn-core",
+ "tokn-maintenance",
+ "tokn-persistence",
+ "tracing",
+ "uuid",
+ "zstd",
 ]
 
 [[package]]

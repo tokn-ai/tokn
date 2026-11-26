@@ -1,19 +1,18 @@
 use crate::config::Config;
-use crate::db::archive::{ArchiveEventHandler, ArchiveRuntime};
 use crate::progress::{ArchiveProgressEventHandler, ProgressEventHandler, ProgressLogEventHandler};
 use anyhow::Result;
 use axum::Router;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::broadcast;
 use tokn_auth::AuthStore;
 use tokn_config::RouteMode;
 use tokn_core::account::AccountConfig;
 use tokn_core::event::{EventBus, EventHandler};
+use tokn_maintenance::{ArchiveEventHandler, ArchiveRuntime};
 
 type EventBusParts = (
   Arc<EventBus>,
@@ -28,6 +27,7 @@ pub fn build_event_bus(cfg: &Config) -> Result<EventBusParts> {
     cfg,
     tokn_config::v2::DEFAULT_ARCHIVE_AFTER_DAYS as i64,
     Some(tokn_config::v2::DEFAULT_PRUNE_AFTER_DAYS as i64),
+    true,
   )
 }
 
@@ -35,12 +35,12 @@ fn build_event_bus_with_retention(
   cfg: &Config,
   archive_after_days: i64,
   prune_after_days: Option<i64>,
+  run_maintenance: bool,
 ) -> Result<EventBusParts> {
   let capacity = cfg.db.write_queue_capacity.max(256);
   let bus = EventBus::new(capacity);
   let receiver = bus.subscribe();
   let mut handlers: Vec<Box<dyn EventHandler>> = Vec::new();
-  let mut archive_handlers: Vec<Box<dyn ArchiveEventHandler>> = Vec::new();
   let tty_progress = std::io::stdout().is_terminal();
 
   if cfg.db.enabled {
@@ -71,27 +71,15 @@ fn build_event_bus_with_retention(
 
   if tty_progress {
     handlers.push(Box::new(ProgressEventHandler::new()));
-    archive_handlers.push(Box::new(ArchiveProgressEventHandler::new()));
   }
 
-  let archive_runtime = if cfg.db.enabled {
-    let paths = cfg.db.resolve_paths()?;
-    let extension = cfg.db.archive_extension.as_deref();
-    match prune_after_days {
-      Some(prune_after_days) => crate::db::archive::start_request_maintenance_worker(
-        paths.requests_dir,
-        extension,
-        archive_after_days,
-        prune_after_days,
-        archive_handlers,
-      ),
-      None => crate::db::archive::start_request_archive_worker(
-        paths.requests_dir,
-        extension,
-        archive_after_days,
-        archive_handlers,
-      ),
-    }
+  let archive_runtime = if cfg.db.enabled && run_maintenance {
+    start_maintenance(
+      cfg.db.resolve_paths()?.requests_dir,
+      cfg.db.archive_extension.as_deref(),
+      archive_after_days,
+      prune_after_days,
+    )
   } else {
     None
   };
@@ -99,21 +87,48 @@ fn build_event_bus_with_retention(
   Ok((Arc::new(bus), receiver, handlers, archive_runtime))
 }
 
+fn start_maintenance(
+  requests_dir: PathBuf,
+  extension: Option<&str>,
+  archive_after_days: i64,
+  prune_after_days: Option<i64>,
+) -> Option<ArchiveRuntime> {
+  let handlers = maintenance_handlers();
+  match prune_after_days {
+    Some(days) => {
+      tokn_maintenance::start_request_maintenance_worker(requests_dir, extension, archive_after_days, days, handlers)
+    }
+    None => tokn_maintenance::start_request_archive_worker(requests_dir, extension, archive_after_days, handlers),
+  }
+}
+
+pub fn maintenance_handlers() -> Vec<Box<dyn ArchiveEventHandler>> {
+  let mut handlers: Vec<Box<dyn ArchiveEventHandler>> = Vec::new();
+  if std::io::stdout().is_terminal() {
+    handlers.push(Box::new(ArchiveProgressEventHandler::new()));
+  }
+  handlers
+}
+
 /// Build the existing event bus from v2 persistence settings.
 ///
 /// This adapter remains in the CLI so the config and router crates stay free
 /// of database and progress-handler dependencies.
-pub fn build_v2_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
-  build_v2_event_bus_with_retention(persistence, Some(persistence.prune_after_days()))
+pub fn build_v2_event_bus(
+  persistence: &tokn_config::v2::PersistencePlan,
+  run_maintenance: bool,
+) -> Result<EventBusParts> {
+  build_v2_event_bus_with_retention(persistence, Some(persistence.prune_after_days()), run_maintenance)
 }
 
 pub fn build_smoke_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
-  build_v2_event_bus_with_retention(persistence, None)
+  build_v2_event_bus_with_retention(persistence, None, true)
 }
 
 fn build_v2_event_bus_with_retention(
   persistence: &tokn_config::v2::PersistencePlan,
   prune_after_days: Option<i64>,
+  run_maintenance: bool,
 ) -> Result<EventBusParts> {
   let mut cfg = Config::default();
   cfg.db.enabled = persistence.enabled();
@@ -128,26 +143,12 @@ fn build_v2_event_bus_with_retention(
     cfg.db.sessions_db_path = Some(paths.sessions_db);
     cfg.db.requests_dir = Some(paths.requests_dir);
   }
-  build_event_bus_with_retention(&cfg, persistence.archive_after_days(), prune_after_days)
-}
-
-/// Frontends own admission failures only. Worker event loops remain responsible
-/// for usage, sessions, body captures, and archival of dispatched requests.
-pub fn build_v2_ingress_event_bus(persistence: &tokn_config::v2::PersistencePlan) -> Result<EventBusParts> {
-  let bus = Arc::new(EventBus::new(persistence.write_queue_capacity().max(256)));
-  let receiver = bus.subscribe();
-  let mut handlers: Vec<Box<dyn EventHandler>> = Vec::new();
-  if persistence.enabled() {
-    let paths = persistence.resolve_paths()?;
-    handlers.push(Box::new(tokn_persistence::RequestEventHandler::with_options(
-      paths.requests_dir,
-      tokn_persistence::requests::RequestPersistenceOptions {
-        record_request_bodies: false,
-        body_max_bytes: 0,
-      },
-    )?));
-  }
-  Ok((bus, receiver, handlers, None))
+  build_event_bus_with_retention(
+    &cfg,
+    persistence.archive_after_days(),
+    prune_after_days,
+    run_maintenance,
+  )
 }
 
 /// Load accounts from the root `auth.yaml` and any `auth.d` fragments.
@@ -195,33 +196,6 @@ where
   tokn_router::server::serve_http(app, listener, shutdown).await
 }
 
-/// Called after every listener has stopped and its connection tasks have been
-/// joined. A stuck finalizer or writer must not hang process termination.
-pub async fn finish_events(events: &EventBus, archive: Option<ArchiveRuntime>) -> Result<()> {
-  finish_events_with_timeout(events, archive, Duration::from_secs(5)).await
-}
-
-async fn finish_events_with_timeout(
-  events: &EventBus,
-  archive: Option<ArchiveRuntime>,
-  timeout: Duration,
-) -> Result<()> {
-  let result = tokio::time::timeout(timeout, async {
-    tokio::join!(events.shutdown(), async {
-      if let Some(archive) = archive {
-        archive.shutdown().await;
-      }
-    });
-  })
-  .await;
-  if result.is_err() {
-    tracing::error!("shutdown persistence cleanup timed out; queued records may be incomplete");
-    anyhow::bail!("shutdown persistence cleanup timed out");
-  }
-  tracing::info!("shutdown persistence cleanup complete");
-  Ok(())
-}
-
 pub fn is_loopback(host: &str) -> bool {
   matches!(host, "127.0.0.1" | "::1" | "localhost")
     || host
@@ -242,34 +216,6 @@ pub fn ensure_bind_host(host: &str, insecure_allow_remote: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[tokio::test]
-  async fn cleanup_waits_for_handler_flush() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    struct Handler(Arc<AtomicBool>);
-    impl EventHandler for Handler {
-      fn handle(&mut self, _: &tokn_core::event::Event) {}
-      fn flush(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-      }
-    }
-    let flushed = Arc::new(AtomicBool::new(false));
-    let events = EventBus::new(16);
-    let worker = tokn_core::event::spawn_event_loop(events.subscribe(), vec![Box::new(Handler(flushed.clone()))]);
-    finish_events(&events, None).await.unwrap();
-    assert!(flushed.load(Ordering::SeqCst));
-    worker.join().unwrap();
-  }
-
-  #[tokio::test]
-  async fn cleanup_reports_stalled_finalizers_instead_of_waiting_forever() {
-    let events = EventBus::new(16);
-    let _finalizer = events.begin_finalizer();
-    let error = finish_events_with_timeout(&events, None, Duration::from_millis(20))
-      .await
-      .unwrap_err();
-    assert!(error.to_string().contains("cleanup timed out"));
-  }
 
   fn persistence_config(record_sessions: bool) -> (Config, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("tokn-server-runtime-test-{}", uuid::Uuid::new_v4()));
@@ -299,105 +245,6 @@ mod tests {
     let _parts = build_event_bus(&cfg).expect("event bus should initialize other persistence");
 
     assert!(!sessions_db.exists());
-  }
-
-  fn ingress_persistence(root: &Path, enabled: bool) -> tokn_config::v2::PersistencePlan {
-    let config = format!(
-      r#"
-schema_version = 2
-[listeners.proxy]
-kind = "forward_proxy"
-bind = "127.0.0.1:8080"
-client_auth = "none"
-default_http_action = {{ kind = "reject" }}
-default_connect = "reject"
-[service.persistence]
-enabled = {enabled}
-usage_db_path = {:?}
-sessions_db_path = {:?}
-requests_dir = {:?}
-"#,
-      root.join("usage.db"),
-      root.join("sessions.db"),
-      root.join("requests"),
-    );
-    tokn_config::v2::parse_config(&config, Path::new("frontend-persistence.toml"))
-      .unwrap()
-      .service()
-      .persistence()
-      .clone()
-  }
-
-  #[tokio::test]
-  async fn ingress_event_bus_persists_rejections_and_drains_without_usage_or_sessions() {
-    use tokn_core::event::Event;
-    use tokn_core::request_event::{IngressRejection, RecordEvent, RequestEndpoint, RequestEvent, RequestEventPayload};
-
-    let root = tempfile::tempdir().unwrap();
-    let persistence = ingress_persistence(root.path(), true);
-    let (events, receiver, handlers, archive) = build_v2_ingress_event_bus(&persistence).unwrap();
-    assert_eq!(handlers.len(), 1);
-    assert!(archive.is_none());
-    let worker = tokn_core::event::spawn_event_loop(receiver, handlers);
-    let ts = tokn_core::util::now_unix_ms();
-    let mut headers = tokn_headers::HeaderMap::new();
-    headers.insert("authorization", "Bearer private-test-value");
-    headers.insert("x-request-id", "req-frontend-persisted");
-    events.emit(Event::Requests(RequestEvent {
-      request_id: "req-frontend-persisted".into(),
-      attempt: 0,
-      ts,
-      payload: RequestEventPayload::Record(RecordEvent::IngressRejected(IngressRejection {
-        started_ts: ts,
-        request_endpoint: RequestEndpoint::infer_from_path("/v1/responses"),
-        status: 413,
-        error: "request body exceeds the configured limit".into(),
-        mode: "requests".into(),
-        pipeline_id: "requests".into(),
-        method: "POST".into(),
-        url: Some("/v1/responses".into()),
-        headers,
-        user: None,
-        api_key_id: None,
-        local_addr: None,
-        peer_addr: None,
-      })),
-    }));
-    finish_events(&events, archive).await.unwrap();
-    worker.join().unwrap();
-
-    assert!(!root.path().join("usage.db").exists());
-    assert!(!root.path().join("sessions.db").exists());
-    let days = tokn_persistence::requests::RequestsDb::day_files(&root.path().join("requests")).unwrap();
-    assert_eq!(days.len(), 1);
-    let db = rusqlite::Connection::open(&days[0]).unwrap();
-    let (status, error, header_bytes, body): (i64, String, Vec<u8>, Option<Vec<u8>>) = db
-      .query_row(
-        "SELECT c.status, c.request_error, d.inbound_req_headers, d.inbound_req_body
-         FROM request_connection c JOIN request_downstream d USING (request_id)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-      )
-      .unwrap();
-    assert_eq!(status, 413);
-    assert!(error.contains("request body exceeds the configured limit"));
-    let headers: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
-    assert_eq!(headers["authorization"], "<redacted>");
-    assert_eq!(headers["x-request-id"], "req-frontend-persisted");
-    assert!(body.is_none());
-  }
-
-  #[tokio::test]
-  async fn disabled_ingress_persistence_does_not_open_databases() {
-    let root = tempfile::tempdir().unwrap();
-    let persistence = ingress_persistence(root.path(), false);
-    let (events, receiver, handlers, archive) = build_v2_ingress_event_bus(&persistence).unwrap();
-    assert!(handlers.is_empty());
-    assert!(archive.is_none());
-    let worker = tokn_core::event::spawn_event_loop(receiver, handlers);
-    finish_events(&events, archive).await.unwrap();
-    worker.join().unwrap();
-    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
   }
 
   #[test]

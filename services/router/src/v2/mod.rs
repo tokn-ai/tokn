@@ -136,6 +136,8 @@ pub struct ReloadReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReloadError {
   NotConfigured,
+  Conflict(String),
+  ActivationUnconfirmed { generation: u64 },
   RestartRequired(String),
   Invalid(String),
 }
@@ -145,7 +147,10 @@ impl std::fmt::Display for ReloadError {
     match self {
       Self::NotConfigured => formatter.write_str("admin config reload is not configured"),
       Self::RestartRequired(message) => write!(formatter, "reload requires restart: {message}"),
-      Self::Invalid(message) => formatter.write_str(message),
+      Self::Conflict(message) | Self::Invalid(message) => formatter.write_str(message),
+      Self::ActivationUnconfirmed { generation } => write!(
+        formatter, "configuration generation {generation} was published at the frontend, but the worker did not confirm activation"
+      ),
     }
   }
 }
@@ -518,9 +523,9 @@ pub struct RuntimeStates {
   pub forward_proxy: Vec<ForwardProxyState>,
 }
 
-struct RuntimeGeneration {
+pub(crate) struct RuntimeGeneration {
   number: u64,
-  accounts: usize,
+  pub(crate) accounts: usize,
   llm_api: BTreeMap<ListenerId, Arc<AppState>>,
   forward_proxy: BTreeMap<ListenerId, Arc<ForwardProxyState>>,
 }
@@ -667,13 +672,6 @@ impl LiveRuntime {
     self.admin_reloader.set(reloader)
   }
 
-  async fn reload(&self) -> Result<ReloadReport, ReloadError> {
-    let Some(reloader) = self.admin_reloader.get() else {
-      return Err(ReloadError::NotConfigured);
-    };
-    reloader.reload().await
-  }
-
   fn current_api(&self, listener_id: &ListenerId) -> Arc<AppState> {
     self
       .current
@@ -745,6 +743,29 @@ impl LiveForwardProxyState {
   pub(crate) fn current(&self) -> Arc<ForwardProxyState> {
     self.runtime.current_forward_proxy(&self.listener_id)
   }
+}
+
+/// Check the process-wide settings that are established at gateway startup.
+pub fn ensure_service_reload_compatible(
+  current: &tokn_config::v2::ServiceSettings,
+  replacement: &tokn_config::v2::ServiceSettings,
+) -> Result<(), ReloadError> {
+  // These fields are restart-only, so every accepted generation still matches
+  // the process-start service settings used as this comparison baseline.
+  let changed = if current.outbound() != replacement.outbound() {
+    "outbound transport settings changed"
+  } else if current.request_limits() != replacement.request_limits() {
+    "request limits changed"
+  } else if current.persistence() != replacement.persistence() {
+    "persistence settings changed"
+  } else if current.logging() != replacement.logging() {
+    "logging settings changed"
+  } else if current.models() != replacement.models() {
+    "model refresh settings changed"
+  } else {
+    return Ok(());
+  };
+  Err(ReloadError::RestartRequired(changed.into()))
 }
 
 fn ensure_reload_compatible(current: &RuntimeGeneration, replacement: &RuntimeGeneration) -> Result<(), ReloadError> {
@@ -1386,6 +1407,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 pub fn router_live(state: LiveAppState) -> Router {
+  let bind = state.bind();
+  router_live_on(state, bind)
+}
+
+/// Build the live API router for the address the server will listen on.
+/// CLI bind overrides determine whether the loopback reload endpoint is available.
+pub fn router_live_on(state: LiveAppState, bind: SocketAddr) -> Router {
   let max_wire_bytes = state.current().request_limits.max_wire_bytes();
   let request_id_header = axum::http::HeaderName::from_static(REQUEST_ID_HEADER);
   let cors_state = state.clone();
@@ -1404,7 +1432,7 @@ pub fn router_live(state: LiveAppState) -> Router {
     // reads live listener policy, including after enabling/disabling CORS.
     .layer(cors);
   let mut router = Router::new().merge(client_routes).route("/healthz", get(health));
-  if state.bind().ip().is_loopback() {
+  if bind.ip().is_loopback() {
     router = router.route("/admin/config/reload", post(admin_config_reload));
   }
   router
@@ -1471,10 +1499,18 @@ async fn authenticate(State(live): State<LiveAppState>, mut request: Request, ne
 }
 
 async fn admin_config_reload(State(state): State<LiveAppState>, headers: HeaderMap) -> Response {
+  handle_admin_reload(headers, state.runtime.admin_reloader.get()).await
+}
+
+pub(crate) async fn handle_admin_reload(headers: HeaderMap, reloader: Option<&AdminReloader>) -> Response {
   if headers.get(ADMIN_ACTION_HEADER).and_then(|value| value.to_str().ok()) != Some(ADMIN_RELOAD_ACTION) {
     return ApiError::forbidden("config reload requires an explicit admin action header").into_response();
   }
-  match state.runtime.reload().await {
+  let result = match reloader {
+    Some(reloader) => reloader.reload().await,
+    None => Err(ReloadError::NotConfigured),
+  };
+  match result {
     Ok(report) => Json(report).into_response(),
     Err(ReloadError::NotConfigured) => reload_error_response(
       StatusCode::NOT_FOUND,
@@ -1484,6 +1520,12 @@ async fn admin_config_reload(State(state): State<LiveAppState>, headers: HeaderM
     Err(error @ ReloadError::RestartRequired(_)) => {
       reload_error_response(StatusCode::CONFLICT, "restart_required", error.to_string())
     }
+    Err(error @ ReloadError::ActivationUnconfirmed { .. }) => reload_error_response(
+      StatusCode::SERVICE_UNAVAILABLE,
+      "activation_unconfirmed",
+      error.to_string(),
+    ),
+    Err(ReloadError::Conflict(message)) => reload_error_response(StatusCode::CONFLICT, "reload_conflict", message),
     Err(error @ ReloadError::Invalid(_)) => {
       tracing::warn!(%error, "v2 configuration reload failed");
       reload_error_response(
@@ -1969,6 +2011,22 @@ allow_insecure_public = true
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(!reload_called.load(std::sync::atomic::Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn admin_reload_uses_the_effective_listener_address() {
+    let live = LiveRuntime::new(reload_test_states("127.0.0.1:4141", "127.0.0.1:4142", "reject"), 1);
+    let state = live.llm_api_listeners().pop().unwrap();
+    for (address, expected) in [
+      ("0.0.0.0:4242", StatusCode::NOT_FOUND),
+      ("[::1]:4242", StatusCode::FORBIDDEN),
+    ] {
+      let response = router_live_on(state.clone(), address.parse().unwrap())
+        .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+      assert_eq!(response.status(), expected);
+    }
   }
 
   #[test]

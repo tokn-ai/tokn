@@ -23,7 +23,8 @@ pub use stages::{RequestEventHandler, RequestPersistenceOptions};
 
 const CACHE_CAP: usize = 3;
 pub(crate) const BOOTSTRAP: &str = include_str!("../../schemas/snapshot/requests/v0.2.0.sql");
-pub(crate) const MIGRATIONS: &[migrate::Migration] = &[
+/// Versioned schema migrations, starting with the original database layout.
+pub const MIGRATIONS: &[migrate::Migration] = &[
   migrate::Migration {
     version: 1,
     name: "initial",
@@ -242,10 +243,26 @@ pub(crate) fn composite_request_id(request_id: &str, attempt: u32) -> String {
   }
 }
 
+/// Return whether `day` is a canonical UTC request-history day (`YYYY-MM-DD`).
+pub fn is_valid_request_day(day: &str) -> bool {
+  let bytes = day.as_bytes();
+  if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+    return false;
+  }
+  if !bytes
+    .iter()
+    .enumerate()
+    .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+  {
+    return false;
+  }
+  time::Date::parse(day, format_description!("[year]-[month]-[day]")).is_ok()
+}
+
 /// Convert a unix timestamp to a day key like `"2026-05-19"`.
 /// Accepts both seconds and milliseconds: values > 10_000_000_000 are
 /// treated as milliseconds (2026 in seconds ≈ 1.7B, in ms ≈ 1.7T).
-pub(crate) fn day_key(ts: i64) -> String {
+pub fn day_key(ts: i64) -> String {
   let ts_secs = if ts > 10_000_000_000 { ts / 1_000 } else { ts };
   let dt = time::OffsetDateTime::from_unix_timestamp(ts_secs).unwrap_or_else(|_| time::OffsetDateTime::now_utc());
   dt.date()

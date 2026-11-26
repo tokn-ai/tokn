@@ -7,7 +7,7 @@
 
 ## Workspace Shape
 
-- This is a Rust workspace, not a single crate. Top-level orchestration lives in `apps/gateway-cli` and `services/router`.
+- This is a Rust workspace. On Unix, `apps/gateway-cli` launches the gateway coordinator in the frontend process. The coordinator lives in `services/gateway`.
 - `apps/gateway-cli` is the shipped CLI/runtime package: Cargo package `tokn-gateway-cli`, binary target `tokn-gateway`.
 - The user-facing clap command name is still `tokn-router` in `apps/gateway-cli/src/cli/mod.rs`. Do not assume README command names match the built binary name.
 - `services/router` owns the HTTP API/router/proxy wiring. `apps/tokn` is a re-export wrapper crate, not the runtime entrypoint.
@@ -15,14 +15,17 @@
 ## Crate Map
 
 - `apps/gateway-cli`: CLI commands, process startup, logging, serve/proxy runtime.
-- `services/router`: axum router, `/v1/*` endpoints, proxy interception, shared request pipeline wiring.
+- `services/gateway`: instance lifecycle, frontend discovery, worker registration, reload coordination, and shutdown.
+- `services/router`: HTTP listeners, axum router, `/v1/*` endpoints, proxy interception, and streaming request dispatch.
 - `services/accounts`: account pool, provider registry, route resolution.
 - `core/auth`: auth provider interfaces and credential storage/import.
 - `core/catalogue`: provider/model catalogue loading and cache handling.
 - `core/config`: config loading, validation, path resolution, TOML edits.
 - `endpoints/convert`: cross-endpoint request/response conversion, including SSE translation.
 - `services/requests`: composable request pipeline stages and event emission.
-- `services/persistence`: SQLite persistence, migrations, archival, schema snapshots.
+- `services/persistence`: SQLite writers, rotation, migrations, schema snapshots, and request-file access.
+- `services/maintenance`: request database archival, verification, and pruning for scheduled and CLI runs.
+- `services/viewer`: read-only request, session, and usage queries for Desktop and CLI, including archived request days.
 - `core/core`: shared types, provider contracts, utilities.
 - `core/headers`: header parsing/schema/persona utilities.
 - `endpoints/*`: typed endpoint schemas and endpoint proc macros; usually touched together when request/response shapes change.

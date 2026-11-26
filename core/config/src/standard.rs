@@ -1,3 +1,4 @@
+use crate::files::load_config_overlays;
 use crate::model_score_pattern_error;
 use crate::{error, file_identity, paths, schema, v2};
 
@@ -15,8 +16,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tokn_core::provider::ID_GITHUB_COPILOT;
-
-use crate::schema::SchemaMarkerError;
 
 pub const DEFAULT_PORT: u16 = 4141;
 pub const DEFAULT_HOST: &str = "127.0.0.1";
@@ -518,20 +517,6 @@ struct ConfigRaw {
   copilot: Option<toml::Table>,
 }
 
-/// A deliberately narrow runtime configuration overlay. Agent integration
-/// tooling owns agent/profile entries, while operators may keep model scores
-/// in a separate fragment. Other root configuration remains primary-file only.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFragment {
-  #[serde(default)]
-  agents: BTreeMap<String, AgentConfig>,
-  #[serde(default)]
-  profiles: BTreeMap<String, ProfileConfig>,
-  #[serde(default)]
-  model_scores: BTreeMap<String, BTreeMap<String, i32>>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
   #[serde(default = "default_host")]
@@ -941,7 +926,8 @@ impl Config {
   /// primary config, such as `config init`.
   pub fn load_primary(explicit: Option<&Path>) -> Result<(Self, PathBuf)> {
     let path = resolve_config_path(explicit)?;
-    let cfg = load_primary_config(&path)?;
+    let document = read_gateway_document(&path)?;
+    let cfg = validated_primary_config(document, &path)?;
     Ok((cfg, path))
   }
 
@@ -949,11 +935,8 @@ impl Config {
   /// from the matching `config.d` directory.
   pub fn load_with_sources(explicit: Option<&Path>) -> Result<LoadedConfig> {
     let path = resolve_config_path(explicit)?;
-    let cfg = load_primary_config(&path)?;
-    let loaded = load_config_overlays(&path, cfg)?;
-    loaded.config.validate()?;
-    tracing::debug!(path = %path.display(), fragments = loaded.sources.fragments.len(), "config loaded");
-    Ok(loaded)
+    let document = read_gateway_document(&path)?;
+    load_legacy_with_sources(document, &path)
   }
 
   pub fn validate(&self) -> Result<()> {
@@ -1164,14 +1147,14 @@ where
   })?;
   let schema = detect_edit_config_schema(&document, path)?;
   if matches!(policy, EditSchemaPolicy::LegacyOnly) {
-    require_legacy_edit_schema(schema, path)?;
+    require_legacy_schema(schema, path)?;
   }
 
   f(&mut document)?;
 
   let edited_schema = detect_edit_config_schema(&document, path)?;
   match policy {
-    EditSchemaPolicy::LegacyOnly => require_legacy_edit_schema(edited_schema, path)?,
+    EditSchemaPolicy::LegacyOnly => require_legacy_schema(edited_schema, path)?,
     EditSchemaPolicy::Preserve => require_unchanged_edit_schema(edited_schema, schema, path)?,
   }
   let serialised = document.to_string();
@@ -1214,34 +1197,26 @@ fn validate_edited_config(path: &Path, schema: ConfigSchema, serialised: &str) -
 /// Present files are parsed strictly enough to reject malformed or unsupported
 /// schema markers before a caller chooses a schema-specific loader.
 pub fn detect_config_schema(path: &Path) -> Result<ConfigSchema> {
-  let raw = match std::fs::read_to_string(path) {
-    Ok(raw) => raw,
-    Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(ConfigSchema::Legacy),
-    Err(source) => {
-      return Err(Error::Read {
-        path: path.to_path_buf(),
-        source,
-      });
+  classify_config_document(&read_gateway_document(path)?, path)
+}
+
+fn read_primary_document(path: &Path) -> Result<toml::Value> {
+  let raw = std::fs::read_to_string(path).context(error::ReadSnafu { path })?;
+  toml::from_str(&raw).context(error::ParseSnafu { path })
+}
+
+fn read_gateway_document(path: &Path) -> Result<toml::Value> {
+  match read_primary_document(path) {
+    // An absent gateway config has the same defaults and overlays as an empty legacy file.
+    Err(Error::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+      Ok(toml::Value::Table(toml::Table::new()))
     }
-  };
-  let document: toml::Value = toml::from_str(&raw).map_err(|source| Error::Parse {
-    path: path.to_path_buf(),
-    source,
-  })?;
-  classify_config_document(&document, path)
+    result => result,
+  }
 }
 
 fn classify_config_document(document: &toml::Value, path: &Path) -> Result<ConfigSchema> {
-  match schema::detect_toml(document) {
-    Ok(schema) => Ok(schema),
-    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
-      path: path.to_path_buf(),
-    }),
-    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
-      path: path.to_path_buf(),
-      found,
-    }),
-  }
+  schema::detect_toml(document).map_err(|error| error.at_path(path))
 }
 
 /// Read configuration for an in-process client without validating listeners.
@@ -1254,12 +1229,7 @@ fn classify_config_document(document: &toml::Value, path: &Path) -> Result<Confi
 /// decoded without compiling gateway admission.
 /// No config or credential files are modified.
 pub fn load_execution_input(path: &Path) -> Result<ExecutionConfigInput> {
-  let raw = std::fs::read_to_string(path).context(error::ReadSnafu {
-    path: path.to_path_buf(),
-  })?;
-  let document: toml::Value = toml::from_str(&raw).context(error::ParseSnafu {
-    path: path.to_path_buf(),
-  })?;
+  let document = read_primary_document(path)?;
   match classify_config_document(&document, path)? {
     ConfigSchema::Legacy => {
       let inline_accounts = document
@@ -1293,15 +1263,45 @@ pub fn load_execution_input(path: &Path) -> Result<ExecutionConfigInput> {
 /// documents include their sorted `config.d` overlays; version 2 documents
 /// are fully compiled before they are returned.
 pub fn load_config(explicit: Option<&Path>) -> Result<SchemaConfig> {
+  read_gateway_config(explicit)?.compile()
+}
+
+/// Gateway input captured from one read of the primary and its applicable overlays.
+pub enum GatewayConfigInput {
+  Legacy(Box<LoadedConfig>),
+  V2 { raw: Box<v2::RawConfig>, path: PathBuf },
+}
+
+impl GatewayConfigInput {
+  pub fn compile(self) -> Result<SchemaConfig> {
+    match self {
+      Self::Legacy(loaded) => Ok(SchemaConfig::Legacy(loaded)),
+      Self::V2 { raw, path } => {
+        let config = v2::compile_config(&raw, &path).map_err(|source| Error::V2 {
+          source: Box::new(source),
+        })?;
+        Ok(SchemaConfig::V2 {
+          config: Box::new(config),
+          path,
+        })
+      }
+    }
+  }
+}
+
+pub fn read_gateway_config(explicit: Option<&Path>) -> Result<GatewayConfigInput> {
   let path = resolve_config_path(explicit)?;
-  match detect_config_schema(&path)? {
-    ConfigSchema::Legacy => Config::load_with_sources(Some(&path)).map(|loaded| SchemaConfig::Legacy(Box::new(loaded))),
+  let document = read_gateway_document(&path)?;
+  match classify_config_document(&document, &path)? {
+    ConfigSchema::Legacy => Ok(GatewayConfigInput::Legacy(Box::new(load_legacy_with_sources(
+      document, &path,
+    )?))),
     ConfigSchema::V2 => {
-      let config = v2::load_config(&path).map_err(|source| Error::V2 {
+      let raw = v2::decode_document(document, &path).map_err(|source| Error::V2 {
         source: Box::new(source),
       })?;
-      Ok(SchemaConfig::V2 {
-        config: Box::new(config),
+      Ok(GatewayConfigInput::V2 {
+        raw: Box::new(raw),
         path,
       })
     }
@@ -1340,23 +1340,22 @@ fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
   }
 }
 
-fn load_primary_config(path: &Path) -> Result<Config> {
-  if !path.exists() {
-    return Ok(Config::default());
-  }
-  let raw = std::fs::read_to_string(path).context(error::ReadSnafu {
-    path: path.to_path_buf(),
-  })?;
-  let document: toml::Value = toml::from_str(&raw).context(error::ParseSnafu {
-    path: path.to_path_buf(),
-  })?;
+fn load_legacy_with_sources(document: toml::Value, path: &Path) -> Result<LoadedConfig> {
+  let cfg = validated_primary_config(document, path)?;
+  let loaded = load_config_overlays(path, cfg)?;
+  loaded.config.validate()?;
+  tracing::debug!(path = %path.display(), fragments = loaded.sources.fragments.len(), "config loaded");
+  Ok(loaded)
+}
+
+pub(crate) fn validated_primary_config(document: toml::Value, path: &Path) -> Result<Config> {
   let config = decode_primary_config(document, path)?;
   config.validate()?;
   Ok(config)
 }
 
 fn decode_primary_config(document: toml::Value, path: &Path) -> Result<Config> {
-  require_legacy_schema(schema::detect_toml(&document), path)?;
+  require_legacy_schema(classify_config_document(&document, path)?, path)?;
   let raw_cfg: ConfigRaw = document.try_into().context(error::ParseSnafu {
     path: path.to_path_buf(),
   })?;
@@ -1368,52 +1367,12 @@ fn decode_primary_config(document: toml::Value, path: &Path) -> Result<Config> {
   Ok(raw_cfg.config)
 }
 
-fn load_config_overlays(path: &Path, mut config: Config) -> Result<LoadedConfig> {
-  let fragment_dir = paths::config_fragment_dir(path);
-  let fragments = load_fragment_paths(&fragment_dir)?;
-  let sources = ConfigSources {
-    root: path.to_path_buf(),
-    fragment_dir,
-    fragments,
-  };
-  let mut fragment_profile_owners = BTreeMap::new();
-  for fragment_path in &sources.fragments {
-    let fragment = load_config_fragment(fragment_path)?;
-    apply_config_fragment(&mut config, fragment_path, fragment, &mut fragment_profile_owners)?;
-  }
-  Ok(LoadedConfig { config, sources })
+/// Classify an already parsed primary document without reading the file again.
+pub fn detect_edit_config_schema(document: &toml_edit::DocumentMut, path: &Path) -> Result<ConfigSchema> {
+  schema::detect_edit(document).map_err(|error| error.at_path(path))
 }
 
-fn require_legacy_schema(schema: std::result::Result<ConfigSchema, SchemaMarkerError>, path: &Path) -> Result<()> {
-  match schema {
-    Ok(ConfigSchema::Legacy) => Ok(()),
-    Ok(ConfigSchema::V2) => Err(Error::V2ConfigRequiresV2Loader {
-      path: path.to_path_buf(),
-    }),
-    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
-      path: path.to_path_buf(),
-    }),
-    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
-      path: path.to_path_buf(),
-      found,
-    }),
-  }
-}
-
-fn detect_edit_config_schema(document: &toml_edit::DocumentMut, path: &Path) -> Result<ConfigSchema> {
-  match schema::detect_edit(document) {
-    Ok(schema) => Ok(schema),
-    Err(SchemaMarkerError::NonInteger) => Err(Error::InvalidSchemaVersion {
-      path: path.to_path_buf(),
-    }),
-    Err(SchemaMarkerError::Unsupported(found)) => Err(Error::UnsupportedSchemaVersion {
-      path: path.to_path_buf(),
-      found,
-    }),
-  }
-}
-
-fn require_legacy_edit_schema(schema: ConfigSchema, path: &Path) -> Result<()> {
+fn require_legacy_schema(schema: ConfigSchema, path: &Path) -> Result<()> {
   match schema {
     ConfigSchema::Legacy => Ok(()),
     ConfigSchema::V2 => Err(Error::V2ConfigRequiresV2Loader {
@@ -1432,177 +1391,6 @@ fn require_unchanged_edit_schema(actual: ConfigSchema, expected: ConfigSchema, p
       path.display()
     ),
   })
-}
-
-fn load_fragment_paths(fragment_dir: &Path) -> Result<Vec<PathBuf>> {
-  let entries = match std::fs::read_dir(fragment_dir) {
-    Ok(entries) => entries,
-    Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-    Err(source) => {
-      return Err(Error::Read {
-        path: fragment_dir.to_path_buf(),
-        source,
-      });
-    }
-  };
-  let mut fragments = Vec::new();
-  for entry in entries {
-    let entry = entry.map_err(|source| Error::Read {
-      path: fragment_dir.to_path_buf(),
-      source,
-    })?;
-    let path = entry.path();
-    if path.is_file() && path.extension().is_some_and(|extension| extension == "toml") {
-      fragments.push(path);
-    }
-  }
-  fragments.sort();
-  Ok(fragments)
-}
-
-fn load_config_fragment(path: &Path) -> Result<ConfigFragment> {
-  let raw = std::fs::read_to_string(path).context(error::ReadSnafu {
-    path: path.to_path_buf(),
-  })?;
-  toml::from_str(&raw).context(error::ParseSnafu {
-    path: path.to_path_buf(),
-  })
-}
-
-fn apply_config_fragment(
-  cfg: &mut Config,
-  path: &Path,
-  fragment: ConfigFragment,
-  fragment_profile_owners: &mut BTreeMap<String, AgentId>,
-) -> Result<()> {
-  if fragment.agents.is_empty() && fragment.profiles.is_empty() {
-    merge_model_scores(&mut cfg.model_scores, fragment.model_scores);
-    return Ok(());
-  }
-
-  let agent_name = path
-    .file_stem()
-    .and_then(|name| name.to_str())
-    .filter(|name| !name.is_empty())
-    .ok_or_else(|| Error::Other {
-      message: format!("agent config fragment has no valid filename: {}", path.display()),
-    })?;
-  let agent = AgentId::from(agent_name);
-  if agent.as_str() != agent_name {
-    return Err(Error::Other {
-      message: format!(
-        "agent config fragment {} must use the canonical agent filename {}.toml",
-        path.display(),
-        agent.as_str()
-      ),
-    });
-  }
-  if fragment.agents.len() > 1 || (!fragment.agents.is_empty() && !fragment.agents.contains_key(agent_name)) {
-    return Err(Error::Other {
-      message: format!(
-        "agent config fragment {} may define only the legacy [agents.{agent_name}] binding",
-        path.display()
-      ),
-    });
-  }
-
-  for (profile_name, profile) in &fragment.profiles {
-    if profile.agent_id.as_ref() != Some(&agent) {
-      return Err(Error::Other {
-        message: format!(
-          "profile '{profile_name}' in {} must set agent_id = '{}'",
-          path.display(),
-          agent.as_str()
-        ),
-      });
-    }
-    if let Some(owner) = fragment_profile_owners.insert(profile_name.clone(), agent.clone()) {
-      return Err(Error::Other {
-        message: format!(
-          "profile '{profile_name}' is managed by both {} and {} agent fragments",
-          owner.as_str(),
-          agent.as_str()
-        ),
-      });
-    }
-    if let Some(existing) = cfg.profiles.get(profile_name) {
-      if existing.agent_id.as_ref() != Some(&agent) {
-        return Err(Error::Other {
-          message: format!(
-            "profile '{profile_name}' in {} conflicts with a profile not owned by {}",
-            path.display(),
-            agent.as_str()
-          ),
-        });
-      }
-    }
-  }
-
-  let binding = fragment.agents.get(agent_name).cloned();
-  if let Some(profile_name) = binding.as_ref().and_then(|binding| binding.profile.as_deref()) {
-    let Some(profile) = fragment.profiles.get(profile_name) else {
-      return Err(Error::Other {
-        message: format!(
-          "agent config fragment {} must define [profiles.{profile_name}] for its legacy [agents.{agent_name}].profile",
-          path.display()
-        ),
-      });
-    };
-    if profile.agent_id.as_ref() != Some(&agent) {
-      return Err(Error::Other {
-        message: format!(
-          "profile '{profile_name}' in {} must set agent_id = '{}'",
-          path.display(),
-          agent.as_str()
-        ),
-      });
-    }
-  }
-
-  // A legacy root binding materialized its base profile and provider-specific
-  // children under the binding name. Mask precisely that set while the
-  // sidecar is active, so an old route cannot remain reachable after a
-  // relink without hiding unrelated profiles that merely share an agent
-  // persona.
-  let legacy_profile = cfg
-    .agents
-    .get(agent_name)
-    .and_then(|existing| existing.profile.as_deref())
-    .map(str::to_string);
-  if let Some(legacy_profile) = legacy_profile.as_deref() {
-    remove_legacy_agent_profiles(cfg, legacy_profile, &agent);
-  }
-  if let Some(binding) = binding {
-    cfg.agents.insert(agent_name.to_string(), binding);
-  } else {
-    cfg.agents.remove(agent_name);
-  }
-  cfg.profiles.extend(fragment.profiles);
-  merge_model_scores(&mut cfg.model_scores, fragment.model_scores);
-  Ok(())
-}
-
-fn merge_model_scores(
-  scores: &mut BTreeMap<String, BTreeMap<String, i32>>,
-  fragment: BTreeMap<String, BTreeMap<String, i32>>,
-) {
-  for (model, provider_scores) in fragment {
-    scores.entry(model).or_default().extend(provider_scores);
-  }
-}
-
-fn remove_legacy_agent_profiles(cfg: &mut Config, profile: &str, agent: &AgentId) {
-  let prefix = format!("{profile}-");
-  cfg.profiles.retain(|name, existing| {
-    // Provider children created by the old link writer always carried their
-    // account allow-list. Keep a same-persona, similarly named user profile
-    // without that migration shape visible rather than treating `agent_id`
-    // itself as ownership evidence.
-    !(name == profile
-      || (name.starts_with(&prefix)
-        && existing.agent_id.as_ref() == Some(agent)
-        && existing.accounts.as_ref().is_some_and(|accounts| !accounts.is_empty())))
-  });
 }
 
 #[allow(dead_code)] // used by AuthStore validation in a follow-up cycle
@@ -2109,6 +1897,34 @@ client_auth = "none"
     assert_eq!(v2.path(), path);
     assert!(v2.legacy().is_none());
     assert!(v2.v2().is_some());
+  }
+
+  #[test]
+  fn gateway_applies_overlays_to_defaults_but_rejects_invalid_primary_settings() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    let fragment = paths::agent_config_fragment_path(&path, "opencode");
+    std::fs::create_dir(fragment.parent().unwrap()).unwrap();
+    std::fs::write(
+      &fragment,
+      "[profiles.work]\nagent_id = 'opencode'\ndefault_provider_id = 'openai'\n",
+    )
+    .unwrap();
+
+    let loaded = load_config(Some(&path)).unwrap();
+    assert_eq!(
+      loaded.legacy().unwrap().profiles["work"].default_provider_id.as_deref(),
+      Some("openai")
+    );
+    assert!(!path.exists());
+
+    // Gateway validation runs before the overlay can replace this profile.
+    std::fs::write(
+      &path,
+      "[profiles.work]\nagent_id = 'opencode'\ndefault_provider_id = ' '\n",
+    )
+    .unwrap();
+    assert!(matches!(load_config(Some(&path)), Err(Error::InvalidAccount { .. })));
   }
 
   #[test]

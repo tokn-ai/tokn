@@ -12,7 +12,7 @@ readme = "../../README.md"
 
 [features]
 default = ["lzma"]
-lzma = ["tokn-persistence/lzma"]
+lzma = ["tokn-maintenance/lzma", "tokn-viewer/lzma"]
 
 [[bin]]
 name = "tokn-gateway"
@@ -28,8 +28,11 @@ tokn-agent-migration = { workspace = true }
 tokn-catalogue = { workspace = true, features = ["std"] }
 tokn-convert = { workspace = true, features = ["std"] }
 tokn-router = { workspace = true }
+tokn-gateway = { workspace = true, features = ["runtime"] }
 tokn-requests = { workspace = true, features = ["std"] }
 tokn-persistence = { workspace = true }
+tokn-maintenance = { workspace = true }
+tokn-viewer = { workspace = true }
 tokn-provider-copilot = { workspace = true, features = ["std"] }
 tokn-provider-deepseek = { workspace = true, features = ["std"] }
 tokn-provider-openai = { workspace = true, features = ["std"] }

@@ -24,11 +24,8 @@ impl RequestDispatcher for Dispatcher {
   }
 }
 
-fn frontend(
-  auth: &str,
-  response: Option<StatusCode>,
-) -> (Frontend, tokio::sync::broadcast::Receiver<Arc<Event>>, Arc<AtomicUsize>) {
-  let config = format!(
+fn frontend_config(auth: &str) -> String {
+  format!(
     r#"
 schema_version = 2
 [service.request_limits]
@@ -53,8 +50,14 @@ provider = {{ kind = "any" }}
 model = {{ kind = "capability" }}
 operation = "translate_compatible"
 "#
-  );
-  let (plan, service) = tokn_config::v2::parse_config(&config, Path::new("frontend-tests.toml"))
+  )
+}
+
+fn frontend(
+  auth: &str,
+  response: Option<StatusCode>,
+) -> (Frontend, tokio::sync::broadcast::Receiver<Arc<Event>>, Arc<AtomicUsize>) {
+  let (plan, service) = tokn_config::v2::parse_config(&frontend_config(auth), Path::new("frontend-tests.toml"))
     .unwrap()
     .into_parts();
   let events = Arc::new(EventBus::new(16));
@@ -94,6 +97,78 @@ fn rejected(receiver: &mut tokio::sync::broadcast::Receiver<Arc<Event>>, id: &st
   };
   assert!(receiver.try_recv().is_err(), "only one rejection is emitted");
   rejection.clone()
+}
+
+#[tokio::test]
+async fn shared_frontend_exposes_admin_reload_only_on_the_bound_loopback_socket() {
+  for (address, expected) in [
+    ("0.0.0.0:0", StatusCode::NOT_FOUND),
+    ("127.0.0.1:0", StatusCode::FORBIDDEN),
+  ] {
+    let (mut frontend, _, _) = frontend("none", None);
+    frontend.proxy.clear();
+    let frontend = frontend.with_admin_reloader(AdminReloader::new(|| async {
+      panic!("an unauthenticated request reached the reload callback")
+    }));
+    let mut bound = frontend
+      .with_bind_override(address.parse().unwrap())
+      .unwrap()
+      .bind()
+      .await
+      .unwrap();
+    let (_, app) = bound.api.pop().unwrap();
+    let response = app
+      .oneshot(Request::post("/admin/config/reload").body(Body::empty()).unwrap())
+      .await
+      .unwrap();
+    assert_eq!(response.status(), expected);
+  }
+}
+
+#[tokio::test]
+async fn reload_keeps_a_partially_read_request_on_its_original_dispatcher() {
+  let (mut frontend, _, old_calls) = frontend("none", Some(StatusCode::ACCEPTED));
+  let app = frontend.api.pop().unwrap().1;
+  let new_calls = Arc::new(AtomicUsize::new(0));
+  let config = frontend_config("none") + "\n[profiles.team]\nroute = 'default'\n";
+  let (plan, service) = tokn_config::v2::parse_config(&config, Path::new("frontend-tests.toml"))
+    .unwrap()
+    .into_parts();
+  let next = frontend
+    .reload_handle()
+    .prepare(
+      &plan,
+      &service,
+      Arc::new(Dispatcher {
+        calls: new_calls.clone(),
+        response: Some(StatusCode::CREATED),
+      }),
+    )
+    .unwrap();
+
+  let (reading, admitted) = tokio::sync::oneshot::channel();
+  let (finish, delay) = tokio::sync::oneshot::channel();
+  let upload = Body::from_stream(futures_util::stream::once(async move {
+    reading.send(()).unwrap();
+    delay.await.unwrap();
+    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{}"))
+  }));
+  let pending = tokio::spawn(
+    app
+      .clone()
+      .oneshot(Request::post("/v1/responses").body(upload).unwrap()),
+  );
+  admitted.await.unwrap();
+  next.publish();
+  let response = app
+    .oneshot(Request::post("/team/v1/responses").body(Body::from("{}")).unwrap())
+    .await
+    .unwrap();
+  assert_eq!(response.status(), StatusCode::CREATED);
+  finish.send(()).unwrap();
+  assert_eq!(pending.await.unwrap().unwrap().status(), StatusCode::ACCEPTED);
+  assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+  assert_eq!(new_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -204,7 +279,7 @@ async fn unavailable_worker_is_recorded_but_worker_error_responses_are_not() {
 #[tokio::test]
 async fn proxy_rejection_retains_authority_and_authenticated_client_context() {
   let (mut frontend, mut receiver, calls) = frontend("none", None);
-  let state = frontend.proxy.pop().unwrap().1;
+  let state = frontend.proxy.pop().unwrap().1.current();
   let ingress = IngressAuthority::from_http(
     tokn_policy::CanonicalAuthority::parse("api.example.test").unwrap(),
     std::num::NonZeroU16::new(80).unwrap(),

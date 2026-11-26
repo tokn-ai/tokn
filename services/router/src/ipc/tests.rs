@@ -37,14 +37,25 @@ struct Worker {
 
 impl Worker {
   async fn start(plan: GatewayPlan, dispatcher: Arc<dyn RequestDispatcher>) -> Self {
+    let info = WorkerInfo::new(&plan, "fixture").unwrap();
+    Self::start_with(|path, stopped| {
+      serve_worker(path, dispatcher, info, async {
+        let _ = stopped.await;
+      })
+    })
+    .await
+  }
+
+  async fn start_with<F, Fut>(serve: F) -> Self
+  where
+    F: FnOnce(PathBuf, oneshot::Receiver<()>) -> Fut,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+  {
     let directory = tempfile::tempdir().unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let path = directory.path().join("worker.sock");
     let (stop, stopped) = oneshot::channel();
-    let info = WorkerInfo::new(&plan, "fixture").unwrap();
-    let task = tokio::spawn(serve_worker(path.clone(), dispatcher, info, async {
-      let _ = stopped.await;
-    }));
+    let task = tokio::spawn(serve(path.clone(), stopped));
     tokio::time::timeout(Duration::from_secs(5), async {
       loop {
         if UnixStream::connect(&path).await.is_ok() {
@@ -837,5 +848,345 @@ async fn disconnect_during_weight_readiness_does_not_publish_stale_assignments()
   assert!(update.await.unwrap_err().to_string().contains("workers changed"));
   assert!(pool.status().workers.is_empty());
   assert!(pool.dispatch(context(), request()).await.is_err());
+  worker.stop().await;
+}
+
+fn mount_config(api: SocketAddr, path: &str) -> tokn_config::v2::CompiledConfig {
+  tokn_config::v2::parse_config(
+    &format!(
+      r#"
+schema_version = 2
+[listeners.api]
+kind = "llm_api"
+bind = "{api}"
+client_auth = "none"
+[profiles.work]
+route = "shared"
+binding = {{ path = "{path}" }}
+[routes.shared]
+kind = "managed"
+provider = {{ kind = "any" }}
+providers = ["openai"]
+model = {{ kind = "capability" }}
+operation = "translate_compatible"
+"#
+    ),
+    Path::new("reload-test.toml"),
+  )
+  .unwrap()
+}
+
+async fn begin_admitted_request(api: SocketAddr, path: &str) -> TcpStream {
+  let mut stream = TcpStream::connect(api).await.unwrap();
+  stream.write_all(format!("GET {path}/models HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+  // Hyper only sends 100 Continue when the body is first polled. At that point
+  // admission has selected an ingress generation, but execution has yet to start.
+  let mut response = Vec::new();
+  tokio::time::timeout(Duration::from_secs(5), async {
+    while !response.ends_with(b"\r\n\r\n") {
+      response.push(stream.read_u8().await.unwrap());
+    }
+  })
+  .await
+  .unwrap();
+  assert!(response.starts_with(b"HTTP/1.1 100 Continue"));
+  stream
+}
+
+async fn finish_admitted_request(mut stream: TcpStream) {
+  stream.write_all(b"x").await.unwrap();
+  let mut response = String::new();
+  tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+}
+
+async fn assert_untagged_worker_mount(path: &Path, current: &str, previous: &str) {
+  use base64::Engine;
+  let ready = Request::get(super::protocol::READY_PATH).body(Body::empty()).unwrap();
+  let response = super::transport::exchange(path, ready).await.unwrap();
+  let info: WorkerInfo = serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+  for (mount, expected) in [(current, StatusCode::OK), (previous, StatusCode::NOT_FOUND)] {
+    let uri = format!("{mount}/models");
+    assert_eq!(
+      info.api_admission.iter().any(|rule| rule.path == uri),
+      expected == StatusCode::OK
+    );
+    let mut context = context();
+    context.origin = RequestOrigin::Api;
+    context.listener_id = "api".into();
+    let wire = super::protocol::WireContext::new(context, uri);
+    let metadata = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&wire).unwrap());
+    let request = Request::get("/_tokn/dispatch")
+      .header(CONTEXT_HEADER, metadata)
+      .body(Body::empty())
+      .unwrap();
+    let response = super::transport::exchange(path, request).await.unwrap();
+    assert_eq!(response.status(), expected);
+  }
+}
+
+#[tokio::test]
+async fn split_reload_preserves_admitted_generations_and_resumes_worker_promotion() {
+  use crate::v2::ReloadError;
+  let api = address();
+  let original = mount_config(api, "/before");
+  let build = |config: tokn_config::v2::CompiledConfig| {
+    let (plan, service) = config.into_parts();
+    build_worker_runtime_states(
+      plan,
+      service,
+      &[],
+      Arc::new(AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap()
+  };
+  let live = Arc::new(LiveRuntime::new(build(original.clone()), 0));
+  let prepare = WorkerReload::new(move |revision| async move {
+    match revision.as_str() {
+      "/after" | "/next" => Ok((build(mount_config(api, &revision)), 0)),
+      "invalid" => Err(ReloadError::Invalid("invalid worker settings".into())),
+      "stale" => Err(ReloadError::Conflict("worker configuration revision differs".into())),
+      _ => Err(ReloadError::RestartRequired(
+        "worker configuration requires restart".into(),
+      )),
+    }
+  });
+  let initial = Arc::downgrade(&live.current_worker_generation());
+  let observed = live.clone();
+  let info = live.worker_info("fixture");
+  let worker = Worker::start_with(move |path, stopped| {
+    serve_reloadable_worker(path, live, info, prepare, async {
+      let _ = stopped.await;
+    })
+  })
+  .await;
+  let (plan, service) = original.into_parts();
+  let pool = Arc::new(WorkerPool::empty(&plan).unwrap());
+  pool.register(worker.endpoint("original", 1)).await.unwrap();
+  // Even a rejection after readiness has pinned a worker must release its lease.
+  assert!(pool.register_candidate(worker.endpoint("duplicate", 0)).await.is_err());
+  let frontend = Frontend::new(
+    plan,
+    service.clone(),
+    Arc::new(AccessStore::disabled()),
+    pool.dispatcher(),
+  )
+  .unwrap();
+  let handle = frontend.reload_handle();
+  let (stop, stopped) = oneshot::channel();
+  let server = tokio::spawn(frontend.serve(async {
+    let _ = stopped.await;
+  }));
+  wait_for_frontend(api).await;
+  let client = reqwest::Client::new();
+  let get = |path: &str| client.get(format!("http://{api}{path}/models")).send();
+  let reload = |mount: &str, revision: &'static str| {
+    pool.reload(&handle, mount_config(api, mount).into_parts().0, &service, revision)
+  };
+  for revision in ["stale", "invalid", "restart"] {
+    let error = reload("/after", revision).await.unwrap_err();
+    assert!(matches!(error, ReloadError::Invalid(_)) == (revision == "invalid"));
+    assert!(matches!(error, ReloadError::RestartRequired(_)) == (revision == "restart"));
+    if revision == "stale" {
+      assert_eq!(
+        error,
+        ReloadError::Conflict("worker configuration revision differs".into())
+      );
+    }
+    assert_eq!(get("/before").await.unwrap().status(), StatusCode::OK);
+    assert_eq!(get("/after").await.unwrap().status(), StatusCode::NOT_FOUND);
+  }
+  // The worker can prepare successfully while the frontend rejects a bind change.
+  // No activation message is sent and ordinary requests keep their existing state.
+  let wrong_bind = mount_config(address(), "/after").into_parts().0;
+  assert!(matches!(
+    pool.reload(&handle, wrong_bind, &service, "/after").await,
+    Err(ReloadError::RestartRequired(_))
+  ));
+  assert_eq!(observed.generation(), 1);
+  assert_eq!(get("/before").await.unwrap().status(), StatusCode::OK);
+  let slow_initial_upload = begin_admitted_request(api, "/before").await;
+  for (generation, before, after) in [(2, "/before", "/after"), (3, "/after", "/next")] {
+    let admitted = begin_admitted_request(api, before).await;
+    assert_eq!(reload(after, after).await.unwrap().generation, generation);
+    assert_untagged_worker_mount(&worker.path, after, before).await;
+    assert!(initial.upgrade().is_some());
+    assert_eq!(get(before).await.unwrap().status(), StatusCode::NOT_FOUND);
+    assert_eq!(get(after).await.unwrap().status(), StatusCode::OK);
+    finish_admitted_request(admitted).await;
+  }
+  pool
+    .update_weights(BTreeMap::from([("original".into(), 1)]))
+    .await
+    .unwrap();
+  let candidate = Worker::start(
+    mount_config(api, "/next").into_parts().0,
+    Arc::new(FixtureDispatcher {
+      stream: parking_lot::Mutex::new(None),
+      contexts: parking_lot::Mutex::new(vec![]),
+    }),
+  )
+  .await;
+  pool
+    .register_rollout(
+      candidate.endpoint("candidate", 0),
+      RolloutPolicy {
+        initial_percent: 10,
+        stages: vec![RolloutStage {
+          duration_seconds: 60,
+          traffic_percent: 90,
+        }],
+        completion_percent: 100,
+      },
+    )
+    .await
+    .unwrap();
+  assert!(matches!(
+    reload("/after", "/after").await,
+    Err(ReloadError::Conflict(_))
+  ));
+  pool.retire("original").unwrap();
+  let mut retired = Box::pin(pool.wait_retired("original"));
+  assert!(futures_util::poll!(&mut retired).is_pending());
+  finish_admitted_request(slow_initial_upload).await;
+  // No registration, default dispatcher, or rejected candidate keeps the startup
+  // providers/accounts alive after the last request captured by that ingress ends.
+  tokio::time::timeout(Duration::from_secs(5), async {
+    while initial.upgrade().is_some() {
+      tokio::task::yield_now().await;
+    }
+  })
+  .await
+  .unwrap();
+  tokio::time::timeout(Duration::from_secs(5), retired)
+    .await
+    .unwrap()
+    .unwrap();
+  pool.disconnect("original");
+  assert_eq!(get("/next").await.unwrap().text().await.unwrap(), "fixture");
+  assert!(matches!(
+    reload("/after", "/after").await,
+    Err(ReloadError::RestartRequired(_))
+  ));
+  stop.send(()).unwrap();
+  server.await.unwrap().unwrap();
+  candidate.stop().await;
+  worker.stop().await;
+}
+
+#[tokio::test]
+async fn lost_worker_activation_acknowledgement_reports_a_published_generation() {
+  use super::reload::{GENERATION_HEADER, LEASE_CAPABILITY, PIN_PATH, PREPARE_PATH};
+  use crate::v2::{AdminReloader, ReloadError};
+  use axum::http::HeaderMap;
+  let api = address();
+  let startup = mount_config(api, "/old");
+  let updated = mount_config(api, "/new");
+  let initial_info = Arc::new(WorkerInfo::new(startup.gateway(), "fixture").unwrap());
+  let updated_info = Arc::new(WorkerInfo::new(updated.gateway(), "fixture").unwrap());
+  let old_id = uuid::Uuid::new_v4();
+  let new_id = uuid::Uuid::new_v4();
+
+  // This peer answers readiness and creates both lease connections. It exits the
+  // prepared lease when it receives activation, before acknowledging that byte.
+  let worker = Worker::start_with(move |path, mut stop| async move {
+    let listener = tokio::net::UnixListener::bind(path)?;
+    let mut sessions = tokio::task::JoinSet::new();
+    loop {
+      let stream = tokio::select! {
+        _ = &mut stop => break,
+        next = listener.accept() => next?.0,
+      };
+      let initial_info = initial_info.clone();
+      let updated_info = updated_info.clone();
+      sessions.spawn(async move {
+        let service = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+          let info = if req
+            .headers()
+            .get(GENERATION_HEADER)
+            .is_some_and(|id| id.as_bytes() == new_id.to_string().as_bytes())
+          {
+            updated_info.clone()
+          } else {
+            initial_info.clone()
+          };
+          async move {
+            let response = match req.uri().path() {
+              super::protocol::READY_PATH => {
+                let mut response = axum::Json(&*info).into_response();
+                response.headers_mut().insert(LEASE_CAPABILITY, "1".parse().unwrap());
+                response
+              }
+              route @ (PIN_PATH | PREPARE_PATH) => {
+                let id = if route == PIN_PATH { old_id } else { new_id };
+                let upgrade = hyper::upgrade::on(&mut req);
+                tokio::spawn(async move {
+                  if let Ok(upgraded) = upgrade.await {
+                    let _ = TokioIo::new(upgraded).read_u8().await;
+                  }
+                });
+                Response::builder()
+                  .status(StatusCode::SWITCHING_PROTOCOLS)
+                  .header("connection", "upgrade")
+                  .header("upgrade", "tokn-reload-v1")
+                  .header(GENERATION_HEADER, id.to_string())
+                  .header("x-tokn-ipc-accounts", "0")
+                  .body(Body::empty())
+                  .unwrap()
+              }
+              _ => StatusCode::NOT_FOUND.into_response(),
+            };
+            Ok::<_, std::convert::Infallible>(response)
+          }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+          .serve_connection(TokioIo::new(stream), service)
+          .with_upgrades()
+          .await;
+      });
+    }
+    std::fs::remove_file(listener.local_addr()?.as_pathname().unwrap())?;
+    Ok(())
+  })
+  .await;
+  let (plan, service) = startup.into_parts();
+  let pool = Arc::new(WorkerPool::empty(&plan).unwrap());
+  pool.register(worker.endpoint("worker", 1)).await.unwrap();
+  let frontend = Frontend::new(
+    plan,
+    service.clone(),
+    Arc::new(AccessStore::disabled()),
+    pool.dispatcher(),
+  )
+  .unwrap();
+  let before = pool.status().generation;
+  let error = pool
+    .reload(
+      &frontend.reload_handle(),
+      updated.gateway().clone(),
+      &service,
+      "revision",
+    )
+    .await
+    .unwrap_err();
+  assert_eq!(error, ReloadError::ActivationUnconfirmed { generation: 2 });
+  assert_eq!(pool.status().generation, before + 1);
+  // The pool's published selector and registration manifest both describe the new mounts.
+  pool.check_ready(updated.gateway()).await.unwrap();
+  let mut headers = HeaderMap::new();
+  headers.insert("x-tokn-admin", "reload".parse().unwrap());
+  let reloader = AdminReloader::new(move || std::future::ready(Err(error.clone())));
+  let response = crate::v2::handle_admin_reload(headers, Some(&reloader)).await;
+  assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+  let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 2048).await.unwrap()).unwrap();
+  assert_eq!(body["error"]["type"], "activation_unconfirmed");
+  assert!(body["error"]["message"]
+    .as_str()
+    .unwrap()
+    .contains("generation 2 was published"));
   worker.stop().await;
 }

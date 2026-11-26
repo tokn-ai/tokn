@@ -3,7 +3,7 @@ use clap::{Args, Subcommand};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use tokn_persistence::archive::{PruneOutcome, PruneProgressEvent, PruneReport};
+use tokn_maintenance::{PruneOutcome, PruneProgressEvent, PruneReport};
 
 #[derive(Subcommand, Debug)]
 pub enum RequestsCmd {
@@ -29,7 +29,7 @@ fn prune(explicit_config: Option<&Path>, args: PruneArgs) -> Result<()> {
   let persistence = config.persistence();
   let paths = persistence.resolve_paths()?;
   let mut progress = PruneProgressDisplay::new(std::io::stdout().is_terminal());
-  let result = tokn_persistence::archive::prune_request_dbs_with_progress(
+  let result = tokn_maintenance::prune_request_dbs_with_progress(
     &paths.requests_dir,
     persistence.archive_extension(),
     persistence.prune_after_days(),
@@ -193,6 +193,7 @@ fn print_report(requests_dir: &Path, report: &PruneReport, commit: bool) {
   let mut missing = 0usize;
   let mut mismatched = 0usize;
   let mut failed = 0usize;
+  let mut in_use = 0usize;
   for entry in &report.entries {
     match &entry.outcome {
       PruneOutcome::Verified { sha256 } => {
@@ -211,6 +212,10 @@ fn print_report(requests_dir: &Path, report: &PruneReport, commit: bool) {
           entry.path.display(),
           entry.archive.display()
         );
+      }
+      PruneOutcome::InUse => {
+        in_use += 1;
+        println!("retained {} (database in use)", entry.path.display());
       }
       PruneOutcome::MissingArchive => {
         missing += 1;
@@ -239,7 +244,7 @@ fn print_report(requests_dir: &Path, report: &PruneReport, commit: bool) {
   println!(
     "summary: eligible={} verified={verified} deleted={deleted} retained={} missing_archive={missing} mismatched={mismatched} failed={failed}",
     report.entries.len(),
-    missing + mismatched + failed
+    missing + mismatched + failed + in_use
   );
   if !commit && verified > 0 {
     println!("dry-run: rerun with --commit to delete verified source databases");

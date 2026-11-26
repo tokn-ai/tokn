@@ -1,10 +1,13 @@
 //! Live request assignment, readiness checks, and response-lifetime accounting.
 
 use super::protocol::{WireContext, CONNECT_TIMEOUT, CONTEXT_HEADER, MAX_CONTEXT_BYTES, PROTOCOL_VERSION, READY_PATH};
+use super::reload::{invalid, GenerationLease, GENERATION_HEADER, LEASE_CAPABILITY};
 use super::transport::{exchange, strip_connection_headers, strip_internal_headers};
 use super::WorkerInfo;
 use crate::dispatch::{DispatchContext, RequestDispatcher};
+use crate::frontend::FrontendReloadHandle;
 use crate::routing::{AbTestStatus, RolloutPolicy, RoutingControl, RoutingReport, WorkerState, WorkerStatus};
+use crate::v2::{ReloadError, ReloadReport};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::body::Body;
@@ -18,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
 use tokn_policy::GatewayPlan;
@@ -39,7 +42,34 @@ pub struct WorkerPool {
   next: AtomicU64,
 }
 
+// A live ingress generation follows normal worker registration and weighting.
+// At reload its final target is frozen for requests still completing admission.
+#[derive(Default)]
+struct DispatchGeneration {
+  frozen: OnceLock<FrozenWorker>,
+}
+
+struct FrozenWorker {
+  endpoint: WorkerEndpoint,
+  owner: Arc<WorkerStats>,
+  lease: Arc<GenerationLease>,
+}
+
+impl Drop for FrozenWorker {
+  fn drop(&mut self) {
+    self.owner.admission_generations.fetch_sub(1, Ordering::Release);
+    self.owner.changed.notify_waiters();
+  }
+}
+
+struct GenerationDispatcher {
+  pool: Arc<WorkerPool>,
+  generation: Arc<DispatchGeneration>,
+}
+
 struct RoutingTable {
+  dispatch_generation: Arc<DispatchGeneration>,
+  config_generation: u64,
   ab_test: Option<AbTest>,
   main_worker_id: Option<String>,
   workers: Vec<WorkerEndpoint>,
@@ -187,7 +217,9 @@ struct WorkerStats {
   keep_alive: std::sync::atomic::AtomicBool,
   changed: tokio::sync::Notify,
   version: parking_lot::RwLock<Option<String>>,
+  generation: parking_lot::RwLock<Option<Arc<GenerationLease>>>,
   in_flight: AtomicU64,
+  admission_generations: AtomicU64,
   requests: AtomicU64,
   completed: AtomicU64,
   cancelled: AtomicU64,
@@ -227,6 +259,8 @@ impl WorkerPool {
       .collect();
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        dispatch_generation: Arc::default(),
+        config_generation: 1,
         ab_test: None,
         main_worker_id,
         workers,
@@ -243,16 +277,24 @@ impl WorkerPool {
 
   /// Verify every configured worker, including zero-weight candidates, before binding the frontend.
   pub async fn check_ready(&self, plan: &GatewayPlan) -> Result<()> {
+    let _update = self.update_lock.lock().await;
     let expected = WorkerInfo::new(plan, "frontend")?;
     let (workers, stats) = {
       let routing = self.routing.read();
       (routing.workers.clone(), routing.stats.clone())
     };
-    for (index, worker) in workers.iter().enumerate() {
-      let info = verify_worker(worker, &expected).await?;
-      *stats[index].version.write() = Some(info.version);
+    for (worker, stats) in workers.iter().zip(stats) {
+      let existing = stats.generation.read().clone();
+      let (info, lease) = verify_and_pin(worker, &expected, existing).await?;
+      *stats.version.write() = Some(info.version);
+      *stats.generation.write() = lease;
     }
-    *self.expected.write() = Some(expected);
+    // Only the startup readiness check establishes the initial manifest. Once a
+    // generation is published, its coordinator owns the admission contract.
+    let mut manifest = self.expected.write();
+    if manifest.is_none() {
+      *manifest = Some(expected);
+    }
     Ok(())
   }
 
@@ -260,6 +302,8 @@ impl WorkerPool {
   pub fn empty(plan: &GatewayPlan) -> Result<Self> {
     Ok(Self {
       routing: parking_lot::RwLock::new(RoutingTable {
+        dispatch_generation: Arc::default(),
+        config_generation: 1,
         ab_test: None,
         main_worker_id: None,
         workers: Vec::new(),
@@ -307,7 +351,7 @@ impl WorkerPool {
     let _update = self.update_lock.lock().await;
     anyhow::ensure!(!worker.worker_id.trim().is_empty(), "worker id must not be empty");
     let expected = self.expected.read().clone().context("missing frontend manifest")?;
-    let info = verify_worker(&worker, &expected).await?;
+    let (info, lease) = verify_and_pin(&worker, &expected, None).await?;
     let mut routing = self.routing.write();
     anyhow::ensure!(
       !routing
@@ -369,6 +413,7 @@ impl WorkerPool {
     }
     let stats = Arc::new(WorkerStats::default());
     *stats.version.write() = Some(info.version);
+    *stats.generation.write() = lease;
     *stats.state.write() = if candidate {
       WorkerState::Stale
     } else {
@@ -454,7 +499,10 @@ impl WorkerPool {
         let state = *stats.state.read();
         let idle_stale =
           state == WorkerState::Stale && routing.weights[index] == 0 && !stats.keep_alive.load(Ordering::Acquire);
-        if (state == WorkerState::Exiting || idle_stale) && stats.in_flight.load(Ordering::Acquire) == 0 {
+        if (state == WorkerState::Exiting || idle_stale)
+          && stats.in_flight.load(Ordering::Acquire) == 0
+          && stats.admission_generations.load(Ordering::Acquire) == 0
+        {
           if idle_stale {
             *stats.state.write() = WorkerState::Exiting;
             routing.generation += 1;
@@ -466,37 +514,173 @@ impl WorkerPool {
     }
   }
 
-  fn select(&self) -> Result<(WorkerEndpoint, RequestLease)> {
-    // Count admission while holding the routing lock. Once a zero weight is
-    // published, status cannot report drained ahead of an older admission.
-    let routing = self.routing.read();
-    anyhow::ensure!(
-      routing.total_weight > 0,
-      "frontend has no active worker; run tokn-gateway worker start"
-    );
-    let mut slot = self.next.fetch_add(1, Ordering::Relaxed) % routing.total_weight;
-    for (index, weight) in routing.weights.iter().enumerate() {
-      if slot < u64::from(*weight) {
-        let stats = routing.stats[index].clone();
-        stats.in_flight.fetch_add(1, Ordering::Relaxed);
-        stats.requests.fetch_add(1, Ordering::Relaxed);
-        return Ok((
-          routing.workers[index].clone(),
-          RequestLease {
-            stats,
-            started: Instant::now(),
-            finished: false,
-          },
+  /// Retain a dispatch generation alongside its frontend admission policies.
+  pub fn dispatcher(self: &Arc<Self>) -> Arc<dyn RequestDispatcher> {
+    Arc::new(GenerationDispatcher {
+      pool: self.clone(),
+      generation: self.routing.read().dispatch_generation.clone(),
+    })
+  }
+
+  /// Publish one matched ingress and execution generation. Multi-worker configurations
+  /// must finish their rollout before one source can be treated as authoritative.
+  pub async fn reload(
+    self: &Arc<Self>,
+    frontend: &FrontendReloadHandle,
+    plan: GatewayPlan,
+    service: &tokn_config::v2::ServiceSettings,
+    revision: &str,
+  ) -> Result<ReloadReport, ReloadError> {
+    let _update = self.update_lock.lock().await;
+    let (worker, owner, generation) = {
+      let routing = self.routing.read();
+      if routing.workers.len() != 1
+        || routing.ab_test.is_some()
+        || routing.total_weight == 0
+        || *routing.stats[0].state.read() != WorkerState::Current
+      {
+        return Err(ReloadError::Conflict(
+          "configuration reload requires one current worker and no rollout".into(),
         ));
       }
-      slot -= u64::from(*weight);
+      (routing.workers[0].clone(), routing.stats[0].clone(), routing.generation)
+    };
+    if owner.generation.read().is_none() {
+      return Err(ReloadError::RestartRequired(
+        "the active worker does not support configuration reload".into(),
+      ));
     }
-    unreachable!("validated worker weights cover every slot")
+    let expected = WorkerInfo::new(&plan, "frontend").map_err(invalid)?;
+    let lease = GenerationLease::prepare(&worker.socket_path, revision).await?;
+    // Independently verify the runtime that will execute the newly admitted requests.
+    verify_generation(&worker, &expected, Some(&lease))
+      .await
+      .map_err(invalid)?;
+    let next = Arc::new(DispatchGeneration::default());
+    let dispatcher = Arc::new(GenerationDispatcher {
+      pool: self.clone(),
+      generation: next.clone(),
+    });
+    let prepared = frontend.prepare(&plan, service, dispatcher)?;
+    let report = {
+      let mut routing = self.routing.write();
+      if routing.generation != generation {
+        return Err(ReloadError::Conflict(
+          "worker changed during configuration reload, retry the request".into(),
+        ));
+      }
+      // An upload may still be reading its body, before it has a worker request lease.
+      // Its frozen dispatcher keeps this worker from retiring during that interval.
+      owner.admission_generations.fetch_add(1, Ordering::Relaxed);
+      let previous = &routing.dispatch_generation;
+      let old_lease = owner
+        .generation
+        .write()
+        .replace(lease.clone())
+        .expect("reloadable worker holds a generation lease");
+      previous
+        .frozen
+        .set(FrozenWorker {
+          endpoint: worker,
+          owner,
+          lease: old_lease,
+        })
+        .unwrap_or_else(|_| unreachable!("only the current generation can be frozen"));
+      routing.dispatch_generation = next;
+      routing.config_generation += 1;
+      routing.generation += 1;
+      *self.expected.write() = Some(expected);
+      prepared.publish();
+      ReloadReport {
+        status: "reloaded",
+        generation: routing.config_generation,
+        accounts: lease.accounts,
+      }
+    };
+    if let Err(error) = lease.activate().await {
+      tracing::warn!(%error, generation = report.generation, "worker activation was not confirmed");
+      return Err(ReloadError::ActivationUnconfirmed {
+        generation: report.generation,
+      });
+    }
+    Ok(report)
+  }
+
+  #[cfg(test)]
+  fn select(&self) -> Result<(WorkerEndpoint, RequestLease)> {
+    let current = self.routing.read().dispatch_generation.clone();
+    self.select_generation(&current)
+  }
+
+  fn select_generation(&self, generation: &DispatchGeneration) -> Result<(WorkerEndpoint, RequestLease)> {
+    // Synchronize the generation freeze with request admission and worker draining.
+    let routing = self.routing.read();
+    let (worker, stats, target) = if let Some(frozen) = generation.frozen.get() {
+      (&frozen.endpoint, &frozen.owner, Some(frozen.lease.clone()))
+    } else {
+      anyhow::ensure!(
+        routing.total_weight > 0,
+        "frontend has no active worker; run tokn-gateway worker start"
+      );
+      let mut slot = self.next.fetch_add(1, Ordering::Relaxed) % routing.total_weight;
+      let index = routing
+        .weights
+        .iter()
+        .position(|weight| {
+          if slot < u64::from(*weight) {
+            true
+          } else {
+            slot -= u64::from(*weight);
+            false
+          }
+        })
+        .expect("validated worker weights cover every slot");
+      (
+        &routing.workers[index],
+        &routing.stats[index],
+        routing.stats[index].generation.read().clone(),
+      )
+    };
+    stats.in_flight.fetch_add(1, Ordering::Relaxed);
+    stats.requests.fetch_add(1, Ordering::Relaxed);
+    Ok((
+      worker.clone(),
+      RequestLease {
+        stats: stats.clone(),
+        generation: target,
+        started: Instant::now(),
+        finished: false,
+      },
+    ))
   }
 }
 
-async fn verify_worker(worker: &WorkerEndpoint, expected: &WorkerInfo) -> Result<WorkerInfo> {
-  let request = Request::get(READY_PATH).body(Body::empty())?;
+async fn verify_and_pin(
+  worker: &WorkerEndpoint,
+  expected: &WorkerInfo,
+  existing: Option<Arc<GenerationLease>>,
+) -> Result<(WorkerInfo, Option<Arc<GenerationLease>>)> {
+  let (info, supports_leases) = verify_generation(worker, expected, existing.as_deref()).await?;
+  if existing.is_some() || !supports_leases {
+    return Ok((info, existing));
+  }
+  // Check what the pin actually obtained in case another frontend published a
+  // new default between discovery and the lease handshake.
+  let lease = GenerationLease::pin_current(&worker.socket_path).await?;
+  let (info, _) = verify_generation(worker, expected, Some(&lease)).await?;
+  Ok((info, Some(lease)))
+}
+
+async fn verify_generation(
+  worker: &WorkerEndpoint,
+  expected: &WorkerInfo,
+  lease: Option<&GenerationLease>,
+) -> Result<(WorkerInfo, bool)> {
+  let mut request = Request::get(READY_PATH);
+  if let Some(lease) = lease {
+    request = request.header(GENERATION_HEADER, &lease.id);
+  }
+  let request = request.body(Body::empty())?;
   let response = tokio::time::timeout(CONNECT_TIMEOUT, exchange(&worker.socket_path, request))
     .await
     .context("worker readiness timed out")??;
@@ -505,6 +689,10 @@ async fn verify_worker(worker: &WorkerEndpoint, expected: &WorkerInfo) -> Result
     "worker '{}' is not ready",
     worker.worker_id
   );
+  let supports_leases = response
+    .headers()
+    .get(LEASE_CAPABILITY)
+    .is_some_and(|value| value == "1");
   let body = tokio::time::timeout(CONNECT_TIMEOUT, axum::body::to_bytes(response.into_body(), 64 * 1024)).await??;
   let info: WorkerInfo = serde_json::from_slice(&body)?;
   anyhow::ensure!(
@@ -526,7 +714,7 @@ async fn verify_worker(worker: &WorkerEndpoint, expected: &WorkerInfo) -> Result
     worker.worker_id
   );
   tracing::info!(worker_id = %worker.worker_id, version = %info.version, "gateway worker ready");
-  Ok(info)
+  Ok((info, supports_leases))
 }
 
 #[async_trait]
@@ -593,7 +781,8 @@ impl RoutingControl for WorkerPool {
     for (index, (worker, weight)) in workers.iter().zip(&values).enumerate() {
       if *weight > 0 {
         anyhow::ensure!(*stats[index].state.read() != WorkerState::Exiting, "worker is exiting");
-        let info = verify_worker(worker, &expected).await?;
+        let lease = stats[index].generation.read().clone();
+        let (info, _) = verify_generation(worker, &expected, lease.as_deref()).await?;
         *stats[index].version.write() = Some(info.version);
       }
     }
@@ -623,6 +812,7 @@ impl RoutingControl for WorkerPool {
 }
 
 struct RequestLease {
+  generation: Option<Arc<GenerationLease>>,
   stats: Arc<WorkerStats>,
   started: Instant,
   finished: bool,
@@ -690,8 +880,27 @@ impl http_body::Body for TrackedBody {
 
 #[async_trait]
 impl RequestDispatcher for WorkerPool {
-  async fn dispatch(&self, context: DispatchContext, mut request: Request) -> Result<Response> {
-    let (worker, mut lease) = self.select()?;
+  async fn dispatch(&self, context: DispatchContext, request: Request) -> Result<Response> {
+    let current = self.routing.read().dispatch_generation.clone();
+    self.dispatch_generation(&current, context, request).await
+  }
+}
+
+#[async_trait]
+impl RequestDispatcher for GenerationDispatcher {
+  async fn dispatch(&self, context: DispatchContext, request: Request) -> Result<Response> {
+    self.pool.dispatch_generation(&self.generation, context, request).await
+  }
+}
+
+impl WorkerPool {
+  async fn dispatch_generation(
+    &self,
+    generation: &DispatchGeneration,
+    context: DispatchContext,
+    mut request: Request,
+  ) -> Result<Response> {
+    let (worker, mut lease) = self.select_generation(generation)?;
     let request_id = request
       .headers()
       .get("x-request-id")
@@ -713,6 +922,11 @@ impl RequestDispatcher for WorkerPool {
     request
       .headers_mut()
       .insert(CONTEXT_HEADER, HeaderValue::from_str(&metadata)?);
+    if let Some(candidate) = &lease.generation {
+      request
+        .headers_mut()
+        .insert(GENERATION_HEADER, HeaderValue::from_str(&candidate.id)?);
+    }
     *request.uri_mut() = "/_tokn/dispatch".parse()?;
     let mut response = match exchange(&worker.socket_path, request).await {
       Ok(response) => response,

@@ -8,7 +8,6 @@
 //!
 //! Only registered when stdout is a TTY (see `server_runtime.rs`).
 
-use crate::db::archive::{ArchiveEvent, ArchiveEventHandler};
 use console::style;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
@@ -22,6 +21,7 @@ use tokn_core::db::Usage;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::request_classification::RequestClassification;
 use tokn_core::request_event::{ConvertedRequestSummary, RecordEvent, RequestEvent, RequestEventPayload, StageEvent};
+use tokn_maintenance::{ArchiveEvent, ArchiveEventHandler};
 use tokn_router::routing::AbTestStatus;
 
 /// Process-wide [`MultiProgress`] shared between [`ProgressEventHandler`]

@@ -1,13 +1,19 @@
 //! Stable client transport with request execution delegated to workers.
 
+mod reload;
+
+pub(crate) use reload::LiveProxyIngress;
+use reload::{FrontendGeneration, LiveApiIngress};
+pub use reload::{FrontendReloadHandle, PreparedFrontend};
+
 use crate::api::error::ApiError;
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
 use crate::ingress_record::IngressRecorder;
 use crate::proxy::ingress::IngressSource;
 use crate::routing::{RoutingControl, UpdateWeights};
 use crate::v2::mounts::{ApiMounts, ApiOperation};
-use crate::v2::InboundConnectionInfo;
-use axum::extract::{Request, State};
+use crate::v2::{AdminReloader, InboundConnectionInfo};
+use axum::extract::{Extension, Request, State};
 use axum::http::Method;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -17,6 +23,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokn_access::{AccessContext, AccessStore};
+use tokn_config::v2::ServiceSettings;
 use tokn_core::event::EventBus;
 use tokn_policy::{
   ConnectAction, CredentialPolicy, ForwardProxyListenerPlan, GatewayPlan, IngressAuthority, ListenerId, ListenerPlan,
@@ -25,7 +32,10 @@ use tokn_policy::{
 
 pub struct Frontend {
   api: Vec<(SocketAddr, Router)>,
-  proxy: Vec<(SocketAddr, Arc<ProxyIngress>)>,
+  proxy: Vec<(SocketAddr, LiveProxyIngress)>,
+  reload: FrontendReloadHandle,
+  routing_control: Option<Arc<dyn RoutingControl>>,
+  admin_reloader: Option<AdminReloader>,
 }
 
 impl Frontend {
@@ -47,93 +57,65 @@ impl Frontend {
     dispatcher: Arc<dyn RequestDispatcher>,
     events: Arc<EventBus>,
   ) -> anyhow::Result<Self> {
-    let mounts = Arc::new(ApiMounts::new(&plan)?);
-    let client_credentials = Arc::new(
-      plan
-        .profiles()
-        .iter()
-        .filter_map(|(id, profile)| {
-          plan
-            .route(profile.route())
-            .filter(|route| route.credential_policy() == CredentialPolicy::Client)
-            .map(|_| id.clone())
-        })
-        .collect::<BTreeSet<_>>(),
-    );
+    let generation = FrontendGeneration::build(&plan, &service, &access, &events, dispatcher, None)?;
+    let reload = FrontendReloadHandle::new(generation, service, access, events);
     let mut api = Vec::new();
     let mut proxy = Vec::new();
     for (id, listener) in plan.listeners() {
       match listener {
         ListenerPlan::LlmApi(listener) => {
-          let state = Arc::new(ApiIngress {
-            listener_id: id.clone(),
-            listener: listener.clone(),
-            mounts: mounts.clone(),
-            client_credentials: client_credentials.clone(),
-            access: access.clone(),
-            dispatcher: dispatcher.clone(),
-            events: events.clone(),
-            max_wire_bytes: service.request_limits().max_wire_bytes(),
-          });
-          let cors_state = state.clone();
-          let cors = crate::cors::layer_for_request(move |origin, parts| {
-            let policy = cors_state.listener.cors();
-            cors_state
-              .mounts
-              .get(parts.uri.path())
-              .is_some_and(|entry| entry.enabled)
+          let state = LiveApiIngress::new(id.clone(), &reload);
+          let cors = crate::cors::layer_for_request(|origin, parts| {
+            let state = parts
+              .extensions
+              .get::<Arc<ApiIngress>>()
+              .expect("ingress snapshot installed");
+            let policy = state.listener.cors();
+            state.mounts.get(parts.uri.path()).is_some_and(|entry| entry.enabled)
               && (policy.allowed_origins().contains(origin)
                 || (policy.allow_localhost() && crate::cors::is_localhost_origin(origin)))
           });
           let app = Router::new()
             .fallback(dispatch_api)
             .layer(cors)
+            .layer(axum::middleware::from_fn_with_state(state, capture_api_ingress))
             .route("/healthz", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(crate::request_id::propagate_request_id))
             .layer(tower_http::request_id::SetRequestIdLayer::new(
               axum::http::HeaderName::from_static(crate::request_id::REQUEST_ID_HEADER),
               crate::request_id::MakeRouterRequestId,
-            ))
-            .with_state(state);
+            ));
           api.push((listener.bind(), app));
         }
         ListenerPlan::ForwardProxy(listener) => {
-          let ca = listener
-            .tls()
-            .map(|tls| crate::proxy::load_or_generate_ca(tls.ca_dir(), false).map(Arc::new))
-            .transpose()?;
-          proxy.push((
-            listener.bind(),
-            Arc::new(ProxyIngress {
-              listener_id: id.clone(),
-              listener: listener.clone(),
-              ca,
-              access: access.clone(),
-              dispatcher: dispatcher.clone(),
-              events: events.clone(),
-              outbound: service.outbound().to_http_client_options(),
-              max_wire_bytes: listener
-                .request_body_max_bytes()
-                .min(service.request_limits().max_wire_bytes()),
-            }),
-          ));
+          proxy.push((listener.bind(), LiveProxyIngress::new(id.clone(), &reload)));
         }
       }
     }
-    Ok(Self { api, proxy })
+    Ok(Self {
+      api,
+      proxy,
+      reload,
+      routing_control: None,
+      admin_reloader: None,
+    })
+  }
+
+  /// Share the live ingress state with the worker reload coordinator.
+  pub fn reload_handle(&self) -> FrontendReloadHandle {
+    self.reload.clone()
+  }
+
+  /// Enable reload on the API sockets that bind to loopback.
+  pub fn with_admin_reloader(mut self, reloader: AdminReloader) -> Self {
+    self.admin_reloader = Some(reloader);
+    self
   }
 
   /// Expose control only on loopback API listeners. Explicit action headers
   /// keep browser navigations and form submissions from changing routing.
   pub fn with_routing_control(mut self, control: Arc<dyn RoutingControl>) -> Self {
-    for (addr, app) in &mut self.api {
-      if addr.ip().is_loopback() {
-        *app = app
-          .clone()
-          .route("/admin/workers", get(worker_status).post(update_weights))
-          .layer(axum::Extension(control.clone()));
-      }
-    }
+    self.routing_control = Some(control);
     self
   }
 
@@ -155,8 +137,24 @@ impl Frontend {
   /// Bind all public sockets before publishing discovery readiness.
   pub async fn bind(self) -> anyhow::Result<BoundFrontend> {
     let mut api = Vec::new();
-    for (addr, app) in self.api {
-      api.push((tokio::net::TcpListener::bind(addr).await?, app));
+    for (addr, mut app) in self.api {
+      let socket = tokio::net::TcpListener::bind(addr).await?;
+      if socket.local_addr()?.ip().is_loopback() {
+        if let Some(control) = &self.routing_control {
+          app = app
+            .route("/admin/workers", get(worker_status).post(update_weights))
+            .layer(Extension(control.clone()));
+        }
+        if let Some(reloader) = self.admin_reloader.clone() {
+          app = app.route(
+            "/admin/config/reload",
+            axum::routing::post(move |headers| async move {
+              crate::v2::handle_admin_reload(headers, Some(&reloader)).await
+            }),
+          );
+        }
+      }
+      api.push((socket, app));
     }
     let mut proxy = Vec::new();
     for (addr, state) in self.proxy {
@@ -179,7 +177,7 @@ impl Frontend {
 
 pub struct BoundFrontend {
   api: Vec<(tokio::net::TcpListener, Router)>,
-  proxy: Vec<(tokio::net::TcpListener, Arc<ProxyIngress>)>,
+  proxy: Vec<(tokio::net::TcpListener, LiveProxyIngress)>,
 }
 
 impl BoundFrontend {
@@ -202,7 +200,7 @@ impl BoundFrontend {
       })));
     }
     for (listener, state) in self.proxy {
-      let outbound = state.outbound.clone();
+      let outbound = state.current().outbound.clone();
       let mut stopped = shutdown_rx.clone();
       servers.push(Box::pin(crate::proxy::serve_bound_v2_policy(
         listener,
@@ -243,8 +241,17 @@ struct ApiIngress {
   max_wire_bytes: usize,
 }
 
+async fn capture_api_ingress(
+  State(live): State<LiveApiIngress>,
+  mut request: Request,
+  next: axum::middleware::Next,
+) -> Response {
+  request.extensions_mut().insert(live.current());
+  next.run(request).await
+}
+
 async fn dispatch_api(
-  State(state): State<Arc<ApiIngress>>,
+  Extension(state): Extension<Arc<ApiIngress>>,
   connection: InboundConnectionInfo,
   mut request: Request,
 ) -> Response {

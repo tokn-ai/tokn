@@ -1,4 +1,3 @@
-use crate::db::UsageDb;
 use anyhow::Result;
 use clap::Args;
 use std::path::PathBuf;
@@ -21,10 +20,8 @@ pub struct UsageArgs {
 pub async fn run(cfg_path: Option<PathBuf>, args: UsageArgs) -> Result<()> {
   let config = tokn_config::load_config(cfg_path.as_deref())?;
   let path = config.persistence().resolve_paths()?.usage_db;
-  let db = UsageDb::open(&path)?;
-
   let since = humantime::parse_duration(&args.since)?;
-  let rows = db.summary_for_window(since, args.account.as_deref(), args.provider.as_deref())?;
+  let rows = tokn_viewer::usage_summary(&path, since, args.account.as_deref(), args.provider.as_deref())?;
   if rows.is_empty() {
     println!("(no requests in window)");
     return Ok(());

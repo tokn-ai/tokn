@@ -1,0 +1,32 @@
+[package]
+name = "tokn-viewer"
+version.workspace = true
+edition.workspace = true
+description = "Read-only request history, session trees and usage reports for Tokn"
+documentation.workspace = true
+homepage.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[features]
+default = ["lzma"]
+lzma = ["tokn-persistence/lzma", "tokn-maintenance/lzma"]
+
+[dependencies]
+base64 = { workspace = true }
+flate2 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+snafu = { workspace = true }
+tempfile = "3"
+tokn-core = { workspace = true, features = ["std"] }
+tokn-persistence = { version = "0.2.4", path = "../persistence", default-features = false }
+tracing = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+time = { workspace = true }
+tokn-maintenance = { workspace = true }
+uuid = { workspace = true }

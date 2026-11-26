@@ -199,7 +199,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     }
   }
 
-  crate::server_runtime::finish_events(&events, archive_runtime).await?;
+  tokn_gateway::finish_events(&events, archive_runtime).await?;
   if args.dry_run && !dry_run_stopped {
     anyhow::bail!("v2 dry-run pipeline did not stop before upstream send");
   }

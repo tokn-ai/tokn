@@ -5,6 +5,11 @@ use std::{
   net::SocketAddr,
   path::{Path, PathBuf},
 };
+use tokn_config::{
+  files::{ConfigFragments, LegacyConfigSnapshot},
+  ConfigSchema,
+};
+use tokn_policy::ListenerPlan;
 use toml_edit::DocumentMut;
 
 mod routing;
@@ -52,46 +57,23 @@ pub fn address() -> Result<SocketAddr> {
       }
       Ok(address)
     }
-    tokn_config::SchemaConfig::V2 { .. } => {
-      let raw = tokn_config::v2::load_raw(&path()?)?;
-      raw
-        .listeners
-        .values()
-        .find_map(|listener| match listener {
-          tokn_config::v2::RawListener::LlmApi { bind, .. } => bind
-            .parse::<SocketAddr>()
-            .ok()
-            .filter(|address| address.ip().is_loopback() && address.port() != 0),
-          _ => None,
-        })
-        .context("Configure a loopback llm_api listener to manage the gateway from Tokn Desktop")
-    }
+    tokn_config::SchemaConfig::V2 { config, .. } => config
+      .gateway()
+      .listeners()
+      .values()
+      .filter_map(|listener| match listener {
+        ListenerPlan::LlmApi(api) => Some(api.bind()),
+        ListenerPlan::ForwardProxy(_) => None,
+      })
+      .find(|address| address.ip().is_loopback() && address.port() != 0)
+      .context("Configure a loopback llm_api listener to manage the gateway from Tokn Desktop"),
   }
 }
 
-fn overlays(path: &Path, schema: tokn_config::ConfigSchema) -> Result<Vec<(PathBuf, Vec<u8>)>> {
-  if schema != tokn_config::ConfigSchema::Legacy {
-    return Ok(Vec::new());
-  }
-  let directory = tokn_config::paths::config_fragment_dir(path);
-  if !directory.exists() {
-    return Ok(Vec::new());
-  }
-  let mut paths = std::fs::read_dir(directory)?
-    .map(|entry| entry.map(|entry| entry.path()))
-    .collect::<std::io::Result<Vec<_>>>()?;
-  paths.retain(|path| path.extension().is_some_and(|extension| extension == "toml"));
-  paths.sort();
-  paths
-    .into_iter()
-    .map(|path| Ok((path.clone(), std::fs::read(path)?)))
-    .collect()
-}
-
-fn snapshot_revision(contents: &str, overlays: &[(PathBuf, Vec<u8>)]) -> String {
+fn snapshot_revision(contents: &str, fragments: &ConfigFragments) -> String {
   let mut hash = Sha256::new();
   hash.update(revision(contents));
-  for (path, bytes) in overlays {
+  for (path, bytes) in fragments.iter() {
     hash.update(path.as_os_str().as_encoded_bytes());
     hash.update(Sha256::digest(bytes));
   }
@@ -102,12 +84,19 @@ fn revision(contents: &str) -> String {
   format!("{:x}", Sha256::digest(contents.as_bytes()))
 }
 
+fn parse_legacy_snapshot<'a>(contents: &str, fragments: &'a ConfigFragments) -> Result<LegacyConfigSnapshot<'a>> {
+  // TOML error chains can include source lines from outside the routing editor.
+  fragments
+    .parse_legacy(contents)
+    .map_err(|error| anyhow::Error::msg(error.to_string()))
+}
+
 pub fn read_at(path: &Path) -> Result<RoutingDocument> {
   let contents = std::fs::read_to_string(path)?;
   let document: DocumentMut = contents.parse()?;
-  let schema = document_schema(&document)?;
-  let overlays = overlays(path, schema)?;
-  let (overview, overview_error) = match routing::summarize(path, &contents, &document, &overlays, schema) {
+  let schema = tokn_config::detect_edit_config_schema(&document, path)?;
+  let fragments = ConfigFragments::read(path, schema)?;
+  let (overview, overview_error) = match routing::summarize(path, &contents, &document, &fragments, schema) {
     Ok(overview) => (Some(overview), None),
     Err(error) => (None, Some(format!("{error:#}"))),
   };
@@ -119,38 +108,22 @@ pub fn read_at(path: &Path) -> Result<RoutingDocument> {
   }
   Ok(RoutingDocument {
     config_path: path.display().to_string(),
-    revision: snapshot_revision(&contents, &overlays),
-    schema: if schema == tokn_config::ConfigSchema::V2 {
-      "v2"
-    } else {
-      "legacy"
-    }
-    .into(),
-    overlay_paths: overlays.iter().map(|(path, _)| path.display().to_string()).collect(),
+    revision: snapshot_revision(&contents, &fragments),
+    schema: if schema == ConfigSchema::V2 { "v2" } else { "legacy" }.into(),
+    overlay_paths: fragments.iter().map(|(path, _)| path.display().to_string()).collect(),
     routing_toml: routing.to_string(),
     overview,
     overview_error,
   })
 }
 
-fn document_schema(document: &DocumentMut) -> Result<tokn_config::ConfigSchema> {
-  match document.get("schema_version") {
-    None => Ok(tokn_config::ConfigSchema::Legacy),
-    Some(marker) => match marker.as_integer() {
-      Some(version) if version == i64::from(tokn_config::v2::SCHEMA_VERSION) => Ok(tokn_config::ConfigSchema::V2),
-      Some(version) => bail!("Unsupported configuration schema version: {version}"),
-      None => bail!("Configuration schema_version must be an integer"),
-    },
-  }
-}
-
 pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Result<RoutingDocument> {
   let lock = tokn_config::lock_config_file(path)?;
   let original = std::fs::read_to_string(path)?;
   let mut document: DocumentMut = original.parse()?;
-  let schema = document_schema(&document)?;
-  let overlays = overlays(path, schema)?;
-  if snapshot_revision(&original, &overlays) != expected_revision {
+  let schema = tokn_config::detect_edit_config_schema(&document, path)?;
+  let fragments = ConfigFragments::read(path, schema)?;
+  if snapshot_revision(&original, &fragments) != expected_revision {
     bail!("Configuration changed on disk. Reload before saving; your draft has been retained.");
   }
   let routing: DocumentMut = routing_toml.parse()?;
@@ -167,17 +140,17 @@ pub fn save_at(path: &Path, expected_revision: &str, routing_toml: &str) -> Resu
   }
   let candidate = document.to_string();
   match schema {
-    tokn_config::ConfigSchema::V2 => {
+    ConfigSchema::V2 => {
       tokn_config::v2::parse_config(&candidate, path)?;
     }
-    tokn_config::ConfigSchema::Legacy => {
+    ConfigSchema::Legacy => {
       if routing.contains_key("routes") {
         bail!("Legacy configuration uses defaults and profiles, not routes");
       }
-      routing::load_legacy_snapshot(path, &candidate, &overlays)?;
+      parse_legacy_snapshot(&candidate, &fragments)?;
     }
   }
-  if snapshot_revision(&original, &self::overlays(path, schema)?) != expected_revision {
+  if snapshot_revision(&original, &ConfigFragments::read(path, schema)?) != expected_revision {
     bail!("Configuration fragments changed during validation. Reload before saving.");
   }
   lock.replace_contents_if_unchanged(Some(original.as_bytes()), candidate.as_bytes())?;
@@ -210,6 +183,11 @@ mod tests {
   fn edits_preserve_service_settings_and_reject_stale_or_invalid_drafts() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
+    std::fs::write(
+      dir.path().join("config.d"),
+      "only legacy configurations read this directory",
+    )
+    .unwrap();
     std::fs::write(&path, "schema_version = 2\n# retained\n[service]\n[defaults]\n[listeners.local]\nkind = 'llm_api'\nbind = '127.0.0.1:4141'\nclient_auth = 'none'\n").unwrap();
     let first = read_at(&path).unwrap();
     let saved = save_at(

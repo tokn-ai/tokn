@@ -50,9 +50,19 @@ also logged during startup.
 
 Native v2 configs declare their listeners directly. Use `frontend` or `serve`
 without `--with-proxy`; `worker start` needs no listener flags for either schema.
-Frontend policy changes require restarting the frontend. An existing frontend
-started without the legacy proxy cannot gain it through a later
-`serve --with-proxy` invocation.
+To apply routing or profile edits, send `POST /admin/config/reload` with
+`x-tokn-admin: reload` to a loopback API listener. Once the worker has prepared
+the same configuration, the frontend publishes the new policies for new requests.
+Reload requires a single current worker. The endpoint returns `409` during an
+A/B experiment, when the worker reads a different config, or when its version
+doesn't support reload. The existing configuration stays active.
+Changing listener addresses, authentication, or TLS requires a restart, as does
+adding the legacy proxy to a running frontend.
+
+Tokn Desktop runs the bundled `tokn-gateway serve` and holds a private pipe to
+the child it starts. Closing Desktop or pressing Stop releases that ownership.
+The frontend closes its listening sockets when Desktop owns it exclusively.
+If an independent worker has joined, the frontend stays available for it.
 
 ## Worker states and Ctrl-C
 
@@ -112,6 +122,9 @@ requests_dir = "/path/to/candidate/requests"
 ```
 
 Changing the config filename alone does not isolate the default database paths.
+The frontend maintains its configured request history directory while workers
+come and go. A worker that uses a different request directory runs maintenance
+for its own data. Older frontends delegate maintenance to their workers.
 For temporary experiments, persistence may instead be disabled explicitly.
 
 ## A/B experiments

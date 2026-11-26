@@ -55,11 +55,14 @@ tokn-endpoint-responses = { version = "0.2.4", path = "endpoints/responses", def
 tokn-access = { version = "0.2.4", path = "services/access" }
 tokn-accounts = { version = "0.2.4", path = "services/accounts", default-features = false }
 tokn-agent-migration = { version = "0.2.4", path = "services/agent-migration" }
+tokn-gateway = { package = "tokn-gateway-service", version = "0.2.4", path = "services/gateway", default-features = false }
+tokn-maintenance = { version = "0.2.4", path = "services/maintenance", default-features = false }
 tokn-mock-server = { version = "0.2.4", path = "services/mock-server" }
 tokn-persistence = { version = "0.2.4", path = "services/persistence" }
 tokn-requests = { version = "0.2.4", path = "services/requests", default-features = false }
 tokn-router = { version = "0.2.4", path = "services/router" }
 tokn-router-legacy-config = { version = "0.2.4", path = "services/legacy-config" }
+tokn-viewer = { version = "0.2.4", path = "services/viewer", default-features = false }
 
 tokn-sdk = { version = "0.2.4", path = "apps/sdk" }
 

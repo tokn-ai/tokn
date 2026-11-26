@@ -1,7 +1,10 @@
 //! Owned Unix connections, streaming bodies, and exclusive socket lifecycle.
 
 use super::protocol::{WireContext, CONNECT_TIMEOUT, CONTEXT_HEADER, MAX_CONTEXT_BYTES, PROTOCOL_VERSION, READY_PATH};
-use super::WorkerInfo;
+use super::{
+  reload::{WorkerGenerations, GENERATION_HEADER, LEASE_CAPABILITY, PIN_PATH, PREPARE_PATH},
+  WorkerInfo, WorkerReload,
+};
 use crate::dispatch::{DispatchContext, RequestDispatcher, RequestOrigin};
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -63,7 +66,7 @@ pub(super) fn strip_connection_headers(headers: &mut axum::http::HeaderMap) -> R
   Ok(())
 }
 
-struct ConnectionTask(JoinHandle<()>);
+pub(super) struct ConnectionTask(pub(super) JoinHandle<()>);
 impl Drop for ConnectionTask {
   fn drop(&mut self) {
     self.0.abort();
@@ -145,6 +148,44 @@ pub async fn serve_worker<F>(
 where
   F: Future<Output = ()> + Send,
 {
+  serve_worker_inner(
+    path,
+    WorkerService::Fixed {
+      dispatcher,
+      info: Arc::new(info),
+    },
+    shutdown,
+  )
+  .await
+}
+
+/// Serve normal worker dispatch plus private, generation-scoped reload preparation.
+pub async fn serve_reloadable_worker<F>(
+  path: PathBuf,
+  live: Arc<crate::v2::LiveRuntime>,
+  info: WorkerInfo,
+  prepare: WorkerReload,
+  shutdown: F,
+) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let revisions = Arc::new(WorkerGenerations::new(live, info, prepare));
+  serve_worker_inner(path, WorkerService::Reloadable(revisions), shutdown).await
+}
+
+enum WorkerService {
+  Fixed {
+    dispatcher: Arc<dyn RequestDispatcher>,
+    info: Arc<WorkerInfo>,
+  },
+  Reloadable(Arc<WorkerGenerations>),
+}
+
+async fn serve_worker_inner<F>(path: PathBuf, worker: WorkerService, shutdown: F) -> Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
   let parent = path
     .parent()
     .filter(|path| !path.as_os_str().is_empty())
@@ -162,8 +203,8 @@ where
     inode: metadata.ino(),
   };
   std::fs::set_permissions(&socket.path, std::fs::Permissions::from_mode(0o600))?;
-  tracing::info!(socket_path = %socket.path.display(), protocol_version = info.protocol_version, "gateway worker listening");
-  let info = Arc::new(info);
+  tracing::info!(socket_path = %socket.path.display(), protocol_version = PROTOCOL_VERSION, "gateway worker listening");
+  let worker = Arc::new(worker);
   let mut connections = JoinSet::new();
   let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
   tokio::pin!(shutdown);
@@ -176,18 +217,18 @@ where
       }
       accepted = listener.accept() => {
         let (stream, _) = match accepted { Ok(value) => value, Err(error) => break Err(error.into()) };
-        let dispatcher = dispatcher.clone();
-        let info = info.clone();
+        let worker = worker.clone();
         let mut stopped = shutdown_rx.clone();
         connections.spawn(async move {
+          let stop = stopped.clone();
           let service = hyper::service::service_fn(move |request| {
-            let dispatcher = dispatcher.clone();
-            let info = info.clone();
-            async move { Ok::<_, std::convert::Infallible>(worker_request(dispatcher, info, request).await) }
+            let worker = worker.clone();
+            let stop = stop.clone();
+            async move { Ok::<_, std::convert::Infallible>(worker_request(worker, stop, request).await) }
           });
           let mut builder = hyper::server::conn::http1::Builder::new();
           builder.keep_alive(false).timer(TokioTimer::new()).header_read_timeout(Duration::from_secs(30));
-          let connection = builder.serve_connection(TokioIo::new(stream), service);
+          let connection = builder.serve_connection(TokioIo::new(stream), service).with_upgrades();
           tokio::pin!(connection);
           let result = tokio::select! {
             result = &mut connection => result,
@@ -205,15 +246,47 @@ where
 }
 
 async fn worker_request(
-  dispatcher: Arc<dyn RequestDispatcher>,
-  info: Arc<WorkerInfo>,
+  worker: Arc<WorkerService>,
+  stop: tokio::sync::watch::Receiver<bool>,
   request: hyper::Request<Incoming>,
 ) -> Response {
+  if matches!(request.uri().path(), PREPARE_PATH | PIN_PATH)
+    && request.method() == Method::POST
+    && !request.headers().contains_key(CONTEXT_HEADER)
+  {
+    let WorkerService::Reloadable(revisions) = worker.as_ref() else {
+      return StatusCode::NOT_IMPLEMENTED.into_response();
+    };
+    return revisions.clone().prepare(request, stop).await;
+  }
+  let selector = request.headers().get(GENERATION_HEADER);
+  let (dispatcher, info) = match worker.as_ref() {
+    WorkerService::Reloadable(revisions) => {
+      let prepared = match selector {
+        None => revisions.current(),
+        Some(id) => {
+          let Some(prepared) = id.to_str().ok().and_then(|id| revisions.get(id)) else {
+            return StatusCode::CONFLICT.into_response();
+          };
+          prepared
+        }
+      };
+      (prepared.generation as Arc<dyn RequestDispatcher>, prepared.info)
+    }
+    WorkerService::Fixed { dispatcher, info } if selector.is_none() => (dispatcher.clone(), info.clone()),
+    WorkerService::Fixed { .. } => return StatusCode::CONFLICT.into_response(),
+  };
   if request.method() == Method::GET
     && request.uri().path() == READY_PATH
     && !request.headers().contains_key(CONTEXT_HEADER)
   {
-    return axum::Json(&*info).into_response();
+    let mut response = axum::Json(&*info).into_response();
+    if matches!(worker.as_ref(), WorkerService::Reloadable(_)) {
+      response
+        .headers_mut()
+        .insert(LEASE_CAPABILITY, HeaderValue::from_static("1"));
+    }
+    return response;
   }
   match decode_request(request, &info) {
     Ok((context, request)) => match dispatcher.dispatch(context, request).await {

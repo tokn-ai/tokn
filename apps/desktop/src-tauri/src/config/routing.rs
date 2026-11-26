@@ -1,9 +1,8 @@
 //! Read-only summaries of the exact configuration snapshot shown by the editor.
 use anyhow::{Context, Result};
 use serde::Serialize;
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use tokn_config::{ConfigSchema, RouteMode};
+use std::path::Path;
+use tokn_config::{files::ConfigFragments, ConfigSchema, RouteMode};
 use tokn_policy::{
   AccountSelectionStrategy, GatewayPlan, ManagedRetry, ModelSelector, OperationPolicy, ProviderSelector,
   QualificationNamespace, RelayCredentials, RelayDestination, RelayRetry, RoutePlan, WireIdentity,
@@ -54,12 +53,12 @@ pub(super) fn summarize(
   path: &Path,
   contents: &str,
   document: &DocumentMut,
-  overlays: &[(PathBuf, Vec<u8>)],
+  fragments: &ConfigFragments,
   schema: ConfigSchema,
 ) -> Result<RoutingOverview> {
   match schema {
     ConfigSchema::V2 => v2_summary(path, contents),
-    ConfigSchema::Legacy => legacy_summary(path, contents, document, overlays),
+    ConfigSchema::Legacy => legacy_summary(path, contents, document, fragments),
   }
 }
 
@@ -298,54 +297,14 @@ fn route_fields(plan: &GatewayPlan, route: &RoutePlan) -> (String, Vec<RoutingSu
   }
 }
 
-pub(super) fn load_legacy_snapshot(
-  path: &Path,
-  contents: &str,
-  overlays: &[(PathBuf, Vec<u8>)],
-) -> Result<tokn_config::Config> {
-  // The public legacy loader owns overlay validation and merge semantics. Feed
-  // it the already-read bytes so the summary cannot race a second live read.
-  let stage = tempfile::tempdir()?;
-  let filename = path.file_name().context("Configuration path has no filename")?;
-  let staged_path = stage.path().join(filename);
-  std::fs::write(&staged_path, contents)?;
-  if !overlays.is_empty() {
-    let fragment_dir = tokn_config::paths::config_fragment_dir(&staged_path);
-    std::fs::create_dir(&fragment_dir)?;
-    for (source, contents) in overlays {
-      std::fs::write(
-        fragment_dir.join(source.file_name().context("Fragment path has no filename")?),
-        contents,
-      )?;
-    }
-  }
-  tokn_config::Config::load(Some(&staged_path))
-    .map(|(config, _)| config)
-    .map_err(|error| {
-      let original_parent = path.parent().unwrap_or_else(|| Path::new("."));
-      anyhow::anyhow!(error.to_string().replace(
-        &stage.path().display().to_string(),
-        &original_parent.display().to_string()
-      ))
-    })
-}
-
 fn legacy_summary(
   path: &Path,
   contents: &str,
   document: &DocumentMut,
-  overlays: &[(PathBuf, Vec<u8>)],
+  fragments: &ConfigFragments,
 ) -> Result<RoutingOverview> {
-  let config = load_legacy_snapshot(path, contents, overlays)?;
-  let mut profile_sources = BTreeMap::new();
-  for (overlay_path, bytes) in overlays {
-    let overlay: DocumentMut = std::str::from_utf8(bytes)?.parse()?;
-    if let Some(profiles) = overlay.get("profiles").and_then(toml_edit::Item::as_table_like) {
-      for (id, _) in profiles.iter() {
-        profile_sources.insert(id.to_owned(), source(overlay_path, section("profiles", id), false));
-      }
-    }
-  }
+  let snapshot = super::parse_legacy_snapshot(contents, fragments)?;
+  let config = &snapshot.config;
   let defaults = &config.defaults;
   let default_mode = if defaults.mode == RouteMode::Route && config.server.route_mode != RouteMode::Route {
     config.server.route_mode
@@ -364,7 +323,7 @@ fn legacy_summary(
     api_path: Some("/v1".to_owned()),
     source: source(path, "defaults".to_owned(), !document.contains_key("defaults")),
     fields: legacy_fields(
-      &config,
+      config,
       defaults.default_provider_id.as_deref(),
       defaults.providers.as_deref(),
       defaults.accounts.as_deref(),
@@ -379,11 +338,13 @@ fn legacy_summary(
       route_id: None,
       route_kind: legacy_mode(mode).to_owned(),
       api_path: Some(legacy_api_path(id)?),
-      source: profile_sources
-        .remove(id)
-        .unwrap_or_else(|| source(path, section("profiles", id), false)),
+      source: source(
+        snapshot.fragment_source("profiles", id).unwrap_or(path),
+        section("profiles", id),
+        false,
+      ),
       fields: legacy_fields(
-        &config,
+        config,
         profile
           .default_provider_id
           .as_deref()

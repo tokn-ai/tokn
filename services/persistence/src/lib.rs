@@ -1,24 +1,14 @@
 pub mod access;
-pub mod archive;
 pub mod history_import;
 pub mod migrate;
+pub mod request_files;
 pub mod requests;
 pub mod sessions;
 pub mod usage;
-pub mod viewer;
 
 pub use access::{AccessDb, ApiKeyRecord, ApiKeySummaryRecord, NewApiKeyRecord};
-pub use requests::{read_request_row, RequestEventHandler, RequestPersistenceOptions};
+pub use requests::{is_valid_request_day, read_request_row, RequestEventHandler, RequestPersistenceOptions};
 pub use sessions::SessionEventHandler;
-pub use viewer::{
-  get_request, get_request_llm_message, get_request_llm_summary, get_request_llm_tool_definition, get_session,
-  get_session_from_db, get_session_node_from_db, get_session_usage, is_valid_request_day, list_latest_requests,
-  list_request_days, list_request_url_paths, list_requests, list_sessions, list_sessions_from_db, LatestRequests,
-  LlmItemDetail, LlmMessageSummary, LlmRequestContentSummary, LlmToolDefinitionSummary, RequestDay, RequestDayState,
-  RequestListOptions, RequestUrlPath, SessionDetail, SessionMessage, SessionMessageTruncation, SessionNodeDetail,
-  SessionNodeDetailTruncation, SessionNodeSummary, SessionPart, SessionPartContent, SessionPartEncoding,
-  SessionPartOmissionReason, SessionRequestUsage, SessionSummary, SessionUsage, StoredSessionDetail,
-};
 
 use bytes::Bytes;
 use snafu::Snafu;
@@ -26,6 +16,17 @@ pub use tokn_core::db::{DbPaths, HttpSnapshot, MessageRecord, PartRecord};
 #[allow(unused_imports)]
 pub(crate) use tokn_core::db::{Usage, UsageDetails};
 pub use usage::{UsageDb, UsageEventHandler};
+
+/// Open an existing SQLite database for queries without creating or migrating it.
+pub fn open_readonly(
+  path: &std::path::Path,
+  busy_timeout: std::time::Duration,
+) -> rusqlite::Result<rusqlite::Connection> {
+  let conn = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+  conn.busy_timeout(busy_timeout)?;
+  conn.execute_batch("PRAGMA query_only = ON;")?;
+  Ok(conn)
+}
 
 /// Serialise an HTTP header map to JSON bytes, redacting values whose name
 /// is sensitive (`authorization`, `proxy-authorization`, `cookie`, anything
@@ -58,19 +59,6 @@ pub enum Error {
 
   #[snafu(display("sqlite"))]
   Sqlite { source: rusqlite::Error },
-
-  #[snafu(display(
-    "sessions database schema version {version} does not support session viewing; version 2 or newer is required"
-  ))]
-  UnsupportedSessionSchema { version: u32 },
-
-  #[snafu(display(
-    "usage database schema version {version} does not support session usage; version 2 or newer is required"
-  ))]
-  UnsupportedUsageSchema { version: u32 },
-
-  #[snafu(display("session node lineage is invalid at {node_id}"))]
-  InvalidSessionLineage { node_id: String },
 
   #[snafu(display("session message tree is invalid at {message_id}"))]
   InvalidMessageTree { message_id: String },
