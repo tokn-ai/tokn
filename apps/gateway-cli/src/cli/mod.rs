@@ -55,7 +55,7 @@ pub enum Cmd {
   ApiKey(api_key::ApiKeyCmd),
   /// Show the Copilot identity headers that will be sent upstream
   Headers(headers::HeadersArgs),
-  /// Start or reuse the frontend and run a replacement worker
+  /// Serve the configured API and proxy listeners
   Serve(serve::ServeArgs),
   /// Run fixed public listeners and accept workers from any gateway version.
   #[cfg(unix)]
@@ -123,9 +123,7 @@ impl Cli {
       Cmd::Agent(c) => agent::run(cfg_path, c).await,
       Cmd::ApiKey(c) => api_key::run(c).await,
       Cmd::Headers(a) => headers::run(cfg_path, a).await,
-      #[cfg(unix)]
-      Cmd::Serve(args) if args.worker_socket.is_none() => lifecycle::serve(cfg_path, args).await,
-      Cmd::Serve(args) => serve::run_direct(cfg_path, args).await,
+      Cmd::Serve(args) => serve_gateway(cfg_path, args).await,
       #[cfg(unix)]
       Cmd::Frontend(a) => lifecycle::frontend(cfg_path, a).await,
       #[cfg(unix)]
@@ -142,6 +140,17 @@ impl Cli {
     };
     r.map_err(Error::from)
   }
+}
+
+async fn serve_gateway(config: Option<PathBuf>, args: serve::ServeArgs) -> anyhow::Result<()> {
+  tokn_gateway::serve(
+    serve::run_direct(config.clone(), args.clone()),
+    #[cfg(unix)]
+    args.worker_socket.is_some(),
+    #[cfg(unix)]
+    lifecycle::serve(config, args),
+  )
+  .await
 }
 
 fn prepare_default_config_home(cfg_path: Option<&Path>) -> anyhow::Result<()> {

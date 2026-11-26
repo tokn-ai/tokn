@@ -4,6 +4,10 @@ The frontend owns the fixed API and forward-proxy listeners. Each worker runs
 its gateway version and accepts requests through one private Unix socket.
 Worker selection happens for each API, plain proxy, or intercepted HTTPS
 request. Existing CONNECT/TLS connections stay open across worker switches.
+
+On Windows, `serve` runs the router in-process. The gateway service handles
+reload and shutdown in both modes. The frontend and worker commands described
+below are available on Unix.
 This mode supports macOS and Linux.
 
 ## Start and upgrade

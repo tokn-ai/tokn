@@ -506,6 +506,15 @@ where
   crate::proxy::serve_bound_v2_policy(listener, outbound, state.into(), shutdown).await
 }
 
+pub async fn serve_live_http<F>(state: LiveAppState, bind: SocketAddr, shutdown: F) -> anyhow::Result<()>
+where
+  F: Future<Output = ()> + Send,
+{
+  let listener = tokio::net::TcpListener::bind(bind).await?;
+  tracing::info!(addr = %listener.local_addr()?, "tokn-router listening");
+  crate::server::serve_http(router_live_on(state, bind), listener, shutdown).await
+}
+
 pub async fn serve_live_forward_proxy<F>(
   state: LiveForwardProxyState,
   bind: SocketAddr,

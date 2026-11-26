@@ -98,9 +98,11 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     );
   }
 
-  let (events, receiver, handlers, archive_runtime) =
-    crate::server_runtime::build_smoke_event_bus(service.persistence())?;
-  let _event_thread = tokn_core::event::spawn_event_loop(receiver, handlers);
+  let runtime_events = tokn_gateway::events::RuntimeEvents::start_archive_only(
+    service.persistence(),
+    crate::server_runtime::event_observers,
+  )?;
+  let events = runtime_events.events();
   let captured = Captured::install(&events);
   if args.format == OutputFormat::Text {
     subscribe_event_printer(&events);
@@ -199,7 +201,7 @@ pub async fn run(cfg_path: Option<PathBuf>, args: SendArgs) -> Result<()> {
     }
   }
 
-  tokn_gateway::finish_events(&events, archive_runtime).await?;
+  runtime_events.finish().await?;
   if args.dry_run && !dry_run_stopped {
     anyhow::bail!("v2 dry-run pipeline did not stop before upstream send");
   }

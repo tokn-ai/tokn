@@ -2996,6 +2996,7 @@ name = "tokn-gateway-service"
 version = "0.2.4"
 dependencies = [
  "anyhow",
+ "futures",
  "libc",
  "rusqlite",
  "serde",
@@ -3007,6 +3008,7 @@ dependencies = [
  "tokn-headers",
  "tokn-maintenance",
  "tokn-persistence",
+ "tokn-policy",
  "tokn-router",
  "tokn-router-config",
  "tracing",

@@ -7,15 +7,15 @@
 
 ## Workspace Shape
 
-- This is a Rust workspace. On Unix, `apps/gateway-cli` launches the gateway coordinator in the frontend process. The coordinator lives in `services/gateway`.
+- This is a Rust workspace. `services/gateway` owns serving and reload coordination. On Unix, normal `serve` uses a frontend and worker. On Windows, the gateway runs the router in-process.
 - `apps/gateway-cli` is the shipped CLI/runtime package: Cargo package `tokn-gateway-cli`, binary target `tokn-gateway`.
 - The user-facing clap command name is still `tokn-router` in `apps/gateway-cli/src/cli/mod.rs`. Do not assume README command names match the built binary name.
 - `services/router` owns the HTTP API/router/proxy wiring. `apps/tokn` is a re-export wrapper crate, not the runtime entrypoint.
 
 ## Crate Map
 
-- `apps/gateway-cli`: CLI commands, process startup, logging, serve/proxy runtime.
-- `services/gateway`: instance lifecycle, frontend discovery, worker registration, reload coordination, and shutdown.
+- `apps/gateway-cli`: command parsing, effective config preparation, logging, and terminal progress.
+- `services/gateway`: in-process serving, Unix frontend discovery and worker registration, reload coordination, and shutdown.
 - `services/router`: HTTP listeners, axum router, `/v1/*` endpoints, proxy interception, and streaming request dispatch.
 - `services/accounts`: account pool, provider registry, route resolution.
 - `core/auth`: auth provider interfaces and credential storage/import.

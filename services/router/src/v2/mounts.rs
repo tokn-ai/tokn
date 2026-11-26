@@ -61,6 +61,7 @@ impl ApiMounts {
     Ok(mounts)
   }
 
+  #[cfg(unix)]
   pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &MountedEndpoint)> {
     self.paths.iter().map(|(path, entry)| (path.as_str(), entry))
   }
