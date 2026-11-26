@@ -388,6 +388,7 @@ impl SessionFooter {
   }
 }
 
+#[cfg(unix)]
 pub fn set_ab_test_status(status: Option<AbTestStatus>) {
   let footer = LIVE_FOOTER.get().and_then(|slot| slot.lock().ok()?.upgrade());
   if let Some(footer) = footer {

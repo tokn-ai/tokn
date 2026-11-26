@@ -1,16 +1,15 @@
 //! Long-lived frontend coordinator for public listeners, worker control and live configuration.
 use crate::control::{control_socket_path, ControlHost};
+use crate::runtime::{listener_bind, load_access_store, BindOptions};
 use crate::supervision::{FrontendOwner, ParentLease};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::future::Future;
-use std::net::SocketAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
-use tokn_access::AccessStore;
 use tokn_config::v2::{CompiledConfig, PersistencePlan};
 use tokn_core::event::{EventBus, EventHandler};
 use tokn_maintenance::ArchiveEventHandler;
@@ -52,10 +51,25 @@ impl Gateway {
   pub async fn bind(
     directory: &Path,
     compiled: CompiledConfig,
-    bind_override: Option<SocketAddr>,
-    access: Arc<AccessStore>,
+    bind: BindOptions,
     candidate: impl Fn() -> Result<(CompiledConfig, String), ReloadError> + Send + Sync + 'static,
   ) -> Result<Self> {
+    let (plan, service) = compiled.into_parts();
+    let needs_access = plan
+      .listeners()
+      .values()
+      .any(|listener| listener.client_auth() == tokn_policy::ClientAuthPlan::LocalKeys);
+    let access = load_access_store(needs_access)?;
+    let bind_override = if bind.host.is_some() || bind.port.is_some() {
+      anyhow::ensure!(
+        plan.listeners().len() == 1,
+        "--host and --port can only override a config with exactly one listener"
+      );
+      let listener = plan.listeners().values().next().context("missing listener")?;
+      Some(listener_bind(listener.bind(), listener.client_auth(), &bind)?)
+    } else {
+      None
+    };
     let candidate = Arc::new(candidate);
     let path = control_socket_path(directory);
     let lease = ParentLease::from_stdin()?;
@@ -63,7 +77,6 @@ impl Gateway {
       .as_ref()
       .map(|_| FrontendOwner::for_launch().map(Arc::new))
       .transpose()?;
-    let (plan, service) = compiled.into_parts();
     let persistence = service.persistence().clone();
     let handlers = crate::ingress::handlers(&persistence)?;
     let events = Arc::new(EventBus::new(persistence.write_queue_capacity().max(256)));

@@ -676,7 +676,7 @@ Zero TTL disables v2 affinity and requires zero extra retention; legacy zero
 TTL with a nonzero tombstone is rejected rather than silently losing retention.
 
 Each loopback-bound `llm_api` listener exposes `POST /admin/config/reload`
-whether you run `tokn-gateway serve` or start the frontend and worker separately.
+when you run `tokn-gateway serve` or start the frontend and worker separately on Unix.
 Reload re-reads the selected config, `auth.yaml`, and `auth.d`. For an unversioned
 legacy config, it also merges fragments and repeats the in-memory v2 projection
 with the original launch flags. Ordinary client keys do not authorize gateway
@@ -691,14 +691,15 @@ curl -X POST http://127.0.0.1:4141/admin/config/reload \
 A successful reload replaces routes, bindings, profiles, retry policies,
 providers, account pools, accounts, discovery data, and forward-proxy routing
 rules as one generation across every listener. Requests already admitted keep
-their previous generation. Invalid configuration returns `422`. The frontend
-returns `409` for restart-only changes or when it cannot apply one configuration
-to both processes. Both responses leave the active generation untouched.
+their previous generation. Invalid configuration returns `422`. Changes that
+require a restart return `409`. In split mode, a frontend that cannot apply one
+configuration to both processes also returns `409`. Both responses leave the
+active generation untouched.
 If the worker loses its acknowledgment connection after publication, the frontend
 returns `503` and identifies the generation it published. Check worker status
 before retrying.
 
-For a live reload, the frontend needs one current worker that supports reload
+In split mode, the frontend needs one current worker that supports reload
 and reads the same configuration and credentials. During an A/B rollout, finish
 the rollout and let previous workers drain before applying the edit.
 
@@ -935,6 +936,9 @@ projected. Native v2 configs can declare one or more `forward_proxy` listeners
 and serve them together with API listeners without compatibility flags.
 
 ## Version switching and A/B tests
+
+Version switching uses separate frontend and worker processes on Unix.
+On Windows, `tokn-gateway serve` runs the router in-process.
 
 `tokn-gateway frontend --with-proxy` owns the fixed public listeners.
 `tokn-gateway worker start` registers a worker and takes all new requests;
