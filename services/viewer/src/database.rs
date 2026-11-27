@@ -1,15 +1,24 @@
 use rusqlite::Connection;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::BufReader;
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::days::DayFile;
 use crate::Result;
-use tokn_persistence::request_files::{begin_read, ArchiveFormat};
+#[cfg(feature = "lzma")]
+use tokn_persistence::archive_xz::BlockReader;
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_archive::indexed::IndexedPackReader;
+use tokn_persistence::request_files::{begin_read, ArchiveContents, ArchiveFormat};
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_files::{indexed_xz_path, StableFile};
 
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(2_500);
+
+#[cfg(feature = "lzma")]
+type XzArchive = IndexedPackReader<BlockReader<BufReader<File>>>;
 
 pub(super) fn open_readonly(path: &Path) -> Result<Option<Connection>> {
   if !path.try_exists()? {
@@ -18,16 +27,55 @@ pub(super) fn open_readonly(path: &Path) -> Result<Option<Connection>> {
   Ok(Some(tokn_persistence::open_readonly(path, READ_BUSY_TIMEOUT)?))
 }
 
-/// Close SQLite before removing a private decompressed database, including on Windows.
-pub(super) struct DayConnection {
-  conn: Connection,
-  _snapshot: Option<tempfile::TempDir>,
+pub(super) struct DayConnection(DayStorage);
+
+enum DayStorage {
+  Sqlite {
+    // Drop the connection before removing its private snapshot on Windows.
+    conn: Connection,
+    snapshot: Option<(tempfile::TempDir, ArchiveContents)>,
+  },
+  #[cfg(feature = "lzma")]
+  Indexed(Box<XzArchive>),
+}
+
+impl DayConnection {
+  pub(super) fn read_indexed_body(&self, request_id: &str, slot: u8) -> Result<Option<(Vec<u8>, u8)>> {
+    #[cfg(feature = "lzma")]
+    if let DayStorage::Indexed(reader) = &self.0 {
+      return Ok(reader.read_body(request_id, slot)?);
+    }
+    #[cfg(not(feature = "lzma"))]
+    let _ = (request_id, slot);
+    Ok(None)
+  }
+
+  pub(super) fn body_is_decoded(&self, request_id: &str, slot: u8) -> rusqlite::Result<bool> {
+    if !matches!(
+      self.0,
+      DayStorage::Sqlite {
+        snapshot: Some((_, ArchiveContents::RequestPack)),
+        ..
+      }
+    ) {
+      return Ok(false);
+    }
+    self.query_row(
+      "SELECT EXISTS (SELECT 1 FROM tokn_archive_decoded_bodies WHERE request_id = ?1 AND slot = ?2)",
+      (request_id, slot),
+      |row| row.get(0),
+    )
+  }
 }
 
 impl Deref for DayConnection {
   type Target = Connection;
   fn deref(&self) -> &Connection {
-    &self.conn
+    match &self.0 {
+      DayStorage::Sqlite { conn, .. } => conn,
+      #[cfg(feature = "lzma")]
+      DayStorage::Indexed(reader) => reader.connection(),
+    }
   }
 }
 
@@ -37,6 +85,14 @@ impl DayFile {
   }
 
   pub(super) fn open_with_timeout(&self, timeout: Duration) -> Result<Option<DayConnection>> {
+    self.open_with_archive_scope(timeout, None)
+  }
+
+  pub(super) fn open_request(&self, request_id: &str) -> Result<Option<DayConnection>> {
+    self.open_with_archive_scope(READ_BUSY_TIMEOUT, Some(request_id))
+  }
+
+  fn open_with_archive_scope(&self, timeout: Duration, request_id: Option<&str>) -> Result<Option<DayConnection>> {
     let mut error = match self.open_raw(timeout) {
       Ok(Some(conn)) => return Ok(Some(conn)),
       Ok(None) => None,
@@ -52,12 +108,20 @@ impl DayFile {
     };
     // The writer publishes an archive before pruning its raw database. Recheck
     // its actual filenames here even if enumeration saw only the raw file.
+    #[cfg(feature = "lzma")]
+    match open_indexed_archive(&self.path, timeout) {
+      Ok(Some(conn)) => return Ok(Some(conn)),
+      Ok(None) => (),
+      Err(err) => {
+        error.get_or_insert(err);
+      }
+    }
     for format in [ArchiveFormat::Zstd, ArchiveFormat::Xz] {
       let path = self.path.with_extension(format.extension());
       if !regular_file(&path)? {
         continue;
       }
-      match open_archive(&path, format, timeout) {
+      match open_archive(&path, format, timeout, request_id) {
         Ok(conn) => return Ok(Some(conn)),
         Err(err) => {
           error.get_or_insert(err);
@@ -76,7 +140,7 @@ impl DayFile {
     }
     let conn = tokn_persistence::open_readonly(&self.path, timeout)?;
     begin_read(&conn)?;
-    Ok(Some(DayConnection { conn, _snapshot: None }))
+    Ok(Some(DayConnection(DayStorage::Sqlite { conn, snapshot: None })))
   }
 }
 
@@ -88,7 +152,25 @@ fn regular_file(path: &Path) -> std::io::Result<bool> {
   }
 }
 
-fn open_archive(path: &Path, format: ArchiveFormat, timeout: Duration) -> Result<DayConnection> {
+#[cfg(feature = "lzma")]
+fn open_indexed_archive(db: &Path, timeout: Duration) -> Result<Option<DayConnection>> {
+  let archive = indexed_xz_path(db);
+  if !regular_file(&archive)? {
+    return Ok(None);
+  }
+
+  let file = StableFile::open(&archive)?;
+  let input = BlockReader::open_xz(BufReader::new(file.file().try_clone()?))?;
+  let reader = IndexedPackReader::open(input, timeout)?;
+  Ok(Some(DayConnection(DayStorage::Indexed(Box::new(reader)))))
+}
+
+fn open_archive(
+  path: &Path,
+  format: ArchiveFormat,
+  timeout: Duration,
+  request_id: Option<&str>,
+) -> Result<DayConnection> {
   let input = BufReader::new(File::open(path)?);
   let mut builder = tempfile::Builder::new();
   builder.prefix("tokn-viewer-");
@@ -99,15 +181,14 @@ fn open_archive(path: &Path, format: ArchiveFormat, timeout: Duration) -> Result
   }
   let directory = builder.tempdir()?;
   let db = directory.path().join("requests.db");
-  {
-    let mut output = BufWriter::new(File::create_new(&db)?);
-    format.decode(input, &mut output)?;
-    output.flush()?;
-  }
+  let contents = match request_id {
+    Some(request_id) => format.restore_request(input, &db, request_id)?,
+    None => format.restore_metadata(input, &db)?,
+  };
   let conn = tokn_persistence::open_readonly(&db, timeout)?;
   begin_read(&conn)?;
-  Ok(DayConnection {
+  Ok(DayConnection(DayStorage::Sqlite {
     conn,
-    _snapshot: Some(directory),
-  })
+    snapshot: Some((directory, contents)),
+  }))
 }

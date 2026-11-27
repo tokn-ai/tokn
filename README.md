@@ -325,8 +325,17 @@ databases at startup and every six hours. On Unix the frontend keeps that task
 running across worker replacements. A worker configured with a separate request
 history directory maintains that directory.
 By default, it compresses days at least 7 days old and prunes the original `.db`
-files at 10 days, after verifying that their SHA-256 hashes match the decompressed
-archives. If a viewer is reading a day, pruning waits for a later scan.
+files at 10 days, after verifying them against their archives. XZ archival of
+supported request databases writes one `<day>.pack.xz` file. Tokn Pack holds the
+SQLite metadata snapshot, original captured headers, body hashes and offsets,
+and packed bodies. The outer XZ layer compresses the whole pack, including
+SQLite, in independently readable chunks of up to 64 MiB. Bodies use exact
+deduplication and deltas across up to eight recent requests in the same session,
+with chains limited to 64 deltas. The pack preserves exact decoded gzip and
+Zstandard body bytes. Captures that cannot be decoded retain their recorded
+bytes. Pruning verifies the pack against the source database. Raw SQLite
+archives are verified byte for byte using SHA-256. If a viewer is reading a day,
+pruning waits for a later scan.
 Set `archive_after_days` and `prune_after_days` under
 `[service.persistence]` to change these cutoffs. `tokn-gateway requests prune`
 previews the eligible days. Add `--commit` to prune them manually.
@@ -337,9 +346,10 @@ Open **Inspect** in [Tokn Desktop](apps/desktop/README.md) to browse persisted
 requests and sessions. The inspector is part of the desktop app; the former
 `tokn-gateway inspect` command and standalone web server have been removed.
 The viewer reads existing request-day databases, `sessions.db`, and `usage.db`
-locally, including while the gateway is stopped. For a pruned request day it opens
-a private temporary copy of the archive and removes the copy when the query
-finishes. The original history files stay in place.
+locally, including while the gateway is stopped. For an indexed pack, it opens
+the metadata snapshot as a private temporary SQLite database and seeks to the
+chunks needed for a requested body. Legacy compressed archives also open
+through a private temporary SQLite database.
 
 The Sessions view reads its list, semantic node tree, and selected-node content
 only from `sessions.db`; opening it does not scan request history. Session and

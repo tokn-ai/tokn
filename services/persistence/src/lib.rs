@@ -1,6 +1,9 @@
 pub mod access;
+#[cfg(feature = "lzma")]
+pub mod archive_xz;
 pub mod history_import;
 pub mod migrate;
+pub mod request_archive;
 pub mod request_files;
 pub mod requests;
 pub mod sessions;

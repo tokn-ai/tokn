@@ -13,19 +13,24 @@ default = ["lzma"]
 lzma = ["dep:lzma-rust2"]
 
 [dependencies]
+anyhow = { workspace = true }
 tokn-core = { workspace = true, features = ["std"] }
 tokn-headers = { workspace = true, features = ["std"] }
 bytes = { workspace = true }
 flate2 = { workspace = true }
+foldhash = "0.2"
+memmap2 = "0.9"
 rusqlite = { workspace = true }
 same-file = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 snafu = { workspace = true }
+tempfile = "3"
 time = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = "2"
 zstd = { workspace = true }
 lzma-rust2 = { workspace = true, optional = true }
 

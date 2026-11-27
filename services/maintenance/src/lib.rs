@@ -1,6 +1,12 @@
 //! Archive, verify and prune rotated request databases.
 
+#[cfg(feature = "lzma")]
+mod pack;
 mod worker;
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_archive::RequestPack;
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_files::indexed_xz_path;
 pub use tokn_persistence::request_files::ArchiveFormat;
 use tokn_persistence::request_files::{RequestMaintenanceLock, StableFile};
 pub use worker::*;
@@ -91,8 +97,8 @@ fn resolve_format(configured_extension: Option<&str>) -> ArchiveFormat {
   let normalized = value.trim_start_matches('.').to_ascii_lowercase();
   match normalized.as_str() {
     "zstd" | "db.zstd" => ArchiveFormat::Zstd,
-    "xz" | "db.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz,
-    "xz" | "db.xz" | "lzma" | "db.lzma" => {
+    "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz,
+    "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" => {
       tracing::warn!(
         archive_extension = value,
         "LZMA archive extension requested without lzma feature; falling back to zstd"
@@ -110,8 +116,8 @@ fn resolve_format(configured_extension: Option<&str>) -> ArchiveFormat {
 }
 
 /// Verify old request database archives and optionally remove their source
-/// `.db` files. Archive bytes are decompressed before hashing so the digest is
-/// compared against the original database content.
+/// `.db` files. Compare raw snapshots byte for byte, and verify the metadata
+/// snapshot, descriptors and body contents of packed archives.
 pub fn prune_request_dbs(
   dir: &Path,
   archive_extension: Option<&str>,
@@ -190,7 +196,7 @@ fn prune_request_dbs_once_with_progress(
   let files_total = paths.len();
   progress(PruneProgressEvent::Started { files_total });
   for (file_index, path) in paths.into_iter().enumerate() {
-    let archive = archive_path(&path, format);
+    let archive = existing_archive_path(&path, format)?;
     let bytes_per_pass = fs::symlink_metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
     let bytes_total = bytes_per_pass.saturating_mul(if commit { 4 } else { 2 });
     progress(PruneProgressEvent::FileStarted {
@@ -201,7 +207,7 @@ fn prune_request_dbs_once_with_progress(
     });
     let mut bytes_processed = 0u64;
     let mut report_bytes = |bytes: u64| {
-      bytes_processed = bytes_processed.saturating_add(bytes);
+      bytes_processed = bytes_processed.saturating_add(bytes).min(bytes_total);
       progress(PruneProgressEvent::FileProgress {
         bytes_processed,
         bytes_total,
@@ -280,7 +286,26 @@ fn prune_request_db(
       };
     }
   };
-  let archived_digest = match hash_archive(&mut archive_file, format, cancelled, progress) {
+  #[cfg(feature = "lzma")]
+  let indexed_pack = format == ArchiveFormat::Xz && archive == indexed_xz_path(db);
+  #[cfg(feature = "lzma")]
+  let packed = if indexed_pack {
+    true
+  } else if format == ArchiveFormat::Xz {
+    match pack::is_pack(&mut archive_file) {
+      Ok(packed) => packed,
+      Err(error) => {
+        return PruneOutcome::Failed {
+          error: format!("inspect archive {}: {error}", archive.display()),
+        };
+      }
+    }
+  } else {
+    false
+  };
+  #[cfg(not(feature = "lzma"))]
+  let packed = false;
+  let archived_digest = match archive_digest(&mut archive_file, format, packed, cancelled, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -297,17 +322,40 @@ fn prune_request_db(
     }
   };
   let source_sha256 = hex_digest(&source_digest);
-  if source_digest != archived_digest {
+  if !packed && source_digest != archived_digest {
     return PruneOutcome::HashMismatch {
       source_sha256,
       archived_sha256: hex_digest(&archived_digest),
     };
   }
+  #[cfg(feature = "lzma")]
+  if packed {
+    let verified = RequestPack::capture(&source_file, &mut |bytes| {
+      check_cancelled(cancelled)?;
+      progress(bytes);
+      Ok(())
+    })
+    .and_then(|pack| {
+      pack.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "source cannot match a request pack"))
+    })
+    .and_then(|snapshot| {
+      if indexed_pack {
+        pack::verify_indexed(&mut archive_file, &snapshot, cancelled, progress)
+      } else {
+        pack::verify(&mut archive_file, &snapshot, cancelled, progress)
+      }
+    });
+    if let Err(error) = verified {
+      return PruneOutcome::Failed {
+        error: format!("verify request pack {}: {error}", archive.display()),
+      };
+    }
+  }
   if !commit {
     return PruneOutcome::Verified { sha256: source_sha256 };
   }
 
-  match hash_archive(&mut archive_file, format, cancelled, progress) {
+  match archive_digest(&mut archive_file, format, packed, cancelled, progress) {
     Ok(current_digest) if current_digest == archived_digest => {}
     Ok(_) => {
       return PruneOutcome::Failed {
@@ -386,16 +434,41 @@ fn hash_archive(
   Ok(digest)
 }
 
+fn archive_digest(
+  file: &mut StableFile,
+  format: ArchiveFormat,
+  packed: bool,
+  cancelled: Option<&AtomicBool>,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<[u8; 32]> {
+  if packed {
+    // The pack is compared logically. Recheck its complete compressed bytes
+    // before deletion to detect any changes after that comparison.
+    hash_file(file, cancelled, progress)
+  } else {
+    hash_archive(file, format, cancelled, progress)
+  }
+}
+
 fn sync_archive_before_prune(archive: &StableFile) -> io::Result<()> {
   // Sync the archive and its directory entry before removing the source on Unix.
   #[cfg(unix)]
   {
     archive.file().sync_all()?;
     let parent = archive.path().parent().filter(|path| !path.as_os_str().is_empty());
-    File::open(parent.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    sync_archive_directory(parent.unwrap_or_else(|| Path::new(".")))?;
   }
   #[cfg(not(unix))]
   let _ = archive;
+  Ok(())
+}
+
+#[cfg(any(unix, feature = "lzma"))]
+fn sync_archive_directory(directory: &Path) -> io::Result<()> {
+  #[cfg(unix)]
+  File::open(directory)?.sync_all()?;
+  #[cfg(not(unix))]
+  let _ = directory;
   Ok(())
 }
 
@@ -629,8 +702,8 @@ fn archive_requests_once_locked(
       continue;
     };
 
-    let archive = archive_path(&path, format);
-    if archive.exists() {
+    let mut archive = existing_archive_path(&path, format)?;
+    if archive.symlink_metadata().is_ok() {
       stats.skipped_existing += 1;
       emit(
         events,
@@ -642,7 +715,10 @@ fn archive_requests_once_locked(
     } else {
       let id = archive_id(&path);
       match compress_db(&path, &archive, format, events, cancelled, &id) {
-        Ok(()) => stats.archived += 1,
+        Ok(published) => {
+          archive = published;
+          stats.archived += 1;
+        }
         Err(err) if err.kind() == io::ErrorKind::Interrupted => return Err(err),
         Err(err) => {
           stats.failed += 1;
@@ -706,6 +782,19 @@ fn archive_path(path: &Path, format: ArchiveFormat) -> PathBuf {
   path.with_extension(format.extension())
 }
 
+fn existing_archive_path(path: &Path, format: ArchiveFormat) -> io::Result<PathBuf> {
+  #[cfg(feature = "lzma")]
+  if format == ArchiveFormat::Xz {
+    let archive = indexed_xz_path(path);
+    match fs::symlink_metadata(&archive) {
+      Ok(_) => return Ok(archive),
+      Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+      Err(error) => return Err(error),
+    }
+  }
+  Ok(archive_path(path, format))
+}
+
 fn temp_archive_path(archive: &Path) -> PathBuf {
   let mut name = archive
     .file_name()
@@ -718,45 +807,45 @@ fn temp_archive_path(archive: &Path) -> PathBuf {
 
 fn compress_db(
   db: &Path,
-  archive: &Path,
+  legacy_archive: &Path,
   format: ArchiveFormat,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
   id: &str,
-) -> io::Result<()> {
-  let temp = temp_archive_path(archive);
+) -> io::Result<PathBuf> {
+  let temp = temp_archive_path(legacy_archive);
   if temp.exists() {
     fs::remove_file(&temp)?;
   }
 
   check_request_db_sidecars(db, false)?;
   let mut source = StableFile::open(db)?;
-  let total_bytes = source.file().metadata()?.len();
+  let source_metadata = source.file().metadata()?;
+  let total_bytes = source_metadata.len();
+  #[cfg(feature = "lzma")]
+  let planned_archive = if format == ArchiveFormat::Xz {
+    indexed_xz_path(db)
+  } else {
+    legacy_archive.to_path_buf()
+  };
+  #[cfg(not(feature = "lzma"))]
+  let planned_archive = legacy_archive.to_path_buf();
   emit(
     events,
     ArchiveEvent::FileStarted {
       id: id.to_string(),
       path: db.to_path_buf(),
-      archive: archive.to_path_buf(),
+      archive: planned_archive.clone(),
       total_bytes,
     },
   );
 
   let result = (|| {
-    let mut input = BufReader::new(source.file_mut());
-    let mut output = BufWriter::new(File::create_new(&temp)?);
-    let mut buf = [0u8; 64 * 1024];
     let mut bytes_read = 0u64;
-    encode_archive(&mut output, format, |encoder| {
-      loop {
-        check_cancelled(cancelled)?;
-        let n = input.read(&mut buf)?;
-        if n == 0 {
-          break;
-        }
-        encoder.write_all(&buf[..n])?;
-        bytes_read = bytes_read.saturating_add(n as u64);
-        check_cancelled(cancelled)?;
+    let mut update = |bytes: u64| {
+      check_cancelled(cancelled)?;
+      if bytes != 0 {
+        bytes_read = bytes_read.saturating_add(bytes).min(total_bytes);
         emit(
           events,
           ArchiveEvent::FileProgress {
@@ -767,33 +856,102 @@ fn compress_db(
         );
       }
       Ok(())
-    })?;
-    if fs::metadata(&temp)?.len() == 0 {
+    };
+
+    #[cfg(feature = "lzma")]
+    if format == ArchiveFormat::Xz {
+      if let Some(request_pack) = RequestPack::capture(&source, &mut update)? {
+        let bytes_out = pack::publish_indexed(&request_pack, &planned_archive, &mut update, || {
+          recheck_archive_source(&source, &source_metadata, cancelled)
+        })
+        .map_err(|error| check_cancelled(cancelled).err().unwrap_or(error))?;
+        return Ok((planned_archive, bytes_out));
+      }
+    }
+
+    let mut output = BufWriter::new(create_archive_temp(&temp)?);
+    encode_snapshot(&mut source, &mut output, format, &mut update)?;
+    let bytes_out = output.get_ref().metadata()?.len();
+    if bytes_out == 0 {
       return Err(io::Error::new(io::ErrorKind::WriteZero, "empty archive"));
     }
     output.get_ref().sync_all()?;
     drop(output);
-    source.revalidate()?;
-    check_request_db_sidecars(db, false)?;
-    fs::rename(&temp, archive)
+    recheck_archive_source(&source, &source_metadata, cancelled)?;
+    fs::rename(&temp, legacy_archive)?;
+    Ok((legacy_archive.to_path_buf(), bytes_out))
   })();
 
-  if result.is_err() {
-    let _ = fs::remove_file(&temp);
-  } else {
-    let bytes_out = fs::metadata(archive)?.len();
-    emit(
-      events,
-      ArchiveEvent::FileCompleted {
-        id: id.to_string(),
-        path: db.to_path_buf(),
-        archive: archive.to_path_buf(),
-        bytes_in: total_bytes,
-        bytes_out,
-      },
-    );
+  match result {
+    Ok((archive, bytes_out)) => {
+      emit(
+        events,
+        ArchiveEvent::FileCompleted {
+          id: id.to_string(),
+          path: db.to_path_buf(),
+          archive: archive.clone(),
+          bytes_in: total_bytes,
+          bytes_out,
+        },
+      );
+      Ok(archive)
+    }
+    Err(error) => {
+      let _ = fs::remove_file(&temp);
+      Err(error)
+    }
   }
-  result
+}
+
+fn recheck_archive_source(
+  source: &StableFile,
+  before: &fs::Metadata,
+  cancelled: Option<&AtomicBool>,
+) -> io::Result<()> {
+  source.revalidate()?;
+  let after = source.file().metadata()?;
+  if after.len() != before.len() || after.modified()? != before.modified()? {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      "request database changed while it was being archived",
+    ));
+  }
+  check_request_db_sidecars(source.path(), false)?;
+  check_cancelled(cancelled)
+}
+
+fn create_archive_temp(path: &Path) -> io::Result<File> {
+  let mut options = fs::OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
+  }
+  options.open(path)
+}
+
+fn encode_snapshot(
+  source: &mut StableFile,
+  output: &mut impl Write,
+  format: ArchiveFormat,
+  update: &mut impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<()> {
+  source.file_mut().rewind()?;
+  let mut input = BufReader::new(source.file_mut());
+  let mut buf = [0u8; 64 * 1024];
+  encode_archive(output, format, |encoder| {
+    loop {
+      update(0)?;
+      let n = input.read(&mut buf)?;
+      if n == 0 {
+        break;
+      }
+      encoder.write_all(&buf[..n])?;
+      update(n as u64)?;
+    }
+    Ok(())
+  })
 }
 
 fn encode_archive<W, F>(output: W, format: ArchiveFormat, write_body: F) -> io::Result<()>
