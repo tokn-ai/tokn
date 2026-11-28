@@ -267,9 +267,9 @@ fn symlinked_source_or_destination_is_rejected() {
 #[test]
 fn archived_source_days_cannot_be_silently_omitted() {
   let fixture = Fixture::new();
-  for extension in ["xz", "zstd", "zst", "lzma"] {
+  for extension in ["db.xz", "db.zstd", "db.zst", "db.lzma", "pack.xz"] {
     // A different day simulates an older archived day alongside the current raw day.
-    let archive = fixture.source.join(format!("requests/2026-09-20.db.{extension}"));
+    let archive = fixture.source.join(format!("requests/2026-09-20.{extension}"));
     fs::write(&archive, b"archive").unwrap();
     assert!(fixture
       .error(true)

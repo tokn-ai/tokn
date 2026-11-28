@@ -186,7 +186,7 @@ fn quote_ident(s: &str) -> String {
   format!("\"{}\"", s.replace('"', "\"\""))
 }
 
-fn ensure_schema_table(conn: &Connection) -> Result<()> {
+pub(crate) fn ensure_schema_table(conn: &Connection) -> rusqlite::Result<()> {
   conn.execute_batch(
     r#"
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -195,8 +195,7 @@ fn ensure_schema_table(conn: &Connection) -> Result<()> {
       applied_ts INTEGER NOT NULL
     );
     "#,
-  )?;
-  Ok(())
+  )
 }
 
 fn current_version(conn: &Connection) -> Result<u32> {

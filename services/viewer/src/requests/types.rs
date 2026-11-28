@@ -116,6 +116,20 @@ impl RequestPayloadField {
   pub(super) fn is_payload_column(value: &str) -> bool {
     value.parse::<Self>().is_ok()
   }
+
+  pub(super) fn body_slot(self) -> Option<u8> {
+    use tokn_persistence::request_archive::{
+      INBOUND_REQUEST_SLOT, INBOUND_RESPONSE_SLOT, OUTBOUND_REQUEST_SLOT, OUTBOUND_RESPONSE_SLOT,
+    };
+
+    match self {
+      Self::InboundReqBody => Some(INBOUND_REQUEST_SLOT),
+      Self::InboundRespBody => Some(INBOUND_RESPONSE_SLOT),
+      Self::OutboundReqBody => Some(OUTBOUND_REQUEST_SLOT),
+      Self::OutboundRespBody => Some(OUTBOUND_RESPONSE_SLOT),
+      _ => None,
+    }
+  }
 }
 
 impl std::str::FromStr for RequestPayloadField {

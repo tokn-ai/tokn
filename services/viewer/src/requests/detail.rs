@@ -1,7 +1,8 @@
-use rusqlite::types::Value as SqlValue;
+use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::{params_from_iter, Connection};
 use serde_json::{Map, Value};
 use std::path::Path;
+use tokn_persistence::request_archive::BODY_IS_TEXT;
 
 use super::{RequestDetail, RequestPayload, RequestPayloadField};
 use crate::days::request_day_files;
@@ -75,7 +76,13 @@ pub fn get_request_payload(
   else {
     return Ok(None);
   };
-  let Some(conn) = day_file.open()? else {
+  let slot = field.body_slot();
+  let conn = if slot.is_some() {
+    day_file.open_request(request_id)?
+  } else {
+    day_file.open()?
+  };
+  let Some(conn) = conn else {
     return Ok(None);
   };
 
@@ -95,9 +102,18 @@ pub fn get_request_payload(
     return Ok(None);
   };
 
+  let indexed_body = slot
+    .map(|slot| conn.read_indexed_body(request_id, slot))
+    .transpose()?
+    .flatten();
+  let body = match &indexed_body {
+    Some((bytes, flags)) if flags & BODY_IS_TEXT != 0 => ValueRef::Text(bytes),
+    Some((bytes, _)) => ValueRef::Blob(bytes),
+    None => row.get_ref(0)?,
+  };
   Ok(Some(RequestPayload {
     field: field_name.to_string(),
-    value: sqlite_value_to_json(row.get_ref(0)?, field_name),
+    value: sqlite_value_to_json(body, field_name),
   }))
 }
 

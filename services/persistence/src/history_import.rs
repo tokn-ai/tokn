@@ -378,7 +378,7 @@ pub fn import_history(source_root: &Path, destination: &DbPaths, commit: bool) -
     if filename == ".tokn-requests-maintenance.lock" {
       continue;
     }
-    if [".db.xz", ".db.zstd", ".db.zst", ".db.lzma"]
+    if [".db.xz", ".db.zstd", ".db.zst", ".db.lzma", ".pack.xz"]
       .iter()
       .any(|suffix| filename.ends_with(suffix))
     {

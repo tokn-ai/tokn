@@ -79,6 +79,183 @@ fn archives_eligible_daily_db_without_removing_original() {
   assert_eq!(decoded, b"sqlite-ish bytes");
 }
 
+#[cfg(feature = "lzma")]
+fn write_packable_db(dir: &Path) -> PathBuf {
+  let path = dir.join("2026-05-01.db");
+  let conn = tokn_persistence::requests::open_day_db(&path).unwrap();
+  conn.pragma_update(None, "journal_mode", "wal").unwrap();
+  conn
+    .execute_batch(
+      r#"INSERT INTO request_connection (request_id, ts) VALUES ('request', 1);
+       INSERT INTO request_downstream (request_id, inbound_req_headers, inbound_req_body)
+       VALUES ('request', '{"content-type":"application/json"}', '{"input":"hello"}');"#,
+    )
+    .unwrap();
+  path
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn verified_request_pack_allows_pruning_a_checkpointed_database() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  let today = date!(2026 - 05 - 11);
+  let format = ArchiveFormat::Xz;
+  let archive = indexed_xz_path(&db);
+
+  assert_eq!(archive_requests_once(&dir, today, 7, format).unwrap().archived, 1);
+  assert!(archive.is_file());
+  assert!(!archive_path(&db, format).exists());
+  let report = prune_request_dbs_once(&dir, today, 10, format, true).unwrap();
+  let [entry] = report.entries.as_slice() else {
+    panic!("expected one request day");
+  };
+  assert_eq!(entry.archive, archive);
+  assert!(matches!(entry.outcome, PruneOutcome::Deleted { .. }), "{entry:?}");
+  assert!(!db.exists());
+  fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn request_pack_does_not_allow_pruning_a_changed_body() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  let today = date!(2026 - 05 - 11);
+  let format = ArchiveFormat::Xz;
+  let archive = indexed_xz_path(&db);
+
+  assert_eq!(archive_requests_once(&dir, today, 7, format).unwrap().archived, 1);
+  assert!(archive.is_file());
+  {
+    let conn = tokn_persistence::requests::open_day_db(&db).unwrap();
+    conn
+      .execute("UPDATE request_downstream SET inbound_req_body = 'changed'", [])
+      .unwrap();
+  }
+  let outcome = prune_request_db(&db, &archive, format, true, None, &mut |_| {});
+  assert!(matches!(outcome, PruneOutcome::Failed { .. }), "{outcome:?}");
+  assert!(db.exists());
+  fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "lzma")]
+fn write_single_file_pack(db: &Path) -> PathBuf {
+  let source = StableFile::open(db).unwrap();
+  let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
+  let archive = archive_path(db, ArchiveFormat::Xz);
+  encode_xz(File::create_new(&archive).unwrap(), |encoder| capture.write(encoder)).unwrap();
+  archive
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn cancellation_interrupts_verifying_an_indexed_request_pack() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  archive_requests_once(&dir, date!(2026 - 05 - 11), 7, ArchiveFormat::Xz).unwrap();
+  let archive = indexed_xz_path(&db);
+
+  let source = StableFile::open(&db).unwrap();
+  let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
+  let cancelled = AtomicBool::new(false);
+  let error = pack::verify_indexed(
+    &mut StableFile::open(&archive).unwrap(),
+    &capture,
+    Some(&cancelled),
+    &mut |_| cancelled.store(true, Ordering::Relaxed),
+  )
+  .unwrap_err();
+  assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+  drop(source);
+  drop(capture);
+  fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn skips_and_prunes_an_existing_single_file_request_pack() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  let archive = write_single_file_pack(&db);
+  let today = date!(2026 - 05 - 11);
+  let format = ArchiveFormat::Xz;
+
+  let stats = archive_requests_once(&dir, today, 7, format).unwrap();
+  assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
+  assert!(!indexed_xz_path(&db).exists());
+  assert!(pack::is_pack(&mut StableFile::open(&archive).unwrap()).unwrap());
+  let report = prune_request_dbs_once(&dir, today, 10, format, true).unwrap();
+  assert!(matches!(report.entries[0].outcome, PruneOutcome::Deleted { .. }));
+  assert!(!db.exists());
+  fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn missing_or_corrupt_indexed_archive_retains_source() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  let today = date!(2026 - 05 - 11);
+  let format = ArchiveFormat::Xz;
+  let archive = indexed_xz_path(&db);
+  assert_eq!(archive_requests_once(&dir, today, 7, format).unwrap().archived, 1);
+  fs::remove_file(&archive).unwrap();
+
+  for corrupt in [false, true] {
+    if corrupt {
+      fs::write(&archive, b"corrupt pack").unwrap();
+    }
+    let report = prune_request_dbs_once(&dir, today, 10, format, true).unwrap();
+    let entry = &report.entries[0];
+    if corrupt {
+      assert_eq!(entry.archive, archive);
+      assert!(matches!(entry.outcome, PruneOutcome::Failed { .. }), "{entry:?}");
+    } else {
+      assert_eq!(entry.outcome, PruneOutcome::MissingArchive);
+    }
+    assert!(db.is_file());
+  }
+  fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(feature = "lzma")]
+#[test]
+fn scheduled_archival_retries_interrupted_publication_and_reports_archive_size() {
+  let dir = tempdir();
+  let db = write_packable_db(&dir);
+  let today = date!(2026 - 05 - 11);
+  let format = ArchiveFormat::Xz;
+  let archive = indexed_xz_path(&db);
+  {
+    let source = StableFile::open(&db).unwrap();
+    let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
+    let error = pack::publish_indexed(&capture, &archive, &mut |_| Ok(()), || {
+      Err(io::Error::new(
+        io::ErrorKind::Interrupted,
+        "test interrupted publication",
+      ))
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+  }
+  assert!(!archive.exists());
+  let report = prune_request_dbs_once(&dir, today, 10, format, true).unwrap();
+  assert!(matches!(report.entries[0].outcome, PruneOutcome::MissingArchive));
+  assert!(db.is_file());
+
+  let emitter = CollectingEmitter::default();
+  let stats = archive_requests_once_with_events(&dir, today, 7, Some(10), format, Some(&emitter), None).unwrap();
+  assert_eq!(stats.archived, 1);
+  assert!(!db.exists());
+  let archive_bytes = fs::metadata(&archive).unwrap().len();
+  assert!(emitter.events.lock().iter().any(|event| matches!(
+    event,
+    ArchiveEvent::FileCompleted { archive: path, bytes_out, .. } if path == &archive && *bytes_out == archive_bytes
+  )));
+  fs::remove_dir_all(dir).unwrap();
+}
+
 #[test]
 fn maintenance_prunes_only_verified_databases_past_the_prune_cutoff() {
   let dir = tempdir();
@@ -471,6 +648,7 @@ fn resolves_configured_extension_or_falls_back_to_zstd() {
   };
   assert_eq!(resolve_format(None), expected_xz);
   assert_eq!(resolve_format(Some(".xz")), expected_xz);
+  assert_eq!(resolve_format(Some(".pack.xz")), expected_xz);
   assert_eq!(resolve_format(Some("lzma")), expected_xz);
 }
 

@@ -6,8 +6,12 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+use tokn_persistence::request_archive::{
+  BODY_IS_DECODED, INBOUND_REQUEST_SLOT, INBOUND_RESPONSE_SLOT, OUTBOUND_REQUEST_SLOT, OUTBOUND_RESPONSE_SLOT,
+};
 
 use super::detail::{quote_identifier, request_lookup_condition};
+use crate::database::DayConnection;
 use crate::days::request_day_files;
 use crate::schema::RequestSchema;
 use crate::Result;
@@ -165,7 +169,7 @@ fn load_request_content(
   else {
     return Ok(None);
   };
-  let Some(conn) = day_file.open()? else {
+  let Some(conn) = day_file.open_request(request_id)? else {
     return Ok(None);
   };
 
@@ -205,28 +209,49 @@ fn load_request_content(
     return Ok(None);
   };
 
-  let (request_headers, request_body) = if !inbound_request.is_empty() {
-    (&inbound_headers, &inbound_request)
+  let (inbound_request, inbound_decoded) = read_request_body(&conn, request_id, INBOUND_REQUEST_SLOT, inbound_request)?;
+  let (request_headers, request_body, already_decoded) = if !inbound_request.is_empty() {
+    (inbound_headers, inbound_request, inbound_decoded)
   } else {
-    (&outbound_headers, &outbound_request)
+    let (outbound_request, outbound_decoded) =
+      read_request_body(&conn, request_id, OUTBOUND_REQUEST_SLOT, outbound_request)?;
+    (outbound_headers, outbound_request, outbound_decoded)
   };
+  let inbound_response = conn
+    .read_indexed_body(request_id, INBOUND_RESPONSE_SLOT)?
+    .map_or(inbound_response, |(bytes, _)| bytes);
   let response_body = if !inbound_response.is_empty() {
-    &inbound_response
+    inbound_response
   } else {
-    &outbound_response
+    conn
+      .read_indexed_body(request_id, OUTBOUND_RESPONSE_SLOT)?
+      .map_or(outbound_response, |(bytes, _)| bytes)
   };
 
   let mut content = CollectedContent::default();
   if !request_body.is_empty() {
-    match decode_json_request(request_headers, request_body) {
+    match decode_json_request(&request_headers, &request_body, already_decoded) {
       Ok(request) => collect_request(&request, &mut content),
       Err(error) => content.warning("request summary unavailable", error),
     }
   }
   if !response_body.is_empty() {
-    collect_response(response_body, &mut content);
+    collect_response(&response_body, &mut content);
   }
   Ok(Some(content))
+}
+
+fn read_request_body(
+  conn: &DayConnection,
+  request_id: &str,
+  slot: u8,
+  sqlite_body: Vec<u8>,
+) -> Result<(Vec<u8>, bool)> {
+  if let Some((bytes, flags)) = conn.read_indexed_body(request_id, slot)? {
+    return Ok((bytes, flags & BODY_IS_DECODED != 0));
+  }
+  let already_decoded = !sqlite_body.is_empty() && conn.body_is_decoded(request_id, slot)?;
+  Ok((sqlite_body, already_decoded))
 }
 
 fn sql_bytes(value: ValueRef<'_>) -> Vec<u8> {
@@ -236,10 +261,17 @@ fn sql_bytes(value: ValueRef<'_>) -> Vec<u8> {
   }
 }
 
-fn decode_json_request(headers: &[u8], body: &[u8]) -> std::result::Result<Value, String> {
-  let headers = serde_json::from_slice::<Value>(headers).unwrap_or(Value::Null);
-  let encoding = header_str(&headers, "content-encoding").unwrap_or("identity");
-  let decoded = match encoding.trim().to_ascii_lowercase().as_str() {
+fn decode_json_request(headers: &[u8], body: &[u8], already_decoded: bool) -> std::result::Result<Value, String> {
+  let encoding = if already_decoded {
+    String::new()
+  } else {
+    let headers = serde_json::from_slice::<Value>(headers).unwrap_or(Value::Null);
+    header_str(&headers, "content-encoding")
+      .unwrap_or_default()
+      .trim()
+      .to_ascii_lowercase()
+  };
+  let decoded = match encoding.as_str() {
     "" | "identity" => bounded_read(body)?,
     "gzip" => bounded_read(GzDecoder::new(body))?,
     "zstd" => {
