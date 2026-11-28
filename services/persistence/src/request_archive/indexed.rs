@@ -49,12 +49,30 @@ pub fn write(
   output: &mut impl Write,
   progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
+  write_with_body_progress(snapshot, output, progress, |_| {})
+}
+
+pub enum PackWriteProgress {
+  BodyBytes(u64),
+  Indexing,
+}
+
+/// Serialize a pack and report input body bytes separately from index construction.
+pub fn write_with_body_progress(
+  snapshot: &RequestPack,
+  output: &mut impl Write,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+  mut on_body_progress: impl FnMut(PackWriteProgress),
+) -> io::Result<()> {
   progress(0)?;
   output.write_all(&MAGIC)?;
   let mut tracked = ProgressIo::new(&mut *output, progress);
-  let result = objects::write_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH);
+  let result = objects::write_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH, |bytes| {
+    on_body_progress(PackWriteProgress::BodyBytes(bytes));
+  });
   let (index, canonical) = tracked.finish(result)?;
 
+  on_body_progress(PackWriteProgress::Indexing);
   let temp = tempfile::tempdir()?;
   let metadata = temp.path().join("metadata.db");
   {
@@ -126,6 +144,7 @@ pub fn verify(
   progress(0)?;
   let input = reader.input.get_mut();
   verify_header(input)?;
+  progress(HEADER_LEN)?;
   let mut input = (&mut *input).take(reader.metadata_offset - HEADER_LEN);
   let mut tracked = ProgressIo::new(&mut input, progress);
   let result = objects::verify_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH);
@@ -200,6 +219,7 @@ impl<R: Read + Seek> IndexedPackReader<R> {
       .checked_sub(metadata_len)
       .filter(|&offset| offset >= HEADER_LEN && metadata_len >= SQLITE_HEADER.len() as u64)
       .ok_or_else(|| invalid_data("invalid indexed request archive metadata bounds"))?;
+    progress(TRAILER_LEN)?;
 
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("metadata.db");
@@ -212,6 +232,7 @@ impl<R: Read + Seek> IndexedPackReader<R> {
     {
       let mut file = create_private_file(&path)?;
       file.write_all(&signature)?;
+      progress(signature.len() as u64)?;
       copy_exact(&mut input, &mut file, metadata_len - signature.len() as u64, progress)?;
     }
     let metadata = crate::open_readonly(&path, timeout).map_err(io::Error::other)?;
@@ -539,7 +560,12 @@ mod tests {
     let (snapshot, target) = fixture()?;
     let mut bytes = Vec::new();
     write(&snapshot, &mut bytes, &mut |_| Ok(()))?;
-    verify(&snapshot, &mut Cursor::new(&bytes), &mut |_| Ok(()))?;
+    let mut verified_bytes = 0;
+    verify(&snapshot, &mut Cursor::new(&bytes), &mut |count| {
+      verified_bytes += count;
+      Ok(())
+    })?;
+    assert_eq!(verified_bytes, bytes.len() as u64);
 
     let first_read = Cell::new(u64::MAX);
     let reader = IndexedPackReader::open(

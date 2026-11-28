@@ -43,6 +43,11 @@ impl RequestPack {
     Ok(capture::load(source, progress)?.map(|capture| Self { capture }))
   }
 
+  /// Total captured body bytes before deduplication and delta encoding.
+  pub fn body_bytes(&self) -> u64 {
+    self.capture.body_bytes()
+  }
+
   fn inputs(&self) -> Vec<InputBody<'_>> {
     let capture = &self.capture;
     let mut seen = HashMap::new();

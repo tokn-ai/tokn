@@ -66,6 +66,7 @@ pub(super) fn write_indexed_objects(
   out: &mut impl Write,
   bodies: &[InputBody<'_>],
   max_depth: usize,
+  mut on_body_written: impl FnMut(u64),
 ) -> Result<(Vec<ObjectIndex>, Vec<usize>)> {
   ensure!(bodies.len() <= MAX_OBJECTS, "too many body objects");
   for (index, body) in bodies.iter().enumerate() {
@@ -125,6 +126,7 @@ pub(super) fn write_indexed_objects(
     });
     canonical.push(duplicate.unwrap_or(index));
     offset += encoded_len;
+    on_body_written(body.bytes.len() as u64);
   }
   Ok((entries, canonical))
 }
@@ -733,7 +735,7 @@ mod tests {
 
   fn encode_and_verify(bodies: &[InputBody<'_>], max_depth: usize) -> (Vec<u8>, Vec<ObjectIndex>, Vec<usize>) {
     let mut archive = Vec::new();
-    let (entries, canonical) = write_indexed_objects(&mut archive, bodies, max_depth).unwrap();
+    let (entries, canonical) = write_indexed_objects(&mut archive, bodies, max_depth, |_| {}).unwrap();
     let mut encoded = archive.as_slice();
     let (verified_entries, verified_canonical) = verify_indexed_objects(&mut encoded, bodies, max_depth).unwrap();
     assert_eq!(verified_entries, entries);
@@ -1008,7 +1010,7 @@ mod tests {
     });
     let prefix = b"body stream prefix";
     let mut pack = prefix.to_vec();
-    let (mut entries, canonical) = write_indexed_objects(&mut pack, &inputs, 2)?;
+    let (mut entries, canonical) = write_indexed_objects(&mut pack, &inputs, 2, |_| {})?;
     assert_eq!(canonical, [0, 1, 2, 2, 4]);
     assert_eq!((entries[4].base, entries[4].depth), (Some(2), 2));
 
@@ -1067,7 +1069,7 @@ mod tests {
       session_bases: &[],
     };
     let mut pack = Vec::new();
-    let (entries, _) = write_indexed_objects(&mut pack, &[body], 1)?;
+    let (entries, _) = write_indexed_objects(&mut pack, &[body], 1, |_| {})?;
     let entry = entries[0];
     let invalid = [
       ObjectIndex {
@@ -1103,6 +1105,7 @@ mod tests {
         session_bases: &[],
       }],
       1,
+      |_| {},
     )
     .unwrap();
   }
@@ -1199,12 +1202,12 @@ mod tests {
       base: Some(0),
       session_bases: &[],
     }];
-    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1).is_err());
+    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1, |_| {}).is_err());
     let bad = [InputBody {
       bytes: b"body",
       base: None,
       session_bases: &[0],
     }];
-    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1).is_err());
+    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1, |_| {}).is_err());
   }
 }

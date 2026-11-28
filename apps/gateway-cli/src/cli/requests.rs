@@ -331,18 +331,18 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
         })?;
       }
       MigrationProgressEvent::DayStarted { day, total, .. } => {
-        if let Some(bar) = self.overall_bar.as_ref().filter(|bar| bar.length().is_none()) {
-          let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> ");
-          bar.disable_steady_tick();
-          bar.set_length(total as u64);
-          bar.set_style(style);
-          bar.set_message("Days");
-        }
-        if let Some(multi) = self.multi {
-          self.clear_stage();
-          let bar = multi.add(ProgressBar::new_spinner());
+        self.clear_stage();
+        if let (Some(multi), Some(overall)) = (self.multi, &self.overall_bar) {
+          if overall.length().is_none() {
+            let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
+              .unwrap_or_else(|_| ProgressStyle::default_bar())
+              .progress_chars("=> ");
+            overall.disable_steady_tick();
+            overall.set_length(total as u64);
+            overall.set_style(style);
+            overall.set_message("Days");
+          }
+          let bar = multi.insert_before(overall, ProgressBar::new_spinner());
           bar.set_prefix(format!("{day} "));
           bar.enable_steady_tick(Duration::from_millis(100));
           self.stage_bar = Some(bar);
@@ -384,8 +384,8 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
     } else {
       let style = ProgressStyle::with_template("{spinner:.cyan} {prefix}{msg} [{bytes} at {bytes_per_sec}]")
         .unwrap_or_else(|_| ProgressStyle::default_spinner());
-      bar.unset_length();
       bar.set_style(style);
+      bar.unset_length();
     }
     bar.set_message(label);
   }

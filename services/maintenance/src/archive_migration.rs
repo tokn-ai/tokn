@@ -406,7 +406,8 @@ mod tests {
         ("Input hash", input_total),
         ("Unpack DB", input_total),
         ("Capture DB", None),
-        ("Build pack", None),
+        ("Build pack", Some(b"request body".len() as u64)),
+        ("Index pack", None),
         ("Recheck input", input_total),
       ]
     );
@@ -429,8 +430,8 @@ mod tests {
 
     let mut commit_stages = Vec::new();
     let commit = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), true, |event| {
-      if let MigrationProgressEvent::StageStarted { label, .. } = event {
-        commit_stages.push(label);
+      if let MigrationProgressEvent::StageStarted { label, bytes_total } = event {
+        commit_stages.push((label, bytes_total));
       }
     })?;
     for label in [
@@ -441,19 +442,19 @@ mod tests {
       "Recheck output",
     ] {
       assert_eq!(
-        commit_stages.iter().filter(|&&stage| stage == label).count(),
+        commit_stages.iter().filter(|&&(stage, _)| stage == label).count(),
         1,
         "{commit_stages:?}"
       );
     }
     let migrated = fs::read(&destination)?;
+    let pack_bytes = zstd::stream::decode_all(migrated.as_slice())?.len() as u64;
+    assert!(commit_stages.contains(&("Verify pack", Some(pack_bytes))));
     let final_stats = MigrationFileStats {
       path: destination.clone(),
       compressed_bytes: migrated.len() as u64,
       sha256: hex_digest(&Sha256::digest(&migrated).into()),
-      uncompressed: Some(MigrationPayloadSize::Pack(
-        zstd::stream::decode_all(migrated.as_slice())?.len() as u64,
-      )),
+      uncompressed: Some(MigrationPayloadSize::Pack(pack_bytes)),
       sqlite_sha256: None,
     };
     assert_eq!(commit.entries[0].outcome, MigrationOutcome::Migrated);

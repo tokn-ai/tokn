@@ -4,7 +4,10 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use tokn_persistence::indexed_archive::{IndexedArchiveFormat, IndexedArchiveReader};
-use tokn_persistence::request_archive::{indexed, RequestPack};
+use tokn_persistence::request_archive::{
+  indexed::{self, PackWriteProgress},
+  RequestPack,
+};
 use tokn_persistence::request_files::{ArchiveFormat, StableFile};
 
 use crate::{encode_archive, hash_reader, ArchiveContents};
@@ -150,9 +153,12 @@ fn write_pack(
   output: impl Write,
   progress: &mut impl FnMut(ContentProgress),
 ) -> io::Result<u64> {
-  progress(ContentProgress::Stage("Build pack", None));
-  let mut writer = TrackedIo::new(output, |bytes: &[u8]| report_bytes(progress, bytes.len() as u64));
-  indexed::write(capture, &mut writer, &mut |_| Ok(()))?;
+  progress(ContentProgress::Stage("Build pack", Some(capture.body_bytes())));
+  let mut writer = TrackedIo::new(output, |_: &[u8]| {});
+  indexed::write_with_body_progress(capture, &mut writer, &mut |_| Ok(()), |event| match event {
+    PackWriteProgress::BodyBytes(bytes) => report_bytes(progress, bytes),
+    PackWriteProgress::Indexing => progress(ContentProgress::Stage("Index pack", None)),
+  })?;
   Ok(writer.bytes)
 }
 
@@ -233,7 +239,7 @@ pub(super) fn verify_captured_pack(
 ) -> io::Result<(bool, PayloadStats)> {
   let mut input = open_indexed_for_stage(pack, pack_format, "Read pack", progress)?;
   let bytes = copy_with_progress(&mut input, io::sink(), progress)?;
-  progress(ContentProgress::Stage("Verify pack", None));
+  progress(ContentProgress::Stage("Verify pack", Some(bytes)));
   let equivalent = match indexed::verify(capture, &mut input, &mut |bytes| {
     report_bytes(progress, bytes);
     Ok(())

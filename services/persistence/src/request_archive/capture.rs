@@ -41,6 +41,10 @@ impl Capture {
   pub fn bytes(&self, body: &Body) -> &[u8] {
     &self.backing.as_deref().unwrap_or_default()[body.bytes.clone()]
   }
+
+  pub fn body_bytes(&self) -> u64 {
+    self.backing.as_deref().unwrap_or_default().len() as u64
+  }
 }
 
 pub(super) struct Body {
