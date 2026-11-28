@@ -4,6 +4,7 @@
 
 use super::transport::ConnectionTask;
 use super::WorkerInfo;
+use crate::frontend::connect_policy::ConnectPolicy;
 use crate::v2::{LiveRuntime, ReloadError, RuntimeGeneration, RuntimeStates};
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -16,7 +17,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{watch, Mutex};
 use uuid::Uuid;
@@ -28,6 +29,9 @@ pub(super) const PREPARE_PATH: &str = "/_tokn/prepare-reload";
 const UPGRADE: &str = "tokn-reload-v1";
 const REVISION: &str = "x-tokn-ipc-config-revision";
 const ACCOUNTS: &str = "x-tokn-ipc-accounts";
+const FRONTEND_CONNECT_POLICY: &str = "x-tokn-ipc-frontend-connect-policy";
+const FRONTEND_CONNECT_POLICY_VERSION: &str = "1";
+const MAX_FRONTEND_CONNECT_POLICY_BYTES: usize = 64 * 1024;
 
 type WorkerFuture = Pin<Box<dyn Future<Output = Result<(RuntimeStates, usize), ReloadError>> + Send>>;
 
@@ -107,14 +111,46 @@ impl WorkerGenerations {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
       }
     };
+    let frontend_connect_policy = if request.uri().path() == PREPARE_PATH
+      && request
+        .headers()
+        .get(FRONTEND_CONNECT_POLICY)
+        .is_some_and(|value| value == FRONTEND_CONNECT_POLICY_VERSION)
+    {
+      let policy = prepared.generation.frontend_connect_policy();
+      let Ok(bytes) = serde_json::to_vec(&policy) else {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+      };
+      if bytes.len() > MAX_FRONTEND_CONNECT_POLICY_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+      }
+      Some(bytes)
+    } else {
+      None
+    };
     let id = Uuid::new_v4();
     let accounts = prepared.generation.accounts;
     let generation = prepared.generation.clone();
     let upgrade = hyper::upgrade::on(&mut request);
     self.states.lock().insert(id, prepared);
+    let mut response = Response::builder()
+      .status(StatusCode::SWITCHING_PROTOCOLS)
+      .header(header::CONNECTION, "upgrade")
+      .header(header::UPGRADE, UPGRADE)
+      .header(GENERATION_HEADER, id.to_string())
+      .header(ACCOUNTS, accounts);
+    if frontend_connect_policy.is_some() {
+      response = response.header(FRONTEND_CONNECT_POLICY, FRONTEND_CONNECT_POLICY_VERSION);
+    }
     tokio::spawn(async move {
       let lease = async {
         let mut socket = TokioIo::new(upgrade.await?);
+        // Only negotiated peers exchange the candidate generation's policy
+        // before the existing one-byte activation acknowledgement protocol.
+        if let Some(bytes) = frontend_connect_policy {
+          socket.write_u32(bytes.len() as u32).await?;
+          socket.write_all(&bytes).await?;
+        }
         // The frontend sends one byte after swapping its admission state. Request
         // dispatch already addresses the prepared runtime by its opaque id.
         if socket.read_u8().await? == 1 {
@@ -127,12 +163,7 @@ impl WorkerGenerations {
       tokio::select! { _ = lease => {}, _ = stop.changed() => {} }
       self.states.lock().remove(&id);
     });
-    Response::builder()
-      .status(StatusCode::SWITCHING_PROTOCOLS)
-      .header(header::CONNECTION, "upgrade")
-      .header(header::UPGRADE, UPGRADE)
-      .header(GENERATION_HEADER, id.to_string())
-      .header(ACCOUNTS, accounts)
+    response
       .body(Body::empty())
       .expect("internal worker response uses validated headers")
   }
@@ -141,6 +172,7 @@ impl WorkerGenerations {
 pub(super) struct GenerationLease {
   pub id: String,
   pub accounts: usize,
+  pub frontend_connect_policy: Option<ConnectPolicy>,
   socket: Mutex<TokioIo<hyper::upgrade::Upgraded>>,
 }
 
@@ -168,7 +200,9 @@ impl GenerationLease {
       let _ = connection.with_upgrades().await;
     }));
     let request = match revision {
-      Some(revision) => Request::post(PREPARE_PATH).header(REVISION, revision),
+      Some(revision) => Request::post(PREPARE_PATH)
+        .header(REVISION, revision)
+        .header(FRONTEND_CONNECT_POLICY, FRONTEND_CONNECT_POLICY_VERSION),
       None => Request::post(PIN_PATH),
     }
     .header(header::HOST, "localhost")
@@ -191,6 +225,7 @@ impl GenerationLease {
         });
       }
       StatusCode::UNPROCESSABLE_ENTITY => return Err(ReloadError::Invalid("worker configuration is invalid".into())),
+      StatusCode::PAYLOAD_TOO_LARGE => return Err(invalid("worker CONNECT policy exceeds the IPC size limit")),
       _ => {
         return Err(ReloadError::RestartRequired(
           "the active worker does not support configuration reload".into(),
@@ -206,10 +241,21 @@ impl GenerationLease {
     };
     let id = Uuid::parse_str(field(GENERATION_HEADER)?).map_err(invalid)?.to_string();
     let accounts = field(ACCOUNTS)?.parse().map_err(invalid)?;
-    let socket = TokioIo::new(hyper::upgrade::on(&mut response).await.map_err(invalid)?);
+    let has_frontend_connect_policy = match response.headers().get(FRONTEND_CONNECT_POLICY) {
+      Some(value) if revision.is_some() && value == FRONTEND_CONNECT_POLICY_VERSION => true,
+      Some(_) => return Err(invalid("invalid worker CONNECT policy negotiation")),
+      None => false,
+    };
+    let mut socket = TokioIo::new(hyper::upgrade::on(&mut response).await.map_err(invalid)?);
+    let frontend_connect_policy = if has_frontend_connect_policy {
+      Some(read_frontend_connect_policy(&mut socket).await?)
+    } else {
+      None
+    };
     Ok(Arc::new(Self {
       id,
       accounts,
+      frontend_connect_policy,
       socket: Mutex::new(socket),
     }))
   }
@@ -237,6 +283,51 @@ impl GenerationLease {
   }
 }
 
+async fn read_frontend_connect_policy(socket: &mut (impl AsyncRead + Unpin)) -> Result<ConnectPolicy, ReloadError> {
+  let size = socket.read_u32().await.map_err(invalid)? as usize;
+  if size == 0 || size > MAX_FRONTEND_CONNECT_POLICY_BYTES {
+    return Err(invalid("invalid worker CONNECT policy size"));
+  }
+  let mut bytes = vec![0; size];
+  socket.read_exact(&mut bytes).await.map_err(invalid)?;
+  serde_json::from_slice(&bytes).map_err(|_| invalid("invalid worker CONNECT policy"))
+}
+
 pub(super) fn invalid(error: impl std::fmt::Display) -> ReloadError {
   ReloadError::Invalid(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn connect_policy_frame_leaves_activation_bytes_unread() {
+    let expected = ConnectPolicy::from_listeners(std::iter::empty());
+    let payload = serde_json::to_vec(&expected).unwrap();
+    let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&payload);
+    frame.push(1);
+    let mut input = frame.as_slice();
+
+    let actual = read_frontend_connect_policy(&mut input).await.unwrap();
+    assert_eq!(serde_json::to_vec(&actual).unwrap(), payload);
+    assert_eq!(input, &[1]);
+  }
+
+  #[tokio::test]
+  async fn connect_policy_frame_rejects_empty_oversized_and_invalid_payloads() {
+    for size in [0, MAX_FRONTEND_CONNECT_POLICY_BYTES as u32 + 1] {
+      let frame = size.to_be_bytes();
+      assert_eq!(
+        read_frontend_connect_policy(&mut frame.as_slice()).await.unwrap_err(),
+        invalid("invalid worker CONNECT policy size")
+      );
+    }
+    let mut invalid_frame = &[0, 0, 0, 1, b'{'][..];
+    assert_eq!(
+      read_frontend_connect_policy(&mut invalid_frame).await.unwrap_err(),
+      invalid("invalid worker CONNECT policy")
+    );
+  }
 }

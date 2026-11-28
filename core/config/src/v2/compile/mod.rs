@@ -1,5 +1,7 @@
 #[cfg(feature = "std")]
 mod listeners;
+#[cfg(feature = "std")]
+pub use listeners::compile_connect_rules;
 mod path;
 mod resources;
 #[cfg(feature = "std")]

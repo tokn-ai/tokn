@@ -1,3 +1,4 @@
+use super::connect_policy::ConnectPolicy;
 use super::*;
 use crate::v2::ReloadError;
 use arc_swap::ArcSwap;
@@ -17,7 +18,12 @@ impl FrontendGeneration {
     events: &Arc<EventBus>,
     dispatcher: Arc<dyn RequestDispatcher>,
     previous: Option<&Self>,
+    connect_policy: Option<&ConnectPolicy>,
   ) -> anyhow::Result<Self> {
+    let mut proxy_listeners = connect_policy
+      .map(|policy| policy.apply(plan))
+      .transpose()?
+      .unwrap_or_default();
     let mounts = Arc::new(ApiMounts::new(plan)?);
     let client_credentials = Arc::new(
       plan
@@ -51,6 +57,7 @@ impl FrontendGeneration {
           );
         }
         ListenerPlan::ForwardProxy(listener) => {
+          let listener = proxy_listeners.remove(id).unwrap_or_else(|| listener.clone());
           // Listener compatibility is checked before preparing a replacement. Keep
           // the original CA and its certificate cache across routing-only edits.
           let ca = match previous {
@@ -64,15 +71,15 @@ impl FrontendGeneration {
             id.clone(),
             Arc::new(ProxyIngress {
               listener_id: id.clone(),
-              listener: listener.clone(),
+              max_wire_bytes: listener
+                .request_body_max_bytes()
+                .min(service.request_limits().max_wire_bytes()),
+              listener,
               ca,
               access: access.clone(),
               events: events.clone(),
               dispatcher: dispatcher.clone(),
               outbound: service.outbound().to_http_client_options(),
-              max_wire_bytes: listener
-                .request_body_max_bytes()
-                .min(service.request_limits().max_wire_bytes()),
             }),
           );
         }
@@ -139,11 +146,29 @@ impl FrontendReloadHandle {
     service: &ServiceSettings,
     dispatcher: Arc<dyn RequestDispatcher>,
   ) -> Result<PreparedFrontend, ReloadError> {
+    self.prepare_with_connect_policy(plan, service, dispatcher, None)
+  }
+
+  pub(crate) fn prepare_with_connect_policy(
+    &self,
+    plan: &GatewayPlan,
+    service: &ServiceSettings,
+    dispatcher: Arc<dyn RequestDispatcher>,
+    connect_policy: Option<&ConnectPolicy>,
+  ) -> Result<PreparedFrontend, ReloadError> {
     crate::v2::ensure_service_reload_compatible(&self.service, service)?;
     let previous = self.current.load();
     previous.validate_listeners(plan)?;
-    let next = FrontendGeneration::build(plan, service, &self.access, &self.events, dispatcher, Some(&previous))
-      .map_err(|e| ReloadError::Invalid(e.to_string()))?;
+    let next = FrontendGeneration::build(
+      plan,
+      service,
+      &self.access,
+      &self.events,
+      dispatcher,
+      Some(&previous),
+      connect_policy,
+    )
+    .map_err(|e| ReloadError::Invalid(e.to_string()))?;
     Ok(PreparedFrontend {
       current: self.current.clone(),
       next: Arc::new(next),

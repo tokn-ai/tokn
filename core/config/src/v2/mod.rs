@@ -15,6 +15,8 @@ mod models;
 mod raw;
 
 #[cfg(feature = "std")]
+pub use compile::compile_connect_rules;
+#[cfg(feature = "std")]
 pub use compiled::{
   CompiledConfig, CompiledExecutionConfig, OutboundPlan, PersistencePaths, PersistencePlan, RequestLimitsPlan,
   ServiceSettings,

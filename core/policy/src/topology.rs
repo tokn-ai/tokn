@@ -295,6 +295,13 @@ impl ForwardProxyListenerPlan {
     self.default_connect_action
   }
 
+  /// Replace only the CONNECT decisions while preserving listener identity and HTTP policy.
+  pub fn with_connect_policy(mut self, rules: Box<[ConnectRulePlan]>, default_action: ConnectAction) -> Self {
+    self.connect_rules = rules;
+    self.default_connect_action = default_action;
+    self
+  }
+
   pub fn tls(&self) -> Option<&TlsPlan> {
     self.tls.as_ref()
   }
@@ -376,6 +383,15 @@ enum HostPatternKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HostPattern {
   kind: HostPatternKind,
+}
+
+impl fmt::Display for HostPattern {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match &self.kind {
+      HostPatternKind::Exact(host) => write!(formatter, "{host}"),
+      HostPatternKind::SubdomainsOf(suffix) => write!(formatter, "*.{suffix}"),
+    }
+  }
 }
 
 impl HostPattern {

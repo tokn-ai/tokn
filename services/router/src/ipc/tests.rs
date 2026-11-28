@@ -107,7 +107,11 @@ fn address() -> SocketAddr {
 }
 
 fn config(api: SocketAddr, proxy: SocketAddr, ca: &Path, upstream: SocketAddr) -> tokn_config::v2::CompiledConfig {
-  tokn_config::v2::parse_config(
+  tokn_config::v2::compile_config(&raw_config(api, proxy, ca, upstream), Path::new("ipc-test.toml")).unwrap()
+}
+
+fn raw_config(api: SocketAddr, proxy: SocketAddr, ca: &Path, upstream: SocketAddr) -> tokn_config::v2::RawConfig {
+  tokn_config::v2::decode(
     &format!(
       r#"
 schema_version = 2
@@ -192,13 +196,36 @@ async fn wait_for_frontend(addr: SocketAddr) {
 }
 
 async fn intercepted(proxy: SocketAddr, cert: &Path, token: &str) -> tokio_rustls::client::TlsStream<TcpStream> {
+  let stream = open_connect(proxy, "api.example.test:443", token).await;
+  connect_intercepted_tls(stream, cert, "api.example.test").await
+}
+
+async fn open_connect(proxy: SocketAddr, authority: &str, token: &str) -> TcpStream {
   let mut stream = TcpStream::connect(proxy).await.unwrap();
-  stream.write_all(format!("CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nProxy-Authorization: Bearer {token}\r\n\r\n").as_bytes()).await.unwrap();
+  stream
+    .write_all(
+      format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Bearer {token}\r\n\r\n")
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
   let mut head = Vec::new();
-  while !head.ends_with(b"\r\n\r\n") {
-    head.push(stream.read_u8().await.unwrap());
-  }
+  tokio::time::timeout(Duration::from_secs(5), async {
+    while !head.ends_with(b"\r\n\r\n") {
+      head.push(stream.read_u8().await.unwrap());
+    }
+  })
+  .await
+  .unwrap();
   assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+  stream
+}
+
+async fn connect_intercepted_tls(
+  stream: TcpStream,
+  cert: &Path,
+  host: &'static str,
+) -> tokio_rustls::client::TlsStream<TcpStream> {
   let mut reader = std::io::BufReader::new(std::fs::File::open(cert).unwrap());
   let mut roots = rustls::RootCertStore::empty();
   for cert in rustls_pemfile::certs(&mut reader) {
@@ -210,10 +237,7 @@ async fn intercepted(proxy: SocketAddr, cert: &Path, token: &str) -> tokio_rustl
     .with_root_certificates(roots)
     .with_no_client_auth();
   tokio_rustls::TlsConnector::from(Arc::new(tls))
-    .connect(
-      rustls::pki_types::ServerName::try_from("api.example.test").unwrap(),
-      stream,
-    )
+    .connect(rustls::pki_types::ServerName::try_from(host).unwrap(), stream)
     .await
     .unwrap()
 }
@@ -926,6 +950,146 @@ async fn assert_untagged_worker_mount(path: &Path, current: &str, previous: &str
     let response = super::transport::exchange(path, request).await.unwrap();
     assert_eq!(response.status(), expected);
   }
+}
+
+#[tokio::test]
+async fn split_reload_uses_the_worker_connect_policy_for_new_tunnels() {
+  use tokn_config::v2::{self, RawBinding, RawBindingAction, RawConnectAction, RawConnectRule, RawListener};
+
+  const REVISION: &str = "shared-source-revision";
+  const HOST: &str = "127.0.0.1";
+  const GREETING: &[u8] = b"opaque tunnel fixture";
+  let tunnel = TcpListener::bind((HOST, 0)).await.unwrap();
+  let tunnel_addr = tunnel.local_addr().unwrap();
+  let tunnel_task = tokio::spawn(async move {
+    let (mut connection, _) = tunnel.accept().await.unwrap();
+    connection.write_all(GREETING).await.unwrap();
+    let probe = connection.read_u8().await.unwrap();
+    connection.write_u8(probe).await.unwrap();
+  });
+  let (upstream_addr, upstream_task) = upstream("reloaded relay").await;
+  let ca = tempfile::tempdir().unwrap();
+  let api = address();
+  let proxy = address();
+  let source = Path::new("worker-connect-reload.toml");
+  let mut frontend_projection = raw_config(api, proxy, ca.path(), upstream_addr);
+  let RawListener::ForwardProxy {
+    default_connect,
+    default_http_action,
+    ..
+  } = frontend_projection.listeners.get_mut("proxy").unwrap()
+  else {
+    panic!("fixture requires a proxy listener");
+  };
+  *default_connect = RawConnectAction::Tunnel;
+  *default_http_action = RawBindingAction::Reject {};
+  let mut worker_projection = frontend_projection.clone();
+  worker_projection.connect_rules.push(RawConnectRule {
+    id: "intercept-fixture".into(),
+    listener: "proxy".into(),
+    action: RawConnectAction::Intercept,
+    hosts: vec![HOST.into()],
+    ports: vec![tunnel_addr.port()],
+  });
+  worker_projection.bindings.push(RawBinding {
+    id: "relay-fixture".into(),
+    listener: "proxy".into(),
+    action: RawBindingAction::Route {
+      profile: "relay".into(),
+    },
+    hosts: vec![HOST.into()],
+    path_prefixes: vec!["/v1".into()],
+    methods: vec!["POST".into()],
+    operations: vec![],
+  });
+  let frontend_config = v2::compile_config(&frontend_projection, source).unwrap();
+  let worker_config = v2::compile_config(&worker_projection, source).unwrap();
+  let build = |compiled: v2::CompiledConfig| {
+    let (plan, service) = compiled.into_parts();
+    build_worker_runtime_states(
+      plan,
+      service,
+      &[],
+      Arc::new(AccessStore::disabled()),
+      Arc::new(EventBus::noop()),
+    )
+    .unwrap()
+  };
+  let live = Arc::new(LiveRuntime::new(build(frontend_config.clone()), 0));
+  let info = live.worker_info("fixture");
+  let prepare = WorkerReload::new(move |revision| {
+    let worker_config = worker_config.clone();
+    async move {
+      assert_eq!(revision, REVISION);
+      Ok((build(worker_config), 0))
+    }
+  });
+  let worker = Worker::start_with(move |path, stopped| {
+    serve_reloadable_worker(path, live, info, prepare, async {
+      let _ = stopped.await;
+    })
+  })
+  .await;
+  let (plan, service) = frontend_config.into_parts();
+  let pool = Arc::new(WorkerPool::empty(&plan).unwrap());
+  pool.register(worker.endpoint("worker", 1)).await.unwrap();
+  let access = Arc::new(AccessStore::disabled());
+  let key = access.create_key("proxy", vec!["local".into()]).unwrap();
+  let frontend = Frontend::new(plan.clone(), service.clone(), access, pool.dispatcher()).unwrap();
+  let handle = frontend.reload_handle();
+  let (stop, stopped) = oneshot::channel();
+  let server = tokio::spawn(frontend.serve(async {
+    let _ = stopped.await;
+  }));
+  wait_for_frontend(proxy).await;
+
+  let authority = tunnel_addr.to_string();
+  let mut opaque = open_connect(proxy, &authority, &key.token).await;
+  let mut greeting = vec![0; GREETING.len()];
+  tokio::time::timeout(Duration::from_secs(5), opaque.read_exact(&mut greeting))
+    .await
+    .unwrap()
+    .unwrap();
+  assert_eq!(greeting, GREETING);
+
+  // The two versions can compile the same source revision differently. Reload
+  // submits the old frontend projection, leaving the prepared worker to
+  // advertise the policy matching its new execution rules.
+  assert_eq!(
+    pool.reload(&handle, plan, &service, REVISION).await.unwrap().generation,
+    2
+  );
+  tokio::time::timeout(Duration::from_secs(5), async {
+    opaque.write_u8(42).await.unwrap();
+    assert_eq!(opaque.read_u8().await.unwrap(), 42);
+  })
+  .await
+  .unwrap();
+  drop(opaque);
+  tunnel_task.await.unwrap();
+
+  let stream = open_connect(proxy, &authority, &key.token).await;
+  let tls = connect_intercepted_tls(stream, &ca.path().join("ca.crt"), HOST).await;
+  let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+  let connection = tokio::spawn(connection);
+  let mut request = request();
+  request.headers_mut().insert("host", authority.parse().unwrap());
+  let response = sender.send_request(request).await.unwrap();
+  assert_eq!(response.status(), StatusCode::OK);
+  assert_eq!(
+    to_bytes(Body::new(response.into_body()), 1024).await.unwrap(),
+    "reloaded relay",
+  );
+  drop(sender);
+  connection.abort();
+  stop.send(()).unwrap();
+  tokio::time::timeout(Duration::from_secs(5), server)
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+  worker.stop().await;
+  upstream_task.abort();
 }
 
 #[tokio::test]

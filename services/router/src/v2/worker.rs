@@ -37,6 +37,13 @@ impl LiveRuntime {
 
 impl RuntimeGeneration {
   #[cfg(unix)]
+  pub(crate) fn frontend_connect_policy(&self) -> crate::frontend::connect_policy::ConnectPolicy {
+    crate::frontend::connect_policy::ConnectPolicy::from_listeners(
+      self.forward_proxy.iter().map(|(id, state)| (id, &state.listener)),
+    )
+  }
+
+  #[cfg(unix)]
   pub(crate) fn worker_info(&self, version: impl Into<String>) -> crate::ipc::WorkerInfo {
     let listeners = self
       .llm_api
