@@ -168,6 +168,88 @@ fn configured_zstd_pack_can_be_pruned_after_switching_archive_format() {
   assert!(!db.exists());
 }
 
+#[test]
+fn prunes_a_verified_alternate_archive_without_a_live_database() {
+  let dir = tempfile::tempdir().unwrap();
+  let db = write_packable_db(dir.path());
+  let old_archive = archive_path(&db, ArchiveFormat::Zstd);
+  let keeper = IndexedArchiveFormat::Zstd.path(&db);
+  let today = date!(2026 - 05 - 11);
+  let preference = resolve_format(Some("pack.zst"));
+  assert_eq!(
+    archive_requests_once(dir.path(), today, 7, ArchiveFormat::Zstd)
+      .unwrap()
+      .archived,
+    1
+  );
+  fs::remove_file(&db).unwrap();
+
+  let prune =
+    |commit| prune_request_dbs_once_with_progress(dir.path(), today, 10, preference, commit, &mut |_| {}).unwrap();
+  let before_migration = prune(true);
+  assert!(before_migration.entries.is_empty());
+  assert_eq!(before_migration.archives[0].outcome, ArchivePruneOutcome::MissingTarget);
+  assert!(old_archive.is_file());
+  assert_eq!(
+    migrate_request_archives(dir.path(), Some("pack.zst"), true)
+      .unwrap()
+      .entries[0]
+      .outcome,
+    MigrationOutcome::Migrated
+  );
+
+  let preview = prune(false);
+  assert_eq!(
+    preview.archives,
+    [ArchivePruneEntry {
+      day: date!(2026 - 05 - 01),
+      path: old_archive.clone(),
+      keeper: keeper.clone(),
+      outcome: ArchivePruneOutcome::WouldRemove,
+    }]
+  );
+  assert!(old_archive.is_file());
+  assert_eq!(prune(true).archives[0].outcome, ArchivePruneOutcome::Removed);
+  assert!(!old_archive.exists());
+  assert!(keeper.is_file());
+  assert!(prune(true).archives.is_empty());
+}
+
+#[test]
+fn alternate_archive_conflict_retains_every_file_for_the_day() {
+  let dir = tempfile::tempdir().unwrap();
+  let db = write_packable_db(dir.path());
+  let today = date!(2026 - 05 - 11);
+  let preference = resolve_format(Some("pack.zst"));
+  archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
+  let keeper = IndexedArchiveFormat::Zstd.path(&db);
+  let keeper_bytes = fs::read(&keeper).unwrap();
+  // Create an older-format snapshot with different request content.
+  tokn_persistence::requests::open_day_db(&db)
+    .unwrap()
+    .execute("UPDATE request_downstream SET inbound_req_body = 'different body'", [])
+    .unwrap();
+  let old_archive = archive_path(&db, ArchiveFormat::Zstd);
+  encode_snapshot(
+    &mut StableFile::open(&db).unwrap(),
+    &mut File::create_new(&old_archive).unwrap(),
+    ArchiveFormat::Zstd,
+    &mut |_| Ok(()),
+  )
+  .unwrap();
+
+  let report = prune_request_dbs_once_with_progress(dir.path(), today, 10, preference, true, &mut |_| {}).unwrap();
+  assert_eq!(report.entries[0].outcome, PruneOutcome::ArchiveConflict);
+  let entry = &report.archives[0];
+  let ArchivePruneOutcome::Conflict { first, other } = &entry.outcome else {
+    panic!("expected conflict, got {entry:?}");
+  };
+  assert_eq!((first, other), (&old_archive, &keeper));
+  assert!(db.is_file());
+  assert!(old_archive.is_file());
+  assert_eq!(fs::read(keeper).unwrap(), keeper_bytes);
+}
+
 #[cfg(feature = "lzma")]
 #[test]
 fn cancellation_interrupts_verifying_an_indexed_request_pack() {

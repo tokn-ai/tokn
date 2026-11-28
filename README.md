@@ -340,8 +340,19 @@ bytes. Pruning verifies the pack against the source database. Raw SQLite
 archives are verified byte for byte using SHA-256. If a viewer is reading a day,
 pruning waits for a later scan.
 Set `archive_after_days` and `prune_after_days` under
-`[service.persistence]` to change these cutoffs. `tokn-gateway requests prune`
-previews the eligible days. Add `--commit` to prune them manually.
+`[service.persistence]` to change these cutoffs.
+
+To convert existing archives, update `archive_extension` and run
+`tokn-gateway requests migrate`. It previews conversions to the configured
+format, including days whose SQLite source was already pruned. Add
+`--commit` to write and verify the destination archives while retaining
+each source.
+
+`tokn-gateway requests prune` previews eligible SQLite files and alternate
+archives. With `--commit`, it removes an alternate archive only when the
+configured destination exists and verification confirms the copies agree.
+When archives conflict, both commands report the files and retain every copy
+for that day.
 
 ### Inspect request history
 

@@ -125,12 +125,7 @@ pub fn verify(
   capture::verify_metadata_rows(snapshot.capture.metadata_snapshot.path(), &reader.metadata)?;
   progress(0)?;
   let input = reader.input.get_mut();
-  input.seek(SeekFrom::Start(0))?;
-  let mut magic = [0; MAGIC.len()];
-  input.read_exact(&mut magic)?;
-  if magic != MAGIC {
-    return Err(invalid_data("invalid indexed request archive header"));
-  }
+  verify_header(input)?;
   let mut input = (&mut *input).take(reader.metadata_offset - HEADER_LEN);
   let mut tracked = ProgressIo::new(&mut input, progress);
   let result = objects::verify_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH);
@@ -139,6 +134,32 @@ pub fn verify(
     return Err(invalid_data("indexed request archive object stream length differs"));
   }
   verify_indexes(&reader.metadata, snapshot, &index, &canonical, progress)
+}
+
+/// Check pack framing, the metadata schema, and SQLite page integrity.
+pub fn validate(input: &mut (impl Read + Seek)) -> io::Result<()> {
+  verify_header(input)?;
+  let reader = IndexedPackReader::open(input, Duration::ZERO)?;
+  let integrity: String = reader
+    .metadata
+    .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+    .map_err(invalid_data)?;
+  if integrity != "ok" {
+    return Err(invalid_data(
+      "indexed request archive metadata failed SQLite validation",
+    ));
+  }
+  Ok(())
+}
+
+fn verify_header(input: &mut (impl Read + Seek)) -> io::Result<()> {
+  input.rewind()?;
+  let mut magic = [0; MAGIC.len()];
+  input.read_exact(&mut magic)?;
+  if magic != MAGIC {
+    return Err(invalid_data("invalid indexed request archive header"));
+  }
+  Ok(())
 }
 
 /// Query the unpacked metadata snapshot and seek to the requested body objects.

@@ -1,7 +1,12 @@
 //! Archive, verify and prune rotated request databases.
 
+mod archive_content;
+mod archive_migration;
+mod archive_sets;
 mod pack;
 mod worker;
+pub use archive_migration::*;
+use archive_sets::{archive_days, ArchiveSet, ArchiveSetError};
 use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 use tokn_persistence::request_archive::RequestPack;
 pub use tokn_persistence::request_files::ArchiveFormat;
@@ -29,7 +34,26 @@ pub struct ArchiveStats {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PruneReport {
   pub cutoff: Date,
+  pub target_extension: &'static str,
   pub entries: Vec<PruneEntry>,
+  pub archives: Vec<ArchivePruneEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchivePruneEntry {
+  pub day: Date,
+  pub path: PathBuf,
+  pub keeper: PathBuf,
+  pub outcome: ArchivePruneOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArchivePruneOutcome {
+  WouldRemove,
+  Removed,
+  MissingTarget,
+  Conflict { first: PathBuf, other: PathBuf },
+  Failed { error: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +73,7 @@ pub enum PruneOutcome {
   },
   MissingArchive,
   InUse,
+  ArchiveConflict,
   HashMismatch {
     source_sha256: String,
     archived_sha256: String,
@@ -89,6 +114,15 @@ struct ArchivePreference {
   snapshot_format: ArchiveFormat,
 }
 
+impl ArchivePreference {
+  fn target(self) -> ArchiveContents {
+    match self.indexed {
+      Some(format) => ArchiveContents::IndexedPack(format),
+      None => ArchiveContents::Snapshot(self.snapshot_format),
+    }
+  }
+}
+
 impl From<ArchiveFormat> for ArchivePreference {
   fn from(snapshot_format: ArchiveFormat) -> Self {
     let indexed = match snapshot_format {
@@ -104,15 +138,25 @@ impl From<ArchiveFormat> for ArchivePreference {
 }
 
 fn resolve_format(configured_extension: Option<&str>) -> ArchivePreference {
+  match configured_format(configured_extension) {
+    Ok(format) => format,
+    Err(error) => {
+      tracing::warn!(archive_extension = configured_extension.unwrap_or_default(), %error, "falling back to zstd");
+      ArchiveFormat::Zstd.into()
+    }
+  }
+}
+
+fn configured_format(configured_extension: Option<&str>) -> io::Result<ArchivePreference> {
   let Some(value) = configured_extension.map(str::trim).filter(|value| !value.is_empty()) else {
-    return if cfg!(feature = "lzma") {
+    return Ok(if cfg!(feature = "lzma") {
       ArchiveFormat::Xz.into()
     } else {
       ArchiveFormat::Zstd.into()
-    };
+    });
   };
   let normalized = value.trim_start_matches('.').to_ascii_lowercase();
-  match normalized.as_str() {
+  let format = match normalized.as_str() {
     "zst" | "pack.zst" | "pack.zstd" => ArchivePreference {
       indexed: Some(IndexedArchiveFormat::Zstd),
       snapshot_format: ArchiveFormat::Zstd,
@@ -120,20 +164,19 @@ fn resolve_format(configured_extension: Option<&str>) -> ArchivePreference {
     "zstd" | "db.zstd" => ArchiveFormat::Zstd.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" => {
-      tracing::warn!(
-        archive_extension = value,
-        "LZMA archive extension requested without lzma feature; falling back to zstd"
-      );
-      ArchiveFormat::Zstd.into()
+      return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "XZ archive_extension requires the lzma feature",
+      ));
     }
     _ => {
-      tracing::warn!(
-        archive_extension = value,
-        "unsupported archive extension; falling back to zstd"
-      );
-      ArchiveFormat::Zstd.into()
+      return Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("unsupported archive_extension {value:?}"),
+      ));
     }
-  }
+  };
+  Ok(format)
 }
 
 /// Verify old request database archives and optionally remove their source
@@ -159,7 +202,7 @@ pub fn prune_request_dbs_with_progress(
     dir,
     OffsetDateTime::now_utc().date(),
     prune_after_days,
-    resolve_format(archive_extension),
+    configured_format(archive_extension)?,
     commit,
     &mut progress,
   )
@@ -194,7 +237,9 @@ fn prune_request_dbs_once_with_progress(
   let cutoff = retention_cutoff(today, prune_after_days, "prune")?;
   let mut report = PruneReport {
     cutoff,
+    target_extension: preference.target().extension(),
     entries: Vec::new(),
+    archives: Vec::new(),
   };
   let _lock = match RequestMaintenanceLock::acquire(dir) {
     Ok(lock) => lock,
@@ -205,23 +250,24 @@ fn prune_request_dbs_once_with_progress(
     }
     Err(error) => return Err(error),
   };
-  let mut paths = Vec::new();
-  for entry in fs::read_dir(dir)? {
-    let path = entry?.path();
-    if is_archivable_request_db(&path, cutoff) {
-      paths.push(path);
-    }
-  }
-  paths.sort();
-
-  let files_total = paths.len();
+  let days: Vec<_> = archive_days(dir)?
+    .into_iter()
+    .filter(|(date, day)| {
+      let keeper = preference.target().path(&day.db);
+      *date <= cutoff && (day.has_db || day.archives.iter().any(|path| *path != keeper))
+    })
+    .collect();
+  let files_total = days.len();
   progress(PruneProgressEvent::Started { files_total });
-  for (file_index, path) in paths.into_iter().enumerate() {
-    let archive = existing_archive_path(&path, preference)?;
-    let bytes_per_pass = fs::symlink_metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
+  for (file_index, (date, day)) in days.into_iter().enumerate() {
+    let keeper = preference.target().path(&day.db);
+    let progress_path = if day.has_db { &day.db } else { &day.archives[0] }.clone();
+    let bytes_per_pass = fs::symlink_metadata(&day.db)
+      .map(|metadata| metadata.len())
+      .unwrap_or(0);
     let bytes_total = bytes_per_pass.saturating_mul(if commit { 4 } else { 2 });
     progress(PruneProgressEvent::FileStarted {
-      path: path.clone(),
+      path: progress_path.clone(),
       file_index,
       files_total,
       bytes_total,
@@ -234,16 +280,115 @@ fn prune_request_dbs_once_with_progress(
         bytes_total,
       });
     };
-    let outcome = prune_request_db(&path, &archive, commit, None, &mut report_bytes);
+    // Distinct snapshots can differ even when each agrees with a normalized
+    // indexed pack. Check all pairs before making any deletions for this day.
+    let verified = (day.archives.len() > 1)
+      .then(|| ArchiveSet::verify(&day.archives))
+      .transpose();
+    let raw = if day.has_db {
+      let archive = existing_archive_path(&day.db, preference)?;
+      let outcome = match &verified {
+        Ok(_) => prune_request_db(&day.db, &archive, commit, None, &mut report_bytes),
+        Err(ArchiveSetError::Conflict { .. }) => PruneOutcome::ArchiveConflict,
+        Err(ArchiveSetError::Io(error)) => PruneOutcome::Failed {
+          error: error.to_string(),
+        },
+      };
+      Some(PruneEntry {
+        path: day.db,
+        archive,
+        outcome,
+      })
+    } else {
+      None
+    };
+    report
+      .archives
+      .extend(prune_archive_copies(date, &day.archives, &keeper, verified, commit));
+    report.entries.extend(raw);
     progress(PruneProgressEvent::FileFinished {
-      path: path.clone(),
+      path: progress_path,
       file_index,
       files_total,
     });
-    report.entries.push(PruneEntry { path, archive, outcome });
   }
   progress(PruneProgressEvent::Finished { files_total });
   Ok(report)
+}
+
+fn prune_archive_copies(
+  day: Date,
+  archives: &[PathBuf],
+  keeper: &Path,
+  verified: Result<Option<ArchiveSet>, ArchiveSetError>,
+  commit: bool,
+) -> Vec<ArchivePruneEntry> {
+  let alternate_entries = |outcome: ArchivePruneOutcome| {
+    archives
+      .iter()
+      .filter(|path| path.as_path() != keeper)
+      .map(|path| ArchivePruneEntry {
+        day,
+        path: path.clone(),
+        keeper: keeper.to_path_buf(),
+        outcome: outcome.clone(),
+      })
+      .collect()
+  };
+  let mut verified = match verified {
+    Err(ArchiveSetError::Conflict { first, other }) => {
+      return alternate_entries(ArchivePruneOutcome::Conflict { first, other });
+    }
+    Err(ArchiveSetError::Io(error)) => {
+      return alternate_entries(ArchivePruneOutcome::Failed {
+        error: error.to_string(),
+      });
+    }
+    Ok(Some(set)) => set,
+    Ok(_) => return alternate_entries(ArchivePruneOutcome::MissingTarget),
+  };
+  let Some(keeper_index) = verified
+    .archives
+    .iter()
+    .position(|archive| archive.file.path() == keeper)
+  else {
+    return alternate_entries(ArchivePruneOutcome::MissingTarget);
+  };
+  if !commit {
+    return alternate_entries(ArchivePruneOutcome::WouldRemove);
+  }
+  if let Err(error) = verified
+    .recheck()
+    .and_then(|()| sync_archive_before_prune(&verified.archives[keeper_index].file))
+  {
+    return alternate_entries(ArchivePruneOutcome::Failed {
+      error: error.to_string(),
+    });
+  }
+  let keeper_file = verified.archives.remove(keeper_index);
+  verified
+    .archives
+    .into_iter()
+    .map(|archive| {
+      let path = archive.file.path().to_path_buf();
+      let outcome = match keeper_file
+        .file
+        .revalidate()
+        .and_then(|()| remove_stable_file(archive.file))
+      {
+        Ok(()) => ArchivePruneOutcome::Removed,
+        Err(error) => ArchivePruneOutcome::Failed {
+          error: error.to_string(),
+        },
+      };
+      ArchivePruneEntry {
+        day,
+        path,
+        keeper: keeper.to_path_buf(),
+        outcome,
+      }
+    })
+    .collect()
 }
 
 fn prune_request_db(
@@ -427,22 +572,33 @@ fn hash_archive(
   cancelled: Option<&AtomicBool>,
   progress: &mut impl FnMut(u64),
 ) -> io::Result<[u8; 32]> {
-  file.file_mut().rewind()?;
-  let digest = match format {
-    ArchiveFormat::Zstd => hash_reader(zstd::stream::read::Decoder::new(file.file_mut())?, cancelled, progress),
-    ArchiveFormat::Xz => hash_xz_archive(file.file_mut(), cancelled, progress),
-  }?;
+  let digest = hash_reader(
+    archive_content::open_snapshot(file.file_mut(), format)?,
+    cancelled,
+    progress,
+  )?;
   file.revalidate()?;
   Ok(digest)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ArchiveContents {
   Snapshot(ArchiveFormat),
   IndexedPack(IndexedArchiveFormat),
 }
 
 impl ArchiveContents {
+  fn extension(self) -> &'static str {
+    match self {
+      Self::Snapshot(format) => format.extension(),
+      Self::IndexedPack(format) => format.extension(),
+    }
+  }
+
+  fn path(self, db: &Path) -> PathBuf {
+    db.with_extension(self.extension())
+  }
+
   fn from_path(path: &Path) -> io::Result<Self> {
     if let Some(format) = IndexedArchiveFormat::from_path(path) {
       return Ok(Self::IndexedPack(format));
@@ -480,7 +636,6 @@ fn sync_archive_before_prune(archive: &StableFile) -> io::Result<()> {
   Ok(())
 }
 
-#[cfg(any(unix, feature = "lzma"))]
 fn sync_archive_directory(directory: &Path) -> io::Result<()> {
   #[cfg(unix)]
   File::open(directory)?.sync_all()?;
@@ -632,27 +787,6 @@ fn retention_cutoff(today: Date, retention_days: i64, operation: &str) -> io::Re
   })
 }
 
-#[cfg(feature = "lzma")]
-fn hash_xz_archive(
-  file: impl Read,
-  cancelled: Option<&AtomicBool>,
-  progress: &mut impl FnMut(u64),
-) -> io::Result<[u8; 32]> {
-  hash_reader(lzma_rust2::XzReader::new(file, false), cancelled, progress)
-}
-
-#[cfg(not(feature = "lzma"))]
-fn hash_xz_archive(
-  _file: impl Read,
-  _cancelled: Option<&AtomicBool>,
-  _progress: &mut impl FnMut(u64),
-) -> io::Result<[u8; 32]> {
-  Err(io::Error::new(
-    io::ErrorKind::Unsupported,
-    "xz archive decompression requires the lzma feature",
-  ))
-}
-
 /// Archive eligible daily databases without pruning their sources.
 pub fn archive_requests_once(
   dir: &Path,
@@ -780,10 +914,6 @@ fn archive_requests_once_locked(
     },
   );
   Ok(stats)
-}
-
-fn is_archivable_request_db(path: &Path, cutoff: Date) -> bool {
-  request_db_day(path).is_some_and(|day| day <= cutoff)
 }
 
 fn request_db_day(path: &Path) -> Option<Date> {
