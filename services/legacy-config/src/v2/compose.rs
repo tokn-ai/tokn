@@ -376,6 +376,26 @@ fn project_forward_proxy(
     }
   }
 
+  let mut intercept_hosts = BTreeSet::new();
+  for host in options
+    .default_intercept_hosts
+    .iter()
+    .chain(legacy.proxy_mode.intercept_hosts.iter())
+  {
+    intercept_hosts.insert(canonical_proxy_host(host)?);
+  }
+  for host in &legacy.proxy_mode.passthrough_hosts {
+    intercept_hosts.remove(&canonical_proxy_host(host)?);
+  }
+  for host in &options.default_passthrough_intercept_hosts {
+    let host = canonical_proxy_host(host)?;
+    if intercept_hosts.contains(&host) {
+      host_assignments
+        .entry(host)
+        .or_insert_with(|| (ProxyProviderMode::Passthrough, Vec::new()));
+    }
+  }
+
   let mut bindings = Vec::new();
   for mode in [ProxyProviderMode::Passthrough, ProxyProviderMode::Switch] {
     let hosts = host_assignments
@@ -412,17 +432,6 @@ fn project_forward_proxy(
     });
   }
 
-  let mut intercept_hosts = BTreeSet::new();
-  for host in options
-    .default_intercept_hosts
-    .iter()
-    .chain(legacy.proxy_mode.intercept_hosts.iter())
-  {
-    intercept_hosts.insert(canonical_proxy_host(host)?);
-  }
-  for host in &legacy.proxy_mode.passthrough_hosts {
-    intercept_hosts.remove(&canonical_proxy_host(host)?);
-  }
   let connect_rules = (!intercept_hosts.is_empty())
     .then(|| RawConnectRule {
       id: "proxy-intercept".to_string(),
@@ -651,6 +660,7 @@ mod tests {
       forward_proxy: Some(V2ForwardProxyProjectionOptions {
         route_mode,
         default_intercept_hosts: vec!["api.openai.com".into(), "chatgpt.com".into()],
+        default_passthrough_intercept_hosts: Vec::new(),
         provider_hosts: BTreeMap::from([
           ("openai".into(), vec!["api.openai.com".into()]),
           ("codex".into(), vec!["chatgpt.com".into()]),
@@ -929,14 +939,16 @@ mod tests {
   fn projects_static_forward_proxy_listener_and_host_policy() {
     let mut legacy = Config::default();
     legacy.proxy_mode.intercept_hosts = vec!["custom.example".into()];
-    legacy.proxy_mode.passthrough_hosts = vec!["API.OPENAI.COM".into()];
+    legacy.proxy_mode.passthrough_hosts = vec!["API.OPENAI.COM".into(), "ZCODE.Z.AI".into()];
 
-    let projection = project_v2_config(
-      &legacy,
-      &[account("primary", "openai", None)],
-      forward_proxy_options(RouteMode::Exact),
-    )
-    .unwrap();
+    let mut options = forward_proxy_options(RouteMode::Exact);
+    let forward_proxy = options.forward_proxy.as_mut().unwrap();
+    forward_proxy.default_intercept_hosts.push("zcode.z.ai".into());
+    forward_proxy
+      .default_passthrough_intercept_hosts
+      .push("zcode.z.ai".into());
+
+    let projection = project_v2_config(&legacy, &[account("primary", "openai", None)], options).unwrap();
     let raw = projection.raw_config();
     let RawListener::ForwardProxy {
       bind,
@@ -964,6 +976,10 @@ mod tests {
     assert_eq!(raw.connect_rules.len(), 1);
     assert_eq!(raw.connect_rules[0].action, RawConnectAction::Intercept);
     assert_eq!(raw.connect_rules[0].hosts, ["chatgpt.com", "custom.example"]);
+    assert!(raw
+      .bindings
+      .iter()
+      .all(|binding| !binding.hosts.iter().any(|host| host == "zcode.z.ai")));
     assert!(projection
       .compiled_config()
       .gateway()

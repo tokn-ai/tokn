@@ -966,6 +966,9 @@ destination and injects a matching account credential. Wildcard host entries
 are rejected because the legacy proxy treated them as literal strings while
 v2 treats them as patterns.
 
+The built-in `zcode.z.ai` interception rule forwards ZCode gateway requests
+using their original destination and client credentials.
+
 Per-request `x-route-mode` and Basic proxy-auth username mode overrides are not
 projected. Native v2 configs can declare one or more `forward_proxy` listeners
 and serve them together with API listeners without compatibility flags.

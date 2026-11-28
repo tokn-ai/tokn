@@ -36,7 +36,13 @@ pub fn proxy_default_intercept_hosts() -> impl Iterator<Item = &'static str> {
   proxy::INTERCEPT_HOSTS
     .iter()
     .chain(proxy::EXTRA_INTERCEPT_HOSTS)
+    .chain(proxy_passthrough_intercept_hosts())
     .copied()
+}
+
+/// Hosts that default to client-authenticated passthrough after interception.
+pub fn proxy_passthrough_intercept_hosts() -> &'static [&'static str] {
+  proxy::PASSTHROUGH_INTERCEPT_HOSTS
 }
 
 pub fn install_rustls_crypto_provider() -> Result<()> {

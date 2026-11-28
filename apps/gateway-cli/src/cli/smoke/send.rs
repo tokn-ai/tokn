@@ -684,7 +684,9 @@ fn redact_header(name: &str, value: &str, redact: bool) -> String {
     return value.to_string();
   }
   match name.to_ascii_lowercase().as_str() {
-    "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" => "<redacted>".into(),
+    "authorization" | "proxy-authorization" | "x-zcode-authorization" | "cookie" | "set-cookie" | "x-api-key" => {
+      "<redacted>".into()
+    }
     _ => value.to_string(),
   }
 }

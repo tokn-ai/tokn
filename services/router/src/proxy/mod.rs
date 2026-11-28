@@ -74,6 +74,9 @@ pub(crate) const INTERCEPT_HOSTS: &[&str] = &[
 /// Hosts the proxy intercepts even though no provider claims them.
 pub(crate) const EXTRA_INTERCEPT_HOSTS: &[&str] = &["openrouter.ai", "api.anthropic.com"];
 
+/// Intercepted gateways whose traffic defaults to the original destination and credentials.
+pub(crate) const PASSTHROUGH_INTERCEPT_HOSTS: &[&str] = &["zcode.z.ai"];
+
 #[derive(Clone)]
 pub struct ProxyOptions {
   pub addr: SocketAddr,
@@ -243,8 +246,9 @@ pub(super) struct HostPolicy {
 
 impl HostPolicy {
   fn new(options: &ProxyOptions) -> Self {
-    let mut intercept = INTERCEPT_HOSTS.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
-    intercept.extend(EXTRA_INTERCEPT_HOSTS.iter().map(|s| s.to_string()));
+    let mut intercept = crate::proxy_default_intercept_hosts()
+      .map(str::to_string)
+      .collect::<HashSet<_>>();
     intercept.extend(options.intercept_hosts.iter().map(|s| s.to_ascii_lowercase()));
     for host in &options.passthrough_hosts {
       intercept.remove(&host.to_ascii_lowercase());
