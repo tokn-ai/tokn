@@ -145,21 +145,22 @@ fn request_pack_does_not_allow_pruning_a_changed_body() {
 }
 
 #[test]
-fn configured_zstd_pack_can_be_pruned_after_switching_archive_format() {
+fn default_zstd_pack_can_be_pruned_after_switching_archive_format() {
   let dir = tempfile::tempdir().unwrap();
   let db = write_packable_db(dir.path());
   let archive = IndexedArchiveFormat::Zstd.path(&db);
   let today = date!(2026 - 05 - 11);
-  let preference = resolve_format(Some("pack.zst"));
+  let preference = resolve_format(None);
 
   let stats = archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
   assert_eq!(stats.archived, 1);
   assert!(archive.is_file());
   assert!(!archive_path(&db, ArchiveFormat::Zstd).exists());
 
-  let stats = archive_requests_once_with_events(dir.path(), today, 7, None, resolve_format(None), None, None).unwrap();
+  let snapshot_format = ArchiveFormat::Zstd;
+  let stats = archive_requests_once(dir.path(), today, 7, snapshot_format).unwrap();
   assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
-  let report = prune_request_dbs_once(dir.path(), today, 10, archive_format(), true).unwrap();
+  let report = prune_request_dbs_once(dir.path(), today, 10, snapshot_format, true).unwrap();
   let [entry] = report.entries.as_slice() else {
     panic!("expected one request day");
   };
@@ -827,13 +828,13 @@ fn uses_selected_archive_extension() {
 
 #[test]
 fn resolves_configured_extension_or_falls_back_to_zstd() {
-  assert_eq!(
-    resolve_format(Some(".pack.zst")),
-    ArchivePreference {
-      indexed: Some(IndexedArchiveFormat::Zstd),
-      snapshot_format: ArchiveFormat::Zstd,
-    }
-  );
+  let zstd_pack = ArchivePreference {
+    indexed: Some(IndexedArchiveFormat::Zstd),
+    snapshot_format: ArchiveFormat::Zstd,
+  };
+  assert_eq!(resolve_format(None), zstd_pack);
+  assert_eq!(resolve_format(Some("  ")), zstd_pack);
+  assert_eq!(resolve_format(Some(".pack.zst")), zstd_pack);
   assert_eq!(resolve_format(Some(".zstd")), ArchiveFormat::Zstd.into());
   assert_eq!(resolve_format(Some("db.zstd")), ArchiveFormat::Zstd.into());
   assert_eq!(resolve_format(Some("not-supported")), ArchiveFormat::Zstd.into());
@@ -842,7 +843,6 @@ fn resolves_configured_extension_or_falls_back_to_zstd() {
   } else {
     ArchiveFormat::Zstd
   };
-  assert_eq!(resolve_format(None), expected_xz.into());
   assert_eq!(resolve_format(Some(".xz")), expected_xz.into());
   assert_eq!(resolve_format(Some(".pack.xz")), expected_xz.into());
   assert_eq!(resolve_format(Some("lzma")), expected_xz.into());

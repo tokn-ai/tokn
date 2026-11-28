@@ -325,11 +325,11 @@ databases at startup and every six hours. On Unix the frontend keeps that task
 running across worker replacements. A worker configured with a separate request
 history directory maintains that directory.
 By default, it compresses days at least 7 days old and prunes the original `.db`
-files at 10 days, after verifying them against their archives. XZ archival of
-supported request databases writes one `<day>.pack.xz` file. Set
-`archive_extension = "pack.zst"` under `[service.persistence]` to write
-`<day>.pack.zst` with Zstandard level 19. Unsupported database schemas use
-a compressed SQLite snapshot. Tokn Pack holds the
+files at 10 days, after verifying them against their archives. The default
+writes one `<day>.pack.zst` file per supported request database using Zstandard
+level 19. It writes a `<day>.db.zstd` snapshot for databases it cannot pack.
+In a build with XZ support, set `archive_extension = "pack.xz"`
+under `[service.persistence]` or legacy `[db]` to use XZ. Tokn Pack holds the
 SQLite metadata snapshot, original captured headers, body hashes and offsets,
 and packed bodies. The outer compression layer compresses the whole pack, including
 SQLite, in independently readable chunks of up to 64 MiB. Bodies use exact
@@ -342,15 +342,15 @@ pruning waits for a later scan.
 Set `archive_after_days` and `prune_after_days` under
 `[service.persistence]` to change these cutoffs.
 
-To convert existing archives, update `archive_extension` and run
-`tokn-gateway requests migrate`. The preview encodes to the configured
-format to measure the output size and hash, including for days whose
-SQLite source was already pruned. It discards the encoded bytes. Add
-`--commit` to write and verify the destination archives while retaining
-each source. The terminal shows the active step's byte count and throughput.
-Each completed day prints one row with a colored status and the original and
-preview or final compressed sizes. Terminal rows show hash prefixes, and
-redirected output includes full SHA-256 hashes and byte counts.
+Run `tokn-gateway requests migrate` to convert existing archives to the
+configured format. The dry run measures the uncompressed pack
+or SQLite payload, including for days whose SQLite source was already pruned.
+Add `--commit` to compress, write, and verify the destination archives while
+retaining each source. The terminal shows the active step's byte count and
+throughput. Each completed day prints one row with a colored status, the
+original archive size and hash, and the destination payload size. A written
+destination also reports its compressed size and hash. Terminal rows show
+hash prefixes, and redirected output includes full SHA-256 hashes and byte counts.
 
 `tokn-gateway requests prune` previews eligible SQLite files and alternate
 archives. With `--commit`, it removes an alternate archive only when the

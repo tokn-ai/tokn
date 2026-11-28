@@ -116,6 +116,11 @@ struct ArchivePreference {
 }
 
 impl ArchivePreference {
+  const ZSTD_PACK: Self = Self {
+    indexed: Some(IndexedArchiveFormat::Zstd),
+    snapshot_format: ArchiveFormat::Zstd,
+  };
+
   fn target(self) -> ArchiveContents {
     match self.indexed {
       Some(format) => ArchiveContents::IndexedPack(format),
@@ -150,18 +155,11 @@ fn resolve_format(configured_extension: Option<&str>) -> ArchivePreference {
 
 fn configured_format(configured_extension: Option<&str>) -> io::Result<ArchivePreference> {
   let Some(value) = configured_extension.map(str::trim).filter(|value| !value.is_empty()) else {
-    return Ok(if cfg!(feature = "lzma") {
-      ArchiveFormat::Xz.into()
-    } else {
-      ArchiveFormat::Zstd.into()
-    });
+    return Ok(ArchivePreference::ZSTD_PACK);
   };
   let normalized = value.trim_start_matches('.').to_ascii_lowercase();
   let format = match normalized.as_str() {
-    "zst" | "pack.zst" | "pack.zstd" => ArchivePreference {
-      indexed: Some(IndexedArchiveFormat::Zstd),
-      snapshot_format: ArchiveFormat::Zstd,
-    },
+    "zst" | "pack.zst" | "pack.zstd" => ArchivePreference::ZSTD_PACK,
     "zstd" | "db.zstd" => ArchiveFormat::Zstd.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" => {

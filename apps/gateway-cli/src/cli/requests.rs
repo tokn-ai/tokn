@@ -21,7 +21,7 @@ pub enum RequestsCmd {
 
 #[derive(Args, Debug)]
 pub struct MigrateArgs {
-  /// Write and verify archives in the configured format. The default is a dry run.
+  /// Compress, write, and verify archives. The default dry run measures uncompressed target payloads.
   #[arg(long)]
   pub commit: bool,
 }
@@ -386,7 +386,7 @@ fn write_migration_day(
 ) -> io::Result<()> {
   let day = entry.day.to_string();
   let (status, color, reason) = match &entry.outcome {
-    MigrationOutcome::WouldMigrate => {
+    MigrationOutcome::WouldMigrate { .. } => {
       counts.changed += 1;
       ("WOULD WRITE", Color::Cyan, None)
     }
@@ -432,16 +432,22 @@ fn write_migration_day(
     if !sources.is_empty() {
       write!(out, " -> ")?;
     }
-    let size_label = match entry.outcome {
-      MigrationOutcome::WouldMigrate => "preview",
-      MigrationOutcome::Migrated | MigrationOutcome::Verified => "final",
-      _ => "destination",
+    let destination = match &entry.outcome {
+      MigrationOutcome::WouldMigrate { size } => format!(
+        "{} ({})",
+        day_filename(&entry.destination, &day),
+        migration_payload_label(*size, row_style.compact)
+      ),
+      outcome => {
+        let size_label = if matches!(outcome, MigrationOutcome::Migrated | MigrationOutcome::Verified) {
+          "final"
+        } else {
+          "destination"
+        };
+        migration_file_label(&entry.destination, &day, &entry.files, size_label, row_style.compact)
+      }
     };
-    write!(
-      out,
-      "{}",
-      migration_file_label(&entry.destination, &day, &entry.files, size_label, row_style.compact)
-    )?;
+    write!(out, "{destination}")?;
   }
   if let Some(reason) = reason {
     write!(out, " | {reason}")?;
@@ -460,18 +466,12 @@ fn migration_file_label(
   let Some(file) = files.iter().find(|file| file.path == path) else {
     return name;
   };
-  let size = |bytes| {
-    if compact {
-      HumanBytes(bytes).to_string()
-    } else {
-      format!("{} ({bytes} bytes)", HumanBytes(bytes))
-    }
-  };
-  let mut fields = vec![format!("{size_label} {}", size(file.compressed_bytes))];
-  match file.uncompressed {
-    Some(MigrationPayloadSize::Sqlite(bytes)) => fields.push(format!("DB {}", size(bytes))),
-    Some(MigrationPayloadSize::Pack(bytes)) => fields.push(format!("pack {}", size(bytes))),
-    None => (),
+  let mut fields = vec![format!(
+    "{size_label} {}",
+    migration_bytes(file.compressed_bytes, compact)
+  )];
+  if let Some(payload) = file.uncompressed {
+    fields.push(migration_payload_label(payload, compact));
   }
   if let Some(prefix) = file.sha256.get(..12).filter(|_| compact && file.sha256.len() > 12) {
     fields.push(format!("sha256 {prefix}…"));
@@ -479,6 +479,22 @@ fn migration_file_label(
     fields.push(format!("sha256 {}", file.sha256));
   }
   format!("{name} ({})", fields.join(", "))
+}
+
+fn migration_payload_label(size: MigrationPayloadSize, compact: bool) -> String {
+  let (label, bytes) = match size {
+    MigrationPayloadSize::Sqlite(bytes) => ("DB", bytes),
+    MigrationPayloadSize::Pack(bytes) => ("pack", bytes),
+  };
+  format!("{label} {}", migration_bytes(bytes, compact))
+}
+
+fn migration_bytes(bytes: u64, compact: bool) -> String {
+  if compact {
+    HumanBytes(bytes).to_string()
+  } else {
+    format!("{} ({bytes} bytes)", HumanBytes(bytes))
+  }
 }
 
 fn write_migration_summary(out: &mut impl Write, counts: &MigrationCounts, commit: bool) -> io::Result<()> {
@@ -672,6 +688,13 @@ mod tests {
   use time::macros::date;
 
   fn write_v2_config(directory: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+    write_v2_config_with_archive_extension(directory, Some("db.zstd"))
+  }
+
+  fn write_v2_config_with_archive_extension(
+    directory: &tempfile::TempDir,
+    archive_extension: Option<&str>,
+  ) -> (PathBuf, PathBuf) {
     let requests_dir = directory.path().join("requests");
     std::fs::create_dir(&requests_dir).unwrap();
     let config_path = directory.path().join("config.toml");
@@ -679,8 +702,12 @@ mod tests {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke.toml");
     let mut config = std::fs::read_to_string(fixture).unwrap();
     config.push_str(&format!(
-      "\n[service.persistence]\nrequests_dir = {serialized_requests_dir}\narchive_extension = \"db.zstd\"\n"
+      "\n[service.persistence]\nrequests_dir = {serialized_requests_dir}\n"
     ));
+    if let Some(extension) = archive_extension {
+      let serialized_extension = serde_json::to_string(extension).unwrap();
+      config.push_str(&format!("archive_extension = {serialized_extension}\n"));
+    }
     std::fs::write(&config_path, config).unwrap();
     (config_path, requests_dir)
   }
@@ -746,21 +773,15 @@ mod tests {
         day: date!(2026 - 05 - 01),
         sources: vec![original.clone()],
         destination: destination.clone(),
-        outcome: MigrationOutcome::WouldMigrate,
-        files: vec![
-          MigrationFileStats {
-            path: original,
-            compressed_bytes: 1024,
-            sha256: "aa".repeat(32),
-            uncompressed: Some(MigrationPayloadSize::Sqlite(8192)),
-          },
-          MigrationFileStats {
-            path: destination.clone(),
-            compressed_bytes: 512,
-            sha256: "bb".repeat(32),
-            uncompressed: Some(MigrationPayloadSize::Pack(4096)),
-          },
-        ],
+        outcome: MigrationOutcome::WouldMigrate {
+          size: MigrationPayloadSize::Pack(4096),
+        },
+        files: vec![MigrationFileStats {
+          path: original,
+          compressed_bytes: 1024,
+          sha256: "aa".repeat(32),
+          uncompressed: Some(MigrationPayloadSize::Sqlite(8192)),
+        }],
       },
       MigrationEntry {
         day: date!(2026 - 05 - 02),
@@ -805,8 +826,8 @@ mod tests {
     assert!(row.contains(".db.zstd (original 1.00 KiB (1024 bytes)"));
     assert!(row.contains("DB 8.00 KiB (8192 bytes)"));
     assert!(row.contains(&format!("sha256 {}", "aa".repeat(32))));
-    assert!(row.contains(" -> .pack.zst (preview 512 B (512 bytes), pack 4.00 KiB (4096 bytes)"));
-    assert!(row.contains(&format!("sha256 {}", "bb".repeat(32))));
+    let (_, planned) = row.split_once(" -> ").unwrap();
+    assert_eq!(planned, ".pack.zst (pack 4.00 KiB (4096 bytes))");
     assert!(!destination.exists());
     assert_eq!(output.matches("2026-05-01").count(), 1);
     assert!(!output.contains("2026-05-02"));
@@ -839,7 +860,7 @@ mod tests {
   }
 
   #[test]
-  fn migration_rows_show_final_measurements_in_plain_and_colored_output() {
+  fn migration_rows_format_measurements_in_plain_and_colored_output() {
     let requests_dir = Path::new("fixture-requests");
     let source = requests_dir.join("2026-05-01.db.xz");
     let destination = requests_dir.join("2026-05-01.pack.zst");
@@ -909,6 +930,17 @@ mod tests {
     assert!(!row.contains(&destination_hash[..13]));
     assert!(!row.contains("16384 bytes"));
     assert_eq!(counts.verified, 1);
+
+    output.clear();
+    entry.destination = requests_dir.join("2026-05-01.db.zstd");
+    entry.files.truncate(1);
+    entry.outcome = MigrationOutcome::WouldMigrate {
+      size: MigrationPayloadSize::Sqlite(8192),
+    };
+    write_migration_day(&mut output, &entry, &mut counts, terminal).unwrap();
+    let row = console::strip_ansi_codes(std::str::from_utf8(&output).unwrap());
+    let (_, planned) = row.trim_end().split_once(" -> ").unwrap();
+    assert_eq!(planned, ".db.zstd (DB 8.00 KiB)");
   }
 
   #[test]
@@ -1086,12 +1118,17 @@ mod tests {
 
   #[tokio::test]
   async fn migrate_and_prune_use_the_same_configured_archive_target() {
+    assert_migrate_and_prune_use_pack(Some("pack.zst")).await;
+  }
+
+  #[tokio::test]
+  async fn migrate_and_prune_default_to_pack_when_archive_extension_is_omitted() {
+    assert_migrate_and_prune_use_pack(None).await;
+  }
+
+  async fn assert_migrate_and_prune_use_pack(archive_extension: Option<&str>) {
     let directory = tempfile::tempdir().unwrap();
-    let (config_path, requests_dir) = write_v2_config(&directory);
-    let config = std::fs::read_to_string(&config_path)
-      .unwrap()
-      .replace("archive_extension = \"db.zstd\"", "archive_extension = \"pack.zst\"");
-    std::fs::write(&config_path, config).unwrap();
+    let (config_path, requests_dir) = write_v2_config_with_archive_extension(&directory, archive_extension);
     let database = requests_dir.join("2000-01-01.db");
     let snapshot = requests_dir.join("2000-01-01.db.zstd");
     let destination = requests_dir.join("2000-01-01.pack.zst");

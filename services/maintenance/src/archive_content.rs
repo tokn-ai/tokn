@@ -58,6 +58,37 @@ pub(super) fn verify_equivalent(
   }
 }
 
+/// Measure the decoded source and target payloads without compressing the target.
+pub(super) fn measure_conversion(
+  source: &mut File,
+  source_format: ArchiveContents,
+  target_format: ArchiveContents,
+  progress: &mut impl FnMut(ContentProgress),
+) -> io::Result<ConversionSizes> {
+  check_conversion(source_format, target_format)?;
+  let (source_bytes, target_bytes) = match (source_format, target_format) {
+    (ArchiveContents::Snapshot(format), ArchiveContents::Snapshot(_)) => {
+      progress(ContentProgress::Stage("Measuring SQLite snapshot"));
+      let bytes = copy_with_progress(open_snapshot(source, format)?, io::sink(), progress)?;
+      (bytes, bytes)
+    }
+    (ArchiveContents::IndexedPack(format), ArchiveContents::IndexedPack(_)) => {
+      progress(ContentProgress::Stage("Measuring indexed pack"));
+      let bytes = copy_with_progress(open_indexed(source, format)?, io::sink(), progress)?;
+      (bytes, bytes)
+    }
+    (ArchiveContents::Snapshot(format), ArchiveContents::IndexedPack(_)) => {
+      let (capture, source_bytes) = capture_snapshot(source, format, progress)?;
+      (source_bytes, write_pack(&capture, io::sink(), progress)?)
+    }
+    (ArchiveContents::IndexedPack(_), ArchiveContents::Snapshot(_)) => return Err(indexed_snapshot_unsupported()),
+  };
+  Ok(ConversionSizes {
+    source_bytes,
+    target_bytes,
+  })
+}
+
 /// Encode a conversion to a fresh output stream.
 pub(super) fn convert(
   source: &mut File,
@@ -90,13 +121,8 @@ pub(super) fn convert(
     }
     (ArchiveContents::Snapshot(source_format), ArchiveContents::IndexedPack(target_format)) => {
       let (capture, source_bytes) = capture_snapshot(source, source_format, progress)?;
-      progress(ContentProgress::Stage("Building indexed pack"));
       let mut encoder = target_format.writer(BufWriter::new(output))?;
-      let target_bytes = {
-        let mut writer = TrackedIo::new(&mut encoder, &mut *progress);
-        indexed::write(&capture, &mut writer, &mut |_| Ok(()))?;
-        writer.bytes
-      };
+      let target_bytes = write_pack(&capture, &mut encoder, progress)?;
       progress(ContentProgress::Stage("Finishing archive"));
       encoder.finish()?.flush()?;
       (source_bytes, target_bytes)
@@ -107,6 +133,17 @@ pub(super) fn convert(
     source_bytes,
     target_bytes,
   })
+}
+
+fn write_pack(
+  capture: &RequestPack,
+  output: impl Write,
+  progress: &mut impl FnMut(ContentProgress),
+) -> io::Result<u64> {
+  progress(ContentProgress::Stage("Building indexed pack"));
+  let mut writer = TrackedIo::new(output, progress);
+  indexed::write(capture, &mut writer, &mut |_| Ok(()))?;
+  Ok(writer.bytes)
 }
 
 pub(super) fn open_snapshot(source: &mut File, format: ArchiveFormat) -> io::Result<Box<dyn Read + '_>> {
@@ -303,6 +340,8 @@ mod tests {
     let mut frames = tempfile::tempfile()?;
     encode_archive(&mut frames, ArchiveFormat::Zstd, |output| output.write_all(b"one"))?;
     encode_archive(&mut frames, ArchiveFormat::Zstd, |output| output.write_all(b" two"))?;
+    let measured = measure_conversion(&mut frames, format, format, &mut |_| {})?;
+    assert_eq!((measured.source_bytes, measured.target_bytes), (7, 7));
     let mut converted = tempfile::tempfile()?;
     let mut converted_bytes = 0;
     let sizes = convert(&mut frames, format, &mut converted, format, &mut |progress| {

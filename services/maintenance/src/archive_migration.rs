@@ -5,8 +5,7 @@ use crate::{
   archive_days, configured_format, hash_reader, hex_digest, sync_archive_directory, ArchiveContents, ArchiveSet,
   ArchiveSetError,
 };
-use sha2::{Digest, Sha256};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use time::Date;
 use tokn_persistence::request_files::{RequestDayLock, RequestMaintenanceLock};
@@ -34,29 +33,19 @@ pub struct MigrationFileStats {
   pub uncompressed: Option<MigrationPayloadSize>,
 }
 
-/// Hash and count encoded bytes while discarding them.
-#[derive(Default)]
-struct PreviewArchive {
-  compressed_bytes: u64,
-  digest: Sha256,
-}
-
-impl Write for PreviewArchive {
-  fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-    self.digest.update(bytes);
-    self.compressed_bytes += bytes.len() as u64;
-    Ok(bytes.len())
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    Ok(())
-  }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MigrationPayloadSize {
   Sqlite(u64),
   Pack(u64),
+}
+
+impl MigrationPayloadSize {
+  fn from_format(format: ArchiveContents, bytes: u64) -> Self {
+    match format {
+      ArchiveContents::Snapshot(_) => Self::Sqlite(bytes),
+      ArchiveContents::IndexedPack(_) => Self::Pack(bytes),
+    }
+  }
 }
 
 pub enum MigrationProgressEvent<'a> {
@@ -69,7 +58,7 @@ pub enum MigrationProgressEvent<'a> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrationOutcome {
-  WouldMigrate,
+  WouldMigrate { size: MigrationPayloadSize },
   Migrated,
   Verified,
   InUse,
@@ -77,7 +66,7 @@ pub enum MigrationOutcome {
   Failed { error: String },
 }
 
-/// Verify existing archives and optionally publish missing destinations. Sources are retained.
+/// Verify existing archives and measure uncompressed targets or publish them. Sources are retained.
 pub fn migrate_request_archives(
   dir: &Path,
   archive_extension: Option<&str>,
@@ -227,10 +216,7 @@ fn file_stats(
     path: path.to_path_buf(),
     compressed_bytes,
     sha256: hex_digest(digest),
-    uncompressed: uncompressed_bytes.map(|bytes| match format {
-      ArchiveContents::Snapshot(_) => MigrationPayloadSize::Sqlite(bytes),
-      ArchiveContents::IndexedPack(_) => MigrationPayloadSize::Pack(bytes),
-    }),
+    uncompressed: uncompressed_bytes.map(|bytes| MigrationPayloadSize::from_format(format, bytes)),
   }
 }
 
@@ -257,19 +243,14 @@ fn migrate_verified_day(
     .unwrap_or(0);
   let source = &mut set.archives[source_index];
   if !commit {
-    let mut preview = PreviewArchive::default();
-    let sizes = archive_content::convert(source.file.file_mut(), source.format, &mut preview, target, progress)?;
+    let sizes = archive_content::measure_conversion(source.file.file_mut(), source.format, target, progress)?;
     source.uncompressed_bytes = Some(sizes.source_bytes);
     set.recheck_with_progress(progress)?;
     return Ok((
-      MigrationOutcome::WouldMigrate,
-      Some(file_stats(
-        destination,
-        target,
-        preview.compressed_bytes,
-        &preview.digest.finalize().into(),
-        Some(sizes.target_bytes),
-      )),
+      MigrationOutcome::WouldMigrate {
+        size: MigrationPayloadSize::from_format(target, sizes.target_bytes),
+      },
+      None,
     ));
   }
 
@@ -335,6 +316,7 @@ fn migrate_verified_day(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use sha2::{Digest, Sha256};
   use std::fs::{self, File};
   use time::macros::date;
   use tokn_persistence::requests::open_day_db;
@@ -380,26 +362,36 @@ mod tests {
     };
     let mut finished = Vec::new();
     let mut reported_bytes = 0;
+    let mut stages = Vec::new();
     let preview = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), false, |event| match event {
       MigrationProgressEvent::BytesProcessed { bytes } => reported_bytes += bytes,
       MigrationProgressEvent::DayFinished(entry) => finished.push(entry.clone()),
+      MigrationProgressEvent::StageStarted { label } => stages.push(label),
       _ => (),
     })?;
     assert_eq!(preview.target_extension, "pack.zst");
     assert_eq!(finished, preview.entries);
     assert!(reported_bytes >= source_stats.compressed_bytes);
+    assert_eq!(
+      stages,
+      [
+        "Hash archive input",
+        "Restoring SQLite snapshot",
+        "Capturing request data",
+        "Building indexed pack",
+        "Recheck archive inputs",
+      ]
+    );
     let [entry] = preview.entries.as_slice() else {
       panic!("expected one candidate");
     };
     assert_eq!(entry.day, day);
     assert_eq!(entry.sources.as_slice(), std::slice::from_ref(&source));
     assert_eq!(entry.destination, destination);
-    assert_eq!(entry.outcome, MigrationOutcome::WouldMigrate);
-    assert_eq!(entry.files[0], source_stats);
-    let preview_stats = &entry.files[1];
-    assert_eq!(preview_stats.path, destination);
-    assert!(preview_stats.compressed_bytes > 0);
-    assert!(matches!(preview_stats.uncompressed, Some(MigrationPayloadSize::Pack(bytes)) if bytes > 0));
+    let MigrationOutcome::WouldMigrate { size } = entry.outcome else {
+      panic!("expected an uncompressed pack preview");
+    };
+    assert_eq!(entry.files, std::slice::from_ref(&source_stats));
     assert!(!destination.exists());
 
     let commit = migrate_request_archives(dir.path(), Some("pack.zst"), true)?;
@@ -413,7 +405,7 @@ mod tests {
       )),
     };
     assert_eq!(commit.entries[0].outcome, MigrationOutcome::Migrated);
-    assert_eq!(preview_stats, &final_stats);
+    assert_eq!(Some(size), final_stats.uncompressed);
     assert_eq!(commit.entries[0].files, [source_stats, final_stats]);
     let existing = migrate_request_archives(dir.path(), Some("pack.zst"), true)?;
     assert_eq!(existing.entries[0].outcome, MigrationOutcome::Verified);
@@ -449,6 +441,16 @@ mod tests {
     let mut encoder = IndexedArchiveFormat::Xz.writer(File::create(&source)?)?;
     encoder.write_all(&original)?;
     encoder.finish()?;
+
+    let preview = migrate_request_archives(dir.path(), Some("pack.zst"), false)?;
+    let [entry] = preview.entries.as_slice() else {
+      panic!("expected one previewed archive");
+    };
+    let size = MigrationPayloadSize::Pack(original.len() as u64);
+    assert_eq!(entry.outcome, MigrationOutcome::WouldMigrate { size });
+    assert_eq!(entry.files.len(), 1);
+    assert_eq!(entry.files[0].uncompressed, Some(size));
+    assert!(!entry.destination.exists());
 
     let report = migrate_request_archives(dir.path(), Some("pack.zst"), true)?;
     let [entry] = report.entries.as_slice() else {
