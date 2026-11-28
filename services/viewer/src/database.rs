@@ -9,7 +9,7 @@ use crate::days::DayFile;
 use crate::Result;
 use tokn_persistence::indexed_archive::{IndexedArchiveFormat, IndexedArchiveReader};
 use tokn_persistence::request_archive::indexed::IndexedPackReader;
-use tokn_persistence::request_files::{begin_read, ArchiveContents, ArchiveFormat, StableFile};
+use tokn_persistence::request_files::{begin_read, ArchiveFormat, StableFile};
 
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(2_500);
 
@@ -28,7 +28,7 @@ enum DayStorage {
   Sqlite {
     // Drop the connection before removing its private snapshot on Windows.
     conn: Connection,
-    snapshot: Option<(tempfile::TempDir, ArchiveContents)>,
+    _snapshot: Option<tempfile::TempDir>,
   },
   Indexed(Box<CompressedArchive>),
 }
@@ -39,23 +39,6 @@ impl DayConnection {
       return Ok(reader.read_body(request_id, slot)?);
     }
     Ok(None)
-  }
-
-  pub(super) fn body_is_decoded(&self, request_id: &str, slot: u8) -> rusqlite::Result<bool> {
-    if !matches!(
-      self.0,
-      DayStorage::Sqlite {
-        snapshot: Some((_, ArchiveContents::RequestPack)),
-        ..
-      }
-    ) {
-      return Ok(false);
-    }
-    self.query_row(
-      "SELECT EXISTS (SELECT 1 FROM tokn_archive_decoded_bodies WHERE request_id = ?1 AND slot = ?2)",
-      (request_id, slot),
-      |row| row.get(0),
-    )
   }
 }
 
@@ -75,14 +58,6 @@ impl DayFile {
   }
 
   pub(super) fn open_with_timeout(&self, timeout: Duration) -> Result<Option<DayConnection>> {
-    self.open_with_archive_scope(timeout, None)
-  }
-
-  pub(super) fn open_request(&self, request_id: &str) -> Result<Option<DayConnection>> {
-    self.open_with_archive_scope(READ_BUSY_TIMEOUT, Some(request_id))
-  }
-
-  fn open_with_archive_scope(&self, timeout: Duration, request_id: Option<&str>) -> Result<Option<DayConnection>> {
     let mut error = match self.open_raw(timeout) {
       Ok(Some(conn)) => return Ok(Some(conn)),
       Ok(None) => None,
@@ -115,7 +90,7 @@ impl DayFile {
       if !regular_file(&path)? {
         continue;
       }
-      match open_archive(&path, format, timeout, request_id) {
+      match open_archive(&path, format, timeout) {
         Ok(conn) => return Ok(Some(conn)),
         Err(err) => {
           error.get_or_insert(err);
@@ -134,7 +109,7 @@ impl DayFile {
     }
     let conn = tokn_persistence::open_readonly(&self.path, timeout)?;
     begin_read(&conn)?;
-    Ok(Some(DayConnection(DayStorage::Sqlite { conn, snapshot: None })))
+    Ok(Some(DayConnection(DayStorage::Sqlite { conn, _snapshot: None })))
   }
 }
 
@@ -153,12 +128,7 @@ fn open_indexed_archive(path: &Path, format: IndexedArchiveFormat, timeout: Dura
   Ok(DayConnection(DayStorage::Indexed(Box::new(reader))))
 }
 
-fn open_archive(
-  path: &Path,
-  format: ArchiveFormat,
-  timeout: Duration,
-  request_id: Option<&str>,
-) -> Result<DayConnection> {
+fn open_archive(path: &Path, format: ArchiveFormat, timeout: Duration) -> Result<DayConnection> {
   let input = BufReader::new(File::open(path)?);
   let mut builder = tempfile::Builder::new();
   builder.prefix("tokn-viewer-");
@@ -169,14 +139,11 @@ fn open_archive(
   }
   let directory = builder.tempdir()?;
   let db = directory.path().join("requests.db");
-  let contents = match request_id {
-    Some(request_id) => format.restore_request(input, &db, request_id)?,
-    None => format.restore_metadata(input, &db)?,
-  };
+  format.restore(input, &db)?;
   let conn = tokn_persistence::open_readonly(&db, timeout)?;
   begin_read(&conn)?;
   Ok(DayConnection(DayStorage::Sqlite {
     conn,
-    snapshot: Some((directory, contents)),
+    _snapshot: Some(directory),
   }))
 }

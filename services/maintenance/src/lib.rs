@@ -86,17 +86,20 @@ pub enum PruneProgressEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArchivePreference {
   indexed: Option<IndexedArchiveFormat>,
-  legacy: ArchiveFormat,
+  snapshot_format: ArchiveFormat,
 }
 
 impl From<ArchiveFormat> for ArchivePreference {
-  fn from(legacy: ArchiveFormat) -> Self {
-    let indexed = match legacy {
+  fn from(snapshot_format: ArchiveFormat) -> Self {
+    let indexed = match snapshot_format {
       #[cfg(feature = "lzma")]
       ArchiveFormat::Xz => Some(IndexedArchiveFormat::Xz),
       _ => None,
     };
-    Self { indexed, legacy }
+    Self {
+      indexed,
+      snapshot_format,
+    }
   }
 }
 
@@ -112,7 +115,7 @@ fn resolve_format(configured_extension: Option<&str>) -> ArchivePreference {
   match normalized.as_str() {
     "zst" | "pack.zst" | "pack.zstd" => ArchivePreference {
       indexed: Some(IndexedArchiveFormat::Zstd),
-      legacy: ArchiveFormat::Zstd,
+      snapshot_format: ArchiveFormat::Zstd,
     },
     "zstd" | "db.zstd" => ArchiveFormat::Zstd.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz.into(),
@@ -303,7 +306,7 @@ fn prune_request_db(
       };
     }
   };
-  let contents = match ArchiveContents::inspect(&mut archive_file) {
+  let contents = match ArchiveContents::from_path(archive_file.path()) {
     Ok(contents) => contents,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -328,13 +331,13 @@ fn prune_request_db(
     }
   };
   let source_sha256 = hex_digest(&source_digest);
-  if matches!(contents, ArchiveContents::Sqlite(_)) && source_digest != archived_digest {
+  if matches!(contents, ArchiveContents::Snapshot(_)) && source_digest != archived_digest {
     return PruneOutcome::HashMismatch {
       source_sha256,
       archived_sha256: hex_digest(&archived_digest),
     };
   }
-  if let ArchiveContents::Pack(format) = contents {
+  if let ArchiveContents::IndexedPack(format) = contents {
     let verified = RequestPack::capture(&source_file, &mut |bytes| {
       check_cancelled(cancelled)?;
       progress(bytes);
@@ -343,7 +346,7 @@ fn prune_request_db(
     .and_then(|pack| {
       pack.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "source cannot match a request pack"))
     })
-    .and_then(|snapshot| format.verify(&mut archive_file, &snapshot, cancelled, progress));
+    .and_then(|snapshot| pack::verify_indexed(format, &mut archive_file, &snapshot, cancelled, progress));
     if let Err(error) = verified {
       return PruneOutcome::Failed {
         error: format!("verify request pack {}: {error}", archive.display()),
@@ -435,22 +438,18 @@ fn hash_archive(
 
 #[derive(Clone, Copy)]
 enum ArchiveContents {
-  Sqlite(ArchiveFormat),
-  Pack(pack::Format),
+  Snapshot(ArchiveFormat),
+  IndexedPack(IndexedArchiveFormat),
 }
 
 impl ArchiveContents {
-  fn inspect(file: &mut StableFile) -> io::Result<Self> {
-    if let Some(format) = IndexedArchiveFormat::from_path(file.path()) {
-      return Ok(Self::Pack(pack::Format::Indexed(format)));
+  fn from_path(path: &Path) -> io::Result<Self> {
+    if let Some(format) = IndexedArchiveFormat::from_path(path) {
+      return Ok(Self::IndexedPack(format));
     }
-    let format = ArchiveFormat::from_path(file.path())
-      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unrecognized request archive extension"))?;
-    #[cfg(feature = "lzma")]
-    if format == ArchiveFormat::Xz && pack::is_pack(file)? {
-      return Ok(Self::Pack(pack::Format::LegacyXz));
-    }
-    Ok(Self::Sqlite(format))
+    ArchiveFormat::from_path(path)
+      .map(Self::Snapshot)
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unrecognized request archive extension"))
   }
 }
 
@@ -463,8 +462,8 @@ fn archive_digest(
   match contents {
     // Packs are compared logically. Recheck their complete compressed bytes
     // before deletion to detect changes after that comparison.
-    ArchiveContents::Pack(_) => hash_file(file, cancelled, progress),
-    ArchiveContents::Sqlite(format) => hash_archive(file, format, cancelled, progress),
+    ArchiveContents::IndexedPack(_) => hash_file(file, cancelled, progress),
+    ArchiveContents::Snapshot(format) => hash_archive(file, format, cancelled, progress),
   }
 }
 
@@ -801,12 +800,12 @@ fn archive_path(path: &Path, format: ArchiveFormat) -> PathBuf {
 }
 
 fn existing_archive_path(path: &Path, preference: ArchivePreference) -> io::Result<PathBuf> {
-  let legacy = archive_path(path, preference.legacy);
+  let snapshot_path = archive_path(path, preference.snapshot_format);
   let candidates = preference
     .indexed
     .into_iter()
     .map(|format| format.path(path))
-    .chain(std::iter::once(legacy.clone()))
+    .chain(std::iter::once(snapshot_path.clone()))
     .chain(
       IndexedArchiveFormat::ALL
         .iter()
@@ -820,7 +819,7 @@ fn existing_archive_path(path: &Path, preference: ArchivePreference) -> io::Resu
         ArchiveFormat::Xz,
       ]
       .into_iter()
-      .filter(|&format| format != preference.legacy)
+      .filter(|&format| format != preference.snapshot_format)
       .map(|format| archive_path(path, format)),
     );
   for archive in candidates {
@@ -830,7 +829,7 @@ fn existing_archive_path(path: &Path, preference: ArchivePreference) -> io::Resu
       Err(error) => return Err(error),
     }
   }
-  Ok(legacy)
+  Ok(snapshot_path)
 }
 
 fn temp_archive_path(archive: &Path) -> PathBuf {
@@ -845,13 +844,13 @@ fn temp_archive_path(archive: &Path) -> PathBuf {
 
 fn compress_db(
   db: &Path,
-  legacy_archive: &Path,
+  snapshot_path: &Path,
   preference: ArchivePreference,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
   id: &str,
 ) -> io::Result<PathBuf> {
-  let temp = temp_archive_path(legacy_archive);
+  let temp = temp_archive_path(snapshot_path);
   if temp.exists() {
     fs::remove_file(&temp)?;
   }
@@ -862,7 +861,7 @@ fn compress_db(
   let total_bytes = source_metadata.len();
   let planned_archive = preference
     .indexed
-    .map_or_else(|| legacy_archive.to_path_buf(), |format| format.path(db));
+    .map_or_else(|| snapshot_path.to_path_buf(), |format| format.path(db));
   emit(
     events,
     ArchiveEvent::FileStarted {
@@ -902,7 +901,7 @@ fn compress_db(
     }
 
     let mut output = BufWriter::new(create_archive_temp(&temp)?);
-    encode_snapshot(&mut source, &mut output, preference.legacy, &mut update)?;
+    encode_snapshot(&mut source, &mut output, preference.snapshot_format, &mut update)?;
     let bytes_out = output.get_ref().metadata()?.len();
     if bytes_out == 0 {
       return Err(io::Error::new(io::ErrorKind::WriteZero, "empty archive"));
@@ -910,8 +909,8 @@ fn compress_db(
     output.get_ref().sync_all()?;
     drop(output);
     recheck_archive_source(&source, &source_metadata, cancelled)?;
-    fs::rename(&temp, legacy_archive)?;
-    Ok((legacy_archive.to_path_buf(), bytes_out))
+    fs::rename(&temp, snapshot_path)?;
+    Ok((snapshot_path.to_path_buf(), bytes_out))
   })();
 
   match result {

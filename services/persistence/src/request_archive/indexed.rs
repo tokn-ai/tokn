@@ -459,6 +459,60 @@ mod tests {
     Ok((snapshot, target))
   }
 
+  fn rewrite_metadata(
+    bytes: &[u8],
+    offset: usize,
+    change: impl FnOnce(&Connection) -> anyhow::Result<()>,
+  ) -> anyhow::Result<Vec<u8>> {
+    let trailer = bytes.len() - TRAILER_LEN as usize;
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("metadata.db");
+    std::fs::write(&path, &bytes[offset..trailer])?;
+    let conn = Connection::open(&path)?;
+    change(&conn)?;
+    drop(conn);
+
+    let metadata = std::fs::read(&path)?;
+    let mut rewritten = bytes[..offset].to_vec();
+    rewritten.extend_from_slice(&metadata);
+    rewritten.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+    rewritten.extend_from_slice(&MAGIC);
+    Ok(rewritten)
+  }
+
+  #[test]
+  fn verifies_metadata_values_independent_of_sqlite_page_layout() -> anyhow::Result<()> {
+    let (snapshot, _) = fixture()?;
+    let mut bytes = Vec::new();
+    write(&snapshot, &mut bytes, &mut |_| Ok(()))?;
+    verify(&snapshot, &mut Cursor::new(&bytes), &mut |_| Ok(()))?;
+    let offset = IndexedPackReader::open(Cursor::new(&bytes), Duration::ZERO)?.metadata_offset as usize;
+
+    let rewritten = rewrite_metadata(&bytes, offset, |conn| {
+      let old_page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+      let page_size = if old_page_size == 1024 { 4096 } else { 1024 };
+      conn.pragma_update(None, "page_size", page_size)?;
+      conn.execute_batch("VACUUM")?;
+      let new_page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+      assert_eq!(new_page_size, page_size);
+      Ok(())
+    })?;
+    assert_ne!(rewritten, bytes);
+    verify(&snapshot, &mut Cursor::new(&rewritten), &mut |_| Ok(()))?;
+
+    let changed = rewrite_metadata(&rewritten, offset, |conn| {
+      let rows = conn.execute(
+        "UPDATE request_metadata SET model = 'other model' WHERE request_id = 'first'",
+        [],
+      )?;
+      assert_eq!(rows, 1);
+      Ok(())
+    })?;
+    let error = verify(&snapshot, &mut Cursor::new(&changed), &mut |_| Ok(())).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    Ok(())
+  }
+
   #[test]
   fn reads_metadata_without_scanning_body_objects_and_reconstructs_requested_deltas() -> anyhow::Result<()> {
     let (snapshot, target) = fixture()?;
@@ -542,20 +596,13 @@ mod tests {
     malformed[trailer..trailer + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     assert!(IndexedPackReader::open(Cursor::new(&malformed), Duration::ZERO).is_err());
 
-    let temp = tempfile::tempdir()?;
-    let path = temp.path().join("metadata.db");
-    std::fs::write(&path, &bytes[offset..trailer])?;
-    let conn = Connection::open(&path)?;
-    conn.execute(
-      "UPDATE tokn_archive_objects SET logical_offset = ?1 WHERE depth = 1",
-      [offset as i64],
-    )?;
-    drop(conn);
-    let metadata = std::fs::read(&path)?;
-    bytes.truncate(offset);
-    bytes.extend_from_slice(&metadata);
-    bytes.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(&MAGIC);
+    let bytes = rewrite_metadata(&bytes, offset, |conn| {
+      conn.execute(
+        "UPDATE tokn_archive_objects SET logical_offset = ?1 WHERE depth = 1",
+        [offset as i64],
+      )?;
+      Ok(())
+    })?;
 
     let reader = IndexedPackReader::open(Cursor::new(&bytes), Duration::ZERO)?;
     assert!(reader.read_body("second", 0).is_err());

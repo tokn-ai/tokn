@@ -351,8 +351,8 @@ requests and sessions. The inspector is part of the desktop app; the former
 The viewer reads existing request-day databases, `sessions.db`, and `usage.db`
 locally, including while the gateway is stopped. For an indexed pack, it opens
 the metadata snapshot as a private temporary SQLite database and seeks to the
-chunks needed for a requested body. Legacy compressed archives also open
-through a private temporary SQLite database.
+chunks needed for a requested body. Whole SQLite snapshots (`.db.xz` and
+`.db.zstd`) open through a private temporary database.
 
 The Sessions view reads its list, semantic node tree, and selected-node content
 only from `sessions.db`; opening it does not scan request history. Session and

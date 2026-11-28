@@ -216,23 +216,13 @@ fn reads_decoded_pack_payloads_and_keeps_the_captured_headers() {
     )
     .unwrap();
   assert_eq!(restored_bodies, 0);
-  drop(metadata_snapshot);
-  let selected = day.open_request(request_id).unwrap().unwrap();
-  let snapshot_body_count: i64 = selected
-    .query_row(
-      "SELECT count(inbound_req_body) + count(outbound_req_body) + count(inbound_resp_body) FROM requests",
-      [],
-      |row| row.get(0),
-    )
-    .unwrap();
-  assert_eq!(snapshot_body_count, 0);
-  let (packed_body, flags) = selected
+  let (packed_body, flags) = metadata_snapshot
     .read_indexed_body(request_id, tokn_persistence::request_archive::OUTBOUND_REQUEST_SLOT)
     .unwrap()
     .unwrap();
   assert_eq!(packed_body, request_bytes);
   assert_ne!(flags & tokn_persistence::request_archive::BODY_IS_DECODED, 0);
-  drop(selected);
+  drop(metadata_snapshot);
 
   for (field, expected) in [
     (RequestPayloadField::OutboundReqHeaders, request_headers),
@@ -290,18 +280,13 @@ fn reads_a_legacy_sqlite_xz_archive_without_migrating_it() {
   assert_eq!(version, 7);
 }
 
-#[cfg(feature = "lzma")]
 #[test]
-fn reads_decoded_bodies_in_a_legacy_combined_pack() {
-  use tokn_persistence::archive_xz::BlockWriter;
-  use tokn_persistence::request_archive::RequestPack;
-  use tokn_persistence::request_files::StableFile;
-
+fn decodes_request_bodies_using_captured_headers_in_a_raw_sqlite_archive() {
   let dir = tempfile::tempdir().unwrap();
   let source = dir.path();
   write_request(source, DAY, "archived", 946_684_800_000, None, None);
   let db = source.join(format!("{DAY}.db"));
-  let request = serde_json::json!({"messages":[{"role":"user","content":"legacy pack input"}]});
+  let request = serde_json::json!({"messages":[{"role":"user","content":"raw archive input"}]});
   let wire = zstd::stream::encode_all(request.to_string().as_bytes(), 0).unwrap();
   let headers = serde_json::json!({
     "content-encoding": "zstd",
@@ -316,22 +301,17 @@ fn reads_decoded_bodies_in_a_legacy_combined_pack() {
     .unwrap();
   drop(conn);
 
-  let stable_db = StableFile::open(&db).unwrap();
-  let snapshot = RequestPack::capture(&stable_db, &mut |_| Ok(())).unwrap().unwrap();
-  let archive = fs::File::create_new(db.with_extension(ArchiveFormat::Xz.extension())).unwrap();
-  let mut encoder = BlockWriter::new(archive);
-  snapshot.write(&mut encoder).unwrap();
-  encoder.finish().unwrap();
-  drop(stable_db);
+  let report = archive_requests_once(source, date!(2000 - 01 - 10), 1, ArchiveFormat::Zstd).unwrap();
+  assert_eq!(report.archived, 1);
   fs::remove_file(db).unwrap();
 
   let summary = get_request_llm_summary(source, DAY, "archived", None).unwrap().unwrap();
   assert!(summary.warning.is_none());
-  assert_eq!(summary.messages[0].preview.as_deref(), Some("legacy pack input"));
-  let payload = get_request_payload(source, DAY, "archived", None, RequestPayloadField::InboundReqBody)
+  assert_eq!(summary.messages[0].preview.as_deref(), Some("raw archive input"));
+  let payload = get_request_payload(source, DAY, "archived", None, RequestPayloadField::InboundReqHeaders)
     .unwrap()
     .unwrap();
-  assert_eq!(payload.value, request);
+  assert_eq!(payload.value, headers);
 }
 
 #[cfg(feature = "lzma")]

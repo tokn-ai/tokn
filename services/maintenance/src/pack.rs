@@ -1,50 +1,11 @@
 use std::io::{self, BufReader, BufWriter};
-#[cfg(feature = "lzma")]
-use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use tokn_persistence::indexed_archive::IndexedArchiveFormat;
-#[cfg(feature = "lzma")]
-use tokn_persistence::request_archive::MAGIC;
 use tokn_persistence::request_archive::{indexed, RequestPack};
 use tokn_persistence::request_files::StableFile;
 
 use crate::{check_cancelled, sync_archive_directory};
-
-#[derive(Clone, Copy)]
-pub(super) enum Format {
-  Indexed(IndexedArchiveFormat),
-  #[cfg(feature = "lzma")]
-  LegacyXz,
-}
-
-impl Format {
-  pub(super) fn verify(
-    self,
-    file: &mut StableFile,
-    pack: &RequestPack,
-    cancelled: Option<&AtomicBool>,
-    progress: &mut impl FnMut(u64),
-  ) -> io::Result<()> {
-    match self {
-      Self::Indexed(format) => verify_indexed(format, file, pack, cancelled, progress),
-      #[cfg(feature = "lzma")]
-      Self::LegacyXz => verify_legacy(file, pack, cancelled, progress),
-    }
-  }
-}
-
-#[cfg(feature = "lzma")]
-pub(super) fn is_pack(file: &mut StableFile) -> io::Result<bool> {
-  file.file_mut().rewind()?;
-  let mut reader = lzma_rust2::XzReader::new(BufReader::new(file.file_mut()), false);
-  let mut prefix = [0; MAGIC.len()];
-  match reader.read_exact(&mut prefix) {
-    Ok(()) => Ok(prefix == MAGIC),
-    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
-    Err(error) => Err(error),
-  }
-}
 
 pub(super) fn publish_indexed(
   format: IndexedArchiveFormat,
@@ -74,7 +35,7 @@ pub(super) fn publish_indexed(
   Ok(bytes)
 }
 
-fn verify_indexed(
+pub(super) fn verify_indexed(
   format: IndexedArchiveFormat,
   file: &mut StableFile,
   pack: &RequestPack,
@@ -93,49 +54,4 @@ fn verify_indexed(
   check_cancelled(cancelled)?;
   result?;
   file.revalidate()
-}
-
-#[cfg(feature = "lzma")]
-fn verify_legacy(
-  file: &mut StableFile,
-  pack: &RequestPack,
-  cancelled: Option<&AtomicBool>,
-  progress: &mut impl FnMut(u64),
-) -> io::Result<()> {
-  file.file_mut().rewind()?;
-  let result = pack.verify(&mut CheckedReader {
-    inner: lzma_rust2::XzReader::new(BufReader::new(file.file_mut()), false),
-    cancelled,
-    progress,
-  });
-  check_cancelled(cancelled)?;
-  result?;
-  file.revalidate()
-}
-
-#[cfg(feature = "lzma")]
-fn check_io_cancelled(cancelled: Option<&AtomicBool>) -> io::Result<()> {
-  // Standard Read/Write helpers retry Interrupted. Translate at the codec
-  // boundary so a cancelled job can unwind through any of those helpers.
-  check_cancelled(cancelled).map_err(io::Error::other)
-}
-
-#[cfg(feature = "lzma")]
-struct CheckedReader<'a, R, F> {
-  inner: R,
-  cancelled: Option<&'a AtomicBool>,
-  progress: &'a mut F,
-}
-
-#[cfg(feature = "lzma")]
-impl<R: Read, F: FnMut(u64)> Read for CheckedReader<'_, R, F> {
-  fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-    check_io_cancelled(self.cancelled)?;
-    let limit = bytes.len().min(64 * 1024);
-    let count = self.inner.read(&mut bytes[..limit])?;
-    if count > 0 {
-      (self.progress)(count as u64);
-    }
-    Ok(count)
-  }
 }

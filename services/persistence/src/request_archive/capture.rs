@@ -181,7 +181,7 @@ fn check_sidecars(path: &Path) -> io::Result<()> {
 
 fn initialize_snapshot(conn: &Connection) -> rusqlite::Result<()> {
   crate::migrate::ensure_schema_table(conn)?;
-  // Pack v1's body fields are tied to the v8 request schema. The forward-only
+  // The packed body fields are tied to the v8 request schema. The forward-only
   // migration history lets newer readers keep recognizing it.
   for migration in crate::requests::MIGRATIONS
     .iter()
@@ -190,10 +190,6 @@ fn initialize_snapshot(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(migration.sql)?;
   }
   Ok(())
-}
-
-pub(super) fn has_snapshot_schema(conn: &Connection, database: &str) -> rusqlite::Result<bool> {
-  has_snapshot_schema_with(conn, database, "")
 }
 
 pub(super) fn has_snapshot_schema_with(
@@ -364,19 +360,6 @@ fn find_session_candidates(
     history.push_front(turn);
   }
   Ok((ranges, indices))
-}
-
-pub(super) fn verify_metadata_snapshot(expected: &Path, actual: &Path) -> io::Result<()> {
-  let open = |path: &Path| {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    conn.execute_batch("PRAGMA trusted_schema = OFF;")?;
-    Ok::<_, rusqlite::Error>(conn)
-  };
-  let actual = open(actual).map_err(invalid_data)?;
-  if !has_snapshot_schema(&actual, "main").map_err(invalid_data)? {
-    return Err(invalid_data("archive metadata snapshot schema differs"));
-  }
-  verify_metadata_rows(expected, &actual)
 }
 
 pub(super) fn verify_metadata_rows(expected: &Path, actual: &Connection) -> io::Result<()> {

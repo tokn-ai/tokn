@@ -37,7 +37,7 @@ fn write_db(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
 }
 
 fn archive_format() -> ArchiveFormat {
-  resolve_format(Some("xz")).legacy
+  resolve_format(Some("xz")).snapshot_format
 }
 
 fn started_event(request_id: &str, ts: i64) -> Event {
@@ -169,15 +169,6 @@ fn configured_zstd_pack_can_be_pruned_after_switching_archive_format() {
 }
 
 #[cfg(feature = "lzma")]
-fn write_single_file_pack(db: &Path) -> PathBuf {
-  let source = StableFile::open(db).unwrap();
-  let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
-  let archive = archive_path(db, ArchiveFormat::Xz);
-  encode_xz(File::create_new(&archive).unwrap(), |encoder| capture.write(encoder)).unwrap();
-  archive
-}
-
-#[cfg(feature = "lzma")]
 #[test]
 fn cancellation_interrupts_verifying_an_indexed_request_pack() {
   let dir = tempdir();
@@ -188,37 +179,52 @@ fn cancellation_interrupts_verifying_an_indexed_request_pack() {
   let source = StableFile::open(&db).unwrap();
   let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
   let cancelled = AtomicBool::new(false);
-  let error = pack::Format::Indexed(IndexedArchiveFormat::Xz)
-    .verify(
-      &mut StableFile::open(&archive).unwrap(),
-      &capture,
-      Some(&cancelled),
-      &mut |_| cancelled.store(true, Ordering::Relaxed),
-    )
-    .unwrap_err();
+  let error = pack::verify_indexed(
+    IndexedArchiveFormat::Xz,
+    &mut StableFile::open(&archive).unwrap(),
+    &capture,
+    Some(&cancelled),
+    &mut |_| cancelled.store(true, Ordering::Relaxed),
+  )
+  .unwrap_err();
   assert_eq!(error.kind(), io::ErrorKind::Interrupted);
   drop(source);
   drop(capture);
   fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(feature = "lzma")]
 #[test]
-fn skips_and_prunes_an_existing_single_file_request_pack() {
-  let dir = tempdir();
-  let db = write_packable_db(&dir);
-  let archive = write_single_file_pack(&db);
+fn skips_and_prunes_existing_sqlite_snapshots() {
   let today = date!(2026 - 05 - 11);
-  let format = ArchiveFormat::Xz;
+  let preference = resolve_format(Some("pack.zst"));
+  for format in [
+    ArchiveFormat::Zstd,
+    #[cfg(feature = "lzma")]
+    ArchiveFormat::Xz,
+  ] {
+    let dir = tempfile::tempdir().unwrap();
+    let db = write_packable_db(dir.path());
+    let archive = archive_path(&db, format);
+    encode_snapshot(
+      &mut StableFile::open(&db).unwrap(),
+      &mut File::create_new(&archive).unwrap(),
+      format,
+      &mut |_| Ok(()),
+    )
+    .unwrap();
 
-  let stats = archive_requests_once(&dir, today, 7, format).unwrap();
-  assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
-  assert!(!indexed_xz_path(&db).exists());
-  assert!(pack::is_pack(&mut StableFile::open(&archive).unwrap()).unwrap());
-  let report = prune_request_dbs_once(&dir, today, 10, format, true).unwrap();
-  assert!(matches!(report.entries[0].outcome, PruneOutcome::Deleted { .. }));
-  assert!(!db.exists());
-  fs::remove_dir_all(dir).unwrap();
+    let stats = archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
+    assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
+    assert!(!IndexedArchiveFormat::Zstd.path(&db).exists());
+
+    let report = prune_request_dbs_once_with_progress(dir.path(), today, 10, preference, true, &mut |_| {}).unwrap();
+    let [entry] = report.entries.as_slice() else {
+      panic!("expected one request day");
+    };
+    assert_eq!(entry.archive, archive);
+    assert!(matches!(entry.outcome, PruneOutcome::Deleted { .. }), "{entry:?}");
+    assert!(!db.exists());
+  }
 }
 
 #[cfg(feature = "lzma")]
@@ -683,7 +689,7 @@ fn resolves_configured_extension_or_falls_back_to_zstd() {
     resolve_format(Some(".pack.zst")),
     ArchivePreference {
       indexed: Some(IndexedArchiveFormat::Zstd),
-      legacy: ArchiveFormat::Zstd,
+      snapshot_format: ArchiveFormat::Zstd,
     }
   );
   assert_eq!(resolve_format(Some(".zstd")), ArchiveFormat::Zstd.into());
