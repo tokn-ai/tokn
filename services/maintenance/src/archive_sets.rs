@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use time::Date;
 
 use super::{archive_content, hash_file, parse_day, ArchiveContents, StableFile};
+use archive_content::ContentProgress;
 
 pub(super) struct ArchiveDay {
   pub db: PathBuf,
@@ -54,7 +55,9 @@ pub(super) fn archive_days(dir: &Path) -> io::Result<BTreeMap<Date, ArchiveDay>>
 pub(super) struct CheckedArchive {
   pub file: StableFile,
   pub format: ArchiveContents,
-  digest: [u8; 32],
+  pub digest: [u8; 32],
+  pub compressed_bytes: u64,
+  pub uncompressed_bytes: Option<u64>,
 }
 
 pub(super) struct ArchiveSet {
@@ -75,30 +78,58 @@ impl From<io::Error> for ArchiveSetError {
 
 impl ArchiveSet {
   pub fn verify(paths: &[PathBuf]) -> Result<Self, ArchiveSetError> {
+    let mut set = Self::open(paths, &mut |_| {})?;
+    set.verify_contents(&mut |_| {})?;
+    Ok(set)
+  }
+
+  pub fn open(paths: &[PathBuf], progress: &mut impl FnMut(ContentProgress)) -> Result<Self, ArchiveSetError> {
     let mut archives = Vec::with_capacity(paths.len());
     for path in paths {
       let format = ArchiveContents::from_path(path).map_err(|error| file_error(path, error))?;
       let mut file = StableFile::open(path)?;
-      let digest = archive_digest(&mut file)?;
-      archives.push(CheckedArchive { file, format, digest });
+      let mut compressed_bytes = 0;
+      progress(ContentProgress::Stage("Hash archive input"));
+      let digest = archive_digest(&mut file, &mut |bytes| {
+        compressed_bytes += bytes;
+        progress(ContentProgress::Bytes(bytes));
+      })?;
+      archives.push(CheckedArchive {
+        file,
+        format,
+        digest,
+        compressed_bytes,
+        uncompressed_bytes: None,
+      });
     }
-    for index in 1..archives.len() {
-      let (earlier, rest) = archives.split_at_mut(index);
+    Ok(Self { archives })
+  }
+
+  pub fn verify_contents(&mut self, progress: &mut impl FnMut(ContentProgress)) -> Result<(), ArchiveSetError> {
+    for index in 1..self.archives.len() {
+      let (earlier, rest) = self.archives.split_at_mut(index);
       let other = &mut rest[0];
       for first in earlier {
-        let equivalent =
-          archive_content::verify_equivalent(first.file.file_mut(), first.format, other.file.file_mut(), other.format)
-            .map_err(|error| {
-              io::Error::new(
-                error.kind(),
-                format!(
-                  "could not compare {} and {}: {error}",
-                  first.file.path().display(),
-                  other.file.path().display()
-                ),
-              )
-            })?;
-        if !equivalent {
+        let comparison = archive_content::verify_equivalent(
+          first.file.file_mut(),
+          first.format,
+          other.file.file_mut(),
+          other.format,
+          progress,
+        )
+        .map_err(|error| {
+          io::Error::new(
+            error.kind(),
+            format!(
+              "could not compare {} and {}: {error}",
+              first.file.path().display(),
+              other.file.path().display()
+            ),
+          )
+        })?;
+        first.uncompressed_bytes = Some(comparison.left_bytes);
+        other.uncompressed_bytes = Some(comparison.right_bytes);
+        if !comparison.equivalent {
           return Err(ArchiveSetError::Conflict {
             first: first.file.path().to_path_buf(),
             other: other.file.path().to_path_buf(),
@@ -106,16 +137,20 @@ impl ArchiveSet {
         }
       }
     }
-    let mut set = Self { archives };
-    if paths.len() > 1 {
-      set.recheck()?;
+    if self.archives.len() > 1 {
+      self.recheck_with_progress(progress)?;
     }
-    Ok(set)
+    Ok(())
   }
 
   pub fn recheck(&mut self) -> io::Result<()> {
+    self.recheck_with_progress(&mut |_| {})
+  }
+
+  pub fn recheck_with_progress(&mut self, progress: &mut impl FnMut(ContentProgress)) -> io::Result<()> {
+    progress(ContentProgress::Stage("Recheck archive inputs"));
     for archive in &mut self.archives {
-      if archive_digest(&mut archive.file)? != archive.digest {
+      if archive_digest(&mut archive.file, &mut |bytes| progress(ContentProgress::Bytes(bytes)))? != archive.digest {
         return Err(io::Error::new(
           io::ErrorKind::InvalidData,
           format!("{} changed during verification", archive.file.path().display()),
@@ -126,8 +161,8 @@ impl ArchiveSet {
   }
 }
 
-fn archive_digest(file: &mut StableFile) -> io::Result<[u8; 32]> {
-  hash_file(file, None, &mut |_| {}).map_err(|error| file_error(file.path(), error))
+fn archive_digest(file: &mut StableFile, progress: &mut impl FnMut(u64)) -> io::Result<[u8; 32]> {
+  hash_file(file, None, progress).map_err(|error| file_error(file.path(), error))
 }
 
 fn file_error(path: &Path, error: io::Error) -> io::Error {

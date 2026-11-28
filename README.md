@@ -343,16 +343,25 @@ Set `archive_after_days` and `prune_after_days` under
 `[service.persistence]` to change these cutoffs.
 
 To convert existing archives, update `archive_extension` and run
-`tokn-gateway requests migrate`. It previews conversions to the configured
-format, including days whose SQLite source was already pruned. Add
+`tokn-gateway requests migrate`. The preview encodes to the configured
+format to measure the output size and hash, including for days whose
+SQLite source was already pruned. It discards the encoded bytes. Add
 `--commit` to write and verify the destination archives while retaining
-each source.
+each source. The terminal shows the active step's byte count and throughput.
+Each completed day prints one row with a colored status and the original and
+preview or final compressed sizes. Terminal rows show hash prefixes, and
+redirected output includes full SHA-256 hashes and byte counts.
 
 `tokn-gateway requests prune` previews eligible SQLite files and alternate
 archives. With `--commit`, it removes an alternate archive only when the
 configured destination exists and verification confirms the copies agree.
 When archives conflict, both commands report the files and retain every copy
 for that day.
+
+Maintenance jobs coordinate with each other through a directory-wide lock.
+They lock each day separately while processing it, and skip days that are
+busy. The gateway takes only the lock for the day it is writing, so
+maintenance on older days can run alongside current request-history writes.
 
 ### Inspect request history
 

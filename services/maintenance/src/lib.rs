@@ -6,11 +6,11 @@ mod archive_sets;
 mod pack;
 mod worker;
 pub use archive_migration::*;
-use archive_sets::{archive_days, ArchiveSet, ArchiveSetError};
+use archive_sets::{archive_days, ArchiveDay, ArchiveSet, ArchiveSetError};
 use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 use tokn_persistence::request_archive::RequestPack;
 pub use tokn_persistence::request_files::ArchiveFormat;
-use tokn_persistence::request_files::{RequestMaintenanceLock, StableFile};
+use tokn_persistence::request_files::{RequestDayLock, RequestMaintenanceLock, StableFile};
 pub use worker::*;
 
 use sha2::{Digest, Sha256};
@@ -52,6 +52,7 @@ pub enum ArchivePruneOutcome {
   WouldRemove,
   Removed,
   MissingTarget,
+  InUse,
   Conflict { first: PathBuf, other: PathBuf },
   Failed { error: String },
 }
@@ -260,7 +261,6 @@ fn prune_request_dbs_once_with_progress(
   let files_total = days.len();
   progress(PruneProgressEvent::Started { files_total });
   for (file_index, (date, day)) in days.into_iter().enumerate() {
-    let keeper = preference.target().path(&day.db);
     let progress_path = if day.has_db { &day.db } else { &day.archives[0] }.clone();
     let bytes_per_pass = fs::symlink_metadata(&day.db)
       .map(|metadata| metadata.len())
@@ -280,32 +280,7 @@ fn prune_request_dbs_once_with_progress(
         bytes_total,
       });
     };
-    // Distinct snapshots can differ even when each agrees with a normalized
-    // indexed pack. Check all pairs before making any deletions for this day.
-    let verified = (day.archives.len() > 1)
-      .then(|| ArchiveSet::verify(&day.archives))
-      .transpose();
-    let raw = if day.has_db {
-      let archive = existing_archive_path(&day.db, preference)?;
-      let outcome = match &verified {
-        Ok(_) => prune_request_db(&day.db, &archive, commit, None, &mut report_bytes),
-        Err(ArchiveSetError::Conflict { .. }) => PruneOutcome::ArchiveConflict,
-        Err(ArchiveSetError::Io(error)) => PruneOutcome::Failed {
-          error: error.to_string(),
-        },
-      };
-      Some(PruneEntry {
-        path: day.db,
-        archive,
-        outcome,
-      })
-    } else {
-      None
-    };
-    report
-      .archives
-      .extend(prune_archive_copies(date, &day.archives, &keeper, verified, commit));
-    report.entries.extend(raw);
+    prune_day(&mut report, date, day, preference, commit, &mut report_bytes)?;
     progress(PruneProgressEvent::FileFinished {
       path: progress_path,
       file_index,
@@ -316,6 +291,88 @@ fn prune_request_dbs_once_with_progress(
   Ok(report)
 }
 
+fn prune_day(
+  report: &mut PruneReport,
+  date: Date,
+  day: ArchiveDay,
+  preference: ArchivePreference,
+  commit: bool,
+  progress: &mut impl FnMut(u64),
+) -> io::Result<()> {
+  let keeper = preference.target().path(&day.db);
+  let raw_archive = day
+    .has_db
+    .then(|| existing_archive_path(&day.db, preference))
+    .transpose()?;
+  let _day_lock = match RequestDayLock::try_acquire(&day.db) {
+    Ok(lock) => lock,
+    Err(error) => {
+      let (raw_outcome, archive_outcome) = if error.kind() == io::ErrorKind::WouldBlock {
+        (PruneOutcome::InUse, ArchivePruneOutcome::InUse)
+      } else {
+        let error = error.to_string();
+        (
+          PruneOutcome::Failed { error: error.clone() },
+          ArchivePruneOutcome::Failed { error },
+        )
+      };
+      if let Some(archive) = raw_archive {
+        report.entries.push(PruneEntry {
+          path: day.db,
+          archive,
+          outcome: raw_outcome,
+        });
+      }
+      report
+        .archives
+        .extend(alternate_archive_entries(date, &day.archives, &keeper, archive_outcome));
+      return Ok(());
+    }
+  };
+
+  // Distinct snapshots can differ even when each agrees with a normalized
+  // indexed pack. Check all pairs before making any deletions for this day.
+  let verified = (day.archives.len() > 1)
+    .then(|| ArchiveSet::verify(&day.archives))
+    .transpose();
+  if let Some(archive) = raw_archive {
+    let outcome = match &verified {
+      Ok(_) => prune_request_db(&day.db, &archive, commit, None, progress),
+      Err(ArchiveSetError::Conflict { .. }) => PruneOutcome::ArchiveConflict,
+      Err(ArchiveSetError::Io(error)) => PruneOutcome::Failed {
+        error: error.to_string(),
+      },
+    };
+    report.entries.push(PruneEntry {
+      path: day.db,
+      archive,
+      outcome,
+    });
+  }
+  report
+    .archives
+    .extend(prune_archive_copies(date, &day.archives, &keeper, verified, commit));
+  Ok(())
+}
+
+fn alternate_archive_entries(
+  day: Date,
+  archives: &[PathBuf],
+  keeper: &Path,
+  outcome: ArchivePruneOutcome,
+) -> Vec<ArchivePruneEntry> {
+  archives
+    .iter()
+    .filter(|path| path.as_path() != keeper)
+    .map(|path| ArchivePruneEntry {
+      day,
+      path: path.clone(),
+      keeper: keeper.to_path_buf(),
+      outcome: outcome.clone(),
+    })
+    .collect()
+}
+
 fn prune_archive_copies(
   day: Date,
   archives: &[PathBuf],
@@ -323,18 +380,7 @@ fn prune_archive_copies(
   verified: Result<Option<ArchiveSet>, ArchiveSetError>,
   commit: bool,
 ) -> Vec<ArchivePruneEntry> {
-  let alternate_entries = |outcome: ArchivePruneOutcome| {
-    archives
-      .iter()
-      .filter(|path| path.as_path() != keeper)
-      .map(|path| ArchivePruneEntry {
-        day,
-        path: path.clone(),
-        keeper: keeper.to_path_buf(),
-        outcome: outcome.clone(),
-      })
-      .collect()
-  };
+  let alternate_entries = |outcome| alternate_archive_entries(day, archives, keeper, outcome);
   let mut verified = match verified {
     Err(ArchiveSetError::Conflict { first, other }) => {
       return alternate_entries(ArchivePruneOutcome::Conflict { first, other });
@@ -854,6 +900,27 @@ fn archive_requests_once_locked(
     };
 
     let mut archive = existing_archive_path(&path, preference)?;
+    let _day_lock = match RequestDayLock::try_acquire(&path) {
+      Ok(lock) => lock,
+      Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+        tracing::debug!(path = %path.display(), "request day is in use; deferring maintenance");
+        continue;
+      }
+      Err(error) => {
+        stats.failed += 1;
+        tracing::warn!(path = %path.display(), %error, "could not lock request day for maintenance");
+        emit(
+          events,
+          ArchiveEvent::FileFailed {
+            id: archive_id(&path),
+            path,
+            archive,
+            error: error.to_string(),
+          },
+        );
+        continue;
+      }
+    };
     if archive.symlink_metadata().is_ok() {
       stats.skipped_existing += 1;
       emit(
@@ -922,7 +989,8 @@ fn request_db_day(path: &Path) -> Option<Date> {
   {
     return None;
   }
-  parse_day(path.file_stem()?.to_str()?)
+  let key = path.file_stem()?.to_str()?;
+  parse_day(key).filter(|day| day.to_string() == key)
 }
 
 fn archive_path(path: &Path, format: ArchiveFormat) -> PathBuf {

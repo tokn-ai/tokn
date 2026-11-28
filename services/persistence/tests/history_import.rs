@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tokn_persistence::request_files::{RequestDayLock, RequestMaintenanceLock};
 use tokn_persistence::{history_import::import_history, requests::open_day_db, sessions::SessionsDb, DbPaths, UsageDb};
 
 const DAY: &str = "2026-09-21.db";
@@ -298,20 +299,25 @@ fn orphan_source_request_sidecars_are_rejected() {
 }
 
 #[test]
-fn source_request_scan_ignores_only_the_regular_maintenance_lock() {
+fn source_request_scan_ignores_only_recognized_regular_lock_files() {
   let fixture = Fixture::new();
-  fs::write(fixture.source.join("requests/.tokn-requests-maintenance.lock"), []).unwrap();
+  let requests = fixture.source.join("requests");
+  drop(RequestMaintenanceLock::acquire(&requests).unwrap());
+  drop(RequestDayLock::try_acquire(&requests.join(DAY)).unwrap());
+  drop(RequestDayLock::try_acquire(&requests.join("2026-09-20.db")).unwrap());
   assert_eq!(
     import_history(&fixture.source, &fixture.destination, false)
       .unwrap()
       .inserted_total,
     9
   );
-  let unexpected = fixture.source.join("requests/scratch.txt");
-  fs::write(&unexpected, b"scratch").unwrap();
-  assert!(fixture.error(true).contains("Unexpected source request entry"));
-  fs::remove_file(unexpected).unwrap();
-  fs::create_dir(fixture.source.join("requests/nested-capture")).unwrap();
+  for name in ["scratch.txt", ".tokn-request-day-2026-02-30.lock"] {
+    let unexpected = requests.join(name);
+    fs::write(&unexpected, b"scratch").unwrap();
+    assert!(fixture.error(true).contains("Unexpected source request entry"));
+    fs::remove_file(unexpected).unwrap();
+  }
+  fs::create_dir(requests.join("nested-capture")).unwrap();
   assert!(fixture.error(true).contains("regular, non-symlink database"));
   assert_eq!(count(&fixture.destination.usage_db, "requests"), 0);
   assert!(!fixture.day().exists());
@@ -321,7 +327,12 @@ fn source_request_scan_ignores_only_the_regular_maintenance_lock() {
 #[test]
 fn source_request_symlinks_are_rejected_regardless_of_filename() {
   let fixture = Fixture::new();
-  for name in ["ignored.txt", ".tokn-requests-maintenance.lock", "2026-09-20.db.xz"] {
+  for name in [
+    "ignored.txt",
+    ".tokn-requests-maintenance.lock",
+    ".tokn-request-day-2026-09-20.lock",
+    "2026-09-20.db.xz",
+  ] {
     let link = fixture.source.join("requests").join(name);
     std::os::unix::fs::symlink(fixture.source.join("usage.db"), &link).unwrap();
     assert!(fixture.error(true).contains("regular, non-symlink database"));

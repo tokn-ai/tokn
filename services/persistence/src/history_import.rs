@@ -2,13 +2,16 @@
 //!
 //! Call this on the host after stopping and exporting the private router. Source
 //! databases must be checkpointed; destination usage/session databases must already
-//! exist. Missing request days are initialized under the request maintenance lock.
-//! Request captures accept only raw day databases and the maintenance lock; archives,
+//! exist. Request days are initialized and updated under the maintenance and day locks.
+//! Request captures accept only raw day databases and recognized lock files. Archives,
 //! sidecars, and other entries are rejected so an incomplete capture cannot succeed.
 //! A single DELETE-journal transaction covers every destination database (at most
 //! eleven files). Dry runs execute the same checks and writes, then roll back.
 
-use crate::{request_files::RequestMaintenanceLock, DbPaths};
+use crate::{
+  request_files::{is_day_lock_filename, RequestDayLock, RequestMaintenanceLock, MAINTENANCE_LOCK_FILE},
+  DbPaths,
+};
 use rusqlite::{params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -376,7 +379,7 @@ pub fn import_history(source_root: &Path, destination: &DbPaths, commit: bool) -
       .file_name()
       .and_then(|value| value.to_str())
       .ok_or_else(|| invalid("Invalid source request filename"))?;
-    if filename == ".tokn-requests-maintenance.lock" {
+    if filename == MAINTENANCE_LOCK_FILE || is_day_lock_filename(filename) {
       continue;
     }
     if REQUEST_ARCHIVE_EXTENSIONS.iter().any(|&extension| {
@@ -400,7 +403,7 @@ pub fn import_history(source_root: &Path, destination: &DbPaths, commit: bool) -
     }
     if source.extension().is_none_or(|extension| extension != "db") {
       return Err(invalid(format!(
-        "Unexpected source request entry (only day databases and the maintenance lock are supported): {}",
+        "Unexpected source request entry (only day databases and recognized lock files are supported): {}",
         source.display()
       )));
     }
@@ -427,7 +430,13 @@ pub fn import_history(source_root: &Path, destination: &DbPaths, commit: bool) -
   for capture in &captures {
     validate_target(capture, &captures, &source_root)?;
   }
-  let _maintenance = RequestMaintenanceLock::acquire_writer(&destination.requests_dir)?;
+  let _maintenance = RequestMaintenanceLock::acquire_blocking(&destination.requests_dir)?;
+  // Day captures follow the sorted source filenames and share a destination directory.
+  let _day_locks = captures
+    .iter()
+    .filter(|capture| capture.is_day)
+    .map(|capture| RequestDayLock::acquire(&capture.destination))
+    .collect::<std::io::Result<Vec<_>>>()?;
   let mut created_days = CreatedDays(Vec::new());
   for capture in &captures {
     validate_target(capture, &captures, &source_root)?;

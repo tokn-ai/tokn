@@ -91,8 +91,9 @@ pub(super) fn load(
   let before = source.file().metadata()?;
   let path = source.path();
   check_sidecars(path)?;
-  // The maintenance lock and checkpoint checks let SQLite use immutable mode,
-  // which keeps it from creating sidecars or competing with the prune guard.
+  // The caller keeps the source stable and the checkpoint check rules out
+  // pending writes. Immutable mode avoids creating sidecars or competing with
+  // the prune guard.
   let mut uri = Url::from_file_path(path.canonicalize()?)
     .map_err(|()| io::Error::new(io::ErrorKind::InvalidInput, "invalid request database path"))?;
   uri.set_query(Some("mode=ro&immutable=1"));

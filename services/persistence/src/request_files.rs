@@ -5,7 +5,16 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAINTENANCE_LOCK_FILE: &str = ".tokn-requests-maintenance.lock";
+const DAY_LOCK_PREFIX: &str = ".tokn-request-day-";
+const DAY_LOCK_SUFFIX: &str = ".lock";
+
 pub struct RequestMaintenanceLock {
+  _file: File,
+}
+
+/// Coordinate writers and maintenance for a single daily request database.
+/// The lock file persists so successive callers always lock the same file.
+pub struct RequestDayLock {
   _file: File,
 }
 
@@ -78,30 +87,50 @@ impl ArchiveFormat {
 impl RequestMaintenanceLock {
   pub fn acquire(dir: &Path) -> io::Result<Self> {
     let lock_path = dir.join(MAINTENANCE_LOCK_FILE);
-    let file = open_maintenance_lock(&lock_path)?;
-    match file.try_lock() {
-      Ok(()) => {
-        revalidate_opened_file(&lock_path, &file, true)?;
-        Ok(Self { _file: file })
-      }
-      Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(
-        io::ErrorKind::WouldBlock,
-        format!(
-          "request database maintenance is already running for {}; retry the command",
-          dir.display()
-        ),
-      )),
-      Err(fs::TryLockError::Error(error)) => Err(error),
-    }
-  }
-
-  pub(crate) fn acquire_writer(dir: &Path) -> io::Result<Self> {
-    let lock_path = dir.join(MAINTENANCE_LOCK_FILE);
-    let file = open_maintenance_lock(&lock_path)?;
-    file.lock()?;
-    revalidate_opened_file(&lock_path, &file, true)?;
+    let file = try_lock_request_file(&lock_path, || {
+      format!(
+        "request database maintenance is already running for {}; retry the command",
+        dir.display()
+      )
+    })?;
     Ok(Self { _file: file })
   }
+
+  pub(crate) fn acquire_blocking(dir: &Path) -> io::Result<Self> {
+    let file = lock_request_file(&dir.join(MAINTENANCE_LOCK_FILE))?;
+    Ok(Self { _file: file })
+  }
+}
+
+impl RequestDayLock {
+  /// Try to lock the day identified by a canonical `YYYY-MM-DD.db` path.
+  pub fn try_acquire(db_path: &Path) -> io::Result<Self> {
+    let path = day_lock_path(db_path)?;
+    let file = try_lock_request_file(&path, || format!("request day {} is in use", db_path.display()))?;
+    Ok(Self { _file: file })
+  }
+
+  pub(crate) fn acquire(db_path: &Path) -> io::Result<Self> {
+    let file = lock_request_file(&day_lock_path(db_path)?)?;
+    Ok(Self { _file: file })
+  }
+}
+
+fn day_lock_path(db_path: &Path) -> io::Result<PathBuf> {
+  let day = db_path
+    .file_name()
+    .and_then(|name| name.to_str())
+    .and_then(|name| name.strip_suffix(".db"))
+    .filter(|day| crate::is_valid_request_day(day))
+    .ok_or_else(|| invalid_file(db_path, "must be a daily request database named YYYY-MM-DD.db"))?;
+  Ok(db_path.with_file_name(format!("{DAY_LOCK_PREFIX}{day}{DAY_LOCK_SUFFIX}")))
+}
+
+pub(crate) fn is_day_lock_filename(name: &str) -> bool {
+  name
+    .strip_prefix(DAY_LOCK_PREFIX)
+    .and_then(|name| name.strip_suffix(DAY_LOCK_SUFFIX))
+    .is_some_and(crate::is_valid_request_day)
 }
 
 impl StableFile {
@@ -137,7 +166,26 @@ impl StableFile {
   }
 }
 
-fn open_maintenance_lock(path: &Path) -> io::Result<File> {
+fn lock_request_file(path: &Path) -> io::Result<File> {
+  let file = open_request_lock(path)?;
+  file.lock()?;
+  revalidate_opened_file(path, &file, true)?;
+  Ok(file)
+}
+
+fn try_lock_request_file(path: &Path, busy_message: impl FnOnce() -> String) -> io::Result<File> {
+  let file = open_request_lock(path)?;
+  match file.try_lock() {
+    Ok(()) => {
+      revalidate_opened_file(path, &file, true)?;
+      Ok(file)
+    }
+    Err(fs::TryLockError::WouldBlock) => Err(io::Error::new(io::ErrorKind::WouldBlock, busy_message())),
+    Err(fs::TryLockError::Error(error)) => Err(error),
+  }
+}
+
+fn open_request_lock(path: &Path) -> io::Result<File> {
   validate_regular_file_path(path, true)?;
   let mut options = OpenOptions::new();
   options.create(true).truncate(false).read(true).write(true);
