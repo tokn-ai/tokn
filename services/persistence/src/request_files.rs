@@ -9,13 +9,13 @@ const DAY_LOCK_PREFIX: &str = ".tokn-request-day-";
 const DAY_LOCK_SUFFIX: &str = ".lock";
 
 pub struct RequestMaintenanceLock {
-  _file: File,
+  file: File,
 }
 
 /// Coordinate writers and maintenance for a single daily request database.
 /// The lock file persists so successive callers always lock the same file.
 pub struct RequestDayLock {
-  _file: File,
+  file: File,
 }
 
 pub struct StableFile {
@@ -93,12 +93,19 @@ impl RequestMaintenanceLock {
         dir.display()
       )
     })?;
-    Ok(Self { _file: file })
+    Ok(Self { file })
   }
 
   pub(crate) fn acquire_blocking(dir: &Path) -> io::Result<Self> {
     let file = lock_request_file(&dir.join(MAINTENANCE_LOCK_FILE))?;
-    Ok(Self { _file: file })
+    Ok(Self { file })
+  }
+}
+
+impl Drop for RequestMaintenanceLock {
+  fn drop(&mut self) {
+    // A forked child can retain a duplicate of the file descriptor until exec.
+    let _ = self.file.unlock();
   }
 }
 
@@ -107,12 +114,18 @@ impl RequestDayLock {
   pub fn try_acquire(db_path: &Path) -> io::Result<Self> {
     let path = day_lock_path(db_path)?;
     let file = try_lock_request_file(&path, || format!("request day {} is in use", db_path.display()))?;
-    Ok(Self { _file: file })
+    Ok(Self { file })
   }
 
   pub(crate) fn acquire(db_path: &Path) -> io::Result<Self> {
     let file = lock_request_file(&day_lock_path(db_path)?)?;
-    Ok(Self { _file: file })
+    Ok(Self { file })
+  }
+}
+
+impl Drop for RequestDayLock {
+  fn drop(&mut self) {
+    let _ = self.file.unlock();
   }
 }
 
@@ -353,5 +366,28 @@ impl PruneGuard {
     }
     #[cfg(windows)]
     Ok(Self {})
+  }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn releases_request_locks_with_duplicate_descriptors() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let maintenance = RequestMaintenanceLock::acquire(dir.path())?;
+    let inherited_maintenance = maintenance.file.try_clone()?;
+    drop(maintenance);
+    let _maintenance = RequestMaintenanceLock::acquire(dir.path())?;
+
+    let day_path = dir.path().join("2026-05-01.db");
+    let day_lock = RequestDayLock::try_acquire(&day_path)?;
+    let inherited_day = day_lock.file.try_clone()?;
+    drop(day_lock);
+    let _day_lock = RequestDayLock::try_acquire(&day_path)?;
+
+    drop((inherited_maintenance, inherited_day));
+    Ok(())
   }
 }
