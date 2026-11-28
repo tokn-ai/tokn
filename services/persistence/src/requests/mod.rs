@@ -10,6 +10,7 @@
 //! re-implements them.
 
 use crate::migrate;
+use crate::request_files::RequestDayLock;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -122,15 +123,18 @@ impl RequestsDb {
     Ok(out)
   }
 
-  /// Borrow (or open) the day connection keyed by `ts`. Refreshes LRU.
-  pub(crate) fn conn_for_ts(&mut self, ts: i64) -> Result<&mut Connection> {
-    let key = day_key(ts);
-    self.conn_for_day(&key)
+  pub(crate) fn lock_day(&self, day: &str) -> Result<RequestDayLock> {
+    Ok(RequestDayLock::acquire(&self.day_path(day))?)
+  }
+
+  fn day_path(&self, day: &str) -> PathBuf {
+    self.dir.join(format!("{day}.db"))
   }
 
   /// Borrow (or open) the day connection keyed by `day` (e.g. `"2026-05-19"`).
+  /// The caller holds that day's lock while accessing the connection.
   pub(crate) fn conn_for_day(&mut self, key: &str) -> Result<&mut Connection> {
-    let path = self.dir.join(format!("{key}.db"));
+    let path = self.day_path(key);
     if self.conns.get(key).is_some_and(|cached| !cached.matches_path(&path)) {
       self.conns.remove(key);
       self.order.retain(|cached| cached != key);
@@ -149,37 +153,33 @@ impl RequestsDb {
     Ok(&mut self.conns.get_mut(key).expect("opened requests db").connection)
   }
 
-  /// Look up the connection a previously-pinned `request_id` was written to.
-  /// Returns `None` if no INSERT has pinned this id yet.
-  pub(crate) fn conn_for_request(&mut self, request_id: &str) -> Option<&mut Connection> {
-    let key = self.request_meta.get(request_id)?.day.clone();
-    self.conn_for_day(&key).ok()
+  /// Lock and open the pinned day for an existing request. An unknown request
+  /// or a connection open failure preserves the stage's no-op behavior.
+  pub(crate) fn locked_conn_for_request(
+    &mut self,
+    request_id: &str,
+  ) -> Result<Option<(RequestDayLock, &mut Connection)>> {
+    let Some(day) = self.pinned_day(request_id).map(str::to_owned) else {
+      return Ok(None);
+    };
+    let lock = self.lock_day(&day)?;
+    Ok(self.conn_for_day(&day).ok().map(|conn| (lock, conn)))
   }
 
   /// A self-contained rejection may follow an inbound-connection record.
   /// Reuse its pinned day rather than creating a second row across midnight.
-  pub(crate) fn conn_for_request_or_ts(&mut self, request_id: &str, ts: i64) -> Result<&mut Connection> {
-    let day = self
+  pub(crate) fn request_day_or_ts(&self, request_id: &str, ts: i64) -> String {
+    self.pinned_day(request_id).map_or_else(|| day_key(ts), str::to_owned)
+  }
+
+  pub(crate) fn pinned_day(&self, request_id: &str) -> Option<&str> {
+    self.request_meta.get(request_id).map(|meta| meta.day.as_str())
+  }
+
+  pub(crate) fn pin_request(&mut self, request_id: &str, day: String, ts: i64) {
+    self
       .request_meta
-      .get(request_id)
-      .map(|meta| meta.day.clone())
-      .unwrap_or_else(|| day_key(ts));
-    self.conn_for_day(&day)
-  }
-
-  pub(crate) fn contains_request(&self, request_id: &str) -> bool {
-    self.request_meta.contains_key(request_id)
-  }
-
-  pub(crate) fn pin_request(&mut self, request_id: &str, ts: i64) {
-    let key = day_key(ts);
-    self.request_meta.insert(
-      request_id.to_string(),
-      RequestMeta {
-        day: key,
-        started_at_ms: ts,
-      },
-    );
+      .insert(request_id.to_string(), RequestMeta { day, started_at_ms: ts });
   }
 
   pub(crate) fn latency_since_start(&self, request_id: &str, ts_now: i64) -> i64 {
@@ -198,10 +198,6 @@ impl RequestsDb {
       self.conns.remove(&meta.day);
       self.order.retain(|day| day != &meta.day);
     }
-  }
-
-  pub(crate) fn dir(&self) -> &Path {
-    &self.dir
   }
 }
 
@@ -302,6 +298,10 @@ pub fn read_request_row(
   let yesterday = day_key(now - 86_400_000);
   for day in [today, yesterday] {
     let path = requests_dir.join(format!("{day}.db"));
+    if !path.exists() {
+      continue;
+    }
+    let _lock = RequestDayLock::acquire(&path)?;
     if !path.exists() {
       continue;
     }

@@ -49,12 +49,33 @@ pub fn write(
   output: &mut impl Write,
   progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
+  write_with_body_progress(snapshot, output, progress, |_| {})
+}
+
+pub enum PackWriteProgress {
+  BodyBytes(u64),
+  Indexing { entries: u64 },
+  EntryIndexed,
+}
+
+/// Serialize a pack and report input body bytes separately from index construction.
+pub fn write_with_body_progress(
+  snapshot: &RequestPack,
+  output: &mut impl Write,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+  mut on_body_progress: impl FnMut(PackWriteProgress),
+) -> io::Result<()> {
   progress(0)?;
   output.write_all(&MAGIC)?;
   let mut tracked = ProgressIo::new(&mut *output, progress);
-  let result = objects::write_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH);
+  let result = objects::write_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH, |bytes| {
+    on_body_progress(PackWriteProgress::BodyBytes(bytes));
+  });
   let (index, canonical) = tracked.finish(result)?;
 
+  on_body_progress(PackWriteProgress::Indexing {
+    entries: snapshot.capture.bodies.len() as u64,
+  });
   let temp = tempfile::tempdir()?;
   let metadata = temp.path().join("metadata.db");
   {
@@ -63,7 +84,9 @@ pub fn write(
     copy_exact(&mut source, &mut create_private_file(&metadata)?, source_len, progress)?;
   }
   let mut conn = Connection::open(&metadata).map_err(invalid_data)?;
-  write_indexes(&mut conn, snapshot, &index, &canonical, progress)?;
+  write_indexes(&mut conn, snapshot, &index, &canonical, progress, || {
+    on_body_progress(PackWriteProgress::EntryIndexed);
+  })?;
   conn.close().map_err(|(_, error)| invalid_data(error))?;
 
   let mut metadata = File::open(&metadata)?;
@@ -79,6 +102,7 @@ fn write_indexes(
   index: &[ObjectIndex],
   canonical: &[usize],
   progress: &mut impl FnMut(u64) -> io::Result<()>,
+  mut on_entry_indexed: impl FnMut(),
 ) -> io::Result<()> {
   let tx = conn.transaction().map_err(invalid_data)?;
   tx.execute_batch(SCHEMA).map_err(invalid_data)?;
@@ -110,6 +134,7 @@ fn write_indexes(
       insert_body
         .execute(params![body.request_id, body.slot, entry.sha256.as_slice(), body.flags])
         .map_err(invalid_data)?;
+      on_entry_indexed();
     }
   }
   tx.commit().map_err(invalid_data)
@@ -122,15 +147,11 @@ pub fn verify(
   progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
   let mut reader = IndexedPackReader::open_with_progress(input, Duration::ZERO, progress)?;
-  capture::verify_metadata_rows(snapshot.capture.metadata_snapshot.path(), &reader.metadata)?;
+  capture::verify_metadata_rows(snapshot.capture.metadata_snapshot.path(), &reader.metadata, progress)?;
   progress(0)?;
   let input = reader.input.get_mut();
-  input.seek(SeekFrom::Start(0))?;
-  let mut magic = [0; MAGIC.len()];
-  input.read_exact(&mut magic)?;
-  if magic != MAGIC {
-    return Err(invalid_data("invalid indexed request archive header"));
-  }
+  verify_header(input)?;
+  progress(HEADER_LEN)?;
   let mut input = (&mut *input).take(reader.metadata_offset - HEADER_LEN);
   let mut tracked = ProgressIo::new(&mut input, progress);
   let result = objects::verify_indexed_objects(&mut tracked, &snapshot.inputs(), MAX_DEPTH);
@@ -139,6 +160,32 @@ pub fn verify(
     return Err(invalid_data("indexed request archive object stream length differs"));
   }
   verify_indexes(&reader.metadata, snapshot, &index, &canonical, progress)
+}
+
+/// Check pack framing, the metadata schema, and SQLite page integrity.
+pub fn validate(input: &mut (impl Read + Seek)) -> io::Result<()> {
+  verify_header(input)?;
+  let reader = IndexedPackReader::open(input, Duration::ZERO)?;
+  let integrity: String = reader
+    .metadata
+    .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+    .map_err(invalid_data)?;
+  if integrity != "ok" {
+    return Err(invalid_data(
+      "indexed request archive metadata failed SQLite validation",
+    ));
+  }
+  Ok(())
+}
+
+fn verify_header(input: &mut (impl Read + Seek)) -> io::Result<()> {
+  input.rewind()?;
+  let mut magic = [0; MAGIC.len()];
+  input.read_exact(&mut magic)?;
+  if magic != MAGIC {
+    return Err(invalid_data("invalid indexed request archive header"));
+  }
+  Ok(())
 }
 
 /// Query the unpacked metadata snapshot and seek to the requested body objects.
@@ -179,6 +226,7 @@ impl<R: Read + Seek> IndexedPackReader<R> {
       .checked_sub(metadata_len)
       .filter(|&offset| offset >= HEADER_LEN && metadata_len >= SQLITE_HEADER.len() as u64)
       .ok_or_else(|| invalid_data("invalid indexed request archive metadata bounds"))?;
+    progress(TRAILER_LEN)?;
 
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("metadata.db");
@@ -191,6 +239,7 @@ impl<R: Read + Seek> IndexedPackReader<R> {
     {
       let mut file = create_private_file(&path)?;
       file.write_all(&signature)?;
+      progress(signature.len() as u64)?;
       copy_exact(&mut input, &mut file, metadata_len - signature.len() as u64, progress)?;
     }
     let metadata = crate::open_readonly(&path, timeout).map_err(io::Error::other)?;
@@ -517,8 +566,24 @@ mod tests {
   fn reads_metadata_without_scanning_body_objects_and_reconstructs_requested_deltas() -> anyhow::Result<()> {
     let (snapshot, target) = fixture()?;
     let mut bytes = Vec::new();
-    write(&snapshot, &mut bytes, &mut |_| Ok(()))?;
-    verify(&snapshot, &mut Cursor::new(&bytes), &mut |_| Ok(()))?;
+    let mut expected_entries = None;
+    let mut indexed = 0;
+    write_with_body_progress(&snapshot, &mut bytes, &mut |_| Ok(()), |event| match event {
+      PackWriteProgress::BodyBytes(_) => assert!(expected_entries.is_none()),
+      PackWriteProgress::Indexing { entries } => assert_eq!(expected_entries.replace(entries), None),
+      PackWriteProgress::EntryIndexed => {
+        assert!(expected_entries.is_some());
+        indexed += 1;
+      }
+    })?;
+    assert_eq!(expected_entries, Some(3));
+    assert_eq!(indexed, 3);
+    let mut verified_bytes = 0;
+    verify(&snapshot, &mut Cursor::new(&bytes), &mut |count| {
+      verified_bytes += count;
+      Ok(())
+    })?;
+    assert_eq!(verified_bytes, bytes.len() as u64);
 
     let first_read = Cell::new(u64::MAX);
     let reader = IndexedPackReader::open(

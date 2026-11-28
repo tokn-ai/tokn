@@ -10,7 +10,7 @@ use tokn_core::provider::Endpoint;
 use tokn_core::request_event::{RequestEndpoint, RequestEvent, RequestEventPayload, StageEvent};
 #[cfg(feature = "lzma")]
 use tokn_persistence::request_files::indexed_xz_path;
-use tokn_persistence::request_files::MAINTENANCE_LOCK_FILE;
+use tokn_persistence::request_files::{RequestDayLock, MAINTENANCE_LOCK_FILE};
 use tokn_persistence::RequestEventHandler;
 
 #[derive(Default)]
@@ -145,27 +145,121 @@ fn request_pack_does_not_allow_pruning_a_changed_body() {
 }
 
 #[test]
-fn configured_zstd_pack_can_be_pruned_after_switching_archive_format() {
+fn default_zstd_pack_can_be_pruned_after_switching_archive_format() {
   let dir = tempfile::tempdir().unwrap();
   let db = write_packable_db(dir.path());
   let archive = IndexedArchiveFormat::Zstd.path(&db);
   let today = date!(2026 - 05 - 11);
-  let preference = resolve_format(Some("pack.zst"));
+  let preference = resolve_format(None);
 
   let stats = archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
   assert_eq!(stats.archived, 1);
   assert!(archive.is_file());
   assert!(!archive_path(&db, ArchiveFormat::Zstd).exists());
 
-  let stats = archive_requests_once_with_events(dir.path(), today, 7, None, resolve_format(None), None, None).unwrap();
+  let snapshot_format = ArchiveFormat::Zstd;
+  let stats = archive_requests_once(dir.path(), today, 7, snapshot_format).unwrap();
   assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
-  let report = prune_request_dbs_once(dir.path(), today, 10, archive_format(), true).unwrap();
+  let report = prune_request_dbs_once(dir.path(), today, 10, snapshot_format, true).unwrap();
   let [entry] = report.entries.as_slice() else {
     panic!("expected one request day");
   };
   assert_eq!(entry.archive, archive);
   assert!(matches!(entry.outcome, PruneOutcome::Deleted { .. }), "{entry:?}");
   assert!(!db.exists());
+}
+
+#[test]
+fn prunes_a_verified_alternate_archive_without_a_live_database() {
+  let dir = tempfile::tempdir().unwrap();
+  let db = write_packable_db(dir.path());
+  let old_archive = archive_path(&db, ArchiveFormat::Zstd);
+  let keeper = IndexedArchiveFormat::Zstd.path(&db);
+  let today = date!(2026 - 05 - 11);
+  let preference = resolve_format(Some("pack.zst"));
+  assert_eq!(
+    archive_requests_once(dir.path(), today, 7, ArchiveFormat::Zstd)
+      .unwrap()
+      .archived,
+    1
+  );
+  fs::remove_file(&db).unwrap();
+
+  let prune =
+    |commit| prune_request_dbs_once_with_progress(dir.path(), today, 10, preference, commit, &mut |_| {}).unwrap();
+  let before_migration = prune(true);
+  assert!(before_migration.entries.is_empty());
+  assert_eq!(before_migration.archives[0].outcome, ArchivePruneOutcome::MissingTarget);
+  assert!(old_archive.is_file());
+  {
+    let _day_lock = RequestDayLock::try_acquire(&db).unwrap();
+    let migration = migrate_request_archives(dir.path(), Some("pack.zst"), true).unwrap();
+    assert_eq!(migration.entries[0].outcome, MigrationOutcome::InUse);
+    assert!(!keeper.exists());
+  }
+  assert_eq!(
+    migrate_request_archives(dir.path(), Some("pack.zst"), true)
+      .unwrap()
+      .entries[0]
+      .outcome,
+    MigrationOutcome::Migrated
+  );
+
+  let preview = prune(false);
+  assert_eq!(
+    preview.archives,
+    [ArchivePruneEntry {
+      day: date!(2026 - 05 - 01),
+      path: old_archive.clone(),
+      keeper: keeper.clone(),
+      outcome: ArchivePruneOutcome::WouldRemove,
+    }]
+  );
+  assert!(old_archive.is_file());
+  {
+    let _day_lock = RequestDayLock::try_acquire(&db).unwrap();
+    assert_eq!(prune(true).archives[0].outcome, ArchivePruneOutcome::InUse);
+    assert!(old_archive.is_file());
+  }
+  assert_eq!(prune(true).archives[0].outcome, ArchivePruneOutcome::Removed);
+  assert!(!old_archive.exists());
+  assert!(keeper.is_file());
+  assert!(prune(true).archives.is_empty());
+}
+
+#[test]
+fn alternate_archive_conflict_retains_every_file_for_the_day() {
+  let dir = tempfile::tempdir().unwrap();
+  let db = write_packable_db(dir.path());
+  let today = date!(2026 - 05 - 11);
+  let preference = resolve_format(Some("pack.zst"));
+  archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
+  let keeper = IndexedArchiveFormat::Zstd.path(&db);
+  let keeper_bytes = fs::read(&keeper).unwrap();
+  // Create an older-format snapshot with different request content.
+  tokn_persistence::requests::open_day_db(&db)
+    .unwrap()
+    .execute("UPDATE request_downstream SET inbound_req_body = 'different body'", [])
+    .unwrap();
+  let old_archive = archive_path(&db, ArchiveFormat::Zstd);
+  encode_snapshot(
+    &mut StableFile::open(&db).unwrap(),
+    &mut File::create_new(&old_archive).unwrap(),
+    ArchiveFormat::Zstd,
+    &mut |_| Ok(()),
+  )
+  .unwrap();
+
+  let report = prune_request_dbs_once_with_progress(dir.path(), today, 10, preference, true, &mut |_| {}).unwrap();
+  assert_eq!(report.entries[0].outcome, PruneOutcome::ArchiveConflict);
+  let entry = &report.archives[0];
+  let ArchivePruneOutcome::Conflict { first, other } = &entry.outcome else {
+    panic!("expected conflict, got {entry:?}");
+  };
+  assert_eq!((first, other), (&old_archive, &keeper));
+  assert!(db.is_file());
+  assert!(old_archive.is_file());
+  assert_eq!(fs::read(keeper).unwrap(), keeper_bytes);
 }
 
 #[cfg(feature = "lzma")]
@@ -568,6 +662,53 @@ fn concurrent_request_write_waits_for_prune_and_is_preserved() {
 }
 
 #[test]
+fn prune_skips_a_busy_day_and_allows_current_day_writes() {
+  let dir = tempfile::tempdir().unwrap();
+  let today = date!(2026 - 05 - 09);
+  let busy = write_db(dir.path(), "2026-05-01.db", b"busy archived day");
+  let ready = write_db(dir.path(), "2026-05-02.db", b"ready archived day");
+  let format = ArchiveFormat::Zstd;
+  archive_requests_once(dir.path(), today, 7, format).unwrap();
+  let _busy_lock = RequestDayLock::try_acquire(&busy).unwrap();
+
+  let mut writer_thread = None;
+  let mut completed_during_prune = false;
+  let report = prune_request_dbs_once_with_progress(dir.path(), today, 7, format.into(), true, &mut |event| {
+    if writer_thread.is_none() && matches!(event, PruneProgressEvent::FileProgress { .. }) {
+      let (done_tx, done_rx) = mpsc::channel();
+      let requests = dir.path().to_path_buf();
+      writer_thread = Some(thread::spawn(move || {
+        let mut handler = RequestEventHandler::new(requests).unwrap();
+        let ts = today.midnight().assume_utc().unix_timestamp() * 1_000;
+        handler.handle(&started_event("current-request", ts));
+        let _ = done_tx.send(());
+      }));
+      completed_during_prune = done_rx.recv_timeout(ThreadDuration::from_secs(5)).is_ok();
+    }
+  })
+  .unwrap();
+
+  writer_thread
+    .expect("prune must progress on the available day")
+    .join()
+    .unwrap();
+  assert!(completed_during_prune, "current-day write waited for old-day prune");
+  assert_eq!(report.entries[0].outcome, PruneOutcome::InUse);
+  assert!(busy.is_file());
+  assert!(matches!(report.entries[1].outcome, PruneOutcome::Deleted { .. }));
+  assert!(!ready.exists());
+  let current = rusqlite::Connection::open(dir.path().join("2026-05-09.db")).unwrap();
+  let count: i64 = current
+    .query_row(
+      "SELECT COUNT(*) FROM requests WHERE request_id = 'current-request'",
+      [],
+      |row| row.get(0),
+    )
+    .unwrap();
+  assert_eq!(count, 1);
+}
+
+#[test]
 fn prune_keeps_source_when_archive_content_does_not_match() {
   let dir = tempdir();
   let db = write_db(&dir, "2026-05-01.db", b"original request database");
@@ -612,9 +753,11 @@ fn maintenance_lock_prevents_overlapping_archive_and_prune_scans() {
 
   let archive_error = archive_requests_once(&dir, date!(2026 - 05 - 09), 7, archive_format()).unwrap_err();
   let prune_error = prune_request_dbs_once(&dir, date!(2026 - 05 - 09), 7, archive_format(), false).unwrap_err();
+  let migrate_error = migrate_request_archives(&dir, Some("pack.zst"), false).unwrap_err();
 
   assert_eq!(archive_error.kind(), io::ErrorKind::WouldBlock);
   assert_eq!(prune_error.kind(), io::ErrorKind::WouldBlock);
+  assert_eq!(migrate_error.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[cfg(unix)]
@@ -685,13 +828,13 @@ fn uses_selected_archive_extension() {
 
 #[test]
 fn resolves_configured_extension_or_falls_back_to_zstd() {
-  assert_eq!(
-    resolve_format(Some(".pack.zst")),
-    ArchivePreference {
-      indexed: Some(IndexedArchiveFormat::Zstd),
-      snapshot_format: ArchiveFormat::Zstd,
-    }
-  );
+  let zstd_pack = ArchivePreference {
+    indexed: Some(IndexedArchiveFormat::Zstd),
+    snapshot_format: ArchiveFormat::Zstd,
+  };
+  assert_eq!(resolve_format(None), zstd_pack);
+  assert_eq!(resolve_format(Some("  ")), zstd_pack);
+  assert_eq!(resolve_format(Some(".pack.zst")), zstd_pack);
   assert_eq!(resolve_format(Some(".zstd")), ArchiveFormat::Zstd.into());
   assert_eq!(resolve_format(Some("db.zstd")), ArchiveFormat::Zstd.into());
   assert_eq!(resolve_format(Some("not-supported")), ArchiveFormat::Zstd.into());
@@ -700,7 +843,6 @@ fn resolves_configured_extension_or_falls_back_to_zstd() {
   } else {
     ArchiveFormat::Zstd
   };
-  assert_eq!(resolve_format(None), expected_xz.into());
   assert_eq!(resolve_format(Some(".xz")), expected_xz.into());
   assert_eq!(resolve_format(Some(".pack.xz")), expected_xz.into());
   assert_eq!(resolve_format(Some("lzma")), expected_xz.into());

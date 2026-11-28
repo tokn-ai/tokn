@@ -11,9 +11,8 @@
 //! `request_id → day` index used to route updates to the correct file.
 
 use super::{composite_request_id, RequestsDb};
-use crate::request_files::RequestMaintenanceLock;
 use crate::{headers_json, Result};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 use std::path::PathBuf;
 use tokn_core::event::{Event, EventHandler};
@@ -58,6 +57,12 @@ pub struct InboundConnectionUpdate<'a> {
   method: &'a str,
   inbound_method: &'a str,
   url: Option<&'a str>,
+}
+
+struct RecordWriter<'a> {
+  id: &'a str,
+  conn: &'a Connection,
+  options: RequestPersistenceOptions,
 }
 
 impl RequestEventHandler {
@@ -125,50 +130,7 @@ impl EventHandler for RequestEventHandler {
       RequestEventPayload::Record(RecordEvent::IngressRejected(rejection)) => {
         self.on_ingress_rejected(request_id, attempt, r2.ts, rejection)
       }
-      RequestEventPayload::Record(record) => {
-        if let Err(e) = self.ensure_started_for_record(request_id, attempt, r2.ts) {
-          tracing::warn!(error = %e, request_id, attempt, "requests record bootstrap failed");
-          return;
-        }
-        match record {
-          RecordEvent::IngressRejected(_) => unreachable!("ingress rejections have their own bootstrap timestamp"),
-          RecordEvent::InboundConnection {
-            user,
-            api_key_id,
-            local_addr,
-            peer_addr,
-            mode,
-            method,
-            inbound_method,
-            url,
-          } => self.on_inbound_connection(
-            request_id,
-            attempt,
-            InboundConnectionUpdate {
-              user: user.as_deref(),
-              api_key_id: api_key_id.as_deref(),
-              local_addr: local_addr.as_deref(),
-              peer_addr: peer_addr.as_deref(),
-              mode: mode.as_str(),
-              method: method.as_str(),
-              inbound_method: inbound_method.as_str(),
-              url: url.as_deref(),
-            },
-          ),
-          RecordEvent::UpstreamReq {
-            method,
-            url,
-            headers,
-            body,
-          } => self.on_upstream_req(request_id, attempt, method.as_str(), url.as_str(), headers, body),
-          RecordEvent::UpstreamResp { status, headers } => {
-            self.on_upstream_resp(request_id, attempt, r2.ts, *status, headers)
-          }
-          RecordEvent::UpstreamBody { body, .. } => self.on_upstream_body(request_id, attempt, body),
-          RecordEvent::ConvertedBody { body, .. } => self.on_converted_body(request_id, attempt, body),
-          RecordEvent::Usage(usage) => self.on_usage(request_id, attempt, usage),
-        }
-      }
+      RequestEventPayload::Record(record) => self.on_record(request_id, attempt, r2.ts, record),
     };
     if let Err(e) = result {
       tracing::warn!(error = %e, request_id, attempt, "requests persistence write failed");
@@ -177,16 +139,79 @@ impl EventHandler for RequestEventHandler {
 }
 
 impl RequestEventHandler {
-  fn acquire_write_lock(&self) -> Result<RequestMaintenanceLock> {
-    Ok(RequestMaintenanceLock::acquire_writer(self.db.dir())?)
+  fn on_record(&mut self, request_id: &str, attempt: u32, ts: i64, record: &RecordEvent) -> Result<()> {
+    let id = composite_request_id(request_id, attempt);
+    let day = self.db.request_day_or_ts(&id, ts);
+    let _lock = self.db.lock_day(&day)?;
+    if self.db.pinned_day(&id).is_none() {
+      if let Err(error) = self.write_started(&id, day.clone(), ts, None) {
+        tracing::warn!(%error, request_id, attempt, "requests record bootstrap failed");
+        return Ok(());
+      }
+    }
+    let latency_header_ms = if matches!(record, RecordEvent::UpstreamResp { .. }) {
+      self.db.latency_since_start(&id, ts)
+    } else {
+      0
+    };
+    let Ok(conn) = self.db.conn_for_day(&day) else {
+      tracing::warn!(request_id = %id, "requests record connection unavailable");
+      return Ok(());
+    };
+    let writer = RecordWriter {
+      id: &id,
+      conn,
+      options: self.options,
+    };
+    match record {
+      RecordEvent::IngressRejected(_) => unreachable!("ingress rejections have their own bootstrap timestamp"),
+      RecordEvent::InboundConnection {
+        user,
+        api_key_id,
+        local_addr,
+        peer_addr,
+        mode,
+        method,
+        inbound_method,
+        url,
+      } => writer.inbound_connection(InboundConnectionUpdate {
+        user: user.as_deref(),
+        api_key_id: api_key_id.as_deref(),
+        local_addr: local_addr.as_deref(),
+        peer_addr: peer_addr.as_deref(),
+        mode: mode.as_str(),
+        method: method.as_str(),
+        inbound_method: inbound_method.as_str(),
+        url: url.as_deref(),
+      }),
+      RecordEvent::UpstreamReq {
+        method,
+        url,
+        headers,
+        body,
+      } => writer.upstream_req(method, url, headers, body),
+      RecordEvent::UpstreamResp { status, headers } => writer.upstream_resp(latency_header_ms, *status, headers),
+      RecordEvent::UpstreamBody { body, .. } => writer.upstream_body(body),
+      RecordEvent::ConvertedBody { body, .. } => writer.converted_body(body),
+      RecordEvent::Usage(usage) => writer.usage(usage),
+    }
   }
 
-  fn ensure_started_for_record(&mut self, request_id: &str, attempt: u32, ts: i64) -> Result<()> {
-    let id = composite_request_id(request_id, attempt);
-    if self.db.contains_request(&id) {
+  fn with_record_writer(
+    &mut self,
+    id: &str,
+    missing_message: &str,
+    write: impl FnOnce(RecordWriter<'_>) -> Result<()>,
+  ) -> Result<()> {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(id)? else {
+      tracing::warn!(request_id = %id, "{missing_message}");
       return Ok(());
-    }
-    self.on_started(request_id, attempt, ts, None)
+    };
+    write(RecordWriter {
+      id,
+      conn,
+      options: self.options,
+    })
   }
 
   /// Admission failures have no pipeline stages or body capture. Persist their
@@ -198,9 +223,10 @@ impl RequestEventHandler {
     ts: i64,
     rejection: &IngressRejection,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
-    let conn = self.db.conn_for_request_or_ts(&id, rejection.started_ts)?;
+    let day = self.db.request_day_or_ts(&id, rejection.started_ts);
+    let _lock = self.db.lock_day(&day)?;
+    let conn = self.db.conn_for_day(&day)?;
     let transaction = conn.transaction()?;
     let error = format!("ingress: {}", rejection.error);
     transaction.execute(
@@ -278,38 +304,10 @@ impl RequestEventHandler {
     attempt: u32,
     update: InboundConnectionUpdate<'_>,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests InboundConnection bootstrap failed");
-      return Ok(());
-    };
-    let mut ctx = Map::new();
-    if let Some(local_addr) = update.local_addr {
-      ctx.insert("local_addr".to_string(), Value::String(local_addr.to_string()));
-    }
-    if let Some(peer_addr) = update.peer_addr {
-      ctx.insert("peer_addr".to_string(), Value::String(peer_addr.to_string()));
-    }
-    if let Some(api_key_id) = update.api_key_id {
-      ctx.insert("api_key_id".to_string(), Value::String(api_key_id.to_string()));
-    }
-    ctx.insert("mode".to_string(), Value::String(update.mode.to_string()));
-    ctx.insert("pipeline_id".to_string(), Value::String(update.method.to_string()));
-    patch_ctx_json(conn, &id, ctx)?;
-    conn.execute(
-      "UPDATE request_connection SET user = COALESCE(user, ?2) WHERE request_id = ?1",
-      params![id, update.user],
-    )?;
-    conn.execute(
-      "INSERT INTO request_downstream (request_id, inbound_req_method, inbound_req_url)
-       VALUES (?1, ?2, ?3)
-       ON CONFLICT(request_id) DO UPDATE SET
-         inbound_req_method = COALESCE(excluded.inbound_req_method, request_downstream.inbound_req_method),
-         inbound_req_url = COALESCE(excluded.inbound_req_url, request_downstream.inbound_req_url)",
-      params![id, update.inbound_method, update.url],
-    )?;
-    Ok(())
+    self.with_record_writer(&id, "requests InboundConnection bootstrap failed", |writer| {
+      writer.inbound_connection(update)
+    })
   }
 
   /// Single anchor INSERT for a fresh request. Later handlers lazily upsert
@@ -321,9 +319,14 @@ impl RequestEventHandler {
     ts: i64,
     endpoint: Option<&RequestEndpoint>,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
-    let conn = self.db.conn_for_ts(ts)?;
+    let day = self.db.request_day_or_ts(&id, ts);
+    let _lock = self.db.lock_day(&day)?;
+    self.write_started(&id, day, ts, endpoint)
+  }
+
+  fn write_started(&mut self, id: &str, day: String, ts: i64, endpoint: Option<&RequestEndpoint>) -> Result<()> {
+    let conn = self.db.conn_for_day(&day)?;
     conn.execute(
       "INSERT INTO request_connection (request_id, ts, ver, endpoint)
        VALUES (?1, ?2, ?3, ?4)
@@ -340,7 +343,7 @@ impl RequestEventHandler {
         endpoint.map(RequestEndpoint::as_str)
       ],
     )?;
-    self.db.pin_request(&id, ts);
+    self.db.pin_request(id, day, ts);
     Ok(())
   }
 
@@ -357,11 +360,10 @@ impl RequestEventHandler {
     inbound_req_headers: &tokn_headers::HeaderMap,
     inbound_req_body: &bytes::Bytes,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_req_headers);
     let persisted_body = persisted_body(self.options, inbound_req_body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests Extract without prior Started");
       return Ok(());
     };
@@ -393,9 +395,8 @@ impl RequestEventHandler {
     provider_id: &str,
     _upstream_endpoint: Option<&RequestEndpoint>,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests Resolve without prior Started");
       return Ok(());
     };
@@ -416,10 +417,9 @@ impl RequestEventHandler {
     attempt: u32,
     outbound_req_headers: &tokn_headers::HeaderMap,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(outbound_req_headers);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests BuildHeaders without prior Started");
       return Ok(());
     };
@@ -434,10 +434,9 @@ impl RequestEventHandler {
   }
 
   pub fn on_convert_request(&mut self, request_id: &str, attempt: u32, outbound_req_body: &bytes::Bytes) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let persisted_body = persisted_body(self.options, outbound_req_body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests ConvertRequest without prior Started");
       return Ok(());
     };
@@ -459,24 +458,11 @@ impl RequestEventHandler {
     status: u16,
     outbound_resp_headers: &tokn_headers::HeaderMap,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
-    let hdr_json = headers_json(outbound_resp_headers);
     let latency_header_ms = self.db.latency_since_start(&id, ts);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests Send without prior Started");
-      return Ok(());
-    };
-    conn.execute(
-      "INSERT INTO request_upstream (request_id, outbound_resp_status, outbound_resp_headers)
-       VALUES (?1, ?2, ?3)
-       ON CONFLICT(request_id) DO UPDATE SET
-         outbound_resp_status = excluded.outbound_resp_status,
-         outbound_resp_headers = excluded.outbound_resp_headers",
-      params![id, status as i64, hdr_json.as_ref()],
-    )?;
-    patch_ctx_json(conn, &id, one_i64("latency_header_ms", latency_header_ms))?;
-    Ok(())
+    self.with_record_writer(&id, "requests Send without prior Started", |writer| {
+      writer.upstream_resp(latency_header_ms, status, outbound_resp_headers)
+    })
   }
 
   pub fn on_convert_response(
@@ -487,11 +473,10 @@ impl RequestEventHandler {
     inbound_resp_headers: &tokn_headers::HeaderMap,
     inbound_resp_body: &bytes::Bytes,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let hdr_json = headers_json(inbound_resp_headers);
     let persisted_body = persisted_body(self.options, inbound_resp_body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests ConvertResponse without prior Started");
       return Ok(());
     };
@@ -512,10 +497,9 @@ impl RequestEventHandler {
   }
 
   pub fn on_error(&mut self, request_id: &str, attempt: u32, stage: Stage, message: &str) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let formatted = format!("{}: {message}", stage.as_str());
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests Error without prior Started");
       return Ok(());
     };
@@ -527,10 +511,9 @@ impl RequestEventHandler {
   }
 
   pub fn on_completed(&mut self, request_id: &str, attempt: u32, ts: i64) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
     let latency_ms = self.db.latency_since_start(&id, ts);
-    let Some(conn) = self.db.conn_for_request(&id) else {
+    let Some((_lock, conn)) = self.db.locked_conn_for_request(&id)? else {
       tracing::warn!(request_id = %id, "requests Completed without prior Started");
       return Ok(());
     };
@@ -555,14 +538,103 @@ impl RequestEventHandler {
     headers: &tokn_headers::HeaderMap,
     body: &bytes::Bytes,
   ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
     let id = composite_request_id(request_id, attempt);
+    self.with_record_writer(&id, "requests UpstreamReq without prior Started", |writer| {
+      writer.upstream_req(method, url, headers, body)
+    })
+  }
+
+  /// Wire-truth upstream-response status + headers. This overlaps with
+  /// `StageEvent::Send` on successful requests, but error responses can fail
+  /// before the Send stage completes, making this record the only place where
+  /// we still learn the upstream status line.
+  pub fn on_upstream_resp(
+    &mut self,
+    request_id: &str,
+    attempt: u32,
+    ts: i64,
+    status: u16,
+    headers: &tokn_headers::HeaderMap,
+  ) -> Result<()> {
+    let id = composite_request_id(request_id, attempt);
+    let latency_header_ms = self.db.latency_since_start(&id, ts);
+    self.with_record_writer(&id, "requests UpstreamResp without prior Started", |writer| {
+      writer.upstream_resp(latency_header_ms, status, headers)
+    })
+  }
+
+  /// Wire-truth upstream-response body, emitted immediately for buffered flows
+  /// or after accumulation for streams. The `Send` stage already wrote status
+  /// and response headers, so this update touches only the body column.
+  pub fn on_upstream_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
+    let id = composite_request_id(request_id, attempt);
+    self.with_record_writer(&id, "requests UpstreamBody without prior Started", |writer| {
+      writer.upstream_body(body)
+    })
+  }
+
+  /// Wire-truth client-facing response body after any stream translation.
+  /// Buffered flows still write `inbound_resp_body` from `StageEvent::ConvertResponse`;
+  /// this record backfills the same column for streaming flows once the full
+  /// SSE output has been accumulated.
+  pub fn on_converted_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
+    let id = composite_request_id(request_id, attempt);
+    self.with_record_writer(&id, "requests ConvertedBody without prior Started", |writer| {
+      writer.converted_body(body)
+    })
+  }
+
+  pub fn on_usage(&mut self, request_id: &str, attempt: u32, usage: &tokn_core::db::Usage) -> Result<()> {
+    let id = composite_request_id(request_id, attempt);
+    self.with_record_writer(&id, "requests Usage without prior Started", |writer| {
+      writer.usage(usage)
+    })
+  }
+}
+
+impl RecordWriter<'_> {
+  fn inbound_connection(&self, update: InboundConnectionUpdate<'_>) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
+    let mut ctx = Map::new();
+    if let Some(local_addr) = update.local_addr {
+      ctx.insert("local_addr".to_string(), Value::String(local_addr.to_string()));
+    }
+    if let Some(peer_addr) = update.peer_addr {
+      ctx.insert("peer_addr".to_string(), Value::String(peer_addr.to_string()));
+    }
+    if let Some(api_key_id) = update.api_key_id {
+      ctx.insert("api_key_id".to_string(), Value::String(api_key_id.to_string()));
+    }
+    ctx.insert("mode".to_string(), Value::String(update.mode.to_string()));
+    ctx.insert("pipeline_id".to_string(), Value::String(update.method.to_string()));
+    patch_ctx_json(conn, id, ctx)?;
+    conn.execute(
+      "UPDATE request_connection SET user = COALESCE(user, ?2) WHERE request_id = ?1",
+      params![id, update.user],
+    )?;
+    conn.execute(
+      "INSERT INTO request_downstream (request_id, inbound_req_method, inbound_req_url)
+       VALUES (?1, ?2, ?3)
+       ON CONFLICT(request_id) DO UPDATE SET
+         inbound_req_method = COALESCE(excluded.inbound_req_method, request_downstream.inbound_req_method),
+         inbound_req_url = COALESCE(excluded.inbound_req_url, request_downstream.inbound_req_url)",
+      params![id, update.inbound_method, update.url],
+    )?;
+    Ok(())
+  }
+
+  fn upstream_req(
+    &self,
+    method: &str,
+    url: &str,
+    headers: &tokn_headers::HeaderMap,
+    body: &bytes::Bytes,
+  ) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
     let hdr_json = headers_json(headers);
     let persisted_body = persisted_body(self.options, body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests UpstreamReq without prior Started");
-      return Ok(());
-    };
     conn.execute(
       "INSERT INTO request_upstream (
          request_id,
@@ -582,26 +654,10 @@ impl RequestEventHandler {
     Ok(())
   }
 
-  /// Wire-truth upstream-response status + headers. This overlaps with
-  /// `StageEvent::Send` on successful requests, but error responses can fail
-  /// before the Send stage completes, making this record the only place where
-  /// we still learn the upstream status line.
-  pub fn on_upstream_resp(
-    &mut self,
-    request_id: &str,
-    attempt: u32,
-    ts: i64,
-    status: u16,
-    headers: &tokn_headers::HeaderMap,
-  ) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
-    let id = composite_request_id(request_id, attempt);
+  fn upstream_resp(&self, latency_header_ms: i64, status: u16, headers: &tokn_headers::HeaderMap) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
     let hdr_json = headers_json(headers);
-    let latency_header_ms = self.db.latency_since_start(&id, ts);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests UpstreamResp without prior Started");
-      return Ok(());
-    };
     conn.execute(
       "INSERT INTO request_upstream (request_id, outbound_resp_status, outbound_resp_headers)
        VALUES (?1, ?2, ?3)
@@ -610,21 +666,14 @@ impl RequestEventHandler {
          outbound_resp_headers = excluded.outbound_resp_headers",
       params![id, status as i64, hdr_json.as_ref()],
     )?;
-    patch_ctx_json(conn, &id, one_i64("latency_header_ms", latency_header_ms))?;
+    patch_ctx_json(conn, id, one_i64("latency_header_ms", latency_header_ms))?;
     Ok(())
   }
 
-  /// Wire-truth upstream-response body, emitted immediately for buffered flows
-  /// or after accumulation for streams. The `Send` stage already wrote status
-  /// and response headers, so this update touches only the body column.
-  pub fn on_upstream_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
-    let id = composite_request_id(request_id, attempt);
+  fn upstream_body(&self, body: &bytes::Bytes) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
     let persisted_body = persisted_body(self.options, body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests UpstreamBody without prior Started");
-      return Ok(());
-    };
     conn.execute(
       "INSERT INTO request_upstream (request_id, outbound_resp_body)
        VALUES (?1, ?2)
@@ -635,18 +684,10 @@ impl RequestEventHandler {
     Ok(())
   }
 
-  /// Wire-truth client-facing response body after any stream translation.
-  /// Buffered flows still write `inbound_resp_body` from `StageEvent::ConvertResponse`;
-  /// this record backfills the same column for streaming flows once the full
-  /// SSE output has been accumulated.
-  pub fn on_converted_body(&mut self, request_id: &str, attempt: u32, body: &bytes::Bytes) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
-    let id = composite_request_id(request_id, attempt);
+  fn converted_body(&self, body: &bytes::Bytes) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
     let persisted_body = persisted_body(self.options, body);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests ConvertedBody without prior Started");
-      return Ok(());
-    };
     conn.execute(
       "INSERT INTO request_downstream (request_id, inbound_resp_body)
        VALUES (?1, ?2)
@@ -657,13 +698,9 @@ impl RequestEventHandler {
     Ok(())
   }
 
-  pub fn on_usage(&mut self, request_id: &str, attempt: u32, usage: &tokn_core::db::Usage) -> Result<()> {
-    let _maintenance = self.acquire_write_lock()?;
-    let id = composite_request_id(request_id, attempt);
-    let Some(conn) = self.db.conn_for_request(&id) else {
-      tracing::warn!(request_id = %id, "requests Usage without prior Started");
-      return Ok(());
-    };
+  fn usage(&self, usage: &tokn_core::db::Usage) -> Result<()> {
+    let id = self.id;
+    let conn = self.conn;
     let usage_json = usage_json(usage);
     conn.execute(
       "INSERT INTO request_metadata (request_id, usage_json)
@@ -769,6 +806,46 @@ fn usage_json(usage: &tokn_core::db::Usage) -> Option<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_record_before_midnight_keeps_later_stages_on_its_original_day() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut handler = RequestEventHandler::new(dir.path().to_path_buf()).unwrap();
+    let before_midnight = time::macros::datetime!(2026-05-01 23:59:59 UTC).unix_timestamp() * 1_000;
+    let after_midnight = before_midnight + 1_000;
+
+    handler
+      .on_record(
+        "request",
+        0,
+        before_midnight,
+        &RecordEvent::UpstreamBody {
+          body: bytes::Bytes::from_static(b"response"),
+          error: None,
+        },
+      )
+      .unwrap();
+    let endpoint = RequestEndpoint::custom("/example");
+    handler
+      .on_started("request", 0, after_midnight, Some(&endpoint))
+      .unwrap();
+    handler.on_completed("request", 0, after_midnight + 50).unwrap();
+
+    assert!(!dir.path().join("2026-05-02.db").exists());
+    let db = Connection::open(dir.path().join("2026-05-01.db")).unwrap();
+    let actual: (i64, String, Vec<u8>, i64) = db
+      .query_row(
+        "SELECT ts, endpoint, outbound_resp_body, json_extract(ctx_json, '$.latency_ms')
+         FROM requests WHERE request_id = 'request'",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+      )
+      .unwrap();
+    assert_eq!(
+      actual,
+      (before_midnight, "/example".to_owned(), b"response".to_vec(), 50)
+    );
+  }
 
   #[test]
   fn zero_body_limit_preserves_only_empty_bodies() {
