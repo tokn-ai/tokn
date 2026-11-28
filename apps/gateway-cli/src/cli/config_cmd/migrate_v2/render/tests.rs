@@ -304,6 +304,7 @@ fn projection_modes_profiles_and_proxy_order_round_trip() {
           forward_proxy: Some(V2ForwardProxyProjectionOptions {
             route_mode: proxy_mode,
             default_intercept_hosts: vec!["chatgpt.com".into()],
+            default_passthrough_intercept_hosts: Vec::new(),
             provider_hosts: BTreeMap::new(),
           }),
           ..Default::default()

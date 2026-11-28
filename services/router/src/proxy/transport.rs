@@ -421,6 +421,12 @@ fn resolve_proxy_route_mode(
     .map(str::to_string)
     .or_else(|| {
       default_proxy_provider_mode(state, headers, intercepted_host, path_and_query)
+        .or_else(|| {
+          super::PASSTHROUGH_INTERCEPT_HOSTS
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(intercepted_host))
+            .then_some(RouteMode::Passthrough)
+        })
         .map(|mode| route_mode_as_str(mode).to_string())
     });
   route_resolver.resolve_mode(route_mode.as_deref())
@@ -746,6 +752,24 @@ mod tests {
     assert_eq!(
       resolve_proxy_route_mode(&state, &route, &headers, "api.anthropic.com", "/v1/messages"),
       Ok(RouteMode::Passthrough)
+    );
+  }
+
+  #[test]
+  fn zcode_gateway_defaults_to_passthrough_in_managed_proxy_mode() {
+    let state = state_with_provider_modes(&[]);
+    let resolver = RouteResolver::new(RouteMode::Route, &[]);
+    let path = "/api/v1/ultra-zai/anthropic/v1/messages";
+    let mut headers = HeaderMap::new();
+
+    assert_eq!(
+      resolve_proxy_route_mode(&state, &resolver, &headers, "zcode.z.ai", path),
+      Ok(RouteMode::Passthrough)
+    );
+    headers.insert(RouteResolver::mode_header(), HeaderValue::from_static("route"));
+    assert_eq!(
+      resolve_proxy_route_mode(&state, &resolver, &headers, "zcode.z.ai", path),
+      Ok(RouteMode::Route)
     );
   }
 }

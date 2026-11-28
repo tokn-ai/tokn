@@ -66,6 +66,7 @@ requests_dir = {:?}
     let ts = tokn_core::util::now_unix_ms();
     let mut headers = tokn_headers::HeaderMap::new();
     headers.insert("authorization", "Bearer private-test-value");
+    headers.insert("X-ZCode-Authorization", "Bearer zcode-fixture");
     headers.insert("x-request-id", "req-frontend-persisted");
     events.emit(Event::Requests(RequestEvent {
       request_id: "req-frontend-persisted".into(),
@@ -107,6 +108,7 @@ requests_dir = {:?}
     assert!(error.contains("request body exceeds the configured limit"));
     let headers: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
     assert_eq!(headers["authorization"], "<redacted>");
+    assert_eq!(headers["x-zcode-authorization"], "<redacted>");
     assert_eq!(headers["x-request-id"], "req-frontend-persisted");
     assert!(body.is_none());
   }

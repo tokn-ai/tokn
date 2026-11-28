@@ -308,6 +308,8 @@ accounts = ["primary"]
 
   #[test]
   fn preview_can_include_the_legacy_forward_proxy() {
+    use tokn_config::v2::{RawBindingAction, RawConnectAction, RawRelayCredentials, RawRelayDestination, RawRoute};
+
     let directory = tempfile::tempdir().unwrap();
     let config_path = directory.path().join("config.toml");
     let auth_path = directory.path().join("auth.yaml");
@@ -315,7 +317,6 @@ accounts = ["primary"]
     write_auth(&auth_path, [account("primary", "openai")]);
     let mut args = args();
     args.with_proxy = true;
-    args.proxy_route_mode = Some(super::super::RouteModeArg::Passthrough);
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
 
@@ -325,6 +326,26 @@ accounts = ["primary"]
     assert_eq!(raw.listeners.len(), 2);
     assert!(raw.listeners.contains_key("api"));
     assert!(raw.listeners.contains_key("proxy"));
+    let host = "zcode.z.ai";
+    assert!(raw.connect_rules.iter().any(|rule| {
+      rule.listener == "proxy" && rule.action == RawConnectAction::Intercept && rule.hosts.iter().any(|h| h == host)
+    }));
+    let binding = raw
+      .bindings
+      .iter()
+      .find(|binding| binding.listener == "proxy" && binding.hosts.iter().any(|h| h == host))
+      .expect("ZCode gateway must have a dedicated passthrough binding");
+    let RawBindingAction::Route { profile } = &binding.action else {
+      panic!("ZCode gateway requests must be routed");
+    };
+    assert!(matches!(
+      raw.routes[&raw.profiles[profile].route],
+      RawRoute::Relay {
+        destination: RawRelayDestination::Original {},
+        credentials: RawRelayCredentials::Client {},
+        ..
+      }
+    ));
   }
 
   #[test]

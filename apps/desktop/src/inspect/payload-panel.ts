@@ -11,6 +11,7 @@ function isSensitiveHeader(name: string): boolean {
   return (
     normalized === "authorization" ||
     normalized === "proxy-authorization" ||
+    normalized === "x-zcode-authorization" ||
     normalized === "cookie" ||
     normalized === "set-cookie" ||
     normalized.includes("api-key") ||

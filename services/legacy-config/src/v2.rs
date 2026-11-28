@@ -40,6 +40,8 @@ pub struct V2ForwardProxyProjectionOptions {
   pub route_mode: RouteMode,
   /// Built-in hosts intercepted by the legacy proxy before config overrides.
   pub default_intercept_hosts: Vec<String>,
+  /// Built-in intercept hosts that default to client-authenticated passthrough.
+  pub default_passthrough_intercept_hosts: Vec<String>,
   /// Provider descriptor hosts used by `[proxy_mode.provider_modes]`.
   pub provider_hosts: BTreeMap<String, Vec<String>>,
 }

@@ -19,6 +19,10 @@ pub(super) fn forward_proxy_options(route_mode: RouteMode) -> V2ForwardProxyProj
     default_intercept_hosts: tokn_router::proxy_default_intercept_hosts()
       .map(str::to_string)
       .collect(),
+    default_passthrough_intercept_hosts: tokn_router::proxy_passthrough_intercept_hosts()
+      .iter()
+      .map(|host| (*host).to_string())
+      .collect(),
     provider_hosts,
   }
 }

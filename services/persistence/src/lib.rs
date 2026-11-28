@@ -34,8 +34,8 @@ pub fn open_readonly(
 }
 
 /// Serialise an HTTP header map to JSON bytes, redacting values whose name
-/// is sensitive (`authorization`, `proxy-authorization`, `cookie`, anything
-/// containing `api-key`). Public so both inbound (server::forward) and
+/// is sensitive (`authorization`, `proxy-authorization`, `x-zcode-authorization`,
+/// `cookie`, anything containing `api-key`). Public so both inbound (server::forward) and
 /// outbound (db::requests) capture paths share the same redaction policy.
 pub fn headers_json(headers: &tokn_headers::HeaderMap) -> Bytes {
   use serde_json::{Map, Value};
@@ -53,7 +53,10 @@ pub fn headers_json(headers: &tokn_headers::HeaderMap) -> Bytes {
 }
 
 pub fn is_sensitive_header(name: &str) -> bool {
-  matches!(name, "authorization" | "proxy-authorization" | "cookie") || name.contains("api-key")
+  matches!(
+    name,
+    "authorization" | "proxy-authorization" | "x-zcode-authorization" | "cookie"
+  ) || name.contains("api-key")
 }
 
 #[derive(Debug, Snafu)]

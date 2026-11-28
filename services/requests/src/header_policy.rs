@@ -21,7 +21,7 @@ pub(crate) fn passthrough_headers(inbound: &HeaderMap, preserve_host: bool, pres
     if lower.starts_with("x-tokn-router-") || matches!(lower.as_str(), "x-route-mode" | "x-behave-as") {
       continue;
     }
-    if !preserve_client_auth && matches!(lower.as_str(), "authorization" | "x-api-key") {
+    if !preserve_client_auth && matches!(lower.as_str(), "authorization" | "x-api-key" | "x-zcode-authorization") {
       continue;
     }
     if HOP_BY_HOP.contains(&lower.as_str()) && !(preserve_host && lower == "host") {

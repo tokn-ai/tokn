@@ -259,7 +259,7 @@ access_token = "codex-client-token"
   client
     .write_all(
       format!(
-        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer codex-client-token\r\nContent-Length: 5\r\nConnection: close, x-hop\r\nKeep-Alive: timeout=5\r\nX-Hop: remove-me\r\n\r\nhello"
+        "POST http://{upstream_addr}/opaque?x=1 HTTP/1.1\r\nHost: {upstream_addr}\r\nAuthorization: Bearer codex-client-token\r\nX-ZCode-Authorization: Bearer zcode-fixture\r\nContent-Length: 5\r\nConnection: close, x-hop\r\nKeep-Alive: timeout=5\r\nX-Hop: remove-me\r\n\r\nhello"
       )
       .as_bytes(),
     )
@@ -296,6 +296,7 @@ access_token = "codex-client-token"
   assert!(request.starts_with("POST /opaque?x=1 HTTP/1.1\r\n"));
   assert!(request.contains("authorization: Bearer codex-client-token\r\n"));
   let request_lower = request.to_ascii_lowercase();
+  assert!(request_lower.contains("x-zcode-authorization: bearer zcode-fixture\r\n"));
   assert!(request_lower.contains(&format!("x-request-id: {}\r\n", generated_request_id)));
   for removed in ["proxy-authorization", "connection:", "keep-alive:", "x-hop:"] {
     assert!(!request_lower.contains(removed), "forwarded request retained {removed}");

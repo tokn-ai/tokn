@@ -211,6 +211,7 @@ mod tests {
       ("host", "api.example.com:8443"),
       ("connection", "keep-alive"),
       ("authorization", "Bearer tok"),
+      ("x-zcode-authorization", "Bearer zcode-fixture"),
       ("x-tokn-router-local-addr", "127.0.0.1:8080"),
     ]);
     let out = PassthroughBuildHeaders::preserve_host()
@@ -232,6 +233,10 @@ mod tests {
       "router-owned still stripped"
     );
     assert!(out.headers.contains_key("authorization"));
+    assert_eq!(
+      out.headers.get("x-zcode-authorization").map(|v| v.as_str()),
+      Some("Bearer zcode-fixture")
+    );
   }
 
   #[tokio::test]
@@ -240,6 +245,7 @@ mod tests {
       ("host", "api.example.com"),
       ("authorization", "Bearer tok"),
       ("x-api-key", "client-key"),
+      ("x-zcode-authorization", "Bearer zcode-fixture"),
       ("accept", "application/json"),
     ]);
     let out = PassthroughBuildHeaders::preserve_host_with_router_auth()
@@ -249,6 +255,7 @@ mod tests {
     assert_eq!(out.headers.get("host").map(|v| v.as_str()), Some("api.example.com"));
     assert!(!out.headers.contains_key("authorization"));
     assert!(!out.headers.contains_key("x-api-key"));
+    assert!(!out.headers.contains_key("x-zcode-authorization"));
     assert!(out.headers.contains_key("accept"));
   }
 }
