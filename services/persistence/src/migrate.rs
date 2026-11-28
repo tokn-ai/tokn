@@ -182,7 +182,7 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
   )
 }
 
-fn quote_ident(s: &str) -> String {
+pub(crate) fn quote_ident(s: &str) -> String {
   format!("\"{}\"", s.replace('"', "\"\""))
 }
 

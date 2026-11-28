@@ -122,7 +122,7 @@ pub fn verify(
   progress: &mut impl FnMut(u64) -> io::Result<()>,
 ) -> io::Result<()> {
   let mut reader = IndexedPackReader::open_with_progress(input, Duration::ZERO, progress)?;
-  capture::verify_metadata_rows(snapshot.capture.metadata_snapshot.path(), &reader.metadata)?;
+  capture::verify_metadata_rows(snapshot.capture.metadata_snapshot.path(), &reader.metadata, progress)?;
   progress(0)?;
   let input = reader.input.get_mut();
   verify_header(input)?;

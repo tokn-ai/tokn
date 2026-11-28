@@ -1,8 +1,9 @@
 use super::{invalid_data, FIELDS, MAX_REQUEST_ID_BYTES, SESSION_WINDOW};
+use crate::migrate::quote_ident;
 use crate::request_files::StableFile;
 use flate2::bufread::MultiGzDecoder;
 use memmap2::Mmap;
-use rusqlite::{types::ValueRef, Connection, ErrorCode, OpenFlags};
+use rusqlite::{types::ValueRef, Connection, ErrorCode, OpenFlags, Statement};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
@@ -14,14 +15,15 @@ use url::Url;
 
 use super::objects::{MAX_BODY_BYTES, MAX_OBJECTS};
 
-const TABLES: [&str; 5] = [
+const SCHEMA_VERSION: i64 = 8;
+// Copy existing tables in their historical order to preserve SQLite page layout in packs.
+const V8_COPY_ORDER: [&str; 5] = [
   "schema_migrations",
   "request_connection",
   "request_metadata",
   "request_downstream",
   "request_upstream",
 ];
-const SCHEMA_VERSION: i64 = 8;
 
 pub(super) struct Capture {
   pub metadata_snapshot: NamedTempFile,
@@ -130,10 +132,7 @@ pub(super) fn load(
       .map_err(invalid_data)?;
     tx.pragma_update(Some("main"), name, value).map_err(invalid_data)?;
   }
-  for table in TABLES {
-    progress(0)?;
-    copy_snapshot_table(&tx, table).map_err(invalid_data)?;
-  }
+  copy_snapshot_tables(&tx, progress)?;
   let mut spool = Spool::new()?;
   let Some(bodies) = read_bodies(&tx, &mut spool, progress)? else {
     return Ok(None);
@@ -220,29 +219,76 @@ fn schema(conn: &Connection, db: &str) -> rusqlite::Result<Vec<String>> {
   definitions.collect()
 }
 
-fn copy_snapshot_table(conn: &Connection, table: &str) -> rusqlite::Result<()> {
-  let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?1, 'main') ORDER BY cid")?;
-  let columns = stmt
-    .query_map([table], |row| row.get::<_, String>(0))?
-    .collect::<rusqlite::Result<Vec<_>>>()?;
-  let select: Vec<_> = columns
+fn snapshot_tables(conn: &Connection, database: &str) -> rusqlite::Result<Vec<String>> {
+  let mut stmt = conn.prepare(&format!(
+    "SELECT name FROM {database}.sqlite_schema WHERE type = 'table' ORDER BY name"
+  ))?;
+  let names = stmt.query_map([], |row| row.get(0))?;
+  names.collect()
+}
+
+fn copy_snapshot_tables(conn: &Connection, progress: &mut impl FnMut(u64) -> io::Result<()>) -> io::Result<()> {
+  let mut tables = snapshot_tables(conn, "source").map_err(invalid_data)?;
+  tables.sort_by_key(|table| {
+    V8_COPY_ORDER
+      .iter()
+      .position(|name| name == table)
+      .unwrap_or(V8_COPY_ORDER.len())
+  });
+  for table in tables {
+    progress(0)?;
+    copy_snapshot_table(conn, &table, progress)?;
+  }
+  Ok(())
+}
+
+fn copy_snapshot_table(
+  conn: &Connection,
+  table: &str,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<()> {
+  let mut stmt = conn
+    .prepare("SELECT name FROM pragma_table_xinfo(?1, 'source') ORDER BY cid")
+    .map_err(invalid_data)?;
+  let names = stmt
+    .query_map([table], |row| row.get::<_, String>(0))
+    .map_err(invalid_data)?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(invalid_data)?;
+  let columns: Vec<_> = names.iter().map(|column| quote_ident(column)).collect();
+  let values = names
     .iter()
-    .map(|column| {
+    .zip(&columns)
+    .map(|(column, quoted)| {
       if FIELDS.iter().any(|(owner, body, _)| *owner == table && *body == column) {
-        "NULL"
+        format!("NULL AS {quoted}")
       } else {
-        column.as_str()
+        quoted.clone()
       }
     })
-    .collect();
-  conn.execute(
-    &format!(
-      "INSERT INTO main.{table}(rowid, {}) SELECT rowid, {} FROM source.{table} ORDER BY rowid",
-      columns.join(", "),
-      select.join(", ")
-    ),
-    [],
-  )?;
+    .collect::<Vec<_>>()
+    .join(", ");
+  let table_name = quote_ident(table);
+  let source_rows = format!("SELECT rowid, {values} FROM source.{table_name} NOT INDEXED ORDER BY rowid");
+  conn
+    .execute(
+      &format!(
+        "INSERT INTO main.{table_name}(rowid, {}) {source_rows}",
+        columns.join(", "),
+      ),
+      [],
+    )
+    .map_err(invalid_data)?;
+
+  // Compare every source metadata value against the complete captured table.
+  // The projection leaves the separately captured bodies on disk.
+  let mut source = conn.prepare(&source_rows).map_err(invalid_data)?;
+  let mut captured = conn.prepare(&table_rows(&table_name)).map_err(invalid_data)?;
+  if !rows_match(&mut source, &mut captured, progress)? {
+    return Err(invalid_data(format!(
+      "captured request metadata {table} differs from the source"
+    )));
+  }
   Ok(())
 }
 
@@ -363,7 +409,11 @@ fn find_session_candidates(
   Ok((ranges, indices))
 }
 
-pub(super) fn verify_metadata_rows(expected: &Path, actual: &Connection) -> io::Result<()> {
+pub(super) fn verify_metadata_rows(
+  expected: &Path,
+  actual: &Connection,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<()> {
   let expected = Connection::open_with_flags(expected, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(invalid_data)?;
   expected
     .execute_batch("PRAGMA trusted_schema = OFF;")
@@ -382,29 +432,45 @@ pub(super) fn verify_metadata_rows(expected: &Path, actual: &Connection) -> io::
       return Err(invalid_data("archive metadata snapshot database identifier differs"));
     }
   }
-  for table in TABLES {
-    if !table_matches(&expected, actual, table).map_err(invalid_data)? {
+  for table in snapshot_tables(&expected, "main").map_err(invalid_data)? {
+    progress(0)?;
+    let sql = table_rows(&quote_ident(&table));
+    let mut expected_rows = expected.prepare(&sql).map_err(invalid_data)?;
+    let mut actual_rows = actual.prepare(&sql).map_err(invalid_data)?;
+    if !rows_match(&mut expected_rows, &mut actual_rows, progress)? {
       return Err(invalid_data(format!("archive metadata snapshot {table} rows differ")));
     }
   }
   Ok(())
 }
 
-fn table_matches(expected: &Connection, actual: &Connection, table: &str) -> rusqlite::Result<bool> {
-  let sql = format!("SELECT rowid, * FROM {table} NOT INDEXED ORDER BY rowid");
-  let mut expected_stmt = expected.prepare(&sql)?;
-  let mut actual_stmt = actual.prepare(&sql)?;
-  let columns = expected_stmt.column_count();
-  let mut expected_rows = expected_stmt.query([])?;
-  let mut actual_rows = actual_stmt.query([])?;
+fn table_rows(quoted_table: &str) -> String {
+  format!("SELECT rowid, * FROM main.{quoted_table} NOT INDEXED ORDER BY rowid")
+}
+
+fn rows_match(
+  expected: &mut Statement<'_>,
+  actual: &mut Statement<'_>,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+) -> io::Result<bool> {
+  if expected.column_names() != actual.column_names() {
+    return Ok(false);
+  }
+  let columns = expected.column_count();
+  let mut expected_rows = expected.query([]).map_err(invalid_data)?;
+  let mut actual_rows = actual.query([]).map_err(invalid_data)?;
   loop {
-    let (left, right) = match (expected_rows.next()?, actual_rows.next()?) {
+    progress(0)?;
+    let (left, right) = match (
+      expected_rows.next().map_err(invalid_data)?,
+      actual_rows.next().map_err(invalid_data)?,
+    ) {
       (Some(left), Some(right)) => (left, right),
       (None, None) => return Ok(true),
       _ => return Ok(false),
     };
     for column in 0..columns {
-      if left.get_ref(column)? != right.get_ref(column)? {
+      if left.get_ref(column).map_err(invalid_data)? != right.get_ref(column).map_err(invalid_data)? {
         return Ok(false);
       }
     }
@@ -451,4 +517,95 @@ fn bounded_decode(reader: impl Read) -> Option<Vec<u8>> {
   let mut bytes = Vec::new();
   reader.take(MAX_BODY_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
   (bytes.len() <= MAX_BODY_BYTES).then_some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn copies_new_tables_and_columns_without_copying_request_bodies() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn
+      .execute_batch(
+        r#"
+        ATTACH DATABASE ':memory:' AS source;
+        CREATE TABLE main.request_downstream (
+          request_id TEXT PRIMARY KEY,
+          inbound_req_body BLOB,
+          "annotation" TEXT
+        );
+        CREATE TABLE source.request_downstream (
+          request_id TEXT PRIMARY KEY,
+          inbound_req_body BLOB,
+          "annotation" TEXT
+        );
+        CREATE TABLE main."future ""metadata""" (tag TEXT PRIMARY KEY, "checksum note" BLOB);
+        CREATE TABLE source."future ""metadata""" (tag TEXT PRIMARY KEY, "checksum note" BLOB);
+        INSERT INTO source.request_downstream VALUES ('fixture', X'616263', 'keep this field');
+        INSERT INTO source."future ""metadata""" (rowid, tag, "checksum note")
+          VALUES (73, 'fixture', X'0102');
+        "#,
+      )
+      .unwrap();
+
+    copy_snapshot_tables(&conn, &mut |_| Ok(())).unwrap();
+
+    let request: (String, Option<Vec<u8>>, String) = conn
+      .query_row(
+        "SELECT request_id, inbound_req_body, annotation FROM main.request_downstream",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+      )
+      .unwrap();
+    assert_eq!(request, ("fixture".into(), None, "keep this field".into()));
+    let metadata: (i64, String, Vec<u8>) = conn
+      .query_row(
+        r#"SELECT rowid, tag, "checksum note" FROM main."future ""metadata""""#,
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+      )
+      .unwrap();
+    assert_eq!(metadata, (73, "fixture".into(), vec![1, 2]));
+  }
+
+  #[test]
+  fn verification_checks_metadata_in_new_columns_and_tables() {
+    let expected = NamedTempFile::new().unwrap();
+    let actual = Connection::open_in_memory().unwrap();
+    let fixture = r#"
+      CREATE TABLE "future metadata" (tag TEXT PRIMARY KEY, "checksum note" BLOB);
+      INSERT INTO "future metadata" VALUES ('fixture', X'0102');
+    "#;
+    Connection::open(expected.path())
+      .unwrap()
+      .execute_batch(fixture)
+      .unwrap();
+    actual.execute_batch(fixture).unwrap();
+    verify_metadata_rows(expected.path(), &actual, &mut |_| Ok(())).unwrap();
+
+    actual
+      .execute_batch(r#"UPDATE "future metadata" SET "checksum note" = X'FF';"#)
+      .unwrap();
+    let error = verify_metadata_rows(expected.path(), &actual, &mut |_| Ok(())).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+    actual
+      .execute_batch(
+        r#"UPDATE "future metadata" SET "checksum note" = X'0102';
+           ALTER TABLE "future metadata" ADD COLUMN extra TEXT;"#,
+      )
+      .unwrap();
+    let error = verify_metadata_rows(expected.path(), &actual, &mut |_| Ok(())).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+    actual
+      .execute_batch(
+        r#"ALTER TABLE "future metadata" DROP COLUMN extra;
+           ALTER TABLE "future metadata" DROP COLUMN "checksum note";"#,
+      )
+      .unwrap();
+    let error = verify_metadata_rows(expected.path(), &actual, &mut |_| Ok(())).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+  }
 }
