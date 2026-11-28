@@ -1,4 +1,4 @@
-use super::{invalid_data, FIELDS, MAX_REQUEST_ID_BYTES, SESSION_WINDOW};
+use super::{invalid_data, CaptureProgress, FIELDS, MAX_REQUEST_ID_BYTES, SESSION_WINDOW};
 use crate::migrate::quote_ident;
 use crate::request_files::StableFile;
 use flate2::bufread::MultiGzDecoder;
@@ -91,6 +91,7 @@ impl Spool {
 pub(super) fn load(
   source: &StableFile,
   progress: &mut impl FnMut(u64) -> io::Result<()>,
+  on_capture: &mut impl FnMut(CaptureProgress),
 ) -> io::Result<Option<Capture>> {
   progress(0)?;
   source.revalidate()?;
@@ -136,9 +137,13 @@ pub(super) fn load(
       .map_err(invalid_data)?;
     tx.pragma_update(Some("main"), name, value).map_err(invalid_data)?;
   }
-  copy_snapshot_tables(&tx, progress)?;
+  let tables = snapshot_tables(&tx, "source").map_err(invalid_data)?;
+  on_capture(CaptureProgress::Started {
+    tasks: (tables.len() + FIELDS.len() + 1) as u64,
+  });
+  copy_snapshot_tables(&tx, tables, progress, on_capture)?;
   let mut spool = Spool::new()?;
-  let Some(bodies) = read_bodies(&tx, &mut spool, progress)? else {
+  let Some(bodies) = read_bodies(&tx, &mut spool, progress, on_capture)? else {
     return Ok(None);
   };
   let (candidate_ranges, candidate_indices) = find_session_candidates(&tx, &bodies, progress)?;
@@ -152,17 +157,21 @@ pub(super) fn load(
   if before.len() != after.len() || before.modified()? != after.modified()? {
     return Err(invalid_data("request database changed during archive capture"));
   }
-  if u32::try_from(metadata_snapshot.as_file().metadata()?.len()).is_err() {
+  let metadata_bytes = metadata_snapshot.as_file().metadata()?.len();
+  if u32::try_from(metadata_bytes).is_err() {
     return Ok(None);
   }
 
-  Ok(Some(Capture {
+  let capture = Capture {
     metadata_snapshot,
     bodies: bodies.into_iter().map(|(_, body)| body).collect(),
     candidate_ranges,
     candidate_indices,
     backing: spool.finish()?,
-  }))
+  };
+  on_capture(CaptureProgress::OutputBytes(metadata_bytes));
+  on_capture(CaptureProgress::TaskFinished);
+  Ok(Some(capture))
 }
 
 fn check_sidecars(path: &Path) -> io::Result<()> {
@@ -231,8 +240,12 @@ fn snapshot_tables(conn: &Connection, database: &str) -> rusqlite::Result<Vec<St
   names.collect()
 }
 
-fn copy_snapshot_tables(conn: &Connection, progress: &mut impl FnMut(u64) -> io::Result<()>) -> io::Result<()> {
-  let mut tables = snapshot_tables(conn, "source").map_err(invalid_data)?;
+fn copy_snapshot_tables(
+  conn: &Connection,
+  mut tables: Vec<String>,
+  progress: &mut impl FnMut(u64) -> io::Result<()>,
+  on_capture: &mut impl FnMut(CaptureProgress),
+) -> io::Result<()> {
   tables.sort_by_key(|table| {
     V8_COPY_ORDER
       .iter()
@@ -242,6 +255,7 @@ fn copy_snapshot_tables(conn: &Connection, progress: &mut impl FnMut(u64) -> io:
   for table in tables {
     progress(0)?;
     copy_snapshot_table(conn, &table, progress)?;
+    on_capture(CaptureProgress::TaskFinished);
   }
   Ok(())
 }
@@ -302,6 +316,7 @@ fn read_bodies(
   conn: &Connection,
   spool: &mut Spool,
   progress: &mut impl FnMut(u64) -> io::Result<()>,
+  on_capture: &mut impl FnMut(CaptureProgress),
 ) -> io::Result<Option<Vec<OrderedBody>>> {
   let mut bodies = Vec::new();
   for (slot, (table, body, headers)) in FIELDS.iter().enumerate() {
@@ -341,6 +356,7 @@ fn read_bodies(
       let Some(bytes) = spool.append(decoded.as_deref().unwrap_or(wire))? else {
         return Ok(None);
       };
+      let output_bytes = bytes.len() as u64;
       let flags = u8::from(decoded.is_some()) | (u8::from(is_text) << 1);
       let rowid = row.get::<_, Option<i64>>(0).map_err(invalid_data)?;
       bodies.push((
@@ -352,7 +368,9 @@ fn read_bodies(
           bytes,
         },
       ));
+      on_capture(CaptureProgress::OutputBytes(output_bytes));
     }
+    on_capture(CaptureProgress::TaskFinished);
   }
   bodies.sort_unstable_by(|(a, left), (b, right)| {
     (a.is_none(), a, &left.request_id, left.slot).cmp(&(b.is_none(), b, &right.request_id, right.slot))
@@ -553,7 +571,8 @@ mod tests {
       )
       .unwrap();
 
-    copy_snapshot_tables(&conn, &mut |_| Ok(())).unwrap();
+    let tables = snapshot_tables(&conn, "source").unwrap();
+    copy_snapshot_tables(&conn, tables, &mut |_| Ok(()), &mut |_| {}).unwrap();
 
     let request: (String, Option<Vec<u8>>, String) = conn
       .query_row(

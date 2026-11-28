@@ -346,12 +346,13 @@ Run `tokn-gateway requests migrate` to convert existing archives to the
 configured format. The dry run measures the uncompressed pack
 or SQLite payload, including for days whose SQLite source was already pruned.
 Add `--commit` to compress, write, and verify the destination archives while
-retaining each source. The terminal shows progress across all days and the
-current stage's byte count and throughput. Each completed day prints one row
-with a colored status, the original archive size, and the destination payload
-size. Decoded SQLite snapshots also show the database SHA-256. A written
-destination reports its compressed size. Terminal rows abbreviate the database
-hash, and redirected output includes the full hash and byte counts.
+retaining each source. The terminal shows progress across all days, the current
+stage's input progress, and separate input and output rates. Each completed day
+prints one row with a colored status, the original archive size, and the
+destination payload size. Decoded SQLite snapshots also show the database
+SHA-256. A written destination reports its compressed size. Terminal rows
+abbreviate the database hash, and redirected output includes the full hash and
+byte counts.
 
 `tokn-gateway requests prune` previews eligible SQLite files and alternate
 archives. With `--commit`, it removes an alternate archive only when the

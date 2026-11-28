@@ -99,13 +99,10 @@ impl ArchiveSet {
       let format = ArchiveContents::from_path(path).map_err(|error| file_error(path, error))?;
       let mut file = StableFile::open(path)?;
       let mut compressed_bytes = 0;
-      progress(ContentProgress::Stage(
-        "Input hash",
-        Some(file.file().metadata()?.len()),
-      ));
+      progress(ContentProgress::read("Input hash", file.file().metadata()?.len()));
       let digest = archive_digest(&mut file, &mut |bytes| {
         compressed_bytes += bytes;
-        progress(ContentProgress::Bytes(bytes));
+        progress(ContentProgress::Input(bytes));
       })?;
       archives.push(CheckedArchive {
         file,
@@ -154,9 +151,9 @@ impl ArchiveSet {
 
   pub fn recheck_with_progress(&mut self, progress: &mut impl FnMut(ContentProgress)) -> io::Result<()> {
     let bytes_total = self.archives.iter().map(|archive| archive.compressed_bytes).sum();
-    progress(ContentProgress::Stage("Recheck input", Some(bytes_total)));
+    progress(ContentProgress::read("Recheck input", bytes_total));
     for archive in &mut self.archives {
-      if archive_digest(&mut archive.file, &mut |bytes| progress(ContentProgress::Bytes(bytes)))? != archive.digest {
+      if archive_digest(&mut archive.file, &mut |bytes| progress(ContentProgress::Input(bytes)))? != archive.digest {
         return Err(io::Error::new(
           io::ErrorKind::InvalidData,
           format!("{} changed during verification", archive.file.path().display()),

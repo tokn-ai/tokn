@@ -54,7 +54,8 @@ pub fn write(
 
 pub enum PackWriteProgress {
   BodyBytes(u64),
-  Indexing,
+  Indexing { entries: u64 },
+  EntryIndexed,
 }
 
 /// Serialize a pack and report input body bytes separately from index construction.
@@ -72,7 +73,9 @@ pub fn write_with_body_progress(
   });
   let (index, canonical) = tracked.finish(result)?;
 
-  on_body_progress(PackWriteProgress::Indexing);
+  on_body_progress(PackWriteProgress::Indexing {
+    entries: snapshot.capture.bodies.len() as u64,
+  });
   let temp = tempfile::tempdir()?;
   let metadata = temp.path().join("metadata.db");
   {
@@ -81,7 +84,9 @@ pub fn write_with_body_progress(
     copy_exact(&mut source, &mut create_private_file(&metadata)?, source_len, progress)?;
   }
   let mut conn = Connection::open(&metadata).map_err(invalid_data)?;
-  write_indexes(&mut conn, snapshot, &index, &canonical, progress)?;
+  write_indexes(&mut conn, snapshot, &index, &canonical, progress, || {
+    on_body_progress(PackWriteProgress::EntryIndexed);
+  })?;
   conn.close().map_err(|(_, error)| invalid_data(error))?;
 
   let mut metadata = File::open(&metadata)?;
@@ -97,6 +102,7 @@ fn write_indexes(
   index: &[ObjectIndex],
   canonical: &[usize],
   progress: &mut impl FnMut(u64) -> io::Result<()>,
+  mut on_entry_indexed: impl FnMut(),
 ) -> io::Result<()> {
   let tx = conn.transaction().map_err(invalid_data)?;
   tx.execute_batch(SCHEMA).map_err(invalid_data)?;
@@ -128,6 +134,7 @@ fn write_indexes(
       insert_body
         .execute(params![body.request_id, body.slot, entry.sha256.as_slice(), body.flags])
         .map_err(invalid_data)?;
+      on_entry_indexed();
     }
   }
   tx.commit().map_err(invalid_data)
@@ -559,7 +566,18 @@ mod tests {
   fn reads_metadata_without_scanning_body_objects_and_reconstructs_requested_deltas() -> anyhow::Result<()> {
     let (snapshot, target) = fixture()?;
     let mut bytes = Vec::new();
-    write(&snapshot, &mut bytes, &mut |_| Ok(()))?;
+    let mut expected_entries = None;
+    let mut indexed = 0;
+    write_with_body_progress(&snapshot, &mut bytes, &mut |_| Ok(()), |event| match event {
+      PackWriteProgress::BodyBytes(_) => assert!(expected_entries.is_none()),
+      PackWriteProgress::Indexing { entries } => assert_eq!(expected_entries.replace(entries), None),
+      PackWriteProgress::EntryIndexed => {
+        assert!(expected_entries.is_some());
+        indexed += 1;
+      }
+    })?;
+    assert_eq!(expected_entries, Some(3));
+    assert_eq!(indexed, 3);
     let mut verified_bytes = 0;
     verify(&snapshot, &mut Cursor::new(&bytes), &mut |count| {
       verified_bytes += count;

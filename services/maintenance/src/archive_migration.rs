@@ -50,6 +50,13 @@ impl MigrationPayloadSize {
   }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationInputUnit {
+  Bytes,
+  Tasks,
+  Entries,
+}
+
 pub enum MigrationProgressEvent<'a> {
   Started {
     target_extension: &'static str,
@@ -61,10 +68,13 @@ pub enum MigrationProgressEvent<'a> {
   },
   StageStarted {
     label: &'static str,
-    bytes_total: Option<u64>,
+    input_unit: MigrationInputUnit,
+    input_total: u64,
+    has_output: bool,
   },
-  BytesProcessed {
-    bytes: u64,
+  StageProgress {
+    input: u64,
+    output_bytes: u64,
   },
   DayFinished(&'a MigrationEntry),
 }
@@ -89,7 +99,7 @@ pub fn migrate_request_archives(
 }
 
 /// Like `migrate_request_archives`, with live progress and results as each day finishes.
-/// Day positions are one-based. Byte events report increments in the current stage.
+/// Day positions are one-based. Stage progress reports input and output increments.
 pub fn migrate_request_archives_with_progress(
   dir: &Path,
   archive_extension: Option<&str>,
@@ -129,22 +139,36 @@ pub fn migrate_request_archives_with_progress(
     });
     let (outcome, files) = match RequestDayLock::try_acquire(&db) {
       Ok(_day_lock) => {
-        let mut pending_bytes = 0;
-        // Pack objects can emit many small writes. Batch progress updates
-        // while preserving each stage's exact byte total.
-        let result = migrate_day(&archives, &destination, target, commit, &mut |event| match event {
-          ContentProgress::Stage(label, bytes_total) => {
-            flush_progress_bytes(&mut pending_bytes, &mut progress);
-            progress(MigrationProgressEvent::StageStarted { label, bytes_total });
-          }
-          ContentProgress::Bytes(bytes) => {
-            pending_bytes += bytes;
-            if pending_bytes >= 256 * 1024 {
-              flush_progress_bytes(&mut pending_bytes, &mut progress);
+        let mut pending = StageUpdates::default();
+        let result = migrate_day(&archives, &destination, target, commit, &mut |event| {
+          match event {
+            ContentProgress::Stage {
+              label,
+              input_unit,
+              input_total,
+              has_output,
+            } => {
+              pending.flush(&mut progress);
+              pending.input_batch = match input_unit {
+                MigrationInputUnit::Bytes => StageUpdates::BYTE_BATCH,
+                MigrationInputUnit::Entries => 64,
+                MigrationInputUnit::Tasks => 1,
+              };
+              progress(MigrationProgressEvent::StageStarted {
+                label,
+                input_unit,
+                input_total,
+                has_output,
+              });
             }
+            ContentProgress::Input(input) => pending.input += input,
+            ContentProgress::Output(bytes) => pending.output_bytes += bytes,
+          }
+          if pending.input >= pending.input_batch || pending.output_bytes >= StageUpdates::BYTE_BATCH {
+            pending.flush(&mut progress);
           }
         });
-        flush_progress_bytes(&mut pending_bytes, &mut progress);
+        pending.flush(&mut progress);
         result
       }
       Err(error) if error.kind() == io::ErrorKind::WouldBlock => (MigrationOutcome::InUse, Vec::new()),
@@ -169,10 +193,23 @@ pub fn migrate_request_archives_with_progress(
   Ok(report)
 }
 
-fn flush_progress_bytes(pending: &mut u64, progress: &mut impl FnMut(MigrationProgressEvent<'_>)) {
-  let bytes = std::mem::take(pending);
-  if bytes > 0 {
-    progress(MigrationProgressEvent::BytesProcessed { bytes });
+#[derive(Default)]
+struct StageUpdates {
+  input: u64,
+  output_bytes: u64,
+  input_batch: u64,
+}
+
+impl StageUpdates {
+  const BYTE_BATCH: u64 = 256 * 1024;
+
+  fn flush(&mut self, progress: &mut impl FnMut(MigrationProgressEvent<'_>)) {
+    if self.input != 0 || self.output_bytes != 0 {
+      progress(MigrationProgressEvent::StageProgress {
+        input: std::mem::take(&mut self.input),
+        output_bytes: std::mem::take(&mut self.output_bytes),
+      });
+    }
   }
 }
 
@@ -279,8 +316,8 @@ fn migrate_verified_day(
 
   let compressed_bytes = staging.as_file().metadata()?.len();
   let mut staged = staging.reopen()?;
-  progress(ContentProgress::Stage("Output hash", Some(compressed_bytes)));
-  let digest = hash_reader(&mut staged, None, &mut |bytes| progress(ContentProgress::Bytes(bytes)))?;
+  progress(ContentProgress::read("Output hash", compressed_bytes));
+  let digest = hash_reader(&mut staged, None, &mut |bytes| progress(ContentProgress::Input(bytes)))?;
   for (index, archive) in set.archives.iter_mut().enumerate() {
     let capture = if index == source_index {
       converted.source_capture.take()
@@ -310,9 +347,9 @@ fn migrate_verified_day(
     }
   }
   set.recheck_with_progress(progress)?;
-  progress(ContentProgress::Stage("Recheck output", Some(compressed_bytes)));
+  progress(ContentProgress::read("Recheck output", compressed_bytes));
   if hash_reader(staging.reopen()?, None, &mut |bytes| {
-    progress(ContentProgress::Bytes(bytes))
+    progress(ContentProgress::Input(bytes))
   })?
     != digest
   {
@@ -367,6 +404,49 @@ mod tests {
     Ok(archive)
   }
 
+  #[derive(Debug)]
+  struct ObservedStage {
+    label: &'static str,
+    unit: MigrationInputUnit,
+    total: u64,
+    has_output: bool,
+    input: u64,
+    output: u64,
+  }
+
+  fn record_stage(stages: &mut Vec<ObservedStage>, event: MigrationProgressEvent<'_>) {
+    match event {
+      MigrationProgressEvent::StageStarted {
+        label,
+        input_unit,
+        input_total,
+        has_output,
+      } => stages.push(ObservedStage {
+        label,
+        unit: input_unit,
+        total: input_total,
+        has_output,
+        input: 0,
+        output: 0,
+      }),
+      MigrationProgressEvent::StageProgress { input, output_bytes } => {
+        let stage = stages.last_mut().expect("progress follows a stage start");
+        stage.input += input;
+        stage.output += output_bytes;
+      }
+      _ => (),
+    }
+  }
+
+  fn assert_completed_stages(stages: &[ObservedStage]) {
+    for stage in stages {
+      assert_eq!(stage.input, stage.total, "{stage:?}");
+      if !stage.has_output {
+        assert_eq!(stage.output, 0, "{stage:?}");
+      }
+    }
+  }
+
   #[test]
   fn migrates_archived_only_days_without_replacing_the_source() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -386,36 +466,27 @@ mod tests {
     let mut finished = Vec::new();
     let mut stages = Vec::new();
     let preview = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), false, |event| match event {
-      MigrationProgressEvent::BytesProcessed { bytes } => {
-        let (_, _, processed) = stages.last_mut().expect("bytes follow a stage start");
-        *processed += bytes;
-      }
       MigrationProgressEvent::DayFinished(entry) => finished.push(entry.clone()),
-      MigrationProgressEvent::StageStarted { label, bytes_total } => stages.push((label, bytes_total, 0)),
-      _ => (),
+      event => record_stage(&mut stages, event),
     })?;
     assert_eq!(preview.target_extension, "pack.zst");
     assert_eq!(finished, preview.entries);
-    let input_total = Some(source_stats.compressed_bytes);
     assert_eq!(
-      stages
-        .iter()
-        .map(|&(label, total, _)| (label, total))
-        .collect::<Vec<_>>(),
+      stages.iter().map(|stage| (stage.label, stage.unit)).collect::<Vec<_>>(),
       [
-        ("Input hash", input_total),
-        ("Unpack DB", input_total),
-        ("Capture DB", None),
-        ("Build pack", Some(b"request body".len() as u64)),
-        ("Index pack", None),
-        ("Recheck input", input_total),
+        ("Input hash", MigrationInputUnit::Bytes),
+        ("Unpack DB", MigrationInputUnit::Bytes),
+        ("Capture DB", MigrationInputUnit::Tasks),
+        ("Build pack", MigrationInputUnit::Bytes),
+        ("Index pack", MigrationInputUnit::Entries),
+        ("Recheck input", MigrationInputUnit::Bytes),
       ]
     );
-    for (label, total, bytes) in stages {
-      if let Some(total) = total {
-        assert_eq!(bytes, total, "{label}");
-      }
-    }
+    assert_completed_stages(&stages);
+    assert_eq!(stages[1].input, original.len() as u64);
+    assert_eq!(stages[1].output, sqlite.len() as u64);
+    assert_eq!(stages[3].input, b"request body".len() as u64);
+    assert_eq!(stages[4].input, 1);
     let [entry] = preview.entries.as_slice() else {
       panic!("expected one candidate");
     };
@@ -425,15 +496,15 @@ mod tests {
     let MigrationOutcome::WouldMigrate { size } = entry.outcome else {
       panic!("expected an uncompressed pack preview");
     };
+    assert_eq!(size, MigrationPayloadSize::Pack(stages[3].output + stages[4].output));
     assert_eq!(entry.files, std::slice::from_ref(&source_stats));
     assert!(!destination.exists());
 
     let mut commit_stages = Vec::new();
     let commit = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), true, |event| {
-      if let MigrationProgressEvent::StageStarted { label, bytes_total } = event {
-        commit_stages.push((label, bytes_total));
-      }
+      record_stage(&mut commit_stages, event);
     })?;
+    assert_completed_stages(&commit_stages);
     for label in [
       "Unpack DB",
       "Capture DB",
@@ -442,14 +513,22 @@ mod tests {
       "Recheck output",
     ] {
       assert_eq!(
-        commit_stages.iter().filter(|&&(stage, _)| stage == label).count(),
+        commit_stages.iter().filter(|stage| stage.label == label).count(),
         1,
         "{commit_stages:?}"
       );
     }
     let migrated = fs::read(&destination)?;
     let pack_bytes = zstd::stream::decode_all(migrated.as_slice())?.len() as u64;
-    assert!(commit_stages.contains(&("Verify pack", Some(pack_bytes))));
+    let verify = commit_stages.iter().find(|stage| stage.label == "Verify pack").unwrap();
+    assert_eq!(verify.input, pack_bytes);
+    assert!(!verify.has_output);
+    let archive_output: u64 = commit_stages
+      .iter()
+      .filter(|stage| matches!(stage.label, "Build pack" | "Index pack" | "Finish"))
+      .map(|stage| stage.output)
+      .sum();
+    assert_eq!(archive_output, migrated.len() as u64);
     let final_stats = MigrationFileStats {
       path: destination.clone(),
       compressed_bytes: migrated.len() as u64,

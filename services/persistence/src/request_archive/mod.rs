@@ -33,6 +33,17 @@ pub struct RequestPack {
   capture: Capture,
 }
 
+/// Work and temporary output produced while capturing a request database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureProgress {
+  /// The number of table copies, body column scans, and finalization steps.
+  Started { tasks: u64 },
+  /// One capture task completed successfully.
+  TaskFinished,
+  /// Bytes added to the body spool or finalized SQLite metadata snapshot.
+  OutputBytes(u64),
+}
+
 impl RequestPack {
   /// Capture a checkpointed request database held stable by the caller.
   ///
@@ -40,7 +51,16 @@ impl RequestPack {
   /// `None` so maintenance can retain the whole-database archive path.
   /// Progress reports source body bytes processed and can interrupt capture.
   pub fn capture(source: &StableFile, progress: &mut impl FnMut(u64) -> io::Result<()>) -> io::Result<Option<Self>> {
-    Ok(capture::load(source, progress)?.map(|capture| Self { capture }))
+    Self::capture_with_progress(source, progress, |_| {})
+  }
+
+  /// Report completed tasks and staged output alongside the cancellable source byte callback.
+  pub fn capture_with_progress(
+    source: &StableFile,
+    progress: &mut impl FnMut(u64) -> io::Result<()>,
+    mut on_capture: impl FnMut(CaptureProgress),
+  ) -> io::Result<Option<Self>> {
+    Ok(capture::load(source, progress, &mut on_capture)?.map(|capture| Self { capture }))
   }
 
   /// Total captured body bytes before deduplication and delta encoding.
@@ -85,6 +105,7 @@ mod tests {
   use super::*;
   use crate::requests::open_day_db;
   use std::fs;
+  use std::io::Write;
 
   #[test]
   fn capture_propagates_cancellation_and_falls_back_for_non_sqlite_files() -> anyhow::Result<()> {
@@ -106,6 +127,53 @@ mod tests {
     let unrecognized = dir.path().join("legacy.db");
     fs::write(&unrecognized, b"not a SQLite database")?;
     assert!(RequestPack::capture(&StableFile::open(&unrecognized)?, &mut |_| Ok(()))?.is_none());
+    Ok(())
+  }
+
+  #[test]
+  fn capture_reports_completed_tasks_and_normalized_output_bytes() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let day = dir.path().join("source.db");
+    let body = b"normalized request body".repeat(32);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&body)?;
+    let wire = encoder.finish()?;
+    open_day_db(&day)?.execute(
+      "INSERT INTO request_downstream(request_id, inbound_req_headers, inbound_req_body) VALUES ('r', ?1, ?2)",
+      (r#"{"content-encoding":"gzip"}"#, wire.as_slice()),
+    )?;
+
+    let mut source_bytes = 0;
+    let mut events = Vec::new();
+    let capture = RequestPack::capture_with_progress(
+      &StableFile::open(&day)?,
+      &mut |bytes| {
+        source_bytes += bytes;
+        Ok(())
+      },
+      |event| events.push(event),
+    )?
+    .expect("packable fixture");
+
+    let tasks = 5 + FIELDS.len() + 1;
+    assert_eq!(events.first(), Some(&CaptureProgress::Started { tasks: tasks as u64 }));
+    assert_eq!(events.last(), Some(&CaptureProgress::TaskFinished));
+    let completed = events
+      .iter()
+      .filter(|event| **event == CaptureProgress::TaskFinished)
+      .count();
+    assert_eq!(completed, tasks);
+
+    let output: Vec<_> = events
+      .into_iter()
+      .filter_map(|event| match event {
+        CaptureProgress::OutputBytes(bytes) => Some(bytes),
+        _ => None,
+      })
+      .collect();
+    let metadata_bytes = capture.capture.metadata_snapshot.as_file().metadata()?.len();
+    assert_eq!(output, [body.len() as u64, metadata_bytes]);
+    assert_eq!(source_bytes, wire.len() as u64);
     Ok(())
   }
 }

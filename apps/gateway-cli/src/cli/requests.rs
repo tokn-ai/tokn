@@ -1,14 +1,17 @@
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use console::{style, Color, StyledObject};
-use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use time::Date;
 use tokn_maintenance::{
-  ArchivePruneEntry, ArchivePruneOutcome, MigrationEntry, MigrationFileStats, MigrationOutcome, MigrationPayloadSize,
-  MigrationProgressEvent, PruneEntry, PruneOutcome, PruneProgressEvent, PruneReport,
+  ArchivePruneEntry, ArchivePruneOutcome, MigrationEntry, MigrationFileStats, MigrationInputUnit, MigrationOutcome,
+  MigrationPayloadSize, MigrationProgressEvent, PruneEntry, PruneOutcome, PruneProgressEvent, PruneReport,
 };
 
 #[derive(Subcommand, Debug)]
@@ -283,13 +286,19 @@ struct RowStyle {
   compact: bool,
 }
 
+struct MigrationStage {
+  bar: ProgressBar,
+  output_bytes: Arc<AtomicU64>,
+}
+
 struct MigrationDisplay<'a, W> {
   out: W,
   requests_dir: &'a Path,
   commit: bool,
   multi: Option<&'a MultiProgress>,
   overall_bar: Option<ProgressBar>,
-  stage_bar: Option<ProgressBar>,
+  active_day: Option<Date>,
+  stage: Option<MigrationStage>,
   counts: MigrationCounts,
   row_style: RowStyle,
 }
@@ -311,7 +320,8 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
       commit,
       multi,
       overall_bar,
-      stage_bar: None,
+      active_day: None,
+      stage: None,
       counts: MigrationCounts::default(),
       row_style: RowStyle {
         color,
@@ -332,33 +342,34 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
       }
       MigrationProgressEvent::DayStarted { day, total, .. } => {
         self.clear_stage();
-        if let (Some(multi), Some(overall)) = (self.multi, &self.overall_bar) {
-          if overall.length().is_none() {
-            let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
-              .unwrap_or_else(|_| ProgressStyle::default_bar())
-              .progress_chars("=> ");
-            overall.disable_steady_tick();
-            overall.set_length(total as u64);
-            overall.set_style(style);
-            overall.set_message("Days");
-          }
-          let bar = multi.insert_before(overall, ProgressBar::new_spinner());
-          bar.set_prefix(format!("{day} "));
-          bar.enable_steady_tick(Duration::from_millis(100));
-          self.stage_bar = Some(bar);
-          self.start_stage("Check", None);
+        self.active_day = Some(day);
+        if let Some(overall) = self.overall_bar.as_ref().filter(|bar| bar.length().is_none()) {
+          let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> ");
+          overall.disable_steady_tick();
+          overall.set_length(total as u64);
+          overall.set_style(style);
+          overall.set_message("Days");
         }
       }
-      MigrationProgressEvent::StageStarted { label, bytes_total } => {
-        self.start_stage(label, bytes_total);
+      MigrationProgressEvent::StageStarted {
+        label,
+        input_unit,
+        input_total,
+        has_output,
+      } => {
+        self.start_stage(label, input_unit, input_total, has_output);
       }
-      MigrationProgressEvent::BytesProcessed { bytes } => {
-        if let Some(bar) = &self.stage_bar {
-          bar.inc(bytes);
+      MigrationProgressEvent::StageProgress { input, output_bytes } => {
+        if let Some(stage) = &self.stage {
+          stage.output_bytes.fetch_add(output_bytes, Ordering::Relaxed);
+          stage.bar.inc(input);
         }
       }
       MigrationProgressEvent::DayFinished(entry) => {
         self.clear_stage();
+        self.active_day = None;
         if let Some(bar) = &self.overall_bar {
           bar.inc(1);
         }
@@ -369,25 +380,37 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
     Ok(())
   }
 
-  fn start_stage(&self, label: &'static str, bytes_total: Option<u64>) {
-    let Some(bar) = &self.stage_bar else {
+  fn start_stage(&mut self, label: &'static str, input_unit: MigrationInputUnit, input_total: u64, has_output: bool) {
+    let (Some(multi), Some(overall), Some(day)) = (self.multi, &self.overall_bar, self.active_day) else {
       return;
     };
-    bar.reset();
-    if let Some(total) = bytes_total {
-      let style =
-        ProgressStyle::with_template("{prefix}{msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} at {bytes_per_sec}")
-          .unwrap_or_else(|_| ProgressStyle::default_bar())
-          .progress_chars("=> ");
-      bar.set_length(total);
-      bar.set_style(style);
-    } else {
-      let style = ProgressStyle::with_template("{spinner:.cyan} {prefix}{msg} [{bytes} at {bytes_per_sec}]")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner());
-      bar.set_style(style);
-      bar.unset_length();
-    }
-    bar.set_message(label);
+    let stage = self.stage.get_or_insert_with(|| {
+      let bar = ProgressBar::new(input_total);
+      bar.set_prefix(format!("{day} "));
+      let bar = multi.insert_before(overall, bar);
+      bar.enable_steady_tick(Duration::from_millis(100));
+      MigrationStage {
+        bar,
+        output_bytes: Arc::new(AtomicU64::new(0)),
+      }
+    });
+    let output_bytes = Arc::clone(&stage.output_bytes);
+    let style = ProgressStyle::with_template("{prefix}{msg} [{wide_bar:.cyan/blue}] {stage_stats}")
+      .unwrap_or_else(|_| ProgressStyle::default_bar())
+      .progress_chars("=> ")
+      .with_key(
+        "stage_stats",
+        move |state: &ProgressState, out: &mut dyn std::fmt::Write| {
+          let output = has_output.then(|| output_bytes.load(Ordering::Relaxed));
+          let stats = migration_stage_stats(input_unit, state.pos(), input_total, output, state.elapsed());
+          let _ = out.write_str(&stats);
+        },
+      );
+    stage.output_bytes.store(0, Ordering::Relaxed);
+    stage.bar.reset();
+    stage.bar.set_length(input_total);
+    stage.bar.set_style(style);
+    stage.bar.set_message(label);
   }
 
   fn write_output(&mut self, render: impl FnOnce(&mut W, &mut MigrationCounts) -> io::Result<()>) -> io::Result<()> {
@@ -413,9 +436,9 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
   }
 
   fn clear_stage(&mut self) {
-    if let Some(bar) = self.stage_bar.take() {
-      bar.disable_steady_tick();
-      bar.finish_and_clear();
+    if let Some(stage) = self.stage.take() {
+      stage.bar.disable_steady_tick();
+      stage.bar.finish_and_clear();
     }
   }
 
@@ -423,6 +446,37 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
     let commit = self.commit;
     self.write_output(|out, counts| write_migration_summary(out, counts, commit))
   }
+}
+
+fn migration_stage_stats(
+  unit: MigrationInputUnit,
+  position: u64,
+  total: u64,
+  output_bytes: Option<u64>,
+  elapsed: Duration,
+) -> String {
+  let rate = |count: u64| {
+    if elapsed.is_zero() {
+      0.0
+    } else {
+      count as f64 / elapsed.as_secs_f64()
+    }
+  };
+  let input = match unit {
+    MigrationInputUnit::Bytes => format!(
+      "{}/{} in {}/s",
+      HumanBytes(position),
+      HumanBytes(total),
+      HumanBytes(rate(position) as u64)
+    ),
+    MigrationInputUnit::Tasks => format!("{position}/{total} tasks in {:.1} tasks/s", rate(position)),
+    MigrationInputUnit::Entries => format!("{position}/{total} entries in {:.1} entries/s", rate(position)),
+  };
+  let output = output_bytes.map_or_else(
+    || "—".to_owned(),
+    |bytes| format!("{}/s", HumanBytes(rate(bytes) as u64)),
+  );
+  format!("{input} · out {output}")
 }
 
 fn write_migration_day(
@@ -874,10 +928,12 @@ mod tests {
     display
       .on_event(MigrationProgressEvent::StageStarted {
         label: "Decode",
-        bytes_total: Some(8192),
+        input_unit: MigrationInputUnit::Bytes,
+        input_total: 8192,
+        has_output: true,
       })
       .unwrap();
-    assert!(display.overall_bar.is_none() && display.stage_bar.is_none());
+    assert!(display.overall_bar.is_none() && display.stage.is_none());
     let output = std::str::from_utf8(display.out.get_ref()).unwrap();
     assert!(output.contains("Target     .pack.zst"));
     assert!(!output.contains("2026-05-01"));
@@ -1020,7 +1076,7 @@ mod tests {
   }
 
   #[test]
-  fn migration_progress_resets_stage_bytes_without_losing_the_active_day() {
+  fn migration_progress_resets_input_and_output_without_losing_the_active_day() {
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
     let mut display = MigrationDisplay::new(Vec::new(), Path::new("fixture-requests"), true, Some(&multi), true);
     let day = date!(2026 - 05 - 01);
@@ -1034,38 +1090,63 @@ mod tests {
     display
       .on_event(MigrationProgressEvent::StageStarted {
         label: "Decode",
-        bytes_total: Some(4096),
+        input_unit: MigrationInputUnit::Bytes,
+        input_total: 4096,
+        has_output: true,
       })
       .unwrap();
     display
-      .on_event(MigrationProgressEvent::BytesProcessed { bytes: 2048 })
+      .on_event(MigrationProgressEvent::StageProgress {
+        input: 2048,
+        output_bytes: 4096,
+      })
       .unwrap();
     display
-      .on_event(MigrationProgressEvent::BytesProcessed { bytes: 1024 })
+      .on_event(MigrationProgressEvent::StageProgress {
+        input: 1024,
+        output_bytes: 2048,
+      })
       .unwrap();
 
     let overall = display.overall_bar.clone().unwrap();
     assert_eq!(overall.length(), Some(3));
     assert_eq!(overall.position(), 0);
-    let bar = display.stage_bar.clone().unwrap();
+    let stage = display.stage.as_ref().unwrap();
+    let bar = stage.bar.clone();
+    let output_bytes = Arc::clone(&stage.output_bytes);
     assert_eq!(bar.prefix(), "2026-05-01 ");
     assert_eq!(bar.message(), "Decode");
     assert_eq!(bar.position(), 3072);
     assert_eq!(bar.length(), Some(4096));
+    assert_eq!(output_bytes.load(Ordering::Relaxed), 6144);
+    display
+      .on_event(MigrationProgressEvent::StageProgress {
+        input: 0,
+        output_bytes: 128,
+      })
+      .unwrap();
+    assert_eq!(bar.position(), 3072);
+    assert_eq!(output_bytes.load(Ordering::Relaxed), 6272);
     display
       .on_event(MigrationProgressEvent::StageStarted {
-        label: "Compress",
-        bytes_total: None,
+        label: "Check tasks",
+        input_unit: MigrationInputUnit::Tasks,
+        input_total: 3,
+        has_output: false,
       })
       .unwrap();
     assert_eq!(bar.prefix(), "2026-05-01 ");
-    assert_eq!(bar.message(), "Compress");
+    assert_eq!(bar.message(), "Check tasks");
     assert_eq!(bar.position(), 0);
-    assert_eq!(bar.length(), None);
+    assert_eq!(bar.length(), Some(3));
+    assert_eq!(output_bytes.load(Ordering::Relaxed), 0);
     display
-      .on_event(MigrationProgressEvent::BytesProcessed { bytes: 1024 })
+      .on_event(MigrationProgressEvent::StageProgress {
+        input: 1,
+        output_bytes: 0,
+      })
       .unwrap();
-    assert_eq!(bar.position(), 1024);
+    assert_eq!(bar.position(), 1);
 
     let mut entry = MigrationEntry {
       day,
@@ -1076,7 +1157,7 @@ mod tests {
     };
     display.on_event(MigrationProgressEvent::DayFinished(&entry)).unwrap();
     assert_eq!(overall.position(), 1);
-    assert!(display.stage_bar.is_none());
+    assert!(display.stage.is_none());
     assert_eq!(display.counts.retained, 1);
     assert!(std::str::from_utf8(&display.out).unwrap().contains("IN USE"));
 
@@ -1104,9 +1185,39 @@ mod tests {
         total: 3,
       })
       .unwrap();
-    assert!(display.stage_bar.is_some());
+    assert!(display.stage.is_none());
+    display
+      .on_event(MigrationProgressEvent::StageStarted {
+        label: "Hash input",
+        input_unit: MigrationInputUnit::Bytes,
+        input_total: 4096,
+        has_output: false,
+      })
+      .unwrap();
+    assert!(display.stage.is_some());
     display.clear_progress();
-    assert!(display.stage_bar.is_none() && display.overall_bar.is_none());
+    assert!(display.stage.is_none() && display.overall_bar.is_none());
+  }
+
+  #[test]
+  fn migration_stage_stats_show_input_units_and_separate_output_rates() {
+    let elapsed = Duration::from_secs(2);
+    assert_eq!(
+      migration_stage_stats(MigrationInputUnit::Bytes, 3072, 4096, Some(1024), elapsed),
+      "3.00 KiB/4.00 KiB in 1.50 KiB/s · out 512 B/s"
+    );
+    assert_eq!(
+      migration_stage_stats(MigrationInputUnit::Bytes, 0, 4096, Some(0), elapsed),
+      "0 B/4.00 KiB in 0 B/s · out 0 B/s"
+    );
+    assert_eq!(
+      migration_stage_stats(MigrationInputUnit::Tasks, 3, 8, None, elapsed),
+      "3/8 tasks in 1.5 tasks/s · out —"
+    );
+    assert_eq!(
+      migration_stage_stats(MigrationInputUnit::Entries, 5, 8, Some(2048), elapsed),
+      "5/8 entries in 2.5 entries/s · out 1.00 KiB/s"
+    );
   }
 
   #[test]
