@@ -1,138 +1,148 @@
 //! Read and verify archive contents through the caller's open file handles.
 
+use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use tokn_persistence::indexed_archive::{IndexedArchiveFormat, IndexedArchiveReader};
 use tokn_persistence::request_archive::{indexed, RequestPack};
 use tokn_persistence::request_files::{ArchiveFormat, StableFile};
 
 use crate::{encode_archive, hash_reader, ArchiveContents};
 
-/// Decoded sizes of the two inputs, in argument order.
-pub(super) struct ContentComparison {
-  pub equivalent: bool,
-  pub left_bytes: u64,
-  pub right_bytes: u64,
+#[derive(Clone, Copy)]
+pub(super) struct PayloadStats {
+  pub bytes: u64,
+  pub sqlite_sha256: Option<[u8; 32]>,
 }
 
-/// Sizes of the complete uncompressed payloads before and after conversion.
-pub(super) struct ConversionSizes {
-  pub source_bytes: u64,
-  pub target_bytes: u64,
+impl PayloadStats {
+  fn new(format: ArchiveContents, bytes: u64, digest: [u8; 32]) -> Self {
+    Self {
+      bytes,
+      sqlite_sha256: matches!(format, ArchiveContents::Snapshot(_)).then_some(digest),
+    }
+  }
+
+  fn pack(bytes: u64) -> Self {
+    Self {
+      bytes,
+      sqlite_sha256: None,
+    }
+  }
+}
+
+/// An open archive and its decoded stats, recorded as soon as they are available.
+pub(super) struct ArchiveInput<'a> {
+  pub file: &'a mut File,
+  pub format: ArchiveContents,
+  pub payload: &'a mut Option<PayloadStats>,
+}
+
+pub(super) struct ConvertedArchive {
+  pub target: PayloadStats,
+  pub source_capture: Option<(RequestPack, IndexedArchiveFormat)>,
 }
 
 /// Report the current operation and byte increments within that operation.
 pub(super) enum ContentProgress {
-  Stage(&'static str),
+  Stage(&'static str, Option<u64>),
   Bytes(u64),
 }
 
 pub(super) fn verify_equivalent(
-  left: &mut File,
-  left_format: ArchiveContents,
-  right: &mut File,
-  right_format: ArchiveContents,
+  left: ArchiveInput<'_>,
+  right: ArchiveInput<'_>,
   progress: &mut impl FnMut(ContentProgress),
-) -> io::Result<ContentComparison> {
-  match (left_format, right_format) {
+) -> io::Result<bool> {
+  match (left.format, right.format) {
     (ArchiveContents::Snapshot(_), ArchiveContents::Snapshot(_))
     | (ArchiveContents::IndexedPack(_), ArchiveContents::IndexedPack(_)) => {
-      progress(ContentProgress::Stage("Hashing first archive"));
-      let (left_digest, left_bytes) = hash_content(left, left_format, progress)?;
-      progress(ContentProgress::Stage("Hashing second archive"));
-      let (right_digest, right_bytes) = hash_content(right, right_format, progress)?;
-      Ok(ContentComparison {
-        equivalent: left_digest == right_digest,
-        left_bytes,
-        right_bytes,
-      })
+      let (left_digest, left_bytes) = hash_content(left.file, left.format, "Compare A", progress)?;
+      *left.payload = Some(PayloadStats::new(left.format, left_bytes, left_digest));
+      let (right_digest, right_bytes) = hash_content(right.file, right.format, "Compare B", progress)?;
+      *right.payload = Some(PayloadStats::new(right.format, right_bytes, right_digest));
+      Ok(left_digest == right_digest)
     }
     (ArchiveContents::Snapshot(snapshot_format), ArchiveContents::IndexedPack(indexed_format)) => {
       verify_snapshot_against_pack(left, snapshot_format, right, indexed_format, progress)
     }
     (ArchiveContents::IndexedPack(indexed_format), ArchiveContents::Snapshot(snapshot_format)) => {
-      let mut comparison = verify_snapshot_against_pack(right, snapshot_format, left, indexed_format, progress)?;
-      std::mem::swap(&mut comparison.left_bytes, &mut comparison.right_bytes);
-      Ok(comparison)
+      verify_snapshot_against_pack(right, snapshot_format, left, indexed_format, progress)
     }
   }
 }
 
 /// Measure the decoded source and target payloads without compressing the target.
 pub(super) fn measure_conversion(
-  source: &mut File,
-  source_format: ArchiveContents,
+  source: ArchiveInput<'_>,
   target_format: ArchiveContents,
   progress: &mut impl FnMut(ContentProgress),
-) -> io::Result<ConversionSizes> {
-  check_conversion(source_format, target_format)?;
-  let (source_bytes, target_bytes) = match (source_format, target_format) {
+) -> io::Result<u64> {
+  check_conversion(source.format, target_format)?;
+  let target_bytes = match (source.format, target_format) {
     (ArchiveContents::Snapshot(format), ArchiveContents::Snapshot(_)) => {
-      progress(ContentProgress::Stage("Measuring SQLite snapshot"));
-      let bytes = copy_with_progress(open_snapshot(source, format)?, io::sink(), progress)?;
-      (bytes, bytes)
+      let input = open_snapshot_for_stage(source.file, format, "Read DB", progress)?;
+      let payload = copy_sqlite(input, io::sink())?;
+      *source.payload = Some(payload);
+      payload.bytes
     }
     (ArchiveContents::IndexedPack(format), ArchiveContents::IndexedPack(_)) => {
-      progress(ContentProgress::Stage("Measuring indexed pack"));
-      let bytes = copy_with_progress(open_indexed(source, format)?, io::sink(), progress)?;
-      (bytes, bytes)
+      let input = open_indexed_for_stage(source.file, format, "Read pack", progress)?;
+      let bytes = copy_with_progress(input, io::sink(), progress)?;
+      *source.payload = Some(PayloadStats::pack(bytes));
+      bytes
     }
     (ArchiveContents::Snapshot(format), ArchiveContents::IndexedPack(_)) => {
-      let (capture, source_bytes) = capture_snapshot(source, format, progress)?;
-      (source_bytes, write_pack(&capture, io::sink(), progress)?)
+      let capture = capture_snapshot(source.file, format, source.payload, progress)?;
+      write_pack(&capture, io::sink(), progress)?
     }
     (ArchiveContents::IndexedPack(_), ArchiveContents::Snapshot(_)) => return Err(indexed_snapshot_unsupported()),
   };
-  Ok(ConversionSizes {
-    source_bytes,
-    target_bytes,
-  })
+  Ok(target_bytes)
 }
 
 /// Encode a conversion to a fresh output stream.
 pub(super) fn convert(
-  source: &mut File,
-  source_format: ArchiveContents,
+  source: ArchiveInput<'_>,
   output: impl Write,
   target_format: ArchiveContents,
   progress: &mut impl FnMut(ContentProgress),
-) -> io::Result<ConversionSizes> {
-  check_conversion(source_format, target_format)?;
-  let (source_bytes, target_bytes) = match (source_format, target_format) {
+) -> io::Result<ConvertedArchive> {
+  check_conversion(source.format, target_format)?;
+  let (target, source_capture) = match (source.format, target_format) {
     (ArchiveContents::Snapshot(source_format), ArchiveContents::Snapshot(target_format)) => {
-      progress(ContentProgress::Stage("Recompressing snapshot"));
-      let input = open_snapshot(source, source_format)?;
-      let mut bytes = 0;
       encode_archive(BufWriter::new(output), target_format, |encoder| {
-        bytes = copy_with_progress(input, encoder, progress)?;
-        progress(ContentProgress::Stage("Finishing archive"));
+        let input = open_snapshot_for_stage(source.file, source_format, "Compress DB", progress)?;
+        *source.payload = Some(copy_sqlite(input, encoder)?);
+        progress(ContentProgress::Stage("Finish", None));
         Ok(())
       })?;
-      (bytes, bytes)
+      (
+        source.payload.expect("archive encoder copied the SQLite snapshot"),
+        None,
+      )
     }
     (ArchiveContents::IndexedPack(source_format), ArchiveContents::IndexedPack(target_format)) => {
-      progress(ContentProgress::Stage("Recompressing indexed pack"));
-      let input = open_indexed(source, source_format)?;
+      let input = open_indexed_for_stage(source.file, source_format, "Compress pack", progress)?;
       let mut encoder = target_format.writer(BufWriter::new(output))?;
       let bytes = copy_with_progress(input, &mut encoder, progress)?;
-      progress(ContentProgress::Stage("Finishing archive"));
+      progress(ContentProgress::Stage("Finish", None));
       encoder.finish()?.flush()?;
-      (bytes, bytes)
+      let payload = PayloadStats::pack(bytes);
+      *source.payload = Some(payload);
+      (payload, None)
     }
     (ArchiveContents::Snapshot(source_format), ArchiveContents::IndexedPack(target_format)) => {
-      let (capture, source_bytes) = capture_snapshot(source, source_format, progress)?;
+      let capture = capture_snapshot(source.file, source_format, source.payload, progress)?;
       let mut encoder = target_format.writer(BufWriter::new(output))?;
       let target_bytes = write_pack(&capture, &mut encoder, progress)?;
-      progress(ContentProgress::Stage("Finishing archive"));
+      progress(ContentProgress::Stage("Finish", None));
       encoder.finish()?.flush()?;
-      (source_bytes, target_bytes)
+      (PayloadStats::pack(target_bytes), Some((capture, target_format)))
     }
     (ArchiveContents::IndexedPack(_), ArchiveContents::Snapshot(_)) => return Err(indexed_snapshot_unsupported()),
   };
-  Ok(ConversionSizes {
-    source_bytes,
-    target_bytes,
-  })
+  Ok(ConvertedArchive { target, source_capture })
 }
 
 fn write_pack(
@@ -140,26 +150,45 @@ fn write_pack(
   output: impl Write,
   progress: &mut impl FnMut(ContentProgress),
 ) -> io::Result<u64> {
-  progress(ContentProgress::Stage("Building indexed pack"));
-  let mut writer = TrackedIo::new(output, progress);
+  progress(ContentProgress::Stage("Build pack", None));
+  let mut writer = TrackedIo::new(output, |bytes: &[u8]| report_bytes(progress, bytes.len() as u64));
   indexed::write(capture, &mut writer, &mut |_| Ok(()))?;
   Ok(writer.bytes)
 }
 
 pub(super) fn open_snapshot(source: &mut File, format: ArchiveFormat) -> io::Result<Box<dyn Read + '_>> {
+  rewind_snapshot(source, format)?;
+  open_snapshot_decoder(source, format)
+}
+
+fn open_snapshot_for_stage<'a>(
+  source: &'a mut File,
+  format: ArchiveFormat,
+  label: &'static str,
+  progress: &'a mut impl FnMut(ContentProgress),
+) -> io::Result<Box<dyn Read + 'a>> {
+  let compressed_bytes = rewind_snapshot(source, format)?;
+  progress(ContentProgress::Stage(label, Some(compressed_bytes)));
+  let tracked = TrackedIo::new(source, |bytes: &[u8]| report_bytes(progress, bytes.len() as u64));
+  open_snapshot_decoder(tracked, format)
+}
+
+fn rewind_snapshot(source: &mut File, format: ArchiveFormat) -> io::Result<u64> {
   source.rewind()?;
+  let bytes = source.metadata()?.len();
+  // XZ streams and padding are both aligned to four bytes. The decoder
+  // validates internal padding but can accept unaligned trailing padding.
+  if cfg!(feature = "lzma") && format == ArchiveFormat::Xz && !bytes.is_multiple_of(4) {
+    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid XZ archive length"));
+  }
+  Ok(bytes)
+}
+
+fn open_snapshot_decoder<'a>(source: impl Read + 'a, format: ArchiveFormat) -> io::Result<Box<dyn Read + 'a>> {
   match format {
     ArchiveFormat::Zstd => Ok(Box::new(zstd::Decoder::new(source)?)),
     #[cfg(feature = "lzma")]
-    ArchiveFormat::Xz => {
-      // XZ streams and their padding are both aligned to four bytes. The
-      // concatenated-stream decoder checks internal padding, but accepts
-      // trailing padding of any length when it encounters EOF.
-      if !source.metadata()?.len().is_multiple_of(4) {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid XZ archive length"));
-      }
-      Ok(Box::new(lzma_rust2::XzReader::new(BufReader::new(source), true)))
-    }
+    ArchiveFormat::Xz => Ok(Box::new(lzma_rust2::XzReader::new(BufReader::new(source), true))),
     #[cfg(not(feature = "lzma"))]
     ArchiveFormat::Xz => Err(io::Error::new(
       io::ErrorKind::Unsupported,
@@ -168,30 +197,44 @@ pub(super) fn open_snapshot(source: &mut File, format: ArchiveFormat) -> io::Res
   }
 }
 
-fn open_indexed(
-  source: &mut File,
+fn open_indexed_for_stage<'a>(
+  source: &'a mut File,
   format: IndexedArchiveFormat,
-) -> io::Result<IndexedArchiveReader<BufReader<&mut File>>> {
+  label: &'static str,
+  progress: &mut impl FnMut(ContentProgress),
+) -> io::Result<IndexedArchiveReader<BufReader<&'a mut File>>> {
   source.rewind()?;
   let mut input = format.open(BufReader::new(source))?;
+  let bytes = input.seek(SeekFrom::End(0))?;
+  progress(ContentProgress::Stage(label, Some(bytes)));
   indexed::validate(&mut input)?;
   input.rewind()?;
   Ok(input)
 }
 
 fn verify_snapshot_against_pack(
-  snapshot: &mut File,
+  snapshot: ArchiveInput<'_>,
   snapshot_format: ArchiveFormat,
+  pack: ArchiveInput<'_>,
+  pack_format: IndexedArchiveFormat,
+  progress: &mut impl FnMut(ContentProgress),
+) -> io::Result<bool> {
+  let capture = capture_snapshot(snapshot.file, snapshot_format, snapshot.payload, progress)?;
+  let (equivalent, payload) = verify_captured_pack(&capture, pack.file, pack_format, progress)?;
+  *pack.payload = Some(payload);
+  Ok(equivalent)
+}
+
+pub(super) fn verify_captured_pack(
+  capture: &RequestPack,
   pack: &mut File,
   pack_format: IndexedArchiveFormat,
   progress: &mut impl FnMut(ContentProgress),
-) -> io::Result<ContentComparison> {
-  let (capture, left_bytes) = capture_snapshot(snapshot, snapshot_format, progress)?;
-  progress(ContentProgress::Stage("Validating indexed pack"));
-  let mut input = open_indexed(pack, pack_format)?;
-  let right_bytes = copy_with_progress(&mut input, io::sink(), progress)?;
-  progress(ContentProgress::Stage("Verifying indexed pack against snapshot"));
-  let equivalent = match indexed::verify(&capture, &mut input, &mut |bytes| {
+) -> io::Result<(bool, PayloadStats)> {
+  let mut input = open_indexed_for_stage(pack, pack_format, "Read pack", progress)?;
+  let bytes = copy_with_progress(&mut input, io::sink(), progress)?;
+  progress(ContentProgress::Stage("Verify pack", None));
+  let equivalent = match indexed::verify(capture, &mut input, &mut |bytes| {
     report_bytes(progress, bytes);
     Ok(())
   }) {
@@ -199,29 +242,28 @@ fn verify_snapshot_against_pack(
     Err(error) if error.kind() == io::ErrorKind::InvalidData => false,
     Err(error) => return Err(error),
   };
-  Ok(ContentComparison {
-    equivalent,
-    left_bytes,
-    right_bytes,
-  })
+  Ok((equivalent, PayloadStats::pack(bytes)))
 }
 
 fn capture_snapshot(
   source: &mut File,
   format: ArchiveFormat,
+  source_payload: &mut Option<PayloadStats>,
   progress: &mut impl FnMut(ContentProgress),
-) -> io::Result<(RequestPack, u64)> {
-  progress(ContentProgress::Stage("Restoring SQLite snapshot"));
+) -> io::Result<RequestPack> {
   let mut snapshot = tempfile::NamedTempFile::new()?;
-  let bytes = {
+  let payload = {
     let mut output = BufWriter::new(snapshot.as_file_mut());
-    let bytes = copy_with_progress(open_snapshot(source, format)?, &mut output, progress)?;
+    let input = open_snapshot_for_stage(source, format, "Unpack DB", progress)?;
+    let payload = copy_sqlite(input, &mut output)?;
     output.flush()?;
-    bytes
+    payload
   };
-  progress(ContentProgress::Stage("Capturing request data"));
+  // Keep the decoded stats even if the database schema cannot be packed.
+  *source_payload = Some(payload);
+  progress(ContentProgress::Stage("Capture DB", None));
   let source = StableFile::open(snapshot.path())?;
-  let capture = RequestPack::capture(&source, &mut |bytes| {
+  RequestPack::capture(&source, &mut |bytes| {
     report_bytes(progress, bytes);
     Ok(())
   })?
@@ -230,23 +272,28 @@ fn capture_snapshot(
       io::ErrorKind::Unsupported,
       "request snapshot schema or contents cannot be represented in an indexed pack",
     )
-  })?;
-  Ok((capture, bytes))
+  })
 }
 
 fn hash_content(
   source: &mut File,
   format: ArchiveContents,
+  label: &'static str,
   progress: &mut impl FnMut(ContentProgress),
 ) -> io::Result<([u8; 32], u64)> {
   let mut bytes = 0;
-  let mut count = |read| {
-    bytes += read;
-    report_bytes(progress, read);
-  };
   let digest = match format {
-    ArchiveContents::Snapshot(format) => hash_reader(open_snapshot(source, format)?, None, &mut count)?,
-    ArchiveContents::IndexedPack(format) => hash_reader(open_indexed(source, format)?, None, &mut count)?,
+    ArchiveContents::Snapshot(format) => {
+      let input = open_snapshot_for_stage(source, format, label, progress)?;
+      hash_reader(input, None, &mut |read| bytes += read)?
+    }
+    ArchiveContents::IndexedPack(format) => {
+      let input = open_indexed_for_stage(source, format, label, progress)?;
+      hash_reader(input, None, &mut |read| {
+        bytes += read;
+        report_bytes(progress, read);
+      })?
+    }
   };
   Ok((digest, bytes))
 }
@@ -256,7 +303,18 @@ fn copy_with_progress(
   mut output: impl Write,
   progress: &mut impl FnMut(ContentProgress),
 ) -> io::Result<u64> {
-  io::copy(&mut TrackedIo::new(input, progress), &mut output)
+  let mut reader = TrackedIo::new(input, |bytes: &[u8]| report_bytes(progress, bytes.len() as u64));
+  io::copy(&mut reader, &mut output)
+}
+
+fn copy_sqlite(input: impl Read, mut output: impl Write) -> io::Result<PayloadStats> {
+  let mut digest = Sha256::new();
+  let mut reader = TrackedIo::new(input, |bytes: &[u8]| digest.update(bytes));
+  let bytes = io::copy(&mut reader, &mut output)?;
+  Ok(PayloadStats {
+    bytes,
+    sqlite_sha256: Some(digest.finalize().into()),
+  })
 }
 
 fn report_bytes(progress: &mut impl FnMut(ContentProgress), bytes: u64) {
@@ -267,37 +325,37 @@ fn report_bytes(progress: &mut impl FnMut(ContentProgress), bytes: u64) {
 
 struct TrackedIo<T, F> {
   inner: T,
-  progress: F,
+  on_bytes: F,
   bytes: u64,
 }
 
-impl<T, F: FnMut(ContentProgress)> TrackedIo<T, F> {
-  fn new(inner: T, progress: F) -> Self {
+impl<T, F: FnMut(&[u8])> TrackedIo<T, F> {
+  fn new(inner: T, on_bytes: F) -> Self {
     Self {
       inner,
-      progress,
+      on_bytes,
       bytes: 0,
     }
   }
 
-  fn record(&mut self, bytes: usize) {
-    self.bytes += bytes as u64;
-    report_bytes(&mut self.progress, bytes as u64);
+  fn record(&mut self, bytes: &[u8]) {
+    self.bytes += bytes.len() as u64;
+    (self.on_bytes)(bytes);
   }
 }
 
-impl<R: Read, F: FnMut(ContentProgress)> Read for TrackedIo<R, F> {
+impl<R: Read, F: FnMut(&[u8])> Read for TrackedIo<R, F> {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
     let bytes = self.inner.read(buf)?;
-    self.record(bytes);
+    self.record(&buf[..bytes]);
     Ok(bytes)
   }
 }
 
-impl<W: Write, F: FnMut(ContentProgress)> Write for TrackedIo<W, F> {
+impl<W: Write, F: FnMut(&[u8])> Write for TrackedIo<W, F> {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
     let bytes = self.inner.write(buf)?;
-    self.record(bytes);
+    self.record(&buf[..bytes]);
     Ok(bytes)
   }
 
@@ -334,29 +392,58 @@ fn indexed_snapshot_unsupported() -> io::Error {
 mod tests {
   use super::*;
 
+  fn input<'a>(file: &'a mut File, format: ArchiveContents, payload: &'a mut Option<PayloadStats>) -> ArchiveInput<'a> {
+    ArchiveInput { file, format, payload }
+  }
+
   #[test]
   fn snapshot_comparison_checks_every_zstd_frame() -> io::Result<()> {
     let format = ArchiveContents::Snapshot(ArchiveFormat::Zstd);
     let mut frames = tempfile::tempfile()?;
     encode_archive(&mut frames, ArchiveFormat::Zstd, |output| output.write_all(b"one"))?;
     encode_archive(&mut frames, ArchiveFormat::Zstd, |output| output.write_all(b" two"))?;
-    let measured = measure_conversion(&mut frames, format, format, &mut |_| {})?;
-    assert_eq!((measured.source_bytes, measured.target_bytes), (7, 7));
+    let compressed_bytes = frames.metadata()?.len();
+    let mut source_payload = None;
+    let measured = measure_conversion(input(&mut frames, format, &mut source_payload), format, &mut |_| {})?;
+    assert_eq!((source_payload.unwrap().bytes, measured), (7, 7));
     let mut converted = tempfile::tempfile()?;
     let mut converted_bytes = 0;
-    let sizes = convert(&mut frames, format, &mut converted, format, &mut |progress| {
-      if let ContentProgress::Bytes(bytes) = progress {
-        converted_bytes += bytes;
-      }
-    })?;
-    assert_eq!((sizes.source_bytes, sizes.target_bytes, converted_bytes), (7, 7, 7));
-    let compared = verify_equivalent(&mut frames, format, &mut converted, format, &mut |_| {})?;
-    assert!(compared.equivalent);
-    assert_eq!((compared.left_bytes, compared.right_bytes), (7, 7));
+    let result = convert(
+      input(&mut frames, format, &mut source_payload),
+      &mut converted,
+      format,
+      &mut |progress| {
+        if let ContentProgress::Bytes(bytes) = progress {
+          converted_bytes += bytes;
+        }
+      },
+    )?;
+    assert_eq!(
+      (source_payload.unwrap().bytes, result.target.bytes, converted_bytes),
+      (7, 7, compressed_bytes)
+    );
+    let mut left = None;
+    let mut right = None;
+    assert!(verify_equivalent(
+      input(&mut frames, format, &mut left),
+      input(&mut converted, format, &mut right),
+      &mut |_| {},
+    )?);
+    assert_eq!((left.unwrap().bytes, right.unwrap().bytes), (7, 7));
+    let digest: [u8; 32] = Sha256::digest(b"one two").into();
+    assert_eq!(source_payload.unwrap().sqlite_sha256, Some(digest));
+    assert_eq!(result.target.sqlite_sha256, Some(digest));
+    assert_eq!(left.unwrap().sqlite_sha256, Some(digest));
+    assert_eq!(right.unwrap().sqlite_sha256, Some(digest));
 
     frames.seek(io::SeekFrom::End(0))?;
     frames.write_all(b"trailing invalid data")?;
-    assert!(verify_equivalent(&mut frames, format, &mut converted, format, &mut |_| {}).is_err());
+    assert!(verify_equivalent(
+      input(&mut frames, format, &mut left),
+      input(&mut converted, format, &mut right),
+      &mut |_| {},
+    )
+    .is_err());
     Ok(())
   }
 
@@ -373,19 +460,32 @@ mod tests {
     let snapshot_format = ArchiveContents::Snapshot(ArchiveFormat::Zstd);
     let pack_format = ArchiveContents::IndexedPack(IndexedArchiveFormat::Zstd);
     let mut pack = tempfile::tempfile()?;
-    let converted = convert(&mut snapshot, snapshot_format, &mut pack, pack_format, &mut |_| {})?;
+    let mut source_payload = None;
+    let converted = convert(
+      input(&mut snapshot, snapshot_format, &mut source_payload),
+      &mut pack,
+      pack_format,
+      &mut |_| {},
+    )?;
     pack.rewind()?;
     let pack_bytes = io::copy(&mut zstd::Decoder::new(&mut pack)?, &mut io::sink())?;
     assert_eq!(
-      (converted.source_bytes, converted.target_bytes),
+      (source_payload.unwrap().bytes, converted.target.bytes),
       (snapshot_bytes, pack_bytes)
     );
-    let compared = verify_equivalent(&mut pack, pack_format, &mut snapshot, snapshot_format, &mut |_| {})?;
-    assert!(compared.equivalent);
+    let mut left = None;
+    let mut right = None;
+    assert!(verify_equivalent(
+      input(&mut pack, pack_format, &mut left),
+      input(&mut snapshot, snapshot_format, &mut right),
+      &mut |_| {},
+    )?);
     assert_eq!(
-      (compared.left_bytes, compared.right_bytes),
+      (left.unwrap().bytes, right.unwrap().bytes),
       (pack_bytes, snapshot_bytes)
     );
+    assert_eq!(left.unwrap().sqlite_sha256, None);
+    assert_eq!(right.unwrap().sqlite_sha256, source_payload.unwrap().sqlite_sha256);
     Ok(())
   }
 

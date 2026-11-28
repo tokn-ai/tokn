@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use time::Date;
 
 use super::{archive_content, hash_file, parse_day, ArchiveContents, StableFile};
-use archive_content::ContentProgress;
+use archive_content::{ArchiveInput, ContentProgress, PayloadStats};
 
 pub(super) struct ArchiveDay {
   pub db: PathBuf,
@@ -57,7 +57,17 @@ pub(super) struct CheckedArchive {
   pub format: ArchiveContents,
   pub digest: [u8; 32],
   pub compressed_bytes: u64,
-  pub uncompressed_bytes: Option<u64>,
+  pub payload: Option<PayloadStats>,
+}
+
+impl CheckedArchive {
+  pub fn input(&mut self) -> ArchiveInput<'_> {
+    ArchiveInput {
+      file: self.file.file_mut(),
+      format: self.format,
+      payload: &mut self.payload,
+    }
+  }
 }
 
 pub(super) struct ArchiveSet {
@@ -89,7 +99,10 @@ impl ArchiveSet {
       let format = ArchiveContents::from_path(path).map_err(|error| file_error(path, error))?;
       let mut file = StableFile::open(path)?;
       let mut compressed_bytes = 0;
-      progress(ContentProgress::Stage("Hash archive input"));
+      progress(ContentProgress::Stage(
+        "Input hash",
+        Some(file.file().metadata()?.len()),
+      ));
       let digest = archive_digest(&mut file, &mut |bytes| {
         compressed_bytes += bytes;
         progress(ContentProgress::Bytes(bytes));
@@ -99,7 +112,7 @@ impl ArchiveSet {
         format,
         digest,
         compressed_bytes,
-        uncompressed_bytes: None,
+        payload: None,
       });
     }
     Ok(Self { archives })
@@ -110,26 +123,18 @@ impl ArchiveSet {
       let (earlier, rest) = self.archives.split_at_mut(index);
       let other = &mut rest[0];
       for first in earlier {
-        let comparison = archive_content::verify_equivalent(
-          first.file.file_mut(),
-          first.format,
-          other.file.file_mut(),
-          other.format,
-          progress,
-        )
-        .map_err(|error| {
-          io::Error::new(
-            error.kind(),
-            format!(
-              "could not compare {} and {}: {error}",
-              first.file.path().display(),
-              other.file.path().display()
-            ),
-          )
-        })?;
-        first.uncompressed_bytes = Some(comparison.left_bytes);
-        other.uncompressed_bytes = Some(comparison.right_bytes);
-        if !comparison.equivalent {
+        let equivalent =
+          archive_content::verify_equivalent(first.input(), other.input(), progress).map_err(|error| {
+            io::Error::new(
+              error.kind(),
+              format!(
+                "could not compare {} and {}: {error}",
+                first.file.path().display(),
+                other.file.path().display()
+              ),
+            )
+          })?;
+        if !equivalent {
           return Err(ArchiveSetError::Conflict {
             first: first.file.path().to_path_buf(),
             other: other.file.path().to_path_buf(),
@@ -148,7 +153,8 @@ impl ArchiveSet {
   }
 
   pub fn recheck_with_progress(&mut self, progress: &mut impl FnMut(ContentProgress)) -> io::Result<()> {
-    progress(ContentProgress::Stage("Recheck archive inputs"));
+    let bytes_total = self.archives.iter().map(|archive| archive.compressed_bytes).sum();
+    progress(ContentProgress::Stage("Recheck input", Some(bytes_total)));
     for archive in &mut self.archives {
       if archive_digest(&mut archive.file, &mut |bytes| progress(ContentProgress::Bytes(bytes)))? != archive.digest {
         return Err(io::Error::new(

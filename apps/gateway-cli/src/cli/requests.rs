@@ -287,19 +287,21 @@ struct MigrationDisplay<'a, W> {
   out: W,
   requests_dir: &'a Path,
   commit: bool,
-  bar: Option<ProgressBar>,
+  multi: Option<&'a MultiProgress>,
+  overall_bar: Option<ProgressBar>,
+  stage_bar: Option<ProgressBar>,
   counts: MigrationCounts,
   row_style: RowStyle,
 }
 
 impl<'a, W: Write> MigrationDisplay<'a, W> {
-  fn new(out: W, requests_dir: &'a Path, commit: bool, multi: Option<&MultiProgress>, color: bool) -> Self {
-    let bar = multi.map(|multi| {
+  fn new(out: W, requests_dir: &'a Path, commit: bool, multi: Option<&'a MultiProgress>, color: bool) -> Self {
+    let overall_bar = multi.map(|multi| {
       let bar = multi.add(ProgressBar::new_spinner());
-      let style = ProgressStyle::with_template("{spinner:.cyan} {prefix}{msg} [{bytes} at {bytes_per_sec}]")
-        .unwrap_or_else(|_| ProgressStyle::default_spinner());
+      let style =
+        ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
       bar.set_style(style);
-      bar.set_message("Finding request archives");
+      bar.set_message("Scan archives");
       bar.enable_steady_tick(Duration::from_millis(100));
       bar
     });
@@ -307,7 +309,9 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
       out,
       requests_dir,
       commit,
-      bar,
+      multi,
+      overall_bar,
+      stage_bar: None,
       counts: MigrationCounts::default(),
       row_style: RowStyle {
         color,
@@ -326,30 +330,64 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
           writeln!(out)
         })?;
       }
-      MigrationProgressEvent::DayStarted { day, index, total } => {
-        if let Some(bar) = &self.bar {
-          bar.reset();
-          bar.set_prefix(format!("{day} ({index}/{total}) "));
-          bar.set_message("Checking request archives");
+      MigrationProgressEvent::DayStarted { day, total, .. } => {
+        if let Some(bar) = self.overall_bar.as_ref().filter(|bar| bar.length().is_none()) {
+          let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("=> ");
+          bar.disable_steady_tick();
+          bar.set_length(total as u64);
+          bar.set_style(style);
+          bar.set_message("Days");
+        }
+        if let Some(multi) = self.multi {
+          self.clear_stage();
+          let bar = multi.add(ProgressBar::new_spinner());
+          bar.set_prefix(format!("{day} "));
+          bar.enable_steady_tick(Duration::from_millis(100));
+          self.stage_bar = Some(bar);
+          self.start_stage("Check", None);
         }
       }
-      MigrationProgressEvent::StageStarted { label } => {
-        if let Some(bar) = &self.bar {
-          bar.reset();
-          bar.set_message(label);
-        }
+      MigrationProgressEvent::StageStarted { label, bytes_total } => {
+        self.start_stage(label, bytes_total);
       }
       MigrationProgressEvent::BytesProcessed { bytes } => {
-        if let Some(bar) = &self.bar {
+        if let Some(bar) = &self.stage_bar {
           bar.inc(bytes);
         }
       }
       MigrationProgressEvent::DayFinished(entry) => {
+        self.clear_stage();
+        if let Some(bar) = &self.overall_bar {
+          bar.inc(1);
+        }
         let row_style = self.row_style;
         self.write_output(|out, counts| write_migration_day(out, entry, counts, row_style))?
       }
     }
     Ok(())
+  }
+
+  fn start_stage(&self, label: &'static str, bytes_total: Option<u64>) {
+    let Some(bar) = &self.stage_bar else {
+      return;
+    };
+    bar.reset();
+    if let Some(total) = bytes_total {
+      let style =
+        ProgressStyle::with_template("{prefix}{msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} at {bytes_per_sec}")
+          .unwrap_or_else(|_| ProgressStyle::default_bar())
+          .progress_chars("=> ");
+      bar.set_length(total);
+      bar.set_style(style);
+    } else {
+      let style = ProgressStyle::with_template("{spinner:.cyan} {prefix}{msg} [{bytes} at {bytes_per_sec}]")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner());
+      bar.unset_length();
+      bar.set_style(style);
+    }
+    bar.set_message(label);
   }
 
   fn write_output(&mut self, render: impl FnOnce(&mut W, &mut MigrationCounts) -> io::Result<()>) -> io::Result<()> {
@@ -359,15 +397,24 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
       render(out, counts)?;
       out.flush()
     };
-    if let Some(bar) = &self.bar {
-      bar.suspend(write)
+    if let Some(multi) = self.multi {
+      multi.suspend(write)
     } else {
       write()
     }
   }
 
   fn clear_progress(&mut self) {
-    if let Some(bar) = self.bar.take() {
+    self.clear_stage();
+    if let Some(bar) = self.overall_bar.take() {
+      bar.disable_steady_tick();
+      bar.finish_and_clear();
+    }
+  }
+
+  fn clear_stage(&mut self) {
+    if let Some(bar) = self.stage_bar.take() {
+      bar.disable_steady_tick();
       bar.finish_and_clear();
     }
   }
@@ -473,10 +520,13 @@ fn migration_file_label(
   if let Some(payload) = file.uncompressed {
     fields.push(migration_payload_label(payload, compact));
   }
-  if let Some(prefix) = file.sha256.get(..12).filter(|_| compact && file.sha256.len() > 12) {
-    fields.push(format!("sha256 {prefix}…"));
-  } else {
-    fields.push(format!("sha256 {}", file.sha256));
+  if let Some(digest) = &file.sqlite_sha256 {
+    let label = if let Some(prefix) = digest.get(..12).filter(|_| compact && digest.len() > 12) {
+      format!("DB sha256 {prefix}…")
+    } else {
+      format!("DB sha256 {digest}")
+    };
+    fields.push(label);
   }
   format!("{name} ({})", fields.join(", "))
 }
@@ -781,6 +831,7 @@ mod tests {
           compressed_bytes: 1024,
           sha256: "aa".repeat(32),
           uncompressed: Some(MigrationPayloadSize::Sqlite(8192)),
+          sqlite_sha256: Some("bb".repeat(32)),
         }],
       },
       MigrationEntry {
@@ -813,6 +864,20 @@ mod tests {
         target_extension: "pack.zst",
       })
       .unwrap();
+    display
+      .on_event(MigrationProgressEvent::DayStarted {
+        day: entries[0].day,
+        index: 1,
+        total: entries.len(),
+      })
+      .unwrap();
+    display
+      .on_event(MigrationProgressEvent::StageStarted {
+        label: "Decode",
+        bytes_total: Some(8192),
+      })
+      .unwrap();
+    assert!(display.overall_bar.is_none() && display.stage_bar.is_none());
     let output = std::str::from_utf8(display.out.get_ref()).unwrap();
     assert!(output.contains("Target     .pack.zst"));
     assert!(!output.contains("2026-05-01"));
@@ -825,7 +890,8 @@ mod tests {
     assert!(row.contains("WOULD WRITE"));
     assert!(row.contains(".db.zstd (original 1.00 KiB (1024 bytes)"));
     assert!(row.contains("DB 8.00 KiB (8192 bytes)"));
-    assert!(row.contains(&format!("sha256 {}", "aa".repeat(32))));
+    assert!(row.contains(&format!("DB sha256 {}", "bb".repeat(32))));
+    assert!(!row.contains(&"aa".repeat(32)));
     let (_, planned) = row.split_once(" -> ").unwrap();
     assert_eq!(planned, ".pack.zst (pack 4.00 KiB (4096 bytes))");
     assert!(!destination.exists());
@@ -865,6 +931,7 @@ mod tests {
     let source = requests_dir.join("2026-05-01.db.xz");
     let destination = requests_dir.join("2026-05-01.pack.zst");
     let source_hash = "ab".repeat(32);
+    let source_db_hash = "bc".repeat(32);
     let destination_hash = "cd".repeat(32);
     let mut entry = MigrationEntry {
       day: date!(2026 - 05 - 01),
@@ -876,13 +943,15 @@ mod tests {
           path: source,
           compressed_bytes: 1024,
           sha256: source_hash.clone(),
-          uncompressed: None,
+          uncompressed: Some(MigrationPayloadSize::Sqlite(8192)),
+          sqlite_sha256: Some(source_db_hash.clone()),
         },
         MigrationFileStats {
           path: destination,
           compressed_bytes: 512,
           sha256: destination_hash.clone(),
           uncompressed: Some(MigrationPayloadSize::Pack(16384)),
+          sqlite_sha256: None,
         },
       ],
     };
@@ -901,10 +970,13 @@ mod tests {
     assert!(!row.contains("\x1b["));
     let (source, destination) = row.split_once(" -> ").unwrap();
     assert!(source.contains(".db.xz"));
-    assert!(source.contains(&source_hash));
+    assert!(!source.contains(&source_hash));
     assert!(source.contains("original 1.00 KiB (1024 bytes)"));
+    assert!(source.contains("DB 8.00 KiB (8192 bytes)"));
+    assert!(source.contains(&format!("DB sha256 {source_db_hash}")));
     assert!(destination.contains(".pack.zst"));
-    assert!(destination.contains(&destination_hash));
+    assert!(!destination.contains("sha256"));
+    assert!(!destination.contains(&destination_hash));
     assert!(destination.contains("final 512 B (512 bytes)"));
     assert!(destination.contains("16.00 KiB (16384 bytes)"));
     assert_eq!(counts.changed, 1);
@@ -926,9 +998,13 @@ mod tests {
     assert!(row.contains(".pack.zst"));
     assert!(row.contains("final 512 B"));
     assert!(row.contains("16.00 KiB"));
-    assert!(row.contains(&format!("sha256 {}…", &destination_hash[..12])));
-    assert!(!row.contains(&destination_hash[..13]));
+    assert!(row.contains(&format!("DB sha256 {}…", &source_db_hash[..12])));
+    assert!(!row.contains(&source_hash[..12]));
+    assert!(!row.contains(&destination_hash[..12]));
+    assert!(!row.contains(&source_db_hash[..13]));
     assert!(!row.contains("16384 bytes"));
+    let (_, destination) = row.trim_end().split_once(" -> ").unwrap();
+    assert_eq!(destination, ".pack.zst (final 512 B, pack 16.00 KiB)");
     assert_eq!(counts.verified, 1);
 
     output.clear();
@@ -947,15 +1023,19 @@ mod tests {
   fn migration_progress_resets_stage_bytes_without_losing_the_active_day() {
     let multi = MultiProgress::with_draw_target(ProgressDrawTarget::hidden());
     let mut display = MigrationDisplay::new(Vec::new(), Path::new("fixture-requests"), true, Some(&multi), true);
+    let day = date!(2026 - 05 - 01);
     display
       .on_event(MigrationProgressEvent::DayStarted {
-        day: date!(2026 - 05 - 01),
-        index: 2,
+        day,
+        index: 1,
         total: 3,
       })
       .unwrap();
     display
-      .on_event(MigrationProgressEvent::StageStarted { label: "Decode" })
+      .on_event(MigrationProgressEvent::StageStarted {
+        label: "Decode",
+        bytes_total: Some(4096),
+      })
       .unwrap();
     display
       .on_event(MigrationProgressEvent::BytesProcessed { bytes: 2048 })
@@ -964,18 +1044,69 @@ mod tests {
       .on_event(MigrationProgressEvent::BytesProcessed { bytes: 1024 })
       .unwrap();
 
-    let bar = display.bar.clone().unwrap();
-    assert_eq!(bar.prefix(), "2026-05-01 (2/3) ");
+    let overall = display.overall_bar.clone().unwrap();
+    assert_eq!(overall.length(), Some(3));
+    assert_eq!(overall.position(), 0);
+    let bar = display.stage_bar.clone().unwrap();
+    assert_eq!(bar.prefix(), "2026-05-01 ");
     assert_eq!(bar.message(), "Decode");
     assert_eq!(bar.position(), 3072);
-    assert_eq!(bar.length(), None);
+    assert_eq!(bar.length(), Some(4096));
     display
-      .on_event(MigrationProgressEvent::StageStarted { label: "Compress" })
+      .on_event(MigrationProgressEvent::StageStarted {
+        label: "Compress",
+        bytes_total: None,
+      })
       .unwrap();
-    assert_eq!(bar.prefix(), "2026-05-01 (2/3) ");
+    assert_eq!(bar.prefix(), "2026-05-01 ");
     assert_eq!(bar.message(), "Compress");
     assert_eq!(bar.position(), 0);
+    assert_eq!(bar.length(), None);
+    display
+      .on_event(MigrationProgressEvent::BytesProcessed { bytes: 1024 })
+      .unwrap();
+    assert_eq!(bar.position(), 1024);
+
+    let mut entry = MigrationEntry {
+      day,
+      sources: vec![PathBuf::from("2026-05-01.db.zstd")],
+      destination: PathBuf::from("2026-05-01.pack.zst"),
+      outcome: MigrationOutcome::InUse,
+      files: Vec::new(),
+    };
+    display.on_event(MigrationProgressEvent::DayFinished(&entry)).unwrap();
+    assert_eq!(overall.position(), 1);
+    assert!(display.stage_bar.is_none());
+    assert_eq!(display.counts.retained, 1);
+    assert!(std::str::from_utf8(&display.out).unwrap().contains("IN USE"));
+
+    entry.day = date!(2026 - 05 - 02);
+    entry.outcome = MigrationOutcome::Failed {
+      error: "fixture error".into(),
+    };
+    display
+      .on_event(MigrationProgressEvent::DayStarted {
+        day: entry.day,
+        index: 2,
+        total: 3,
+      })
+      .unwrap();
+    assert_eq!(overall.position(), 1);
+    display.on_event(MigrationProgressEvent::DayFinished(&entry)).unwrap();
+    assert_eq!(overall.position(), 2);
+    assert_eq!(display.counts.failed, 1);
+    assert!(std::str::from_utf8(&display.out).unwrap().contains("BLOCKED"));
+
+    display
+      .on_event(MigrationProgressEvent::DayStarted {
+        day: date!(2026 - 05 - 03),
+        index: 3,
+        total: 3,
+      })
+      .unwrap();
+    assert!(display.stage_bar.is_some());
     display.clear_progress();
+    assert!(display.stage_bar.is_none() && display.overall_bar.is_none());
   }
 
   #[test]

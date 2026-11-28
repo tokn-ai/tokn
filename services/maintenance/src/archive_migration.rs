@@ -1,6 +1,6 @@
 //! Verify and migrate previously archived request days to the configured format.
 
-use crate::archive_content::{self, ContentProgress};
+use crate::archive_content::{self, ArchiveInput, ContentProgress, PayloadStats};
 use crate::{
   archive_days, configured_format, hash_reader, hex_digest, sync_archive_directory, ArchiveContents, ArchiveSet,
   ArchiveSetError,
@@ -31,6 +31,8 @@ pub struct MigrationFileStats {
   pub compressed_bytes: u64,
   pub sha256: String,
   pub uncompressed: Option<MigrationPayloadSize>,
+  /// SHA-256 of the complete decoded SQLite snapshot, when available.
+  pub sqlite_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,10 +51,21 @@ impl MigrationPayloadSize {
 }
 
 pub enum MigrationProgressEvent<'a> {
-  Started { target_extension: &'static str },
-  DayStarted { day: Date, index: usize, total: usize },
-  StageStarted { label: &'static str },
-  BytesProcessed { bytes: u64 },
+  Started {
+    target_extension: &'static str,
+  },
+  DayStarted {
+    day: Date,
+    index: usize,
+    total: usize,
+  },
+  StageStarted {
+    label: &'static str,
+    bytes_total: Option<u64>,
+  },
+  BytesProcessed {
+    bytes: u64,
+  },
   DayFinished(&'a MigrationEntry),
 }
 
@@ -120,9 +133,9 @@ pub fn migrate_request_archives_with_progress(
         // Pack objects can emit many small writes. Batch progress updates
         // while preserving each stage's exact byte total.
         let result = migrate_day(&archives, &destination, target, commit, &mut |event| match event {
-          ContentProgress::Stage(label) => {
+          ContentProgress::Stage(label, bytes_total) => {
             flush_progress_bytes(&mut pending_bytes, &mut progress);
-            progress(MigrationProgressEvent::StageStarted { label });
+            progress(MigrationProgressEvent::StageStarted { label, bytes_total });
           }
           ContentProgress::Bytes(bytes) => {
             pending_bytes += bytes;
@@ -188,7 +201,7 @@ fn migrate_day(
         archive.format,
         archive.compressed_bytes,
         &archive.digest,
-        archive.uncompressed_bytes,
+        archive.payload,
       )
     })
     .collect();
@@ -210,13 +223,14 @@ fn file_stats(
   format: ArchiveContents,
   compressed_bytes: u64,
   digest: &[u8; 32],
-  uncompressed_bytes: Option<u64>,
+  payload: Option<PayloadStats>,
 ) -> MigrationFileStats {
   MigrationFileStats {
     path: path.to_path_buf(),
     compressed_bytes,
     sha256: hex_digest(digest),
-    uncompressed: uncompressed_bytes.map(|bytes| MigrationPayloadSize::from_format(format, bytes)),
+    uncompressed: payload.map(|stats| MigrationPayloadSize::from_format(format, stats.bytes)),
+    sqlite_sha256: payload.and_then(|stats| stats.sqlite_sha256).as_ref().map(hex_digest),
   }
 }
 
@@ -243,12 +257,11 @@ fn migrate_verified_day(
     .unwrap_or(0);
   let source = &mut set.archives[source_index];
   if !commit {
-    let sizes = archive_content::measure_conversion(source.file.file_mut(), source.format, target, progress)?;
-    source.uncompressed_bytes = Some(sizes.source_bytes);
+    let target_bytes = archive_content::measure_conversion(source.input(), target, progress)?;
     set.recheck_with_progress(progress)?;
     return Ok((
       MigrationOutcome::WouldMigrate {
-        size: MigrationPayloadSize::from_format(target, sizes.target_bytes),
+        size: MigrationPayloadSize::from_format(target, target_bytes),
       },
       None,
     ));
@@ -261,25 +274,35 @@ fn migrate_verified_day(
   let mut staging = tempfile::Builder::new()
     .prefix(".tokn-migration-")
     .tempfile_in(parent)?;
-  let sizes = archive_content::convert(
-    source.file.file_mut(),
-    source.format,
-    staging.as_file_mut(),
-    target,
-    progress,
-  )?;
-  source.uncompressed_bytes = Some(sizes.source_bytes);
+  let mut converted = archive_content::convert(source.input(), staging.as_file_mut(), target, progress)?;
   staging.as_file().sync_all()?;
 
   let compressed_bytes = staging.as_file().metadata()?.len();
   let mut staged = staging.reopen()?;
-  progress(ContentProgress::Stage("Hash final archive"));
+  progress(ContentProgress::Stage("Output hash", Some(compressed_bytes)));
   let digest = hash_reader(&mut staged, None, &mut |bytes| progress(ContentProgress::Bytes(bytes)))?;
-  for archive in &mut set.archives {
-    let comparison =
-      archive_content::verify_equivalent(archive.file.file_mut(), archive.format, &mut staged, target, progress)?;
-    archive.uncompressed_bytes = Some(comparison.left_bytes);
-    if !comparison.equivalent {
+  for (index, archive) in set.archives.iter_mut().enumerate() {
+    let capture = if index == source_index {
+      converted.source_capture.take()
+    } else {
+      None
+    };
+    let equivalent = if let Some((capture, format)) = capture {
+      let (equivalent, payload) = archive_content::verify_captured_pack(&capture, &mut staged, format, progress)?;
+      equivalent && payload.bytes == converted.target.bytes
+    } else {
+      let mut staged_payload = None;
+      archive_content::verify_equivalent(
+        archive.input(),
+        ArchiveInput {
+          file: &mut staged,
+          format: target,
+          payload: &mut staged_payload,
+        },
+        progress,
+      )?
+    };
+    if !equivalent {
       return Err(io::Error::new(
         io::ErrorKind::InvalidData,
         format!("staged archive differs from {}", archive.file.path().display()),
@@ -287,7 +310,7 @@ fn migrate_verified_day(
     }
   }
   set.recheck_with_progress(progress)?;
-  progress(ContentProgress::Stage("Recheck final archive"));
+  progress(ContentProgress::Stage("Recheck output", Some(compressed_bytes)));
   if hash_reader(staging.reopen()?, None, &mut |bytes| {
     progress(ContentProgress::Bytes(bytes))
   })?
@@ -308,7 +331,7 @@ fn migrate_verified_day(
       target,
       compressed_bytes,
       &digest,
-      Some(sizes.target_bytes),
+      Some(converted.target),
     )),
   ))
 }
@@ -351,37 +374,47 @@ mod tests {
     let source = snapshot(dir.path(), day, b"request body")?;
     let destination = dir.path().join(format!("{day}.pack.zst"));
     let original = fs::read(&source)?;
+    let sqlite = zstd::stream::decode_all(original.as_slice())?;
 
     let source_stats = MigrationFileStats {
       path: source.clone(),
       compressed_bytes: original.len() as u64,
       sha256: hex_digest(&Sha256::digest(&original).into()),
-      uncompressed: Some(MigrationPayloadSize::Sqlite(
-        zstd::stream::decode_all(original.as_slice())?.len() as u64,
-      )),
+      uncompressed: Some(MigrationPayloadSize::Sqlite(sqlite.len() as u64)),
+      sqlite_sha256: Some(hex_digest(&Sha256::digest(&sqlite).into())),
     };
     let mut finished = Vec::new();
-    let mut reported_bytes = 0;
     let mut stages = Vec::new();
     let preview = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), false, |event| match event {
-      MigrationProgressEvent::BytesProcessed { bytes } => reported_bytes += bytes,
+      MigrationProgressEvent::BytesProcessed { bytes } => {
+        let (_, _, processed) = stages.last_mut().expect("bytes follow a stage start");
+        *processed += bytes;
+      }
       MigrationProgressEvent::DayFinished(entry) => finished.push(entry.clone()),
-      MigrationProgressEvent::StageStarted { label } => stages.push(label),
+      MigrationProgressEvent::StageStarted { label, bytes_total } => stages.push((label, bytes_total, 0)),
       _ => (),
     })?;
     assert_eq!(preview.target_extension, "pack.zst");
     assert_eq!(finished, preview.entries);
-    assert!(reported_bytes >= source_stats.compressed_bytes);
+    let input_total = Some(source_stats.compressed_bytes);
     assert_eq!(
-      stages,
+      stages
+        .iter()
+        .map(|&(label, total, _)| (label, total))
+        .collect::<Vec<_>>(),
       [
-        "Hash archive input",
-        "Restoring SQLite snapshot",
-        "Capturing request data",
-        "Building indexed pack",
-        "Recheck archive inputs",
+        ("Input hash", input_total),
+        ("Unpack DB", input_total),
+        ("Capture DB", None),
+        ("Build pack", None),
+        ("Recheck input", input_total),
       ]
     );
+    for (label, total, bytes) in stages {
+      if let Some(total) = total {
+        assert_eq!(bytes, total, "{label}");
+      }
+    }
     let [entry] = preview.entries.as_slice() else {
       panic!("expected one candidate");
     };
@@ -394,7 +427,25 @@ mod tests {
     assert_eq!(entry.files, std::slice::from_ref(&source_stats));
     assert!(!destination.exists());
 
-    let commit = migrate_request_archives(dir.path(), Some("pack.zst"), true)?;
+    let mut commit_stages = Vec::new();
+    let commit = migrate_request_archives_with_progress(dir.path(), Some("pack.zst"), true, |event| {
+      if let MigrationProgressEvent::StageStarted { label, .. } = event {
+        commit_stages.push(label);
+      }
+    })?;
+    for label in [
+      "Unpack DB",
+      "Capture DB",
+      "Output hash",
+      "Recheck input",
+      "Recheck output",
+    ] {
+      assert_eq!(
+        commit_stages.iter().filter(|&&stage| stage == label).count(),
+        1,
+        "{commit_stages:?}"
+      );
+    }
     let migrated = fs::read(&destination)?;
     let final_stats = MigrationFileStats {
       path: destination.clone(),
@@ -403,6 +454,7 @@ mod tests {
       uncompressed: Some(MigrationPayloadSize::Pack(
         zstd::stream::decode_all(migrated.as_slice())?.len() as u64,
       )),
+      sqlite_sha256: None,
     };
     assert_eq!(commit.entries[0].outcome, MigrationOutcome::Migrated);
     assert_eq!(Some(size), final_stats.uncompressed);
@@ -463,6 +515,44 @@ mod tests {
       .open(File::open(&entry.destination)?)?
       .read_to_end(&mut converted)?;
     assert_eq!(converted, original);
+    Ok(())
+  }
+
+  #[test]
+  fn reports_decoded_snapshot_hash_when_its_schema_cannot_be_packed() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let scratch = tempfile::tempdir()?;
+    let db = scratch.path().join("old.db");
+    let conn = rusqlite::Connection::open(&db).map_err(io::Error::other)?;
+    conn
+      .execute_batch("CREATE TABLE requests (id INTEGER PRIMARY KEY);")
+      .map_err(io::Error::other)?;
+    drop(conn);
+    let sqlite = fs::read(db)?;
+    let day = date!(2026 - 05 - 01);
+    let archive = dir.path().join(format!("{day}.db.zstd"));
+    zstd::stream::copy_encode(sqlite.as_slice(), File::create(&archive)?, 0)?;
+    let target = dir.path().join(format!("{day}.pack.zst"));
+    snapshot(scratch.path(), day, b"packable fixture")?;
+    let finished = migrate_request_archives(scratch.path(), None, true)?;
+
+    for target_exists in [false, true] {
+      if target_exists {
+        fs::copy(&finished.entries[0].destination, &target)?;
+      }
+      let report = migrate_request_archives(dir.path(), None, false)?;
+      let [entry] = report.entries.as_slice() else {
+        panic!("expected one blocked day");
+      };
+      assert!(matches!(entry.outcome, MigrationOutcome::Failed { .. }));
+      let source = entry.files.iter().find(|file| file.path == archive).unwrap();
+      assert_eq!(
+        source.uncompressed,
+        Some(MigrationPayloadSize::Sqlite(sqlite.len() as u64))
+      );
+      assert_eq!(source.sqlite_sha256, Some(hex_digest(&Sha256::digest(&sqlite).into())));
+      assert_eq!(entry.destination.exists(), target_exists);
+    }
     Ok(())
   }
 
