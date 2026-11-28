@@ -54,12 +54,17 @@ also logged during startup.
 
 Native v2 configs declare their listeners directly. Use `frontend` or `serve`
 without `--with-proxy`; `worker start` needs no listener flags for either schema.
-To apply routing or profile edits, send `POST /admin/config/reload` with
+To apply routing, profile, or proxy CONNECT rule edits, send `POST /admin/config/reload` with
 `x-tokn-admin: reload` to a loopback API listener. Once the worker has prepared
-the same configuration, the frontend publishes the new policies for new requests.
-Reload requires a single current worker. The endpoint returns `409` during an
-A/B experiment, when the worker reads a different config, or when its version
-doesn't support reload. The existing configuration stays active.
+the same configuration, it returns its effective CONNECT rules, including
+built-in hosts and configured overrides. The frontend publishes those rules
+together with the matching worker generation. New CONNECTs use the published
+rules, and established opaque tunnels keep their original decision.
+Reload requires a single current worker. For forward proxies, upgrade both
+the frontend and worker to builds that support exchanging CONNECT rules.
+The endpoint returns `409` during an A/B experiment, when the worker reads a
+different config, or when its version doesn't support reload. The existing
+configuration stays active.
 Changing listener addresses, authentication, or TLS requires a restart, as does
 adding the legacy proxy to a running frontend.
 

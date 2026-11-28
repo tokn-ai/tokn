@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Instant;
-use tokn_policy::GatewayPlan;
+use tokn_policy::{GatewayPlan, ListenerPlan};
 
 #[derive(Clone, Debug)]
 pub struct WorkerEndpoint {
@@ -552,6 +552,16 @@ impl WorkerPool {
     }
     let expected = WorkerInfo::new(&plan, "frontend").map_err(invalid)?;
     let lease = GenerationLease::prepare(&worker.socket_path, revision).await?;
+    if lease.frontend_connect_policy.is_none()
+      && plan
+        .listeners()
+        .values()
+        .any(|listener| matches!(listener, ListenerPlan::ForwardProxy(_)))
+    {
+      return Err(ReloadError::RestartRequired(
+        "upgrade the active worker to a build that supports CONNECT policy reload before retrying".into(),
+      ));
+    }
     // Independently verify the runtime that will execute the newly admitted requests.
     verify_generation(&worker, &expected, Some(&lease))
       .await
@@ -561,7 +571,8 @@ impl WorkerPool {
       pool: self.clone(),
       generation: next.clone(),
     });
-    let prepared = frontend.prepare(&plan, service, dispatcher)?;
+    let prepared =
+      frontend.prepare_with_connect_policy(&plan, service, dispatcher, lease.frontend_connect_policy.as_ref())?;
     let report = {
       let mut routing = self.routing.write();
       if routing.generation != generation {

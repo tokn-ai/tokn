@@ -1,5 +1,6 @@
 //! Stable client transport with request execution delegated to workers.
 
+pub(crate) mod connect_policy;
 mod reload;
 
 pub(crate) use reload::LiveProxyIngress;
@@ -57,7 +58,7 @@ impl Frontend {
     dispatcher: Arc<dyn RequestDispatcher>,
     events: Arc<EventBus>,
   ) -> anyhow::Result<Self> {
-    let generation = FrontendGeneration::build(&plan, &service, &access, &events, dispatcher, None)?;
+    let generation = FrontendGeneration::build(&plan, &service, &access, &events, dispatcher, None, None)?;
     let reload = FrontendReloadHandle::new(generation, service, access, events);
     let mut api = Vec::new();
     let mut proxy = Vec::new();

@@ -1,5 +1,5 @@
 use super::path::canonical_path_prefix;
-use crate::v2::{CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectAction, RawListener};
+use crate::v2::{CompileError, RawBindingAction, RawClientAuth, RawConfig, RawConnectRule, RawListener};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -160,7 +160,7 @@ pub(super) fn compile_listeners(
         *allow_insecure_public,
         NonZeroUsize::new(request_body_max_bytes.unwrap_or(usize::MAX)),
         Some(default_http_action),
-        Some(compile_connect_action(*default_connect)),
+        Some((*default_connect).into()),
         resolve_ca_dir(ca_dir.as_deref(), source, raw_id)?,
       ),
     };
@@ -275,42 +275,9 @@ pub(super) fn compile_listeners(
       .push(HttpBindingPlan::new(id, matcher, action));
   }
 
-  let mut connect_rules = BTreeMap::<ListenerId, Vec<ConnectRulePlan>>::new();
-  let mut connect_matchers = BTreeMap::<ListenerId, Vec<(ConnectMatchKey, BindingId)>>::new();
-  for raw_rule in &raw.connect_rules {
-    let id = claim_binding_id(&raw_rule.id, &mut binding_ids)?;
-    let listener_id = resolve_listener(&raw_rule.listener, "CONNECT rule", &raw_rule.id, "listener", &drafts)?;
-    if drafts[&listener_id].flavor != ListenerFlavor::ForwardProxy {
-      return Err(invalid_value(
-        format!("connect_rules.{}.listener", raw_rule.id),
-        format!("listener `{listener_id}` is not a forward proxy"),
-      ));
-    }
-    let (matcher, key) = compile_connect_match(raw_rule)?;
-    let prior_matchers = connect_matchers.entry(listener_id.clone()).or_default();
-    if let Some((_, first)) = prior_matchers.iter().find(|(prior, _)| prior.subsumes(&key)) {
-      return Err(invalid_value(
-        format!("connect_rules.{}", raw_rule.id),
-        format!(
-          "matcher is unreachable because CONNECT rule `{first}` matches all of its requests on listener `{listener_id}`"
-        ),
-      ));
-    }
-    if connect_matchers_subsume_union(prior_matchers, &key) {
-      return Err(invalid_value(
-        format!("connect_rules.{}", raw_rule.id),
-        format!(
-          "matcher is unreachable because earlier CONNECT rules collectively match all of its requests on listener `{listener_id}`"
-        ),
-      ));
-    }
-    prior_matchers.push((key, id.clone()));
-    connect_rules.entry(listener_id).or_default().push(ConnectRulePlan::new(
-      id,
-      matcher,
-      compile_connect_action(raw_rule.action),
-    ));
-  }
+  let mut connect_rules = compile_connect_rules_for(&raw.connect_rules, &drafts, binding_ids, |listener| {
+    listener.flavor == ListenerFlavor::ForwardProxy
+  })?;
 
   drafts
     .into_iter()
@@ -358,6 +325,60 @@ pub(super) fn compile_listeners(
       Ok((id, plan))
     })
     .collect()
+}
+
+/// Validate a complete set of CONNECT rules for an existing set of listeners.
+pub fn compile_connect_rules(
+  raw_rules: &[RawConnectRule],
+  listeners: &BTreeMap<ListenerId, ListenerPlan>,
+) -> Result<BTreeMap<ListenerId, Vec<ConnectRulePlan>>, CompileError> {
+  compile_connect_rules_for(raw_rules, listeners, BTreeSet::new(), |listener| {
+    matches!(listener, ListenerPlan::ForwardProxy(_))
+  })
+}
+
+fn compile_connect_rules_for<T>(
+  raw_rules: &[RawConnectRule],
+  listeners: &BTreeMap<ListenerId, T>,
+  mut binding_ids: BTreeSet<BindingId>,
+  is_forward_proxy: impl Fn(&T) -> bool,
+) -> Result<BTreeMap<ListenerId, Vec<ConnectRulePlan>>, CompileError> {
+  let mut connect_rules = BTreeMap::<ListenerId, Vec<ConnectRulePlan>>::new();
+  let mut connect_matchers = BTreeMap::<ListenerId, Vec<(ConnectMatchKey, BindingId)>>::new();
+  for raw_rule in raw_rules {
+    let id = claim_binding_id(&raw_rule.id, &mut binding_ids)?;
+    let listener_id = resolve_listener(&raw_rule.listener, "CONNECT rule", &raw_rule.id, "listener", listeners)?;
+    if !is_forward_proxy(&listeners[&listener_id]) {
+      return Err(invalid_value(
+        format!("connect_rules.{}.listener", raw_rule.id),
+        format!("listener `{listener_id}` is not a forward proxy"),
+      ));
+    }
+    let (matcher, key) = compile_connect_match(raw_rule)?;
+    let prior_matchers = connect_matchers.entry(listener_id.clone()).or_default();
+    if let Some((_, first)) = prior_matchers.iter().find(|(prior, _)| prior.subsumes(&key)) {
+      return Err(invalid_value(
+        format!("connect_rules.{}", raw_rule.id),
+        format!(
+          "matcher is unreachable because CONNECT rule `{first}` matches all of its requests on listener `{listener_id}`"
+        ),
+      ));
+    }
+    if connect_matchers_subsume_union(prior_matchers, &key) {
+      return Err(invalid_value(
+        format!("connect_rules.{}", raw_rule.id),
+        format!(
+          "matcher is unreachable because earlier CONNECT rules collectively match all of its requests on listener `{listener_id}`"
+        ),
+      ));
+    }
+    prior_matchers.push((key, id.clone()));
+    connect_rules
+      .entry(listener_id)
+      .or_default()
+      .push(ConnectRulePlan::new(id, matcher, raw_rule.action.into()));
+  }
+  Ok(connect_rules)
 }
 
 fn compile_bind(raw: &str, listener_id: &str) -> Result<SocketAddr, CompileError> {
@@ -416,12 +437,12 @@ fn claim_binding_id(raw: &str, ids: &mut BTreeSet<BindingId>) -> Result<BindingI
   Ok(id)
 }
 
-fn resolve_listener(
+fn resolve_listener<T>(
   raw_listener: &str,
   owner_kind: &'static str,
   owner: &str,
   field: &'static str,
-  listeners: &BTreeMap<ListenerId, ListenerDraft>,
+  listeners: &BTreeMap<ListenerId, T>,
 ) -> Result<ListenerId, CompileError> {
   let listener = parse_id::<ListenerId>("listener reference", raw_listener)?;
   if listeners.contains_key(&listener) {
@@ -675,14 +696,6 @@ fn compile_operations(
   }
   let keys = operations.iter().map(ToString::to_string).collect();
   Ok((operations, keys))
-}
-
-fn compile_connect_action(raw: RawConnectAction) -> ConnectAction {
-  match raw {
-    RawConnectAction::Intercept => ConnectAction::Intercept,
-    RawConnectAction::Tunnel => ConnectAction::Tunnel,
-    RawConnectAction::Reject => ConnectAction::Reject,
-  }
 }
 
 fn parse_id<T>(resource: &'static str, value: &str) -> Result<T, CompileError>

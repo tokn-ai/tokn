@@ -264,6 +264,26 @@ pub enum RawConnectAction {
   Reject,
 }
 
+impl From<RawConnectAction> for tokn_policy::ConnectAction {
+  fn from(action: RawConnectAction) -> Self {
+    match action {
+      RawConnectAction::Intercept => Self::Intercept,
+      RawConnectAction::Tunnel => Self::Tunnel,
+      RawConnectAction::Reject => Self::Reject,
+    }
+  }
+}
+
+impl From<tokn_policy::ConnectAction> for RawConnectAction {
+  fn from(action: tokn_policy::ConnectAction) -> Self {
+    match action {
+      tokn_policy::ConnectAction::Intercept => Self::Intercept,
+      tokn_policy::ConnectAction::Tunnel => Self::Tunnel,
+      tokn_policy::ConnectAction::Reject => Self::Reject,
+    }
+  }
+}
+
 /// A named execution context with its own account selection state and API mount.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
