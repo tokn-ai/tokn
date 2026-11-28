@@ -10,6 +10,7 @@ use std::{
 };
 use time::macros::date;
 use tokn_maintenance::{archive_requests_once, prune_request_dbs, ArchiveFormat};
+use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 
 const DAY: &str = "2000-01-01";
 
@@ -23,7 +24,7 @@ fn archive_file(dir: &Path, format: ArchiveFormat) -> PathBuf {
   let db = dir.join(format!("{DAY}.db"));
   #[cfg(feature = "lzma")]
   if format == ArchiveFormat::Xz {
-    return tokn_persistence::request_files::indexed_xz_path(&db);
+    return IndexedArchiveFormat::Xz.path(&db);
   }
   db.with_extension(format.extension())
 }
@@ -96,6 +97,59 @@ fn check_archived_history(format: ArchiveFormat) {
 #[test]
 fn browses_zstd_archives_offline_and_prefers_the_live_database() {
   check_archived_history(ArchiveFormat::Zstd);
+}
+
+#[test]
+fn browses_indexed_zstd_history_with_live_priority_and_legacy_fallback() {
+  use tokn_persistence::request_archive::{indexed, RequestPack};
+  use tokn_persistence::request_files::StableFile;
+
+  let dir = tempfile::tempdir().unwrap();
+  let source = dir.path();
+  archive_fixture(source, ArchiveFormat::Zstd);
+  write_request(source, DAY, "packed", 946_684_801_000, None, None);
+  let db = source.join(format!("{DAY}.db"));
+  let format = IndexedArchiveFormat::Zstd;
+  let archive = format.path(&db);
+  {
+    let file = StableFile::open(&db).unwrap();
+    let snapshot = RequestPack::capture(&file, &mut |_| Ok(())).unwrap().unwrap();
+    let mut encoder = format.writer(fs::File::create_new(&archive).unwrap()).unwrap();
+    indexed::write(&snapshot, &mut encoder, &mut |_| Ok(())).unwrap();
+    encoder.finish().unwrap();
+  }
+
+  write_request(source, DAY, "live", 946_684_802_000, None, None);
+  assert_eq!(list_latest_requests(source, None, None).unwrap().requests.len(), 3);
+  fs::remove_file(db).unwrap();
+
+  let days = list_request_days(source).unwrap();
+  assert_eq!(days.len(), 1);
+  assert_eq!(days[0].day, DAY);
+  assert_eq!(days[0].state, RequestDayState::Available);
+  assert_eq!(
+    list_requests(source, &RequestListOptions::default())
+      .unwrap()
+      .requests
+      .len(),
+    2
+  );
+  let request = get_request(source, DAY, "packed", None).unwrap().unwrap();
+  let payload = get_request_payload(
+    source,
+    DAY,
+    "packed",
+    Some(request.row_id),
+    RequestPayloadField::InboundReqBody,
+  )
+  .unwrap()
+  .unwrap();
+  assert_eq!(payload.value["input"], "hello");
+
+  fs::write(&archive, b"damaged").unwrap();
+  assert_eq!(list_request_days(source).unwrap()[0].state, RequestDayState::Available);
+  assert!(get_request(source, DAY, "packed", None).unwrap().is_none());
+  assert!(get_request(source, DAY, "archived", None).unwrap().is_some());
 }
 
 #[cfg(feature = "lzma")]
@@ -292,6 +346,7 @@ fn tries_a_legacy_archive_when_the_indexed_archive_is_missing_or_corrupt() {
   assert_eq!(report.archived, 1);
   fs::copy(legacy.path().join(&legacy_archive), dir.path().join(legacy_archive)).unwrap();
   let db = dir.path().join(format!("{DAY}.db"));
+  fs::write(IndexedArchiveFormat::Zstd.path(&db), b"damaged").unwrap();
   fs::remove_file(&db).unwrap();
 
   let archive = archive_file(dir.path(), ArchiveFormat::Xz);

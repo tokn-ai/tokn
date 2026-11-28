@@ -7,18 +7,13 @@ use std::time::Duration;
 
 use crate::days::DayFile;
 use crate::Result;
-#[cfg(feature = "lzma")]
-use tokn_persistence::archive_xz::BlockReader;
-#[cfg(feature = "lzma")]
+use tokn_persistence::indexed_archive::{IndexedArchiveFormat, IndexedArchiveReader};
 use tokn_persistence::request_archive::indexed::IndexedPackReader;
-use tokn_persistence::request_files::{begin_read, ArchiveContents, ArchiveFormat};
-#[cfg(feature = "lzma")]
-use tokn_persistence::request_files::{indexed_xz_path, StableFile};
+use tokn_persistence::request_files::{begin_read, ArchiveContents, ArchiveFormat, StableFile};
 
 const READ_BUSY_TIMEOUT: Duration = Duration::from_millis(2_500);
 
-#[cfg(feature = "lzma")]
-type XzArchive = IndexedPackReader<BlockReader<BufReader<File>>>;
+type CompressedArchive = IndexedPackReader<IndexedArchiveReader<BufReader<File>>>;
 
 pub(super) fn open_readonly(path: &Path) -> Result<Option<Connection>> {
   if !path.try_exists()? {
@@ -35,18 +30,14 @@ enum DayStorage {
     conn: Connection,
     snapshot: Option<(tempfile::TempDir, ArchiveContents)>,
   },
-  #[cfg(feature = "lzma")]
-  Indexed(Box<XzArchive>),
+  Indexed(Box<CompressedArchive>),
 }
 
 impl DayConnection {
   pub(super) fn read_indexed_body(&self, request_id: &str, slot: u8) -> Result<Option<(Vec<u8>, u8)>> {
-    #[cfg(feature = "lzma")]
     if let DayStorage::Indexed(reader) = &self.0 {
       return Ok(reader.read_body(request_id, slot)?);
     }
-    #[cfg(not(feature = "lzma"))]
-    let _ = (request_id, slot);
     Ok(None)
   }
 
@@ -73,7 +64,6 @@ impl Deref for DayConnection {
   fn deref(&self) -> &Connection {
     match &self.0 {
       DayStorage::Sqlite { conn, .. } => conn,
-      #[cfg(feature = "lzma")]
       DayStorage::Indexed(reader) => reader.connection(),
     }
   }
@@ -108,12 +98,16 @@ impl DayFile {
     };
     // The writer publishes an archive before pruning its raw database. Recheck
     // its actual filenames here even if enumeration saw only the raw file.
-    #[cfg(feature = "lzma")]
-    match open_indexed_archive(&self.path, timeout) {
-      Ok(Some(conn)) => return Ok(Some(conn)),
-      Ok(None) => (),
-      Err(err) => {
-        error.get_or_insert(err);
+    for &format in IndexedArchiveFormat::ALL {
+      let path = format.path(&self.path);
+      if !regular_file(&path)? {
+        continue;
+      }
+      match open_indexed_archive(&path, format, timeout) {
+        Ok(conn) => return Ok(Some(conn)),
+        Err(err) => {
+          error.get_or_insert(err);
+        }
       }
     }
     for format in [ArchiveFormat::Zstd, ArchiveFormat::Xz] {
@@ -152,17 +146,11 @@ fn regular_file(path: &Path) -> std::io::Result<bool> {
   }
 }
 
-#[cfg(feature = "lzma")]
-fn open_indexed_archive(db: &Path, timeout: Duration) -> Result<Option<DayConnection>> {
-  let archive = indexed_xz_path(db);
-  if !regular_file(&archive)? {
-    return Ok(None);
-  }
-
-  let file = StableFile::open(&archive)?;
-  let input = BlockReader::open_xz(BufReader::new(file.file().try_clone()?))?;
+fn open_indexed_archive(path: &Path, format: IndexedArchiveFormat, timeout: Duration) -> Result<DayConnection> {
+  let file = StableFile::open(path)?;
+  let input = format.open(BufReader::new(file.file().try_clone()?))?;
   let reader = IndexedPackReader::open(input, timeout)?;
-  Ok(Some(DayConnection(DayStorage::Indexed(Box::new(reader)))))
+  Ok(DayConnection(DayStorage::Indexed(Box::new(reader))))
 }
 
 fn open_archive(

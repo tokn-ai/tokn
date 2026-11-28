@@ -210,10 +210,14 @@ fn destination_schema_mismatch_rolls_back_and_cleans_new_day() {
 #[test]
 fn archived_destination_day_is_never_recreated() {
   let fixture = Fixture::new();
-  fs::write(fixture.destination.requests_dir.join(format!("{DAY}.xz")), b"archive").unwrap();
-  assert!(fixture.error(true).contains("has an archive"));
-  assert!(!fixture.day().exists());
-  assert_eq!(count(&fixture.destination.usage_db, "requests"), 0);
+  for extension in ["db.xz", "pack.xz", "pack.zst"] {
+    let archive = fixture.day().with_extension(extension);
+    fs::write(&archive, b"archive").unwrap();
+    assert!(fixture.error(true).contains("has an archive"));
+    assert!(!fixture.day().exists());
+    assert_eq!(count(&fixture.destination.usage_db, "requests"), 0);
+    fs::remove_file(archive).unwrap();
+  }
 }
 
 #[test]
@@ -267,7 +271,7 @@ fn symlinked_source_or_destination_is_rejected() {
 #[test]
 fn archived_source_days_cannot_be_silently_omitted() {
   let fixture = Fixture::new();
-  for extension in ["db.xz", "db.zstd", "db.zst", "db.lzma", "pack.xz"] {
+  for extension in ["db.xz", "db.zstd", "db.zst", "db.lzma", "pack.xz", "pack.zst"] {
     // A different day simulates an older archived day alongside the current raw day.
     let archive = fixture.source.join(format!("requests/2026-09-20.{extension}"));
     fs::write(&archive, b"archive").unwrap();

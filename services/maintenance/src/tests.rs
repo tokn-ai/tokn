@@ -8,6 +8,8 @@ use time::macros::date;
 use tokn_core::event::{Event, EventHandler};
 use tokn_core::provider::Endpoint;
 use tokn_core::request_event::{RequestEndpoint, RequestEvent, RequestEventPayload, StageEvent};
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_files::indexed_xz_path;
 use tokn_persistence::request_files::MAINTENANCE_LOCK_FILE;
 use tokn_persistence::RequestEventHandler;
 
@@ -35,7 +37,7 @@ fn write_db(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
 }
 
 fn archive_format() -> ArchiveFormat {
-  resolve_format(Some("xz"))
+  resolve_format(Some("xz")).legacy
 }
 
 fn started_event(request_id: &str, ts: i64) -> Event {
@@ -79,7 +81,6 @@ fn archives_eligible_daily_db_without_removing_original() {
   assert_eq!(decoded, b"sqlite-ish bytes");
 }
 
-#[cfg(feature = "lzma")]
 fn write_packable_db(dir: &Path) -> PathBuf {
   let path = dir.join("2026-05-01.db");
   let conn = tokn_persistence::requests::open_day_db(&path).unwrap();
@@ -116,27 +117,55 @@ fn verified_request_pack_allows_pruning_a_checkpointed_database() {
   fs::remove_dir_all(dir).unwrap();
 }
 
-#[cfg(feature = "lzma")]
 #[test]
 fn request_pack_does_not_allow_pruning_a_changed_body() {
-  let dir = tempdir();
-  let db = write_packable_db(&dir);
-  let today = date!(2026 - 05 - 11);
-  let format = ArchiveFormat::Xz;
-  let archive = indexed_xz_path(&db);
+  for format in [
+    IndexedArchiveFormat::Zstd,
+    #[cfg(feature = "lzma")]
+    IndexedArchiveFormat::Xz,
+  ] {
+    let dir = tempfile::tempdir().unwrap();
+    let db = write_packable_db(dir.path());
+    let today = date!(2026 - 05 - 11);
+    let preference = resolve_format(Some(format.extension()));
+    let archive = format.path(&db);
 
-  assert_eq!(archive_requests_once(&dir, today, 7, format).unwrap().archived, 1);
-  assert!(archive.is_file());
-  {
+    let stats = archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
+    assert_eq!(stats.archived, 1);
     let conn = tokn_persistence::requests::open_day_db(&db).unwrap();
     conn
       .execute("UPDATE request_downstream SET inbound_req_body = 'changed'", [])
       .unwrap();
+    drop(conn);
+
+    let outcome = prune_request_db(&db, &archive, true, None, &mut |_| {});
+    assert!(matches!(outcome, PruneOutcome::Failed { .. }), "{outcome:?}");
+    assert!(db.exists());
   }
-  let outcome = prune_request_db(&db, &archive, format, true, None, &mut |_| {});
-  assert!(matches!(outcome, PruneOutcome::Failed { .. }), "{outcome:?}");
-  assert!(db.exists());
-  fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn configured_zstd_pack_can_be_pruned_after_switching_archive_format() {
+  let dir = tempfile::tempdir().unwrap();
+  let db = write_packable_db(dir.path());
+  let archive = IndexedArchiveFormat::Zstd.path(&db);
+  let today = date!(2026 - 05 - 11);
+  let preference = resolve_format(Some("pack.zst"));
+
+  let stats = archive_requests_once_with_events(dir.path(), today, 7, None, preference, None, None).unwrap();
+  assert_eq!(stats.archived, 1);
+  assert!(archive.is_file());
+  assert!(!archive_path(&db, ArchiveFormat::Zstd).exists());
+
+  let stats = archive_requests_once_with_events(dir.path(), today, 7, None, resolve_format(None), None, None).unwrap();
+  assert_eq!((stats.archived, stats.skipped_existing), (0, 1));
+  let report = prune_request_dbs_once(dir.path(), today, 10, archive_format(), true).unwrap();
+  let [entry] = report.entries.as_slice() else {
+    panic!("expected one request day");
+  };
+  assert_eq!(entry.archive, archive);
+  assert!(matches!(entry.outcome, PruneOutcome::Deleted { .. }), "{entry:?}");
+  assert!(!db.exists());
 }
 
 #[cfg(feature = "lzma")]
@@ -159,13 +188,14 @@ fn cancellation_interrupts_verifying_an_indexed_request_pack() {
   let source = StableFile::open(&db).unwrap();
   let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
   let cancelled = AtomicBool::new(false);
-  let error = pack::verify_indexed(
-    &mut StableFile::open(&archive).unwrap(),
-    &capture,
-    Some(&cancelled),
-    &mut |_| cancelled.store(true, Ordering::Relaxed),
-  )
-  .unwrap_err();
+  let error = pack::Format::Indexed(IndexedArchiveFormat::Xz)
+    .verify(
+      &mut StableFile::open(&archive).unwrap(),
+      &capture,
+      Some(&cancelled),
+      &mut |_| cancelled.store(true, Ordering::Relaxed),
+    )
+    .unwrap_err();
   assert_eq!(error.kind(), io::ErrorKind::Interrupted);
   drop(source);
   drop(capture);
@@ -230,7 +260,7 @@ fn scheduled_archival_retries_interrupted_publication_and_reports_archive_size()
   {
     let source = StableFile::open(&db).unwrap();
     let capture = RequestPack::capture(&source, &mut |_| Ok(())).unwrap().unwrap();
-    let error = pack::publish_indexed(&capture, &archive, &mut |_| Ok(()), || {
+    let error = pack::publish_indexed(IndexedArchiveFormat::Xz, &capture, &archive, &mut |_| Ok(()), || {
       Err(io::Error::new(
         io::ErrorKind::Interrupted,
         "test interrupted publication",
@@ -245,7 +275,7 @@ fn scheduled_archival_retries_interrupted_publication_and_reports_archive_size()
   assert!(db.is_file());
 
   let emitter = CollectingEmitter::default();
-  let stats = archive_requests_once_with_events(&dir, today, 7, Some(10), format, Some(&emitter), None).unwrap();
+  let stats = archive_requests_once_with_events(&dir, today, 7, Some(10), format.into(), Some(&emitter), None).unwrap();
   assert_eq!(stats.archived, 1);
   assert!(!db.exists());
   let archive_bytes = fs::metadata(&archive).unwrap().len();
@@ -271,7 +301,7 @@ fn maintenance_prunes_only_verified_databases_past_the_prune_cutoff() {
   let journaled = write_db(&dir, "2026-04-28.db", b"database with a sidecar");
   write_db(&dir, "2026-04-28.db-wal", b"uncheckpointed writes");
 
-  archive_requests_once_with_events(&dir, today, 7, Some(10), format, None, None).unwrap();
+  archive_requests_once_with_events(&dir, today, 7, Some(10), format.into(), None, None).unwrap();
 
   for (db, contents) in [
     (existing, b"already archived".as_slice()),
@@ -298,7 +328,7 @@ fn cancellation_during_prune_verification_retains_the_database() {
   let archive = archive_path(&db, format);
   let cancelled = AtomicBool::new(false);
 
-  let outcome = prune_request_db(&db, &archive, format, true, Some(&cancelled), &mut |_| {
+  let outcome = prune_request_db(&db, &archive, true, Some(&cancelled), &mut |_| {
     cancelled.store(true, Ordering::Relaxed);
   });
 
@@ -344,8 +374,16 @@ fn out_of_range_retention_cutoffs_return_errors() {
   );
 
   let db = write_db(&dir, "2026-05-01.db", b"archive despite an invalid prune cutoff");
-  let stats =
-    archive_requests_once_with_events(&dir, date!(2026 - 05 - 09), 7, Some(1_000_000_000), format, None, None).unwrap();
+  let stats = archive_requests_once_with_events(
+    &dir,
+    date!(2026 - 05 - 09),
+    7,
+    Some(1_000_000_000),
+    format.into(),
+    None,
+    None,
+  )
+  .unwrap();
   assert_eq!(stats.archived, 1);
   assert!(db.exists());
   fs::remove_dir_all(dir).unwrap();
@@ -391,10 +429,11 @@ fn prune_reports_file_and_byte_progress() {
   archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
   let mut events = Vec::new();
 
-  let report = prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format, false, &mut |event| {
-    events.push(event)
-  })
-  .unwrap();
+  let report =
+    prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format.into(), false, &mut |event| {
+      events.push(event)
+    })
+    .unwrap();
 
   assert_eq!(report.entries.len(), 1);
   assert!(matches!(
@@ -458,14 +497,15 @@ fn prune_preserves_replacement_source_file() {
   archive_requests_once(&dir, date!(2026 - 05 - 09), 7, format).unwrap();
   let mut replaced = false;
 
-  let report = prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format, true, &mut |event| {
-    if !replaced && matches!(event, PruneProgressEvent::FileProgress { .. }) {
-      fs::rename(&db, &original).unwrap();
-      fs::write(&db, b"replacement request database").unwrap();
-      replaced = true;
-    }
-  })
-  .unwrap();
+  let report =
+    prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format.into(), true, &mut |event| {
+      if !replaced && matches!(event, PruneProgressEvent::FileProgress { .. }) {
+        fs::rename(&db, &original).unwrap();
+        fs::write(&db, b"replacement request database").unwrap();
+        replaced = true;
+      }
+    })
+    .unwrap();
 
   assert!(matches!(report.entries[0].outcome, PruneOutcome::Failed { .. }));
   assert_eq!(fs::read(&db).unwrap(), b"replacement request database");
@@ -487,22 +527,23 @@ fn concurrent_request_write_waits_for_prune_and_is_preserved() {
   let mut writer = Some(handler);
   let mut writer_thread = None;
   let mut launched = false;
-  let report = prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format, true, &mut |event| {
-    if !launched && matches!(event, PruneProgressEvent::FileProgress { .. }) {
-      launched = true;
-      let mut handler = writer.take().unwrap();
-      let started_tx = started_tx.clone();
-      let done_tx = done_tx.clone();
-      writer_thread = Some(thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        handler.handle(&started_event("concurrent-request", ts + 1));
-        done_tx.send(()).unwrap();
-      }));
-      started_rx.recv_timeout(ThreadDuration::from_secs(1)).unwrap();
-      assert!(done_rx.recv_timeout(ThreadDuration::from_millis(100)).is_err());
-    }
-  })
-  .unwrap();
+  let report =
+    prune_request_dbs_once_with_progress(&dir, date!(2026 - 05 - 09), 7, format.into(), true, &mut |event| {
+      if !launched && matches!(event, PruneProgressEvent::FileProgress { .. }) {
+        launched = true;
+        let mut handler = writer.take().unwrap();
+        let started_tx = started_tx.clone();
+        let done_tx = done_tx.clone();
+        writer_thread = Some(thread::spawn(move || {
+          started_tx.send(()).unwrap();
+          handler.handle(&started_event("concurrent-request", ts + 1));
+          done_tx.send(()).unwrap();
+        }));
+        started_rx.recv_timeout(ThreadDuration::from_secs(1)).unwrap();
+        assert!(done_rx.recv_timeout(ThreadDuration::from_millis(100)).is_err());
+      }
+    })
+    .unwrap();
 
   assert!(matches!(report.entries[0].outcome, PruneOutcome::Deleted { .. }));
   done_rx.recv_timeout(ThreadDuration::from_secs(5)).unwrap();
@@ -638,18 +679,25 @@ fn uses_selected_archive_extension() {
 
 #[test]
 fn resolves_configured_extension_or_falls_back_to_zstd() {
-  assert_eq!(resolve_format(Some(".zstd")), ArchiveFormat::Zstd);
-  assert_eq!(resolve_format(Some("db.zstd")), ArchiveFormat::Zstd);
-  assert_eq!(resolve_format(Some("not-supported")), ArchiveFormat::Zstd);
+  assert_eq!(
+    resolve_format(Some(".pack.zst")),
+    ArchivePreference {
+      indexed: Some(IndexedArchiveFormat::Zstd),
+      legacy: ArchiveFormat::Zstd,
+    }
+  );
+  assert_eq!(resolve_format(Some(".zstd")), ArchiveFormat::Zstd.into());
+  assert_eq!(resolve_format(Some("db.zstd")), ArchiveFormat::Zstd.into());
+  assert_eq!(resolve_format(Some("not-supported")), ArchiveFormat::Zstd.into());
   let expected_xz = if cfg!(feature = "lzma") {
     ArchiveFormat::Xz
   } else {
     ArchiveFormat::Zstd
   };
-  assert_eq!(resolve_format(None), expected_xz);
-  assert_eq!(resolve_format(Some(".xz")), expected_xz);
-  assert_eq!(resolve_format(Some(".pack.xz")), expected_xz);
-  assert_eq!(resolve_format(Some("lzma")), expected_xz);
+  assert_eq!(resolve_format(None), expected_xz.into());
+  assert_eq!(resolve_format(Some(".xz")), expected_xz.into());
+  assert_eq!(resolve_format(Some(".pack.xz")), expected_xz.into());
+  assert_eq!(resolve_format(Some("lzma")), expected_xz.into());
 }
 
 #[test]
@@ -663,7 +711,7 @@ fn emits_archive_progress_events() {
     date!(2026 - 05 - 09),
     7,
     None,
-    archive_format(),
+    archive_format().into(),
     Some(emitter.as_ref()),
     None,
   )
@@ -699,7 +747,7 @@ fn cancellation_interrupts_compression_and_removes_temp_archive() {
     date!(2026 - 05 - 09),
     7,
     None,
-    archive_format(),
+    archive_format().into(),
     None,
     Some(&cancelled),
   )

@@ -326,9 +326,12 @@ running across worker replacements. A worker configured with a separate request
 history directory maintains that directory.
 By default, it compresses days at least 7 days old and prunes the original `.db`
 files at 10 days, after verifying them against their archives. XZ archival of
-supported request databases writes one `<day>.pack.xz` file. Tokn Pack holds the
+supported request databases writes one `<day>.pack.xz` file. Set
+`archive_extension = "pack.zst"` under `[service.persistence]` to write
+`<day>.pack.zst` with Zstandard level 19. Unsupported database schemas use
+a compressed SQLite snapshot. Tokn Pack holds the
 SQLite metadata snapshot, original captured headers, body hashes and offsets,
-and packed bodies. The outer XZ layer compresses the whole pack, including
+and packed bodies. The outer compression layer compresses the whole pack, including
 SQLite, in independently readable chunks of up to 64 MiB. Bodies use exact
 deduplication and deltas across up to eight recent requests in the same session,
 with chains limited to 64 deltas. The pack preserves exact decoded gzip and

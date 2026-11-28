@@ -1,14 +1,40 @@
-use std::io::{self, BufReader, BufWriter, Read, Seek};
+use std::io::{self, BufReader, BufWriter};
+#[cfg(feature = "lzma")]
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use tokn_persistence::archive_xz::{BlockReader, BlockWriter};
-use tokn_persistence::request_archive::{indexed, RequestPack, MAGIC};
+use tokn_persistence::indexed_archive::IndexedArchiveFormat;
+#[cfg(feature = "lzma")]
+use tokn_persistence::request_archive::MAGIC;
+use tokn_persistence::request_archive::{indexed, RequestPack};
 use tokn_persistence::request_files::StableFile;
 
 use crate::{check_cancelled, sync_archive_directory};
 
-const IO_CHUNK: usize = 64 * 1024;
+#[derive(Clone, Copy)]
+pub(super) enum Format {
+  Indexed(IndexedArchiveFormat),
+  #[cfg(feature = "lzma")]
+  LegacyXz,
+}
 
+impl Format {
+  pub(super) fn verify(
+    self,
+    file: &mut StableFile,
+    pack: &RequestPack,
+    cancelled: Option<&AtomicBool>,
+    progress: &mut impl FnMut(u64),
+  ) -> io::Result<()> {
+    match self {
+      Self::Indexed(format) => verify_indexed(format, file, pack, cancelled, progress),
+      #[cfg(feature = "lzma")]
+      Self::LegacyXz => verify_legacy(file, pack, cancelled, progress),
+    }
+  }
+}
+
+#[cfg(feature = "lzma")]
 pub(super) fn is_pack(file: &mut StableFile) -> io::Result<bool> {
   file.file_mut().rewind()?;
   let mut reader = lzma_rust2::XzReader::new(BufReader::new(file.file_mut()), false);
@@ -21,6 +47,7 @@ pub(super) fn is_pack(file: &mut StableFile) -> io::Result<bool> {
 }
 
 pub(super) fn publish_indexed(
+  format: IndexedArchiveFormat,
   snapshot: &RequestPack,
   archive: &Path,
   progress: &mut impl FnMut(u64) -> io::Result<()>,
@@ -31,12 +58,12 @@ pub(super) fn publish_indexed(
     .filter(|path| !path.as_os_str().is_empty())
     .unwrap_or_else(|| Path::new("."));
   let mut staging = tempfile::Builder::new().prefix(".tokn-archive-").tempfile_in(parent)?;
-  let mut encoder = BlockWriter::new(BufWriter::new(staging.as_file_mut()));
+  let mut encoder = format.writer(BufWriter::new(staging.as_file_mut()))?;
   indexed::write(snapshot, &mut encoder, progress)?;
   encoder.finish()?;
   staging.as_file().sync_all()?;
   {
-    let mut input = BlockReader::open_xz(BufReader::new(staging.reopen()?))?;
+    let mut input = format.open(BufReader::new(staging.reopen()?))?;
     indexed::verify(snapshot, &mut input, progress)?;
   }
   validate_source()?;
@@ -47,14 +74,15 @@ pub(super) fn publish_indexed(
   Ok(bytes)
 }
 
-pub(super) fn verify_indexed(
+fn verify_indexed(
+  format: IndexedArchiveFormat,
   file: &mut StableFile,
   pack: &RequestPack,
   cancelled: Option<&AtomicBool>,
   progress: &mut impl FnMut(u64),
 ) -> io::Result<()> {
   check_cancelled(cancelled)?;
-  let mut input = BlockReader::open_xz(BufReader::new(file.file_mut()))?;
+  let mut input = format.open(BufReader::new(file.file_mut()))?;
   let result = indexed::verify(pack, &mut input, &mut |bytes| {
     check_cancelled(cancelled)?;
     if bytes > 0 {
@@ -67,7 +95,8 @@ pub(super) fn verify_indexed(
   file.revalidate()
 }
 
-pub(super) fn verify(
+#[cfg(feature = "lzma")]
+fn verify_legacy(
   file: &mut StableFile,
   pack: &RequestPack,
   cancelled: Option<&AtomicBool>,
@@ -84,22 +113,25 @@ pub(super) fn verify(
   file.revalidate()
 }
 
+#[cfg(feature = "lzma")]
 fn check_io_cancelled(cancelled: Option<&AtomicBool>) -> io::Result<()> {
   // Standard Read/Write helpers retry Interrupted. Translate at the codec
   // boundary so a cancelled job can unwind through any of those helpers.
   check_cancelled(cancelled).map_err(io::Error::other)
 }
 
+#[cfg(feature = "lzma")]
 struct CheckedReader<'a, R, F> {
   inner: R,
   cancelled: Option<&'a AtomicBool>,
   progress: &'a mut F,
 }
 
+#[cfg(feature = "lzma")]
 impl<R: Read, F: FnMut(u64)> Read for CheckedReader<'_, R, F> {
   fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
     check_io_cancelled(self.cancelled)?;
-    let limit = bytes.len().min(IO_CHUNK);
+    let limit = bytes.len().min(64 * 1024);
     let count = self.inner.read(&mut bytes[..limit])?;
     if count > 0 {
       (self.progress)(count as u64);

@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 use tokn_persistence::request_files::ArchiveFormat;
 
 use super::schema::RequestSchema;
@@ -60,12 +61,7 @@ pub(super) fn request_day_files(requests_dir: &Path) -> Result<Vec<DayFile>> {
       continue;
     }
     let mut path = entry.path();
-    #[cfg(feature = "lzma")]
-    if let Some(day) = path
-      .file_name()
-      .and_then(|name| name.to_str())
-      .and_then(|name| name.strip_suffix(".pack.xz"))
-    {
+    if let Some(day) = IndexedArchiveFormat::day_from_path(&path) {
       if is_valid_request_day(day) {
         days.insert(day.to_owned());
       }
