@@ -464,19 +464,18 @@ fn migration_stage_stats(
   };
   let input = match unit {
     MigrationInputUnit::Bytes => format!(
-      "{}/{} in {}/s",
+      "{}/{} ↓ {}/s",
       HumanBytes(position),
       HumanBytes(total),
       HumanBytes(rate(position) as u64)
     ),
-    MigrationInputUnit::Tasks => format!("{position}/{total} tasks in {:.1} tasks/s", rate(position)),
-    MigrationInputUnit::Entries => format!("{position}/{total} entries in {:.1} entries/s", rate(position)),
+    MigrationInputUnit::Tasks => format!("{position}/{total} tasks ↓ {:.1} tasks/s", rate(position)),
+    MigrationInputUnit::Entries => format!("{position}/{total} entries ↓ {:.1} entries/s", rate(position)),
   };
-  let output = output_bytes.map_or_else(
-    || "—".to_owned(),
-    |bytes| format!("{}/s", HumanBytes(rate(bytes) as u64)),
-  );
-  format!("{input} · out {output}")
+  match output_bytes {
+    Some(bytes) => format!("{input} ↑ {}/s", HumanBytes(rate(bytes) as u64)),
+    None => input,
+  }
 }
 
 fn write_migration_day(
@@ -1204,19 +1203,23 @@ mod tests {
     let elapsed = Duration::from_secs(2);
     assert_eq!(
       migration_stage_stats(MigrationInputUnit::Bytes, 3072, 4096, Some(1024), elapsed),
-      "3.00 KiB/4.00 KiB in 1.50 KiB/s · out 512 B/s"
+      "3.00 KiB/4.00 KiB ↓ 1.50 KiB/s ↑ 512 B/s"
     );
     assert_eq!(
       migration_stage_stats(MigrationInputUnit::Bytes, 0, 4096, Some(0), elapsed),
-      "0 B/4.00 KiB in 0 B/s · out 0 B/s"
+      "0 B/4.00 KiB ↓ 0 B/s ↑ 0 B/s"
     );
     assert_eq!(
       migration_stage_stats(MigrationInputUnit::Tasks, 3, 8, None, elapsed),
-      "3/8 tasks in 1.5 tasks/s · out —"
+      "3/8 tasks ↓ 1.5 tasks/s"
     );
     assert_eq!(
       migration_stage_stats(MigrationInputUnit::Entries, 5, 8, Some(2048), elapsed),
-      "5/8 entries in 2.5 entries/s · out 1.00 KiB/s"
+      "5/8 entries ↓ 2.5 entries/s ↑ 1.00 KiB/s"
+    );
+    assert_eq!(
+      migration_stage_stats(MigrationInputUnit::Bytes, 3072, 4096, None, elapsed),
+      "3.00 KiB/4.00 KiB ↓ 1.50 KiB/s"
     );
   }
 
