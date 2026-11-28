@@ -3,8 +3,7 @@
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 
 const FULL: u8 = 0;
@@ -28,25 +27,6 @@ const MAX_CACHED_ANCHOR_BYTES: usize = 96 * 1024 * 1024;
 // Allows for hash table control bytes and unused buckets as well as entries.
 const ANCHOR_ENTRY_BYTES: usize = 32;
 
-#[derive(Clone, Copy)]
-pub(super) enum Sharing {
-  #[cfg(test)]
-  Full,
-  #[cfg(test)]
-  Dedup,
-  Delta,
-}
-
-impl Sharing {
-  fn dedup(self) -> bool {
-    match self {
-      #[cfg(test)]
-      Self::Full => false,
-      _ => true,
-    }
-  }
-}
-
 pub(super) struct InputBody<'a> {
   pub bytes: &'a [u8],
   pub base: Option<usize>,
@@ -61,15 +41,6 @@ pub(super) struct ObjectIndex {
   pub sha256: [u8; 32],
   pub base: Option<usize>,
   pub depth: usize,
-}
-
-#[derive(Default)]
-pub(super) struct ObjectStats {
-  pub full: usize,
-  pub references: usize,
-  pub deltas: usize,
-  pub session_deltas: usize,
-  pub max_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -89,15 +60,6 @@ impl Form {
   }
 }
 
-pub(super) fn write_objects(
-  out: &mut impl Write,
-  bodies: &[InputBody<'_>],
-  sharing: Sharing,
-  max_depth: usize,
-) -> Result<ObjectStats> {
-  write_objects_with_index(out, bodies, sharing, max_depth, |_, _| {})
-}
-
 /// Each index entry describes an object relative to the first encoded byte.
 /// The second vector directs body slots to their canonical object ordinals.
 pub(super) fn write_indexed_objects(
@@ -105,22 +67,6 @@ pub(super) fn write_indexed_objects(
   bodies: &[InputBody<'_>],
   max_depth: usize,
 ) -> Result<(Vec<ObjectIndex>, Vec<usize>)> {
-  let mut entries = Vec::new();
-  let mut canonical = Vec::new();
-  write_objects_with_index(out, bodies, Sharing::Delta, max_depth, |entry, ordinal| {
-    entries.push(entry);
-    canonical.push(ordinal);
-  })?;
-  Ok((entries, canonical))
-}
-
-fn write_objects_with_index(
-  out: &mut impl Write,
-  bodies: &[InputBody<'_>],
-  sharing: Sharing,
-  max_depth: usize,
-  mut record: impl FnMut(ObjectIndex, usize),
-) -> Result<ObjectStats> {
   ensure!(bodies.len() <= MAX_OBJECTS, "too many body objects");
   for (index, body) in bodies.iter().enumerate() {
     ensure!(body.bytes.len() <= MAX_BODY_BYTES, "body exceeds size limit");
@@ -134,42 +80,28 @@ fn write_objects_with_index(
     );
   }
 
-  let mut stats = ObjectStats::default();
+  let mut entries = Vec::with_capacity(bodies.len());
+  let mut canonical = Vec::with_capacity(bodies.len());
   let mut forms = Vec::<Form>::with_capacity(bodies.len());
   let mut seen = HashMap::<[u8; 32], Vec<usize>>::new();
   let mut anchors = AnchorCache::default();
   let mut offset = 0;
   for (index, body) in bodies.iter().enumerate() {
-    let mut sha256 = [0; 32];
-    let canonical = if sharing.dedup() {
-      sha256 = Sha256::digest(body.bytes).into();
-      let matches = seen.entry(sha256).or_default();
-      let duplicate = matches.iter().copied().find(|&prior| bodies[prior].bytes == body.bytes);
-      if duplicate.is_none() {
-        matches.push(index);
-      }
-      duplicate
-    } else {
-      None
-    };
-    let delta = if canonical.is_none() && matches!(sharing, Sharing::Delta) {
-      best_delta(bodies, &forms, body, max_depth, &mut anchors)
-    } else {
-      None
-    };
-    let (form, base, encoded_len, depth) = if let Some(prior) = canonical {
+    let sha256 = Sha256::digest(body.bytes).into();
+    let matches = seen.entry(sha256).or_default();
+    let duplicate = matches.iter().copied().find(|&prior| bodies[prior].bytes == body.bytes);
+    if duplicate.is_none() {
+      matches.push(index);
+    }
+    let (form, base, encoded_len, depth) = if let Some(prior) = duplicate {
       out.write_all(&[REFERENCE])?;
       write_uint(out, prior)?;
-      stats.references += 1;
       let depth = forms[prior]
         .canonical_depth()
         .expect("deduplication indexes canonical objects");
       (Form::Reference(prior), None, 5, depth)
-    } else if let Some(delta) = delta {
+    } else if let Some(delta) = best_delta(bodies, &forms, body, max_depth, &mut anchors) {
       write_delta(out, delta.base, body.bytes, &delta.edits)?;
-      stats.deltas += 1;
-      stats.session_deltas += usize::from(delta.is_session);
-      stats.max_depth = stats.max_depth.max(delta.depth);
       (
         Form::Delta(delta.depth),
         Some(delta.base),
@@ -180,24 +112,21 @@ fn write_objects_with_index(
       out.write_all(&[FULL])?;
       write_uint(out, body.bytes.len())?;
       out.write_all(body.bytes)?;
-      stats.full += 1;
       (Form::Full, None, 5 + body.bytes.len() as u64, 0)
     };
     forms.push(form);
-    record(
-      ObjectIndex {
-        offset,
-        encoded_len,
-        body_len: body.bytes.len(),
-        sha256,
-        base,
-        depth,
-      },
-      canonical.unwrap_or(index),
-    );
+    entries.push(ObjectIndex {
+      offset,
+      encoded_len,
+      body_len: body.bytes.len(),
+      sha256,
+      base,
+      depth,
+    });
+    canonical.push(duplicate.unwrap_or(index));
     offset += encoded_len;
   }
-  Ok(stats)
+  Ok((entries, canonical))
 }
 
 struct Delta {
@@ -205,7 +134,6 @@ struct Delta {
   depth: usize,
   edits: Vec<Edit>,
   wire_len: usize,
-  is_session: bool,
 }
 
 fn best_delta(
@@ -216,14 +144,10 @@ fn best_delta(
   anchors: &mut AnchorCache,
 ) -> Option<Delta> {
   let limit = body_delta_limit(body.bytes.len())?;
-  let candidates = body
-    .base
-    .into_iter()
-    .map(|base| (base, false))
-    .chain(body.session_bases.iter().map(|&base| (base, true)));
+  let candidates = body.base.into_iter().chain(body.session_bases.iter().copied());
   let mut tried = Vec::new();
   let mut best: Option<Delta> = None;
-  for (base, is_session) in candidates {
+  for base in candidates {
     let base = match forms[base] {
       Form::Reference(target) => target,
       _ => base,
@@ -251,25 +175,10 @@ fn best_delta(
         depth,
         edits,
         wire_len,
-        is_session,
       });
     }
   }
   best
-}
-
-/// Check each object against the original bytes. Earlier bodies can serve as
-/// references only after their bytes have been verified in this stream.
-pub(super) fn verify_objects(input: &mut impl Read, bodies: &[InputBody<'_>], max_depth: usize) -> Result<()> {
-  ensure!(bodies.len() <= MAX_OBJECTS, "too many body objects");
-  let mut forms = Vec::with_capacity(bodies.len());
-  let mut buffer = [0; 16 * 1024];
-  for (index, body) in bodies.iter().enumerate() {
-    let (form, _) = verify_object(input, &bodies[..index], &forms, body.bytes, &mut buffer, max_depth)
-      .with_context(|| format!("verify body object {index}"))?;
-    forms.push(form);
-  }
-  Ok(())
 }
 
 /// Verify the objects against their source bodies and rebuild the indexes from
@@ -385,245 +294,6 @@ fn read_header(
       })
     }
     tag => anyhow::bail!("unknown body object tag {tag}"),
-  }
-}
-
-/// Rebuild each object in pack order. A private spool retains canonical bodies
-/// for later copies and references while one buffer is reused for SQLite writes.
-pub(super) fn restore_objects(
-  input: &mut impl Read,
-  count: usize,
-  max_depth: usize,
-  mut emit: impl FnMut(usize, &[u8]) -> Result<()>,
-) -> Result<()> {
-  ensure!(count <= MAX_OBJECTS, "too many body objects");
-  let mut bodies = Vec::with_capacity(count);
-  let mut spool = BodySpool::new()?;
-  let mut buffer = Vec::new();
-  for index in 0..count {
-    let stored = restore_object(input, &bodies, &mut spool, &mut buffer, max_depth)
-      .with_context(|| format!("restore body object {index}"))?;
-    emit(index, &buffer)?;
-    bodies.push(stored);
-  }
-  Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct StoredBody {
-  offset: u64,
-  len: usize,
-  depth: usize,
-}
-
-struct BodySpool {
-  file: File,
-  end: u64,
-}
-
-impl BodySpool {
-  fn new() -> Result<Self> {
-    Ok(Self {
-      file: tempfile::tempfile()?,
-      end: 0,
-    })
-  }
-
-  fn append(&mut self, bytes: &[u8], depth: usize) -> Result<StoredBody> {
-    let offset = self.end;
-    let end = offset
-      .checked_add(bytes.len() as u64)
-      .context("body spool offset overflow")?;
-    self.file.seek(SeekFrom::Start(offset))?;
-    self.file.write_all(bytes)?;
-    self.end = end;
-    Ok(StoredBody {
-      offset,
-      len: bytes.len(),
-      depth,
-    })
-  }
-
-  fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<()> {
-    self.file.seek(SeekFrom::Start(offset))?;
-    self.file.read_exact(output)?;
-    Ok(())
-  }
-}
-
-fn restore_object(
-  input: &mut impl Read,
-  prior: &[Option<StoredBody>],
-  spool: &mut BodySpool,
-  buffer: &mut Vec<u8>,
-  max_depth: usize,
-) -> Result<Option<StoredBody>> {
-  let header = read_header(input, max_depth, |index| prior.get(index)?.map(|body| body.depth))?;
-  match header {
-    ObjectHeader::Full { len } => {
-      buffer.resize(len, 0);
-      input.read_exact(buffer)?;
-      Ok(Some(spool.append(buffer, 0)?))
-    }
-    ObjectHeader::Reference { target } => {
-      let target = prior[target].expect("canonical target validated by the object header");
-      buffer.resize(target.len, 0);
-      spool.read_at(target.offset, buffer)?;
-      Ok(None)
-    }
-    ObjectHeader::Delta { base, len, depth } => {
-      let base = prior[base].expect("canonical base validated by the object header");
-      buffer.resize(len, 0);
-      read_delta(input, base.len, len, |input, operation| {
-        match operation {
-          DeltaOperation::Copy { source, target } => {
-            spool.read_at(base.offset + source.start as u64, &mut buffer[target])?;
-          }
-          DeltaOperation::Literal { target } => input.read_exact(&mut buffer[target])?,
-        }
-        Ok(())
-      })?;
-      Ok(Some(spool.append(buffer, depth)?))
-    }
-  }
-}
-
-/// Index the encoded stream for selective restoration without expanding any
-/// canonical body. The private spool stores one copy of the encoded objects.
-pub(super) fn index_objects(input: &mut dyn Read, count: usize, max_depth: usize) -> Result<IndexedBodies> {
-  ensure!(count <= MAX_OBJECTS, "too many body objects");
-  let mut input = SpoolingInput {
-    input,
-    file: BufWriter::new(tempfile::tempfile()?),
-    len: 0,
-  };
-  let mut entries = Vec::<IndexedBody>::with_capacity(count);
-  let mut buffer = [0; 16 * 1024];
-  for _ in 0..count {
-    let header = read_header(&mut input, max_depth, |index| entries.get(index)?.canonical_depth())?;
-    let offset = input.len;
-    let entry = match header {
-      ObjectHeader::Full { len } => {
-        skip_exact(&mut input, len, &mut buffer)?;
-        IndexedBody {
-          offset,
-          len,
-          depth: 0,
-          form: IndexedForm::Full,
-        }
-      }
-      ObjectHeader::Reference { target } => IndexedBody {
-        offset,
-        len: entries[target].len,
-        depth: entries[target].depth,
-        form: IndexedForm::Reference(target),
-      },
-      ObjectHeader::Delta { base, len, depth } => {
-        read_delta(&mut input, entries[base].len, len, |input, operation| {
-          if let DeltaOperation::Literal { target } = operation {
-            skip_exact(input, target.len(), &mut buffer)?;
-          }
-          Ok(())
-        })?;
-        IndexedBody {
-          offset,
-          len,
-          depth,
-          form: IndexedForm::Delta(base),
-        }
-      }
-    };
-    entries.push(entry);
-  }
-  let file = input.file.into_inner().map_err(|error| error.into_error())?;
-  Ok(IndexedBodies {
-    file: BufReader::new(file),
-    entries,
-    body: Vec::new(),
-    next: Vec::new(),
-  })
-}
-
-struct SpoolingInput<'a> {
-  input: &'a mut dyn Read,
-  file: BufWriter<File>,
-  len: u64,
-}
-
-impl Read for SpoolingInput<'_> {
-  fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-    let n = self.input.read(output)?;
-    self.file.write_all(&output[..n])?;
-    self.len = self
-      .len
-      .checked_add(n as u64)
-      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "object spool offset overflow"))?;
-    Ok(n)
-  }
-}
-
-fn skip_exact(input: &mut impl Read, mut len: usize, buffer: &mut [u8]) -> Result<()> {
-  while len != 0 {
-    let count = len.min(buffer.len());
-    input.read_exact(&mut buffer[..count])?;
-    len -= count;
-  }
-  Ok(())
-}
-
-#[derive(Clone, Copy)]
-enum IndexedForm {
-  Full,
-  Reference(usize),
-  Delta(usize),
-}
-
-#[derive(Clone, Copy)]
-struct IndexedBody {
-  offset: u64,
-  len: usize,
-  depth: usize,
-  form: IndexedForm,
-}
-
-impl IndexedBody {
-  fn canonical_depth(self) -> Option<usize> {
-    match self.form {
-      IndexedForm::Full | IndexedForm::Delta(_) => Some(self.depth),
-      IndexedForm::Reference(_) => None,
-    }
-  }
-}
-
-pub(super) struct IndexedBodies {
-  file: BufReader<File>,
-  entries: Vec<IndexedBody>,
-  body: Vec<u8>,
-  next: Vec<u8>,
-}
-
-impl IndexedBodies {
-  pub(super) fn body(&mut self, index: usize) -> Result<&[u8]> {
-    let target = *self.entries.get(index).context("missing indexed body")?;
-    let mut entry = match target.form {
-      IndexedForm::Reference(base) => self.entries[base],
-      _ => target,
-    };
-    let mut deltas = Vec::with_capacity(entry.depth);
-    while let IndexedForm::Delta(base) = entry.form {
-      deltas.push(entry);
-      entry = self.entries[base];
-    }
-    self.file.seek(SeekFrom::Start(entry.offset))?;
-    self.body.resize(entry.len, 0);
-    self.file.read_exact(&mut self.body)?;
-    for delta in deltas.into_iter().rev() {
-      self.file.seek(SeekFrom::Start(delta.offset))?;
-      self.next.resize(delta.len, 0);
-      materialize_delta(&mut self.file, &self.body, &mut self.next)?;
-      std::mem::swap(&mut self.body, &mut self.next);
-    }
-    Ok(&self.body)
   }
 }
 
@@ -1059,6 +729,18 @@ fn read_tag(input: &mut impl Read) -> Result<u8> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::io::Cursor;
+
+  fn encode_and_verify(bodies: &[InputBody<'_>], max_depth: usize) -> (Vec<u8>, Vec<ObjectIndex>, Vec<usize>) {
+    let mut archive = Vec::new();
+    let (entries, canonical) = write_indexed_objects(&mut archive, bodies, max_depth).unwrap();
+    let mut encoded = archive.as_slice();
+    let (verified_entries, verified_canonical) = verify_indexed_objects(&mut encoded, bodies, max_depth).unwrap();
+    assert_eq!(verified_entries, entries);
+    assert_eq!(verified_canonical, canonical);
+    assert!(encoded.is_empty());
+    (archive, entries, canonical)
+  }
 
   fn translated_streams() -> (Vec<u8>, Vec<u8>) {
     let mut original = String::from("event: upstream.response.created\n\n");
@@ -1079,7 +761,7 @@ mod tests {
   }
 
   #[test]
-  fn all_sharing_modes_round_trip_and_find_disjoint_translated_runs() {
+  fn indexed_objects_round_trip_and_find_disjoint_translated_runs() {
     let (base, converted) = translated_streams();
     let limit = body_delta_limit(converted.len()).unwrap();
     let copies = select_delta(&base_anchors(&base), &base, &converted, limit, limit)
@@ -1121,17 +803,13 @@ mod tests {
         session_bases: &[],
       },
     ];
-    for (sharing, counts) in [
-      (Sharing::Full, (6, 0, 0)),
-      (Sharing::Dedup, (4, 2, 0)),
-      (Sharing::Delta, (3, 2, 1)),
-    ] {
-      let mut archive = Vec::new();
-      let stats = write_objects(&mut archive, &bodies, sharing, 1).unwrap();
-      assert_eq!((stats.full, stats.references, stats.deltas), counts);
-      let mut encoded = &archive[..];
-      verify_objects(&mut encoded, &bodies, 1).unwrap();
-      assert!(encoded.is_empty());
+    let (archive, entries, canonical) = encode_and_verify(&bodies, 1);
+    assert_eq!(canonical, [0, 0, 2, 2, 4, 5]);
+    assert_eq!((entries[2].base, entries[2].depth), (Some(0), 1));
+    let mut input = Cursor::new(&archive);
+    for (body, ordinal) in bodies.iter().zip(canonical) {
+      let restored = read_indexed_body(&mut input, ordinal, 1, |index| Ok(entries[index])).unwrap();
+      assert_eq!(restored, body.bytes);
     }
   }
 
@@ -1197,21 +875,14 @@ mod tests {
         session_bases: &[3],
       },
     ];
-    let mut archive = Vec::new();
-    let stats = write_objects(&mut archive, &bodies, Sharing::Delta, 1).unwrap();
-    assert_eq!(
-      (stats.full, stats.references, stats.deltas, stats.session_deltas),
-      (3, 1, 1, 1)
-    );
-    verify_objects(&mut &archive[..], &bodies, 1).unwrap();
+    let (_, entries, canonical) = encode_and_verify(&bodies, 1);
+    assert_eq!(canonical, [0, 1, 2, 2, 4]);
+    assert_eq!((entries[2].base, entries[2].depth), (Some(1), 1));
+    assert_eq!((entries[4].base, entries[4].depth), (None, 0));
 
-    archive.clear();
-    let stats = write_objects(&mut archive, &bodies, Sharing::Delta, 2).unwrap();
-    assert_eq!(
-      (stats.full, stats.references, stats.session_deltas, stats.max_depth),
-      (2, 1, 2, 2)
-    );
-    verify_objects(&mut &archive[..], &bodies, 2).unwrap();
+    let (archive, entries, canonical) = encode_and_verify(&bodies, 2);
+    assert_eq!(canonical, [0, 1, 2, 2, 4]);
+    assert_eq!((entries[4].base, entries[4].depth), (Some(2), 2));
     assert_rejected(
       &archive,
       &[&paired, &previous, &body, &body, &following],
@@ -1243,10 +914,8 @@ mod tests {
         session_bases: &[1],
       },
     ];
-    let mut archive = Vec::new();
-    let stats = write_objects(&mut archive, &bodies, Sharing::Delta, 1).unwrap();
-    assert_eq!((stats.deltas, stats.session_deltas), (1, 0));
-    verify_objects(&mut &archive[..], &bodies, 1).unwrap();
+    let (_, entries, _) = encode_and_verify(&bodies, 1);
+    assert_eq!((entries[2].base, entries[2].depth), (Some(0), 1));
   }
 
   #[test]
@@ -1273,10 +942,9 @@ mod tests {
         session_bases: &[0],
       },
     ];
-    let mut archive = Vec::new();
-    let stats = write_objects(&mut archive, &bodies, Sharing::Delta, 2).unwrap();
-    assert_eq!((stats.deltas, stats.session_deltas, stats.max_depth), (2, 1, 1));
-    verify_objects(&mut &archive[..], &bodies, 1).unwrap();
+    let (_, entries, _) = encode_and_verify(&bodies, 2);
+    assert_eq!((entries[1].base, entries[1].depth), (Some(0), 1));
+    assert_eq!((entries[2].base, entries[2].depth), (Some(0), 1));
   }
 
   #[test]
@@ -1311,10 +979,11 @@ mod tests {
       },
     ];
     for max_depth in [2, 3] {
-      let mut archive = Vec::new();
-      let stats = write_objects(&mut archive, &bodies, Sharing::Delta, max_depth).unwrap();
-      assert_eq!((stats.full, stats.session_deltas, stats.max_depth), (1, 3, max_depth));
-      verify_objects(&mut &archive[..], &bodies, max_depth).unwrap();
+      let (_, entries, canonical) = encode_and_verify(&bodies, max_depth);
+      assert_eq!(canonical, [0, 1, 2, 3]);
+      assert_eq!((entries[1].base, entries[1].depth), (Some(0), 1));
+      assert_eq!((entries[2].base, entries[2].depth), (Some(1), 2));
+      assert_eq!((entries[3].base, entries[3].depth), (Some(max_depth - 1), max_depth));
     }
   }
 
@@ -1343,11 +1012,8 @@ mod tests {
     assert_eq!(canonical, [0, 1, 2, 2, 4]);
     assert_eq!((entries[4].base, entries[4].depth), (Some(2), 2));
 
-    let mut legacy = prefix.to_vec();
-    write_objects(&mut legacy, &inputs, Sharing::Delta, 2)?;
-    assert_eq!(legacy, pack);
     let prefix_len = prefix.len() as u64;
-    let mut input = io::Cursor::new(&pack);
+    let mut input = Cursor::new(&pack);
     input.seek(SeekFrom::Start(prefix_len))?;
     let (verified_entries, verified_canonical) = verify_indexed_objects(&mut input, &inputs, 2)?;
     assert_eq!(verified_entries, entries);
@@ -1357,7 +1023,7 @@ mod tests {
     }
 
     let mut input = ObservedReader {
-      cursor: io::Cursor::new(&pack),
+      cursor: Cursor::new(&pack),
       positions: Vec::new(),
     };
     let mut lookups = Vec::new();
@@ -1375,7 +1041,7 @@ mod tests {
   }
 
   struct ObservedReader<'a> {
-    cursor: io::Cursor<&'a Vec<u8>>,
+    cursor: Cursor<&'a Vec<u8>>,
     positions: Vec<u64>,
   }
 
@@ -1423,20 +1089,19 @@ mod tests {
       },
     ];
     for entry in invalid {
-      assert!(read_indexed_body(&mut io::Cursor::new(&pack), 0, 1, |_| Ok(entry)).is_err());
+      assert!(read_indexed_body(&mut Cursor::new(&pack), 0, 1, |_| Ok(entry)).is_err());
     }
     Ok(())
   }
 
   fn full(out: &mut Vec<u8>, bytes: &[u8]) {
-    write_objects(
+    write_indexed_objects(
       out,
       &[InputBody {
         bytes,
         base: None,
         session_bases: &[],
       }],
-      Sharing::Full,
       1,
     )
     .unwrap();
@@ -1456,7 +1121,7 @@ mod tests {
         session_bases: &[],
       })
       .collect();
-    let error = verify_objects(&mut bytes, &expected, 1).unwrap_err();
+    let error = verify_indexed_objects(&mut bytes, &expected, 1).unwrap_err();
     assert!(format!("{error:#}").contains(message), "{error:#}");
   }
 
@@ -1534,12 +1199,12 @@ mod tests {
       base: Some(0),
       session_bases: &[],
     }];
-    assert!(write_objects(&mut Vec::new(), &bad, Sharing::Delta, 1).is_err());
+    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1).is_err());
     let bad = [InputBody {
       bytes: b"body",
       base: None,
       session_bases: &[0],
     }];
-    assert!(write_objects(&mut Vec::new(), &bad, Sharing::Delta, 1).is_err());
+    assert!(write_indexed_objects(&mut Vec::new(), &bad, 1).is_err());
   }
 }

@@ -326,9 +326,12 @@ running across worker replacements. A worker configured with a separate request
 history directory maintains that directory.
 By default, it compresses days at least 7 days old and prunes the original `.db`
 files at 10 days, after verifying them against their archives. XZ archival of
-supported request databases writes one `<day>.pack.xz` file. Tokn Pack holds the
+supported request databases writes one `<day>.pack.xz` file. Set
+`archive_extension = "pack.zst"` under `[service.persistence]` to write
+`<day>.pack.zst` with Zstandard level 19. Unsupported database schemas use
+a compressed SQLite snapshot. Tokn Pack holds the
 SQLite metadata snapshot, original captured headers, body hashes and offsets,
-and packed bodies. The outer XZ layer compresses the whole pack, including
+and packed bodies. The outer compression layer compresses the whole pack, including
 SQLite, in independently readable chunks of up to 64 MiB. Bodies use exact
 deduplication and deltas across up to eight recent requests in the same session,
 with chains limited to 64 deltas. The pack preserves exact decoded gzip and
@@ -348,8 +351,8 @@ requests and sessions. The inspector is part of the desktop app; the former
 The viewer reads existing request-day databases, `sessions.db`, and `usage.db`
 locally, including while the gateway is stopped. For an indexed pack, it opens
 the metadata snapshot as a private temporary SQLite database and seeks to the
-chunks needed for a requested body. Legacy compressed archives also open
-through a private temporary SQLite database.
+chunks needed for a requested body. Whole SQLite snapshots (`.db.xz` and
+`.db.zstd`) open through a private temporary database.
 
 The Sessions view reads its list, semantic node tree, and selected-node content
 only from `sessions.db`; opening it does not scan request history. Session and

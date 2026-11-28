@@ -10,6 +10,7 @@ use std::{
 };
 use time::macros::date;
 use tokn_maintenance::{archive_requests_once, prune_request_dbs, ArchiveFormat};
+use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 
 const DAY: &str = "2000-01-01";
 
@@ -23,7 +24,7 @@ fn archive_file(dir: &Path, format: ArchiveFormat) -> PathBuf {
   let db = dir.join(format!("{DAY}.db"));
   #[cfg(feature = "lzma")]
   if format == ArchiveFormat::Xz {
-    return tokn_persistence::request_files::indexed_xz_path(&db);
+    return IndexedArchiveFormat::Xz.path(&db);
   }
   db.with_extension(format.extension())
 }
@@ -98,6 +99,59 @@ fn browses_zstd_archives_offline_and_prefers_the_live_database() {
   check_archived_history(ArchiveFormat::Zstd);
 }
 
+#[test]
+fn browses_indexed_zstd_history_with_live_priority_and_legacy_fallback() {
+  use tokn_persistence::request_archive::{indexed, RequestPack};
+  use tokn_persistence::request_files::StableFile;
+
+  let dir = tempfile::tempdir().unwrap();
+  let source = dir.path();
+  archive_fixture(source, ArchiveFormat::Zstd);
+  write_request(source, DAY, "packed", 946_684_801_000, None, None);
+  let db = source.join(format!("{DAY}.db"));
+  let format = IndexedArchiveFormat::Zstd;
+  let archive = format.path(&db);
+  {
+    let file = StableFile::open(&db).unwrap();
+    let snapshot = RequestPack::capture(&file, &mut |_| Ok(())).unwrap().unwrap();
+    let mut encoder = format.writer(fs::File::create_new(&archive).unwrap()).unwrap();
+    indexed::write(&snapshot, &mut encoder, &mut |_| Ok(())).unwrap();
+    encoder.finish().unwrap();
+  }
+
+  write_request(source, DAY, "live", 946_684_802_000, None, None);
+  assert_eq!(list_latest_requests(source, None, None).unwrap().requests.len(), 3);
+  fs::remove_file(db).unwrap();
+
+  let days = list_request_days(source).unwrap();
+  assert_eq!(days.len(), 1);
+  assert_eq!(days[0].day, DAY);
+  assert_eq!(days[0].state, RequestDayState::Available);
+  assert_eq!(
+    list_requests(source, &RequestListOptions::default())
+      .unwrap()
+      .requests
+      .len(),
+    2
+  );
+  let request = get_request(source, DAY, "packed", None).unwrap().unwrap();
+  let payload = get_request_payload(
+    source,
+    DAY,
+    "packed",
+    Some(request.row_id),
+    RequestPayloadField::InboundReqBody,
+  )
+  .unwrap()
+  .unwrap();
+  assert_eq!(payload.value["input"], "hello");
+
+  fs::write(&archive, b"damaged").unwrap();
+  assert_eq!(list_request_days(source).unwrap()[0].state, RequestDayState::Available);
+  assert!(get_request(source, DAY, "packed", None).unwrap().is_none());
+  assert!(get_request(source, DAY, "archived", None).unwrap().is_some());
+}
+
 #[cfg(feature = "lzma")]
 #[test]
 fn browses_indexed_archives_offline_and_prefers_the_live_database() {
@@ -162,23 +216,13 @@ fn reads_decoded_pack_payloads_and_keeps_the_captured_headers() {
     )
     .unwrap();
   assert_eq!(restored_bodies, 0);
-  drop(metadata_snapshot);
-  let selected = day.open_request(request_id).unwrap().unwrap();
-  let snapshot_body_count: i64 = selected
-    .query_row(
-      "SELECT count(inbound_req_body) + count(outbound_req_body) + count(inbound_resp_body) FROM requests",
-      [],
-      |row| row.get(0),
-    )
-    .unwrap();
-  assert_eq!(snapshot_body_count, 0);
-  let (packed_body, flags) = selected
+  let (packed_body, flags) = metadata_snapshot
     .read_indexed_body(request_id, tokn_persistence::request_archive::OUTBOUND_REQUEST_SLOT)
     .unwrap()
     .unwrap();
   assert_eq!(packed_body, request_bytes);
   assert_ne!(flags & tokn_persistence::request_archive::BODY_IS_DECODED, 0);
-  drop(selected);
+  drop(metadata_snapshot);
 
   for (field, expected) in [
     (RequestPayloadField::OutboundReqHeaders, request_headers),
@@ -236,18 +280,13 @@ fn reads_a_legacy_sqlite_xz_archive_without_migrating_it() {
   assert_eq!(version, 7);
 }
 
-#[cfg(feature = "lzma")]
 #[test]
-fn reads_decoded_bodies_in_a_legacy_combined_pack() {
-  use tokn_persistence::archive_xz::BlockWriter;
-  use tokn_persistence::request_archive::RequestPack;
-  use tokn_persistence::request_files::StableFile;
-
+fn decodes_request_bodies_using_captured_headers_in_a_raw_sqlite_archive() {
   let dir = tempfile::tempdir().unwrap();
   let source = dir.path();
   write_request(source, DAY, "archived", 946_684_800_000, None, None);
   let db = source.join(format!("{DAY}.db"));
-  let request = serde_json::json!({"messages":[{"role":"user","content":"legacy pack input"}]});
+  let request = serde_json::json!({"messages":[{"role":"user","content":"raw archive input"}]});
   let wire = zstd::stream::encode_all(request.to_string().as_bytes(), 0).unwrap();
   let headers = serde_json::json!({
     "content-encoding": "zstd",
@@ -262,22 +301,17 @@ fn reads_decoded_bodies_in_a_legacy_combined_pack() {
     .unwrap();
   drop(conn);
 
-  let stable_db = StableFile::open(&db).unwrap();
-  let snapshot = RequestPack::capture(&stable_db, &mut |_| Ok(())).unwrap().unwrap();
-  let archive = fs::File::create_new(db.with_extension(ArchiveFormat::Xz.extension())).unwrap();
-  let mut encoder = BlockWriter::new(archive);
-  snapshot.write(&mut encoder).unwrap();
-  encoder.finish().unwrap();
-  drop(stable_db);
+  let report = archive_requests_once(source, date!(2000 - 01 - 10), 1, ArchiveFormat::Zstd).unwrap();
+  assert_eq!(report.archived, 1);
   fs::remove_file(db).unwrap();
 
   let summary = get_request_llm_summary(source, DAY, "archived", None).unwrap().unwrap();
   assert!(summary.warning.is_none());
-  assert_eq!(summary.messages[0].preview.as_deref(), Some("legacy pack input"));
-  let payload = get_request_payload(source, DAY, "archived", None, RequestPayloadField::InboundReqBody)
+  assert_eq!(summary.messages[0].preview.as_deref(), Some("raw archive input"));
+  let payload = get_request_payload(source, DAY, "archived", None, RequestPayloadField::InboundReqHeaders)
     .unwrap()
     .unwrap();
-  assert_eq!(payload.value, request);
+  assert_eq!(payload.value, headers);
 }
 
 #[cfg(feature = "lzma")]
@@ -292,6 +326,7 @@ fn tries_a_legacy_archive_when_the_indexed_archive_is_missing_or_corrupt() {
   assert_eq!(report.archived, 1);
   fs::copy(legacy.path().join(&legacy_archive), dir.path().join(legacy_archive)).unwrap();
   let db = dir.path().join(format!("{DAY}.db"));
+  fs::write(IndexedArchiveFormat::Zstd.path(&db), b"damaged").unwrap();
   fs::remove_file(&db).unwrap();
 
   let archive = archive_file(dir.path(), ArchiveFormat::Xz);

@@ -1,12 +1,9 @@
 //! Archive, verify and prune rotated request databases.
 
-#[cfg(feature = "lzma")]
 mod pack;
 mod worker;
-#[cfg(feature = "lzma")]
+use tokn_persistence::indexed_archive::IndexedArchiveFormat;
 use tokn_persistence::request_archive::RequestPack;
-#[cfg(feature = "lzma")]
-use tokn_persistence::request_files::indexed_xz_path;
 pub use tokn_persistence::request_files::ArchiveFormat;
 use tokn_persistence::request_files::{RequestMaintenanceLock, StableFile};
 pub use worker::*;
@@ -86,31 +83,55 @@ pub enum PruneProgressEvent {
   },
 }
 
-fn resolve_format(configured_extension: Option<&str>) -> ArchiveFormat {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArchivePreference {
+  indexed: Option<IndexedArchiveFormat>,
+  snapshot_format: ArchiveFormat,
+}
+
+impl From<ArchiveFormat> for ArchivePreference {
+  fn from(snapshot_format: ArchiveFormat) -> Self {
+    let indexed = match snapshot_format {
+      #[cfg(feature = "lzma")]
+      ArchiveFormat::Xz => Some(IndexedArchiveFormat::Xz),
+      _ => None,
+    };
+    Self {
+      indexed,
+      snapshot_format,
+    }
+  }
+}
+
+fn resolve_format(configured_extension: Option<&str>) -> ArchivePreference {
   let Some(value) = configured_extension.map(str::trim).filter(|value| !value.is_empty()) else {
     return if cfg!(feature = "lzma") {
-      ArchiveFormat::Xz
+      ArchiveFormat::Xz.into()
     } else {
-      ArchiveFormat::Zstd
+      ArchiveFormat::Zstd.into()
     };
   };
   let normalized = value.trim_start_matches('.').to_ascii_lowercase();
   match normalized.as_str() {
-    "zstd" | "db.zstd" => ArchiveFormat::Zstd,
-    "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz,
+    "zst" | "pack.zst" | "pack.zstd" => ArchivePreference {
+      indexed: Some(IndexedArchiveFormat::Zstd),
+      snapshot_format: ArchiveFormat::Zstd,
+    },
+    "zstd" | "db.zstd" => ArchiveFormat::Zstd.into(),
+    "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" if cfg!(feature = "lzma") => ArchiveFormat::Xz.into(),
     "xz" | "db.xz" | "pack.xz" | "lzma" | "db.lzma" => {
       tracing::warn!(
         archive_extension = value,
         "LZMA archive extension requested without lzma feature; falling back to zstd"
       );
-      ArchiveFormat::Zstd
+      ArchiveFormat::Zstd.into()
     }
     _ => {
       tracing::warn!(
         archive_extension = value,
         "unsupported archive extension; falling back to zstd"
       );
-      ArchiveFormat::Zstd
+      ArchiveFormat::Zstd.into()
     }
   }
 }
@@ -156,7 +177,7 @@ fn prune_request_dbs_once(
     dir,
     today,
     prune_after_days,
-    format,
+    format.into(),
     commit,
     &mut |_: PruneProgressEvent| {},
   )
@@ -166,7 +187,7 @@ fn prune_request_dbs_once_with_progress(
   dir: &Path,
   today: Date,
   prune_after_days: i64,
-  format: ArchiveFormat,
+  preference: ArchivePreference,
   commit: bool,
   progress: &mut impl FnMut(PruneProgressEvent),
 ) -> io::Result<PruneReport> {
@@ -196,7 +217,7 @@ fn prune_request_dbs_once_with_progress(
   let files_total = paths.len();
   progress(PruneProgressEvent::Started { files_total });
   for (file_index, path) in paths.into_iter().enumerate() {
-    let archive = existing_archive_path(&path, format)?;
+    let archive = existing_archive_path(&path, preference)?;
     let bytes_per_pass = fs::symlink_metadata(&path).map(|metadata| metadata.len()).unwrap_or(0);
     let bytes_total = bytes_per_pass.saturating_mul(if commit { 4 } else { 2 });
     progress(PruneProgressEvent::FileStarted {
@@ -213,7 +234,7 @@ fn prune_request_dbs_once_with_progress(
         bytes_total,
       });
     };
-    let outcome = prune_request_db(&path, &archive, format, commit, None, &mut report_bytes);
+    let outcome = prune_request_db(&path, &archive, commit, None, &mut report_bytes);
     progress(PruneProgressEvent::FileFinished {
       path: path.clone(),
       file_index,
@@ -228,7 +249,6 @@ fn prune_request_dbs_once_with_progress(
 fn prune_request_db(
   db: &Path,
   archive: &Path,
-  format: ArchiveFormat,
   commit: bool,
   cancelled: Option<&AtomicBool>,
   progress: &mut impl FnMut(u64),
@@ -286,26 +306,15 @@ fn prune_request_db(
       };
     }
   };
-  #[cfg(feature = "lzma")]
-  let indexed_pack = format == ArchiveFormat::Xz && archive == indexed_xz_path(db);
-  #[cfg(feature = "lzma")]
-  let packed = if indexed_pack {
-    true
-  } else if format == ArchiveFormat::Xz {
-    match pack::is_pack(&mut archive_file) {
-      Ok(packed) => packed,
-      Err(error) => {
-        return PruneOutcome::Failed {
-          error: format!("inspect archive {}: {error}", archive.display()),
-        };
-      }
+  let contents = match ArchiveContents::from_path(archive_file.path()) {
+    Ok(contents) => contents,
+    Err(error) => {
+      return PruneOutcome::Failed {
+        error: format!("inspect archive {}: {error}", archive.display()),
+      };
     }
-  } else {
-    false
   };
-  #[cfg(not(feature = "lzma"))]
-  let packed = false;
-  let archived_digest = match archive_digest(&mut archive_file, format, packed, cancelled, progress) {
+  let archived_digest = match archive_digest(&mut archive_file, contents, cancelled, progress) {
     Ok(digest) => digest,
     Err(error) => {
       return PruneOutcome::Failed {
@@ -322,14 +331,13 @@ fn prune_request_db(
     }
   };
   let source_sha256 = hex_digest(&source_digest);
-  if !packed && source_digest != archived_digest {
+  if matches!(contents, ArchiveContents::Snapshot(_)) && source_digest != archived_digest {
     return PruneOutcome::HashMismatch {
       source_sha256,
       archived_sha256: hex_digest(&archived_digest),
     };
   }
-  #[cfg(feature = "lzma")]
-  if packed {
+  if let ArchiveContents::IndexedPack(format) = contents {
     let verified = RequestPack::capture(&source_file, &mut |bytes| {
       check_cancelled(cancelled)?;
       progress(bytes);
@@ -338,13 +346,7 @@ fn prune_request_db(
     .and_then(|pack| {
       pack.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "source cannot match a request pack"))
     })
-    .and_then(|snapshot| {
-      if indexed_pack {
-        pack::verify_indexed(&mut archive_file, &snapshot, cancelled, progress)
-      } else {
-        pack::verify(&mut archive_file, &snapshot, cancelled, progress)
-      }
-    });
+    .and_then(|snapshot| pack::verify_indexed(format, &mut archive_file, &snapshot, cancelled, progress));
     if let Err(error) = verified {
       return PruneOutcome::Failed {
         error: format!("verify request pack {}: {error}", archive.display()),
@@ -355,7 +357,7 @@ fn prune_request_db(
     return PruneOutcome::Verified { sha256: source_sha256 };
   }
 
-  match archive_digest(&mut archive_file, format, packed, cancelled, progress) {
+  match archive_digest(&mut archive_file, contents, cancelled, progress) {
     Ok(current_digest) if current_digest == archived_digest => {}
     Ok(_) => {
       return PruneOutcome::Failed {
@@ -434,19 +436,34 @@ fn hash_archive(
   Ok(digest)
 }
 
+#[derive(Clone, Copy)]
+enum ArchiveContents {
+  Snapshot(ArchiveFormat),
+  IndexedPack(IndexedArchiveFormat),
+}
+
+impl ArchiveContents {
+  fn from_path(path: &Path) -> io::Result<Self> {
+    if let Some(format) = IndexedArchiveFormat::from_path(path) {
+      return Ok(Self::IndexedPack(format));
+    }
+    ArchiveFormat::from_path(path)
+      .map(Self::Snapshot)
+      .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "unrecognized request archive extension"))
+  }
+}
+
 fn archive_digest(
   file: &mut StableFile,
-  format: ArchiveFormat,
-  packed: bool,
+  contents: ArchiveContents,
   cancelled: Option<&AtomicBool>,
   progress: &mut impl FnMut(u64),
 ) -> io::Result<[u8; 32]> {
-  if packed {
-    // The pack is compared logically. Recheck its complete compressed bytes
-    // before deletion to detect any changes after that comparison.
-    hash_file(file, cancelled, progress)
-  } else {
-    hash_archive(file, format, cancelled, progress)
+  match contents {
+    // Packs are compared logically. Recheck their complete compressed bytes
+    // before deletion to detect changes after that comparison.
+    ArchiveContents::IndexedPack(_) => hash_file(file, cancelled, progress),
+    ArchiveContents::Snapshot(format) => hash_archive(file, format, cancelled, progress),
   }
 }
 
@@ -643,7 +660,7 @@ pub fn archive_requests_once(
   archive_after_days: i64,
   format: ArchiveFormat,
 ) -> io::Result<ArchiveStats> {
-  archive_requests_once_with_events(dir, today, archive_after_days, None, format, None, None)
+  archive_requests_once_with_events(dir, today, archive_after_days, None, format.into(), None, None)
 }
 
 fn archive_requests_once_with_events(
@@ -651,7 +668,7 @@ fn archive_requests_once_with_events(
   today: Date,
   archive_after_days: i64,
   prune_after_days: Option<i64>,
-  format: ArchiveFormat,
+  preference: ArchivePreference,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
 ) -> io::Result<ArchiveStats> {
@@ -668,7 +685,7 @@ fn archive_requests_once_with_events(
     Err(error) if error.kind() == io::ErrorKind::NotFound => return empty_archive_scan(dir, events),
     Err(error) => return Err(error),
   };
-  archive_requests_once_locked(dir, cutoff, prune_cutoff, format, events, cancelled)
+  archive_requests_once_locked(dir, cutoff, prune_cutoff, preference, events, cancelled)
 }
 
 fn empty_archive_scan(dir: &Path, events: Option<&dyn ArchiveEmitter>) -> io::Result<ArchiveStats> {
@@ -688,7 +705,7 @@ fn archive_requests_once_locked(
   dir: &Path,
   cutoff: Date,
   prune_cutoff: Option<Date>,
-  format: ArchiveFormat,
+  preference: ArchivePreference,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
 ) -> io::Result<ArchiveStats> {
@@ -702,7 +719,7 @@ fn archive_requests_once_locked(
       continue;
     };
 
-    let mut archive = existing_archive_path(&path, format)?;
+    let mut archive = existing_archive_path(&path, preference)?;
     if archive.symlink_metadata().is_ok() {
       stats.skipped_existing += 1;
       emit(
@@ -714,7 +731,7 @@ fn archive_requests_once_locked(
       );
     } else {
       let id = archive_id(&path);
-      match compress_db(&path, &archive, format, events, cancelled, &id) {
+      match compress_db(&path, &archive, preference, events, cancelled, &id) {
         Ok(published) => {
           archive = published;
           stats.archived += 1;
@@ -739,7 +756,7 @@ fn archive_requests_once_locked(
 
     if prune_cutoff.is_some_and(|cutoff| day <= cutoff) {
       check_cancelled(cancelled)?;
-      let outcome = prune_request_db(&path, &archive, format, true, cancelled, &mut |_| {});
+      let outcome = prune_request_db(&path, &archive, true, cancelled, &mut |_| {});
       check_cancelled(cancelled)?;
       match outcome {
         PruneOutcome::Deleted { sha256 } => tracing::info!(
@@ -782,17 +799,37 @@ fn archive_path(path: &Path, format: ArchiveFormat) -> PathBuf {
   path.with_extension(format.extension())
 }
 
-fn existing_archive_path(path: &Path, format: ArchiveFormat) -> io::Result<PathBuf> {
-  #[cfg(feature = "lzma")]
-  if format == ArchiveFormat::Xz {
-    let archive = indexed_xz_path(path);
+fn existing_archive_path(path: &Path, preference: ArchivePreference) -> io::Result<PathBuf> {
+  let snapshot_path = archive_path(path, preference.snapshot_format);
+  let candidates = preference
+    .indexed
+    .into_iter()
+    .map(|format| format.path(path))
+    .chain(std::iter::once(snapshot_path.clone()))
+    .chain(
+      IndexedArchiveFormat::ALL
+        .iter()
+        .filter(|&&format| Some(format) != preference.indexed)
+        .map(|format| format.path(path)),
+    )
+    .chain(
+      [
+        ArchiveFormat::Zstd,
+        #[cfg(feature = "lzma")]
+        ArchiveFormat::Xz,
+      ]
+      .into_iter()
+      .filter(|&format| format != preference.snapshot_format)
+      .map(|format| archive_path(path, format)),
+    );
+  for archive in candidates {
     match fs::symlink_metadata(&archive) {
       Ok(_) => return Ok(archive),
       Err(error) if error.kind() == io::ErrorKind::NotFound => {}
       Err(error) => return Err(error),
     }
   }
-  Ok(archive_path(path, format))
+  Ok(snapshot_path)
 }
 
 fn temp_archive_path(archive: &Path) -> PathBuf {
@@ -807,13 +844,13 @@ fn temp_archive_path(archive: &Path) -> PathBuf {
 
 fn compress_db(
   db: &Path,
-  legacy_archive: &Path,
-  format: ArchiveFormat,
+  snapshot_path: &Path,
+  preference: ArchivePreference,
   events: Option<&dyn ArchiveEmitter>,
   cancelled: Option<&AtomicBool>,
   id: &str,
 ) -> io::Result<PathBuf> {
-  let temp = temp_archive_path(legacy_archive);
+  let temp = temp_archive_path(snapshot_path);
   if temp.exists() {
     fs::remove_file(&temp)?;
   }
@@ -822,14 +859,9 @@ fn compress_db(
   let mut source = StableFile::open(db)?;
   let source_metadata = source.file().metadata()?;
   let total_bytes = source_metadata.len();
-  #[cfg(feature = "lzma")]
-  let planned_archive = if format == ArchiveFormat::Xz {
-    indexed_xz_path(db)
-  } else {
-    legacy_archive.to_path_buf()
-  };
-  #[cfg(not(feature = "lzma"))]
-  let planned_archive = legacy_archive.to_path_buf();
+  let planned_archive = preference
+    .indexed
+    .map_or_else(|| snapshot_path.to_path_buf(), |format| format.path(db));
   emit(
     events,
     ArchiveEvent::FileStarted {
@@ -858,10 +890,9 @@ fn compress_db(
       Ok(())
     };
 
-    #[cfg(feature = "lzma")]
-    if format == ArchiveFormat::Xz {
+    if let Some(format) = preference.indexed {
       if let Some(request_pack) = RequestPack::capture(&source, &mut update)? {
-        let bytes_out = pack::publish_indexed(&request_pack, &planned_archive, &mut update, || {
+        let bytes_out = pack::publish_indexed(format, &request_pack, &planned_archive, &mut update, || {
           recheck_archive_source(&source, &source_metadata, cancelled)
         })
         .map_err(|error| check_cancelled(cancelled).err().unwrap_or(error))?;
@@ -870,7 +901,7 @@ fn compress_db(
     }
 
     let mut output = BufWriter::new(create_archive_temp(&temp)?);
-    encode_snapshot(&mut source, &mut output, format, &mut update)?;
+    encode_snapshot(&mut source, &mut output, preference.snapshot_format, &mut update)?;
     let bytes_out = output.get_ref().metadata()?.len();
     if bytes_out == 0 {
       return Err(io::Error::new(io::ErrorKind::WriteZero, "empty archive"));
@@ -878,8 +909,8 @@ fn compress_db(
     output.get_ref().sync_all()?;
     drop(output);
     recheck_archive_source(&source, &source_metadata, cancelled)?;
-    fs::rename(&temp, legacy_archive)?;
-    Ok((legacy_archive.to_path_buf(), bytes_out))
+    fs::rename(&temp, snapshot_path)?;
+    Ok((snapshot_path.to_path_buf(), bytes_out))
   })();
 
   match result {

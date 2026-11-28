@@ -37,6 +37,7 @@ const REQUEST_TABLES: &[&str] = &[
   "request_downstream",
   "request_upstream",
 ];
+const REQUEST_ARCHIVE_EXTENSIONS: &[&str] = &["db.xz", "db.zstd", "db.zst", "db.lzma", "pack.xz", "pack.zst"];
 
 #[derive(Debug, Snafu)]
 pub enum ImportError {
@@ -378,10 +379,11 @@ pub fn import_history(source_root: &Path, destination: &DbPaths, commit: bool) -
     if filename == ".tokn-requests-maintenance.lock" {
       continue;
     }
-    if [".db.xz", ".db.zstd", ".db.zst", ".db.lzma", ".pack.xz"]
-      .iter()
-      .any(|suffix| filename.ends_with(suffix))
-    {
+    if REQUEST_ARCHIVE_EXTENSIONS.iter().any(|&extension| {
+      filename
+        .strip_suffix(extension)
+        .is_some_and(|prefix| prefix.ends_with('.'))
+    }) {
       return Err(invalid(format!(
         "Archived source request days are not supported; export raw checkpointed databases: {}",
         source.display()
@@ -535,8 +537,8 @@ fn validate_target(capture: &Capture, captures: &[Capture], source_root: &Path) 
     return Err(invalid("Source and destination must be separate"));
   }
   if capture.is_day {
-    for suffix in [".xz", ".zstd", ".zst", ".lzma"] {
-      if fs::symlink_metadata(sidecar(target, suffix)).is_ok() {
+    for &extension in REQUEST_ARCHIVE_EXTENSIONS {
+      if fs::symlink_metadata(target.with_extension(extension)).is_ok() {
         return Err(invalid(format!("Destination day has an archive: {}", target.display())));
       }
     }

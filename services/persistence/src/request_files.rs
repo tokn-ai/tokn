@@ -25,12 +25,6 @@ pub enum ArchiveFormat {
   Xz,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArchiveContents {
-  Sqlite,
-  RequestPack,
-}
-
 impl ArchiveFormat {
   pub fn from_path(path: &Path) -> Option<Self> {
     let name = path.file_name()?.to_str()?;
@@ -45,59 +39,10 @@ impl ArchiveFormat {
 
   /// Decompress the archive's byte stream.
   pub fn decode(&self, reader: impl Read, mut writer: impl Write) -> io::Result<u64> {
-    self.with_decoder(reader, |input| io::copy(input, &mut writer))
-  }
-
-  /// Reconstruct a SQLite snapshot at a new path in the caller's private directory.
-  pub fn restore(&self, reader: impl Read, destination: &Path) -> io::Result<ArchiveContents> {
-    self.restore_with(reader, destination, crate::request_archive::restore)
-  }
-
-  /// Restore a SQLite snapshot for querying request metadata and headers.
-  pub fn restore_metadata(&self, reader: impl Read, destination: &Path) -> io::Result<ArchiveContents> {
-    self.restore_with(reader, destination, crate::request_archive::restore_metadata)
-  }
-
-  /// Restore the metadata snapshot and the selected request's bodies.
-  pub fn restore_request(
-    &self,
-    reader: impl Read,
-    destination: &Path,
-    request_id: &str,
-  ) -> io::Result<ArchiveContents> {
-    self.restore_with(reader, destination, |input, path| {
-      crate::request_archive::restore_request(input, path, request_id)
-    })
-  }
-
-  fn restore_with(
-    &self,
-    reader: impl Read,
-    destination: &Path,
-    restore_pack: impl FnOnce(&mut dyn Read, &Path) -> io::Result<()>,
-  ) -> io::Result<ArchiveContents> {
-    self.with_decoder(reader, |input| {
-      if *self == Self::Xz {
-        use crate::request_archive::MAGIC;
-
-        let mut prefix = [0; MAGIC.len()];
-        input.read_exact(&mut prefix)?;
-        let mut reader = prefix.as_slice().chain(input);
-        if prefix == MAGIC {
-          restore_pack(&mut reader, destination)?;
-          return Ok(ArchiveContents::RequestPack);
-        }
-        return copy_snapshot(&mut reader, destination);
-      }
-      copy_snapshot(input, destination)
-    })
-  }
-
-  fn with_decoder<T>(&self, reader: impl Read, read: impl FnOnce(&mut dyn Read) -> io::Result<T>) -> io::Result<T> {
     match self {
-      Self::Zstd => read(&mut zstd::Decoder::new(reader)?),
+      Self::Zstd => io::copy(&mut zstd::Decoder::new(reader)?, &mut writer),
       #[cfg(feature = "lzma")]
-      Self::Xz => read(&mut lzma_rust2::XzReader::new(reader, false)),
+      Self::Xz => io::copy(&mut lzma_rust2::XzReader::new(reader, false), &mut writer),
       #[cfg(not(feature = "lzma"))]
       Self::Xz => Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -105,27 +50,29 @@ impl ArchiveFormat {
       )),
     }
   }
+
+  /// Restore a SQLite snapshot at a new path in the caller's private directory.
+  pub fn restore(&self, reader: impl Read, destination: &Path) -> io::Result<()> {
+    let dir = destination
+      .parent()
+      .filter(|parent| !parent.as_os_str().is_empty())
+      .unwrap_or_else(|| Path::new("."));
+    let mut snapshot = tempfile::NamedTempFile::new_in(dir)?;
+    {
+      let mut output = BufWriter::new(snapshot.as_file_mut());
+      self.decode(reader, &mut output)?;
+      output.flush()?;
+    }
+    snapshot.persist_noclobber(destination).map_err(|error| error.error)?;
+    Ok(())
+  }
+
   pub fn extension(self) -> &'static str {
     match self {
       Self::Zstd => "db.zstd",
       Self::Xz => "db.xz",
     }
   }
-}
-
-fn copy_snapshot(reader: &mut dyn Read, destination: &Path) -> io::Result<ArchiveContents> {
-  let dir = destination
-    .parent()
-    .filter(|parent| !parent.as_os_str().is_empty())
-    .unwrap_or_else(|| Path::new("."));
-  let mut snapshot = tempfile::NamedTempFile::new_in(dir)?;
-  {
-    let mut output = BufWriter::new(snapshot.as_file_mut());
-    io::copy(reader, &mut output)?;
-    output.flush()?;
-  }
-  snapshot.persist_noclobber(destination).map_err(|error| error.error)?;
-  Ok(ArchiveContents::Sqlite)
 }
 
 impl RequestMaintenanceLock {

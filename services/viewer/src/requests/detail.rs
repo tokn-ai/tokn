@@ -76,13 +76,7 @@ pub fn get_request_payload(
   else {
     return Ok(None);
   };
-  let slot = field.body_slot();
-  let conn = if slot.is_some() {
-    day_file.open_request(request_id)?
-  } else {
-    day_file.open()?
-  };
-  let Some(conn) = conn else {
+  let Some(conn) = day_file.open()? else {
     return Ok(None);
   };
 
@@ -102,7 +96,8 @@ pub fn get_request_payload(
     return Ok(None);
   };
 
-  let indexed_body = slot
+  let indexed_body = field
+    .body_slot()
     .map(|slot| conn.read_indexed_body(request_id, slot))
     .transpose()?
     .flatten();

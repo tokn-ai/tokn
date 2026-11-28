@@ -169,7 +169,7 @@ fn load_request_content(
   else {
     return Ok(None);
   };
-  let Some(conn) = day_file.open_request(request_id)? else {
+  let Some(conn) = day_file.open()? else {
     return Ok(None);
   };
 
@@ -250,8 +250,7 @@ fn read_request_body(
   if let Some((bytes, flags)) = conn.read_indexed_body(request_id, slot)? {
     return Ok((bytes, flags & BODY_IS_DECODED != 0));
   }
-  let already_decoded = !sqlite_body.is_empty() && conn.body_is_decoded(request_id, slot)?;
-  Ok((sqlite_body, already_decoded))
+  Ok((sqlite_body, false))
 }
 
 fn sql_bytes(value: ValueRef<'_>) -> Vec<u8> {

@@ -15,7 +15,7 @@ lzma = ["dep:lzma-rust2", "tokn-persistence/lzma"]
 [dependencies]
 anyhow = { workspace = true }
 tokn-config = { workspace = true, features = ["std"] }
-tokn-persistence = { workspace = true }
+tokn-persistence = { version = "0.2.4", path = "../persistence", default-features = false }
 lzma-rust2 = { workspace = true, optional = true }
 sha2 = { workspace = true }
 tempfile = "3"
