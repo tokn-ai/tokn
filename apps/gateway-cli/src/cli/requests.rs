@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
-use console::{style, Color, StyledObject};
-use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use console::{measure_text_width, style, truncate_str, Color, StyledObject, Term};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressDrawTarget, ProgressState, ProgressStyle, TermLike};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -49,6 +49,13 @@ fn migrate(explicit_config: Option<&Path>, args: MigrateArgs) -> Result<()> {
   let paths = persistence.resolve_paths()?;
   let stdout = io::stdout();
   let multi = stdout.is_terminal().then(crate::progress::multi);
+  let terminal_progress = multi.filter(|multi| !multi.is_hidden());
+  if let Some(multi) = terminal_progress {
+    multi.set_draw_target(ProgressDrawTarget::term_like_with_hz(
+      Box::new(MigrationTerminal(Term::buffered_stdout())),
+      20,
+    ));
+  }
   let mut display = MigrationDisplay::new(
     stdout,
     &paths.requests_dir,
@@ -68,6 +75,9 @@ fn migrate(explicit_config: Option<&Path>, args: MigrateArgs) -> Result<()> {
     },
   );
   display.clear_progress();
+  if let Some(multi) = terminal_progress {
+    multi.set_draw_target(ProgressDrawTarget::stdout());
+  }
   result?;
   output_result?;
   display.write_summary()?;
@@ -169,9 +179,7 @@ impl PruneProgressDisplay {
           bar.finish_and_clear();
         }
         let bar = if bytes_total == 0 {
-          let bar = ProgressBar::new_spinner();
-          bar.enable_steady_tick(std::time::Duration::from_millis(100));
-          bar
+          ProgressBar::new_spinner()
         } else {
           let bar = ProgressBar::new(bytes_total);
           bar.set_style(self.file_style.clone());
@@ -183,6 +191,9 @@ impl PruneProgressDisplay {
           self.multi.add(bar)
         };
         bar.set_message(format!("verify {} {}/{}", filename(&path), file_index + 1, files_total));
+        if bytes_total == 0 {
+          bar.enable_steady_tick(Duration::from_millis(100));
+        }
         self.file_bar = Some(bar);
       }
       PruneProgressEvent::FileProgress {
@@ -291,6 +302,52 @@ struct MigrationStage {
   output_bytes: Arc<AtomicU64>,
 }
 
+#[derive(Debug)]
+struct MigrationTerminal(Term);
+
+impl TermLike for MigrationTerminal {
+  fn width(&self) -> u16 {
+    // Indicatif pads its last line to this width. Leave one physical column unused.
+    migration_line_width(&self.0).max(1)
+  }
+
+  fn height(&self) -> u16 {
+    self.0.size().0
+  }
+
+  fn move_cursor_up(&self, n: usize) -> io::Result<()> {
+    self.0.move_cursor_up(n)
+  }
+
+  fn move_cursor_down(&self, n: usize) -> io::Result<()> {
+    self.0.move_cursor_down(n)
+  }
+
+  fn move_cursor_right(&self, n: usize) -> io::Result<()> {
+    self.0.move_cursor_right(n)
+  }
+
+  fn move_cursor_left(&self, n: usize) -> io::Result<()> {
+    self.0.move_cursor_left(n)
+  }
+
+  fn write_line(&self, line: &str) -> io::Result<()> {
+    self.0.write_line(line)
+  }
+
+  fn write_str(&self, text: &str) -> io::Result<()> {
+    self.0.write_str(text)
+  }
+
+  fn clear_line(&self) -> io::Result<()> {
+    self.0.clear_line()
+  }
+
+  fn flush(&self) -> io::Result<()> {
+    self.0.flush()
+  }
+}
+
 struct MigrationDisplay<'a, W> {
   out: W,
   requests_dir: &'a Path,
@@ -308,7 +365,7 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
     let overall_bar = multi.map(|multi| {
       let bar = multi.add(ProgressBar::new_spinner());
       let style =
-        ProgressStyle::with_template("{spinner:.cyan} {msg}").unwrap_or_else(|_| ProgressStyle::default_spinner());
+        ProgressStyle::with_template("{spinner:.cyan} {wide_msg}").expect("valid migration scan progress template");
       bar.set_style(style);
       bar.set_message("Scan archives");
       bar.enable_steady_tick(Duration::from_millis(100));
@@ -344,13 +401,25 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
         self.clear_stage();
         self.active_day = Some(day);
         if let Some(overall) = self.overall_bar.as_ref().filter(|bar| bar.length().is_none()) {
-          let style = ProgressStyle::with_template("{msg} [{wide_bar:.green/blue}] {pos}/{len}")
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("=> ");
-          overall.disable_steady_tick();
-          overall.set_length(total as u64);
+          let terminal = Term::stdout();
+          let style = ProgressStyle::with_template("{migration_line}")
+            .expect("valid migration progress template")
+            .with_key(
+              "migration_line",
+              move |state: &ProgressState, out: &mut dyn std::fmt::Write| {
+                let days = format!("{}/{total}", state.pos());
+                let line = migration_progress_line(
+                  "Days",
+                  &days,
+                  state.fraction(),
+                  Color::Green,
+                  usize::from(migration_line_width(&terminal)),
+                );
+                let _ = out.write_str(&line);
+              },
+            );
           overall.set_style(style);
-          overall.set_message("Days");
+          overall.set_length(total as u64);
         }
       }
       MigrationProgressEvent::StageStarted {
@@ -373,8 +442,14 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
         if let Some(bar) = &self.overall_bar {
           bar.inc(1);
         }
-        let row_style = self.row_style;
-        self.write_output(|out, counts| write_migration_day(out, entry, counts, row_style))?
+        let width = self.multi.map(|_| usize::from(migration_line_width(&Term::stdout())));
+        let row = migration_day_line(entry, &mut self.counts, self.row_style, width);
+        if let Some(multi) = self.multi.filter(|multi| !multi.is_hidden()) {
+          multi.println(row)?;
+        } else {
+          writeln!(self.out, "{row}")?;
+          self.out.flush()?;
+        }
       }
     }
     Ok(())
@@ -384,33 +459,42 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
     let (Some(multi), Some(overall), Some(day)) = (self.multi, &self.overall_bar, self.active_day) else {
       return;
     };
-    let stage = self.stage.get_or_insert_with(|| {
-      let bar = ProgressBar::new(input_total);
-      bar.set_prefix(format!("{day} "));
-      let bar = multi.insert_before(overall, bar);
-      bar.enable_steady_tick(Duration::from_millis(100));
-      MigrationStage {
-        bar,
-        output_bytes: Arc::new(AtomicU64::new(0)),
-      }
+    let new_stage = self.stage.is_none();
+    let stage = self.stage.get_or_insert_with(|| MigrationStage {
+      // Configure the bar without drawing to stderr before it joins the shared display.
+      bar: ProgressBar::hidden(),
+      output_bytes: Arc::new(AtomicU64::new(0)),
     });
     let output_bytes = Arc::clone(&stage.output_bytes);
-    let style = ProgressStyle::with_template("{prefix}{msg} [{wide_bar:.cyan/blue}] {stage_stats}")
-      .unwrap_or_else(|_| ProgressStyle::default_bar())
-      .progress_chars("=> ")
+    let terminal = Term::stdout();
+    let dated_label = format!("{day} {label}");
+    let style = ProgressStyle::with_template("{migration_line}")
+      .expect("valid migration progress template")
       .with_key(
-        "stage_stats",
+        "migration_line",
         move |state: &ProgressState, out: &mut dyn std::fmt::Write| {
           let output = has_output.then(|| output_bytes.load(Ordering::Relaxed));
-          let stats = migration_stage_stats(input_unit, state.pos(), input_total, output, state.elapsed());
-          let _ = out.write_str(&stats);
+          let (consumed, rates) = migration_stage_stats(input_unit, state.pos(), input_total, output, state.elapsed());
+          let line = migration_stage_line(
+            &dated_label,
+            label,
+            &consumed,
+            &rates,
+            state.fraction(),
+            usize::from(migration_line_width(&terminal)),
+          );
+          let _ = out.write_str(&line);
         },
       );
     stage.output_bytes.store(0, Ordering::Relaxed);
     stage.bar.reset();
-    stage.bar.set_length(input_total);
     stage.bar.set_style(style);
-    stage.bar.set_message(label);
+    stage.bar.set_length(input_total);
+    if new_stage {
+      multi.insert_before(overall, stage.bar.clone());
+      stage.bar.tick();
+      stage.bar.enable_steady_tick(Duration::from_millis(100));
+    }
   }
 
   fn write_output(&mut self, render: impl FnOnce(&mut W, &mut MigrationCounts) -> io::Result<()>) -> io::Result<()> {
@@ -448,13 +532,58 @@ impl<'a, W: Write> MigrationDisplay<'a, W> {
   }
 }
 
+fn migration_line_width(terminal: &Term) -> u16 {
+  terminal.size().1.saturating_sub(1)
+}
+
+fn migration_stage_line(
+  dated_label: &str,
+  label: &str,
+  consumed: &str,
+  rates: &str,
+  fraction: f32,
+  width: usize,
+) -> String {
+  // Some terminals display the direction arrows in two cells each.
+  let width = width.saturating_sub(rates.matches(['↓', '↑']).count());
+  let stats = format!("{consumed} {rates}");
+  // Keep space for the brackets and at least three cells of progress.
+  let label_space = width.saturating_sub(measure_text_width(&stats) + 7);
+  let (label, detail) = if measure_text_width(dated_label) <= label_space {
+    (dated_label, stats.as_str())
+  } else if measure_text_width(label) <= label_space {
+    (label, stats.as_str())
+  } else {
+    (label, rates)
+  };
+  migration_progress_line(label, detail, fraction, Color::Cyan, width)
+}
+
+fn migration_progress_line(label: &str, detail: &str, fraction: f32, color: Color, width: usize) -> String {
+  if width == 0 {
+    return String::new();
+  }
+  let bar_width = width
+    .saturating_sub(measure_text_width(label) + measure_text_width(detail) + 4)
+    .min(24);
+  if bar_width == 0 {
+    return truncate_str(&format!("{label} {detail}"), width, "…").into_owned();
+  }
+  let completed = (fraction * bar_width as f32) as usize;
+  let advancing = fraction > 0.0 && completed < bar_width;
+  let marker = if advancing { ">" } else { "" };
+  let filled = style(format!("{}{marker}", "=".repeat(completed))).fg(color);
+  let remaining = " ".repeat(bar_width - completed - usize::from(advancing));
+  format!("{label} [{filled}{remaining}] {detail}")
+}
+
 fn migration_stage_stats(
   unit: MigrationInputUnit,
   position: u64,
   total: u64,
   output_bytes: Option<u64>,
   elapsed: Duration,
-) -> String {
+) -> (String, String) {
   let rate = |count: u64| {
     if elapsed.is_zero() {
       0.0
@@ -462,28 +591,32 @@ fn migration_stage_stats(
       count as f64 / elapsed.as_secs_f64()
     }
   };
-  let input = match unit {
-    MigrationInputUnit::Bytes => format!(
-      "{}/{} ↓ {}/s",
-      HumanBytes(position),
-      HumanBytes(total),
-      HumanBytes(rate(position) as u64)
+  let (consumed, mut rates) = match unit {
+    MigrationInputUnit::Bytes => (
+      format!("{}/{}", HumanBytes(position), HumanBytes(total)),
+      format!("↓ {}/s", HumanBytes(rate(position) as u64)),
     ),
-    MigrationInputUnit::Tasks => format!("{position}/{total} tasks ↓ {:.1} tasks/s", rate(position)),
-    MigrationInputUnit::Entries => format!("{position}/{total} entries ↓ {:.1} entries/s", rate(position)),
+    MigrationInputUnit::Tasks => (
+      format!("{position}/{total} tasks"),
+      format!("↓ {:.1} tasks/s", rate(position)),
+    ),
+    MigrationInputUnit::Entries => (
+      format!("{position}/{total} entries"),
+      format!("↓ {:.1} entries/s", rate(position)),
+    ),
   };
-  match output_bytes {
-    Some(bytes) => format!("{input} ↑ {}/s", HumanBytes(rate(bytes) as u64)),
-    None => input,
+  if let Some(bytes) = output_bytes {
+    rates.push_str(&format!(" ↑ {}/s", HumanBytes(rate(bytes) as u64)));
   }
+  (consumed, rates)
 }
 
-fn write_migration_day(
-  out: &mut impl Write,
+fn migration_day_line(
   entry: &MigrationEntry,
   counts: &mut MigrationCounts,
   row_style: RowStyle,
-) -> io::Result<()> {
+  max_width: Option<usize>,
+) -> String {
   let day = entry.day.to_string();
   let (status, color, reason) = match &entry.outcome {
     MigrationOutcome::WouldMigrate { .. } => {
@@ -518,41 +651,69 @@ fn write_migration_day(
   };
   let style_day = style(&day).bold().force_styling(row_style.color);
   let status = styled_status(status, color, row_style.color);
-  write!(out, "{style_day}  {status:<11}  ")?;
+  let with_reason = |route: &str| match &reason {
+    Some(reason) => format!("{route} | {reason}"),
+    None => route.to_owned(),
+  };
+  let route = migration_archive_route(entry, &day, row_style.compact, false);
+  let full = format!("{style_day}  {status:<11}  {}", with_reason(&route));
+  let Some(width) = max_width else {
+    return full;
+  };
+  if measure_text_width(&full) <= width {
+    return full;
+  }
+  if width == 0 {
+    return String::new();
+  }
+  let route = migration_archive_route(entry, &day, row_style.compact, true);
+  let prefix = format!("{style_day}  {status}  ");
+  let shorter = format!("{prefix}{}", with_reason(&route));
+  if measure_text_width(&shorter) <= width {
+    return shorter;
+  }
+  let narrow = match reason {
+    Some(reason) => {
+      let line = format!("{prefix}{reason}");
+      if !route.is_empty() && width.saturating_sub(measure_text_width(&line)) > 4 {
+        format!("{line} | {route}")
+      } else {
+        line
+      }
+    }
+    None => shorter,
+  };
+  truncate_str(&narrow, width, "…").into_owned()
+}
+
+fn migration_archive_route(entry: &MigrationEntry, day: &str, compact: bool, brief: bool) -> String {
   let sources = entry
     .sources
     .iter()
-    .map(|source| migration_file_label(source, &day, &entry.files, "original", row_style.compact))
+    .map(|source| migration_file_label(source, day, &entry.files, "original", compact, brief))
     .collect::<Vec<_>>()
     .join(", ");
-  if !sources.is_empty() {
-    write!(out, "{sources}")?;
-  }
-  if !matches!(entry.outcome, MigrationOutcome::InUse) {
-    if !sources.is_empty() {
-      write!(out, " -> ")?;
+  let destination = match &entry.outcome {
+    MigrationOutcome::InUse => return sources,
+    MigrationOutcome::WouldMigrate { size } => format!(
+      "{} ({})",
+      day_filename(&entry.destination, day),
+      migration_payload_label(*size, compact)
+    ),
+    outcome => {
+      let size_label = if matches!(outcome, MigrationOutcome::Migrated | MigrationOutcome::Verified) {
+        "final"
+      } else {
+        "destination"
+      };
+      migration_file_label(&entry.destination, day, &entry.files, size_label, compact, brief)
     }
-    let destination = match &entry.outcome {
-      MigrationOutcome::WouldMigrate { size } => format!(
-        "{} ({})",
-        day_filename(&entry.destination, &day),
-        migration_payload_label(*size, row_style.compact)
-      ),
-      outcome => {
-        let size_label = if matches!(outcome, MigrationOutcome::Migrated | MigrationOutcome::Verified) {
-          "final"
-        } else {
-          "destination"
-        };
-        migration_file_label(&entry.destination, &day, &entry.files, size_label, row_style.compact)
-      }
-    };
-    write!(out, "{destination}")?;
+  };
+  if sources.is_empty() {
+    destination
+  } else {
+    format!("{sources} -> {destination}")
   }
-  if let Some(reason) = reason {
-    write!(out, " | {reason}")?;
-  }
-  writeln!(out)
 }
 
 fn migration_file_label(
@@ -561,11 +722,15 @@ fn migration_file_label(
   files: &[MigrationFileStats],
   size_label: &str,
   compact: bool,
+  brief: bool,
 ) -> String {
   let name = day_filename(path, day);
   let Some(file) = files.iter().find(|file| file.path == path) else {
     return name;
   };
+  if brief {
+    return format!("{name} ({})", HumanBytes(file.compressed_bytes));
+  }
   let mut fields = vec![format!(
     "{size_label} {}",
     migration_bytes(file.compressed_bytes, compact)
@@ -1010,14 +1175,12 @@ mod tests {
         },
       ],
     };
-    let mut output = Vec::new();
     let mut counts = MigrationCounts::default();
     let plain = RowStyle {
       color: false,
       compact: false,
     };
-    write_migration_day(&mut output, &entry, &mut counts, plain).unwrap();
-    let row = std::str::from_utf8(&output).unwrap();
+    let row = migration_day_line(&entry, &mut counts, plain, None);
     assert_eq!(row.lines().count(), 1);
     assert_eq!(row.matches("2026-05-01").count(), 1);
     assert!(row.starts_with("2026-05-01"));
@@ -1036,17 +1199,15 @@ mod tests {
     assert!(destination.contains("16.00 KiB (16384 bytes)"));
     assert_eq!(counts.changed, 1);
 
-    output.clear();
     entry.outcome = MigrationOutcome::Verified;
     let terminal = RowStyle {
       color: true,
       compact: true,
     };
-    write_migration_day(&mut output, &entry, &mut counts, terminal).unwrap();
-    let colored = std::str::from_utf8(&output).unwrap();
+    let colored = migration_day_line(&entry, &mut counts, terminal, Some(160));
     assert_eq!(colored.lines().count(), 1);
     assert!(colored.contains("\x1b["));
-    let row = console::strip_ansi_codes(colored);
+    let row = console::strip_ansi_codes(&colored);
     assert!(row.starts_with("2026-05-01"));
     assert_eq!(row.matches("2026-05-01").count(), 1);
     assert!(row.contains("VERIFIED"));
@@ -1062,16 +1223,47 @@ mod tests {
     assert_eq!(destination, ".pack.zst (final 512 B, pack 16.00 KiB)");
     assert_eq!(counts.verified, 1);
 
-    output.clear();
+    let colored = migration_day_line(&entry, &mut counts, terminal, Some(88));
+    let row = console::strip_ansi_codes(&colored);
+    assert!(row.contains(".db.xz (1.00 KiB) -> .pack.zst (512 B)"));
+    assert!(console::measure_text_width(row.trim_end()) <= 88);
+
     entry.destination = requests_dir.join("2026-05-01.db.zstd");
     entry.files.truncate(1);
     entry.outcome = MigrationOutcome::WouldMigrate {
       size: MigrationPayloadSize::Sqlite(8192),
     };
-    write_migration_day(&mut output, &entry, &mut counts, terminal).unwrap();
-    let row = console::strip_ansi_codes(std::str::from_utf8(&output).unwrap());
+    let colored = migration_day_line(&entry, &mut counts, terminal, Some(160));
+    let row = console::strip_ansi_codes(&colored);
     let (_, planned) = row.trim_end().split_once(" -> ").unwrap();
     assert_eq!(planned, ".db.zstd (DB 8.00 KiB)");
+  }
+
+  #[test]
+  fn narrow_colored_migration_row_prioritizes_the_conflict_reason() {
+    let first = PathBuf::from("fixture-requests/2026-05-01.db.xz");
+    let other = PathBuf::from("fixture-requests/2026-05-01.db.zstd");
+    let entry = MigrationEntry {
+      day: date!(2026 - 05 - 01),
+      sources: vec![first.clone(), other.clone()],
+      destination: PathBuf::from("fixture-requests/2026-05-01.pack.zst"),
+      outcome: MigrationOutcome::Conflict { first, other },
+      files: Vec::new(),
+    };
+    let mut counts = MigrationCounts::default();
+    let width = 52;
+    let terminal = RowStyle {
+      color: true,
+      compact: true,
+    };
+    let output = migration_day_line(&entry, &mut counts, terminal, Some(width));
+    assert!(output.contains("\x1b["));
+    assert_eq!(output.lines().count(), 1);
+    assert!(console::measure_text_width(output.trim_end()) <= width);
+    let row = console::strip_ansi_codes(&output);
+    assert!(row.starts_with("2026-05-01  BLOCKED"));
+    assert!(row.contains(".db.xz differs from .db.zstd"));
+    assert_eq!(counts.conflicts, 1);
   }
 
   #[test]
@@ -1113,8 +1305,6 @@ mod tests {
     let stage = display.stage.as_ref().unwrap();
     let bar = stage.bar.clone();
     let output_bytes = Arc::clone(&stage.output_bytes);
-    assert_eq!(bar.prefix(), "2026-05-01 ");
-    assert_eq!(bar.message(), "Decode");
     assert_eq!(bar.position(), 3072);
     assert_eq!(bar.length(), Some(4096));
     assert_eq!(output_bytes.load(Ordering::Relaxed), 6144);
@@ -1134,8 +1324,6 @@ mod tests {
         has_output: false,
       })
       .unwrap();
-    assert_eq!(bar.prefix(), "2026-05-01 ");
-    assert_eq!(bar.message(), "Check tasks");
     assert_eq!(bar.position(), 0);
     assert_eq!(bar.length(), Some(3));
     assert_eq!(output_bytes.load(Ordering::Relaxed), 0);
@@ -1201,26 +1389,53 @@ mod tests {
   #[test]
   fn migration_stage_stats_show_input_units_and_separate_output_rates() {
     let elapsed = Duration::from_secs(2);
+    let stats = |unit, position, total, output_bytes| {
+      let (consumed, rates) = migration_stage_stats(unit, position, total, output_bytes, elapsed);
+      format!("{consumed} {rates}")
+    };
     assert_eq!(
-      migration_stage_stats(MigrationInputUnit::Bytes, 3072, 4096, Some(1024), elapsed),
+      stats(MigrationInputUnit::Bytes, 3072, 4096, Some(1024)),
       "3.00 KiB/4.00 KiB ↓ 1.50 KiB/s ↑ 512 B/s"
     );
     assert_eq!(
-      migration_stage_stats(MigrationInputUnit::Bytes, 0, 4096, Some(0), elapsed),
+      stats(MigrationInputUnit::Bytes, 0, 4096, Some(0)),
       "0 B/4.00 KiB ↓ 0 B/s ↑ 0 B/s"
     );
+    assert_eq!(stats(MigrationInputUnit::Tasks, 3, 8, None), "3/8 tasks ↓ 1.5 tasks/s");
     assert_eq!(
-      migration_stage_stats(MigrationInputUnit::Tasks, 3, 8, None, elapsed),
-      "3/8 tasks ↓ 1.5 tasks/s"
-    );
-    assert_eq!(
-      migration_stage_stats(MigrationInputUnit::Entries, 5, 8, Some(2048), elapsed),
+      stats(MigrationInputUnit::Entries, 5, 8, Some(2048)),
       "5/8 entries ↓ 2.5 entries/s ↑ 1.00 KiB/s"
     );
     assert_eq!(
-      migration_stage_stats(MigrationInputUnit::Bytes, 3072, 4096, None, elapsed),
+      stats(MigrationInputUnit::Bytes, 3072, 4096, None),
       "3.00 KiB/4.00 KiB ↓ 1.50 KiB/s"
     );
+  }
+
+  #[test]
+  fn migration_progress_keeps_rates_and_bars_on_narrow_lines() {
+    let render = |width| {
+      migration_stage_line(
+        "2026-05-01 Decode",
+        "Decode",
+        "3.00 GiB/4.00 GiB",
+        "↓ 1.50 GiB/s ↑ 512.00 MiB/s",
+        0.75,
+        width,
+      )
+    };
+    let wide = console::strip_ansi_codes(&render(88)).into_owned();
+    assert!(wide.starts_with("2026-05-01 Decode ["));
+    assert!(wide.contains("3.00 GiB/4.00 GiB"));
+
+    let narrow = console::strip_ansi_codes(&render(42)).into_owned();
+    assert!(narrow.starts_with("Decode ["));
+    assert!(narrow.contains("↓ 1.50 GiB/s ↑ 512.00 MiB/s"));
+    for width in 0..=88 {
+      let line = render(width);
+      assert!(measure_text_width(&line) <= width);
+      assert!(!line.contains('\n'));
+    }
   }
 
   #[test]
